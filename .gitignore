@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Bun
+bun.lockb
+
+# Claude-specific (not for cross-tool sharing)
+CLAUDE.md

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quip Node Manager</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Tab Bar -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="status">Status Monitor</button>
+      <button class="tab-btn" data-tab="dashboard">Dashboard</button>
+      <span id="app-version" class="app-version">v0.0.0</span>
+    </div>
+
+    <!-- Status Monitor Tab -->
+    <div id="tab-status" class="tab-content active">
+
+      <!-- Node Status -->
+      <div class="card">
+        <div class="status-section">
+          <div id="status-dot" class="status-dot status-stopped"></div>
+          <div>
+            <div id="status-text" class="status-text status-stopped">STOPPED</div>
+            <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Container not running</div>
+          </div>
+          <div style="margin-left:auto;display:flex;gap:8px;">
+            <button id="btn-start" class="btn btn-primary">Start Node</button>
+            <button id="btn-stop" class="btn btn-secondary">Stop Node</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Requirements Checklist -->
+      <div class="card">
+        <div class="section-heading">Requirements</div>
+        <ul id="checklist" class="checklist">
+          <li class="checklist-item" data-id="docker">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Docker installed &amp; running</span>
+            <button class="btn btn-sm btn-secondary check-action" style="display:none">Install Docker</button>
+          </li>
+          <li class="checklist-item" data-id="image">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Node image available</span>
+            <button class="btn btn-sm btn-secondary check-action" style="display:none">Pull Image</button>
+          </li>
+          <li class="checklist-item" data-id="secret">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Node secret configured</span>
+            <button class="btn btn-sm btn-secondary check-action" style="display:none">Generate Secret</button>
+          </li>
+          <li class="checklist-item" data-id="config">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Config file generated</span>
+            <button class="btn btn-sm btn-secondary check-action" style="display:none">Generate Config</button>
+          </li>
+          <li class="checklist-item" data-id="ip">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Public IP reachable</span>
+            <span class="check-action"></span>
+          </li>
+          <li class="checklist-item" data-id="port">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Port 20049 forwarded</span>
+            <span class="check-action"></span>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Mining Configuration -->
+      <div class="card">
+        <div class="section-heading">Mining Configuration</div>
+        <div class="mining-config-grid">
+          <div class="form-group">
+            <label for="num-cpus">CPU Cores</label>
+            <input type="number" id="num-cpus" min="1" max="64" value="2" />
+          </div>
+          <div class="form-group">
+            <label for="gpu-backend">GPU Backend</label>
+            <select id="gpu-backend">
+              <option value="local">Local GPU</option>
+              <option value="modal">Modal</option>
+              <option value="mps">MPS (Apple Silicon)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="gpu-devices">GPU Device IDs (comma-separated)</label>
+            <input type="text" id="gpu-devices" placeholder="e.g. 0,1" />
+          </div>
+          <div class="form-group">
+            <label for="gpu-util">GPU Utilization: <span id="gpu-util-val">80</span>%</label>
+            <input type="range" id="gpu-util" min="0" max="100" value="80" />
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <label style="margin:0;">QPU Endpoints</label>
+            <button id="btn-add-qpu" class="btn btn-sm btn-secondary">+ Add QPU</button>
+          </div>
+          <table class="qpu-table" id="qpu-table">
+            <thead>
+              <tr><th>URL</th><th>API Key</th><th style="width:40px;"></th></tr>
+            </thead>
+            <tbody id="qpu-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="apply-row">
+          <button id="btn-apply" class="btn btn-primary">Apply &amp; Restart</button>
+          <span id="apply-status" style="font-size:13px;color:var(--text-faint);"></span>
+        </div>
+      </div>
+
+      <!-- Log Panel -->
+      <div class="card">
+        <div class="log-toolbar">
+          <div class="section-heading" style="margin:0;">Node Logs</div>
+          <div style="display:flex;gap:8px;">
+            <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
+            <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
+          </div>
+        </div>
+        <div id="log-output" class="log-output"></div>
+      </div>
+
+    </div>
+
+    <!-- Dashboard Tab -->
+    <div id="tab-dashboard" class="tab-content">
+      <div class="dashboard-placeholder">
+        <span>Coming Soon</span>
+      </div>
+    </div>
+
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
