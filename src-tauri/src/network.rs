@@ -10,8 +10,7 @@ pub async fn detect_public_ip() -> Result<String, String> {
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get("https://ifconfig.co/ip")
-        .header("Accept", "text/plain")
+        .get("https://api.ipify.org")
         .send()
         .await
         .map_err(|e| e.to_string())?;

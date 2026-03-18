@@ -17,35 +17,110 @@ impl Default for GpuBackend {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GpuDeviceConfig {
+    pub index: u32,
+    pub enabled: bool,
+    pub utilization: u8,
+    pub yielding: bool,
+}
+
+impl Default for GpuDeviceConfig {
+    fn default() -> Self {
+        GpuDeviceConfig {
+            index: 0,
+            enabled: true,
+            utilization: 80,
+            yielding: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct QpuConfig {
-    pub url: String,
+    /// D-Wave API key (DWAVE_API_KEY)
     pub api_key: String,
+    /// D-Wave solver name (e.g. "Advantage_system6.4")
+    pub solver: String,
+    /// D-Wave region URL (e.g. "https://na-west-1.cloud.dwavesys.com/sapi/v2/")
+    pub region_url: String,
+    /// Daily QPU time budget (e.g. "60s", "5m")
+    pub daily_budget: String,
 }
+
+fn default_port() -> u16 { 20049 }
+fn default_listen() -> String { "::".to_string() }
+fn default_num_cpus() -> u32 { 1 }
+fn default_timeout() -> u32 { 3 }
+fn default_heartbeat_interval() -> u32 { 15 }
+fn default_heartbeat_timeout() -> u32 { 300 }
+fn default_verify_ssl() -> bool { true }
+fn default_log_level() -> String { "info".to_string() }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
-    pub num_cpus: u32,
-    pub gpu_backend: GpuBackend,
-    pub gpu_devices: Vec<u32>,
-    pub gpu_utilization: u8,
-    pub qpu_configs: Vec<QpuConfig>,
-    pub peers: Vec<String>,
+    // Network
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub public_host: String,
+    #[serde(default)]
+    pub node_name: String,
+    #[serde(default)]
+    pub peers: Vec<String>,
+    #[serde(default)]
+    pub auto_mine: bool,
+    // Identity
+    #[serde(default)]
     pub secret: String,
+    // CPU mining
+    #[serde(default = "default_num_cpus")]
+    pub num_cpus: u32,
+    // GPU mining
+    #[serde(default)]
+    pub gpu_backend: GpuBackend,
+    #[serde(default)]
+    pub gpu_device_configs: Vec<GpuDeviceConfig>,
+    // QPU
+    #[serde(default)]
+    pub qpu_config: Option<QpuConfig>,
+    // Advanced
+    #[serde(default = "default_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval: u32,
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout: u32,
+    #[serde(default)]
+    pub fanout: Option<u32>,
+    #[serde(default = "default_verify_ssl")]
+    pub verify_ssl: bool,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
-            num_cpus: 2,
-            gpu_backend: GpuBackend::Local,
-            gpu_devices: vec![],
-            gpu_utilization: 80,
-            qpu_configs: vec![],
-            peers: vec![],
             port: 20049,
+            listen: "::".to_string(),
+            public_host: String::new(),
+            node_name: String::new(),
+            peers: vec![],
+            auto_mine: false,
             secret: String::new(),
+            num_cpus: 1,
+            gpu_backend: GpuBackend::Local,
+            gpu_device_configs: vec![],
+            qpu_config: None,
+            timeout: 3,
+            heartbeat_interval: 15,
+            heartbeat_timeout: 300,
+            fanout: None,
+            verify_ssl: true,
+            log_level: "info".to_string(),
         }
     }
 }

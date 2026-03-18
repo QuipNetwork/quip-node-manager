@@ -10,6 +10,7 @@
   <div id="app">
     <!-- Tab Bar -->
     <div class="tab-bar">
+      <img src="quipv3.png" class="tab-logo" alt="Quip" />
       <button class="tab-btn active" data-tab="status">Status Monitor</button>
       <button class="tab-btn" data-tab="dashboard">Dashboard</button>
       <span id="app-version" class="app-version">v0.0.0</span>
@@ -24,18 +25,24 @@
           <div id="status-dot" class="status-dot status-stopped"></div>
           <div>
             <div id="status-text" class="status-text status-stopped">STOPPED</div>
-            <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Container not running</div>
+            <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Node not running</div>
           </div>
           <div style="margin-left:auto;display:flex;gap:8px;">
-            <button id="btn-start" class="btn btn-primary">Start Node</button>
-            <button id="btn-stop" class="btn btn-secondary">Stop Node</button>
+            <button id="btn-start" class="btn btn-primary" disabled>Start Node</button>
+            <button id="btn-stop" class="btn btn-secondary" disabled>Stop Node</button>
           </div>
         </div>
       </div>
 
       <!-- Requirements Checklist -->
       <div class="card">
-        <div class="section-heading">Requirements</div>
+        <button id="checklist-toggle" class="checklist-toggle" aria-expanded="true">
+          <div class="section-heading" style="margin:0;">Requirements</div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div id="checklist-summary" class="checklist-summary">Checking&hellip;</div>
+            <span class="checklist-chevron"></span>
+          </div>
+        </button>
         <ul id="checklist" class="checklist">
           <li class="checklist-item" data-id="docker">
             <span class="check-icon">&#9675;</span>
@@ -52,14 +59,14 @@
             <span class="check-label">Node secret configured</span>
             <button class="btn btn-sm btn-secondary check-action" style="display:none">Generate Secret</button>
           </li>
-          <li class="checklist-item" data-id="config">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Config file generated</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Generate Config</button>
-          </li>
           <li class="checklist-item" data-id="ip">
             <span class="check-icon">&#9675;</span>
             <span class="check-label">Public IP reachable</span>
+            <span class="check-action"></span>
+          </li>
+          <li class="checklist-item" data-id="hostname">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Hostname accessible to internet</span>
             <span class="check-action"></span>
           </li>
           <li class="checklist-item" data-id="port">
@@ -67,52 +74,182 @@
             <span class="check-label">Port 20049 forwarded</span>
             <span class="check-action"></span>
           </li>
+          <li class="checklist-item" data-id="firewall">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Local firewall allows port</span>
+            <span class="check-action"></span>
+          </li>
         </ul>
       </div>
 
-      <!-- Mining Configuration -->
+      <!-- Configuration (collapsible) -->
       <div class="card">
-        <div class="section-heading">Mining Configuration</div>
-        <div class="mining-config-grid">
-          <div class="form-group">
-            <label for="num-cpus">CPU Cores</label>
-            <input type="number" id="num-cpus" min="1" max="64" value="2" />
-          </div>
-          <div class="form-group">
-            <label for="gpu-backend">GPU Backend</label>
-            <select id="gpu-backend">
-              <option value="local">Local GPU</option>
-              <option value="modal">Modal</option>
-              <option value="mps">MPS (Apple Silicon)</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label for="gpu-devices">GPU Device IDs (comma-separated)</label>
-            <input type="text" id="gpu-devices" placeholder="e.g. 0,1" />
-          </div>
-          <div class="form-group">
-            <label for="gpu-util">GPU Utilization: <span id="gpu-util-val">80</span>%</label>
-            <input type="range" id="gpu-util" min="0" max="100" value="80" />
-          </div>
-        </div>
+        <button id="btn-config-toggle" class="checklist-toggle flush" aria-expanded="false">
+          <div class="section-heading" style="margin:0;">Configuration</div>
+          <span class="checklist-chevron"></span>
+        </button>
 
-        <div class="form-group" style="margin-top:8px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <label style="margin:0;">QPU Endpoints</label>
-            <button id="btn-add-qpu" class="btn btn-sm btn-secondary">+ Add QPU</button>
-          </div>
-          <table class="qpu-table" id="qpu-table">
-            <thead>
-              <tr><th>URL</th><th>API Key</th><th style="width:40px;"></th></tr>
-            </thead>
-            <tbody id="qpu-tbody"></tbody>
-          </table>
-        </div>
+        <div id="config-section" style="display:none;">
 
-        <div class="apply-row">
-          <button id="btn-apply" class="btn btn-primary">Apply &amp; Restart</button>
-          <span id="apply-status" style="font-size:13px;color:var(--text-faint);"></span>
-        </div>
+          <!-- Node Configuration -->
+          <div class="config-section-divider">
+            <div class="section-heading">Node Configuration</div>
+            <div class="mining-config-grid">
+              <div class="form-group">
+                <label for="port">Port (UDP)</label>
+                <input type="number" id="port" min="1024" max="65535" value="20049" />
+              </div>
+              <div class="form-group">
+                <label for="listen">Listen Address</label>
+                <input type="text" id="listen" value="::" readonly />
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Node Secret</label>
+              <div class="secret-row">
+                <input type="password" id="secret-display" readonly placeholder="No secret set" />
+                <button id="btn-show-secret" class="btn btn-sm btn-secondary">Show</button>
+                <button id="btn-regen-secret" class="btn btn-sm btn-secondary">Regenerate</button>
+              </div>
+            </div>
+            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+              <input type="checkbox" id="auto-mine" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+              <label for="auto-mine" style="margin:0;cursor:pointer;">Auto-mine when no peers found</label>
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+              <label for="node-name">Node Name <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+              <input type="text" id="node-name" placeholder="e.g. my-quip-node" />
+            </div>
+            <div style="margin-top:16px;">
+              <button id="btn-custom-toggle" class="checklist-toggle" aria-expanded="false">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <div class="section-heading" style="margin:0;">Custom Settings</div>
+                  <span style="font-size:11px;color:var(--warning);font-weight:500;">&#9888; incorrect settings can break connectivity</span>
+                </div>
+                <span class="checklist-chevron"></span>
+              </button>
+              <div id="custom-settings-section" style="display:none;">
+                <div class="form-group">
+                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                    <input type="checkbox" id="public-host-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host:Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
+                  </div>
+                  <input type="text" id="public-host" placeholder="1.2.3.4:20049 or myhostname.com:20049" disabled />
+                  <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
+                </div>
+                <div class="form-group">
+                  <label for="peers">Bootstrap Peers <span style="color:var(--text-faint);font-weight:400;">(one per line — leave empty for defaults)</span></label>
+                  <textarea id="peers" rows="4" placeholder="qpu-1.nodes.quip.network:20049&#10;cpu-1.quip.carback.us:20049&#10;gpu-1.quip.carback.us:20049&#10;gpu-2.quip.carback.us:20049"></textarea>
+                </div>
+                <div class="mining-config-grid">
+                  <div class="form-group">
+                    <label for="timeout">Timeout <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
+                    <input type="number" id="timeout" min="1" max="60" value="3" />
+                  </div>
+                  <div class="form-group">
+                    <label for="heartbeat-interval">Heartbeat Interval <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
+                    <input type="number" id="heartbeat-interval" min="1" max="300" value="15" />
+                  </div>
+                  <div class="form-group">
+                    <label for="heartbeat-timeout">Heartbeat Timeout <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
+                    <input type="number" id="heartbeat-timeout" min="1" max="3600" value="300" />
+                  </div>
+                  <div class="form-group">
+                    <label for="fanout">Fanout <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                    <input type="number" id="fanout" min="1" max="50" placeholder="default" />
+                  </div>
+                  <div class="form-group">
+                    <label for="log-level">Log Level</label>
+                    <select id="log-level">
+                      <option value="info">info</option>
+                      <option value="debug">debug</option>
+                      <option value="warn">warn</option>
+                      <option value="error">error</option>
+                    </select>
+                  </div>
+                  <div class="form-group" style="display:flex;align-items:center;gap:10px;padding-top:18px;">
+                    <input type="checkbox" id="verify-ssl" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                    <label for="verify-ssl" style="margin:0;cursor:pointer;">Verify SSL</label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- CPU Miner Configuration -->
+          <div class="config-section-divider">
+            <div class="section-heading">CPU Miner Configuration</div>
+            <div class="form-group" style="max-width:160px;margin-bottom:0;">
+              <label for="num-cpus">CPU Cores</label>
+              <input type="number" id="num-cpus" min="1" max="64" value="1" />
+            </div>
+          </div>
+
+          <!-- GPU Miner Configuration -->
+          <div class="config-section-divider">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+              <div class="section-heading" style="margin:0;">GPU Miner Configuration</div>
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">
+                <input type="checkbox" id="gpu-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                <span style="font-size:13px;color:var(--text-dim);">Enable GPU Mining</span>
+              </label>
+            </div>
+            <div id="gpu-options" style="display:none;margin-top:16px;">
+              <div class="form-group" style="max-width:260px;">
+                <label for="gpu-backend">GPU Backend</label>
+                <select id="gpu-backend">
+                  <option value="local">CUDA (NVIDIA GPU)</option>
+                  <option value="mps">Metal (Apple Silicon GPU)</option>
+                </select>
+              </div>
+              <div class="gpu-setting-row" style="margin-bottom:12px;">
+                <label>Utilization</label>
+                <input type="range" id="gpu-utilization" min="0" max="100" value="80" />
+                <span id="gpu-util-display" class="gpu-util-display">80%</span>
+              </div>
+              <label class="gpu-yielding-row">
+                <input type="checkbox" id="gpu-yielding" style="width:15px;height:15px;accent-color:var(--warning);cursor:pointer;" />
+                <span class="gpu-yielding-flag">&#127987;&#65039;</span>
+                <span>Yielding &#8212; GPU will yield to other applications when under load</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- QPU Miner Configuration -->
+          <div class="config-section-divider">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+              <div class="section-heading" style="margin:0;">QPU Miner Configuration</div>
+              <button id="btn-qpu-toggle" class="btn btn-sm btn-secondary">Have D-Wave / QPU Access? Click here</button>
+            </div>
+            <div id="qpu-section" style="display:none;margin-top:16px;">
+              <div class="mining-config-grid">
+                <div class="form-group">
+                  <label for="qpu-api-key">D-Wave API Key</label>
+                  <input type="password" id="qpu-api-key" placeholder="DEV-..." />
+                </div>
+                <div class="form-group">
+                  <label for="qpu-solver">Solver <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                  <input type="text" id="qpu-solver" placeholder="Advantage_system6.4" />
+                </div>
+                <div class="form-group">
+                  <label for="qpu-region-url">Region URL <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                  <input type="text" id="qpu-region-url" placeholder="https://na-west-1.cloud.dwavesys.com/sapi/v2/" />
+                </div>
+                <div class="form-group">
+                  <label for="qpu-daily-budget">Daily Budget <span style="color:var(--text-faint);font-weight:400;">(e.g. 60s, 5m)</span></label>
+                  <input type="text" id="qpu-daily-budget" placeholder="60s" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Apply & Restart -->
+          <div style="display:flex;gap:8px;align-items:center;padding-top:4px;">
+            <button id="btn-apply" class="btn btn-primary" disabled>Apply &amp; Restart</button>
+            <span id="apply-status" style="font-size:13px;color:var(--text-faint);"></span>
+          </div>
+
+        </div><!-- /config-section -->
       </div>
 
       <!-- Log Panel -->
