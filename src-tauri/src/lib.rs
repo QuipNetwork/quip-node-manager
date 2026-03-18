@@ -28,6 +28,8 @@ pub fn run() {
             docker::stop_node_container,
             docker::get_container_status,
             docker::get_container_config,
+            docker::detect_gpu_backend,
+            docker::list_gpu_devices,
             network::detect_public_ip,
             network::check_port_forwarding,
             update::check_app_update,
