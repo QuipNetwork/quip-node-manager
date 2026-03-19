@@ -86,27 +86,58 @@ async fn fetch_ip_ipify() -> Option<String> {
 
 // ─── Port check ───────────────────────────────────────────────────────────────
 
-// Checks whether the node port is reachable from the public internet.
-// Uses check.quip.network /checkport (TCP probe). Falls back to false.
-async fn check_port_forwarded(port: u16) -> bool {
-    if let Some(result) = check_port_via_service(port).await {
-        return result;
+/// Bind a TCP listener on `port` and wait up to 15 seconds for any inbound
+/// connection (netcat-style: `nc -l <port>`). Returns true the moment a
+/// connection is accepted, false on timeout or bind error.
+///
+/// This is intentionally passive — it does not send any outbound probes.
+/// The caller (or the user via an external tool) is expected to initiate the
+/// connection from outside the network.
+/// Check port forwarding by connecting to our own public IP (hairpin NAT).
+///
+/// Binds a temporary listener on the port (so there is something to connect to
+/// even when the node is stopped), fetches our public IP, then tries to connect
+/// to `public_ip:port` from this machine. If the connection is accepted the
+/// router is doing hairpin NAT and the port is forwarded.
+///
+/// When the port is already occupied (node running), skips binding and connects
+/// directly — the node itself will accept and immediately see the client
+/// disconnect, which is harmless.
+pub async fn probe_port_forwarding(port: u16) -> bool {
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let public_ip = match fetch_public_ip().await {
+        Some(ip) => ip,
+        None => return false,
+    };
+    let addr = format!("{}:{}", public_ip, port);
+
+    // Try to bind a listener. If the port is already in use (node running) we
+    // skip binding and just attempt the outbound connect — the node will accept.
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.ok();
+
+    if let Some(listener) = listener {
+        // Concurrently connect outbound and accept inbound.
+        let connect_fut =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr));
+        let accept_fut =
+            tokio::time::timeout(Duration::from_secs(6), listener.accept());
+
+        let (conn, acc) = tokio::join!(connect_fut, accept_fut);
+        conn.map(|r| r.is_ok()).unwrap_or(false) && acc.map(|r| r.is_ok()).unwrap_or(false)
+    } else {
+        // Node already running on this port — just try the outbound connect.
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await,
+            Ok(Ok(_))
+        )
     }
-    false
 }
 
-async fn check_port_via_service(port: u16) -> Option<bool> {
-    let client = make_client(15)?;
-    let resp = client
-        .get(format!("{}/checkport?port={}", CHECK_SERVICE, port))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: Value = resp.json().await.ok()?;
-    Some(json["reachable"].as_bool().unwrap_or(false))
+#[tauri::command]
+pub async fn recheck_port_forwarding(port: u16) -> Result<bool, String> {
+    Ok(probe_port_forwarding(port).await)
 }
 
 // ─── Hostname check ───────────────────────────────────────────────────────────
@@ -228,15 +259,11 @@ fn check_local_firewall(port: u16) -> (bool, String) {
 
 // ─── Checklist runner ─────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, String> {
+pub async fn run_checklist_core<F>(on_progress: F) -> Vec<CheckItem>
+where
+    F: Fn(&[CheckItem]) + Send,
+{
     let mut checks = Vec::new();
-
-    macro_rules! emit_check {
-        ($checks:expr, $app:expr) => {
-            let _ = $app.emit("checklist-update", &$checks);
-        };
-    }
 
     // 1. Docker
     checks.push(CheckItem {
@@ -244,7 +271,7 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: check_docker(),
         label: "Docker installed & running".to_string(),
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
     // 2. Image
     checks.push(CheckItem {
@@ -252,7 +279,7 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: check_image_present(),
         label: "Node image available".to_string(),
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
     // 3. Secret
     checks.push(CheckItem {
@@ -260,7 +287,7 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: check_secret_exists(),
         label: "Node secret configured".to_string(),
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
     // 4. Public IP
     let ip_opt = fetch_public_ip().await;
@@ -274,28 +301,24 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: ip_passed,
         label: ip_label,
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
     // 5. Hostname accessible to internet
     let config = crate::settings::load_settings().node_config;
     let port = config.port;
     let (hostname, host_passed) = if !config.public_host.is_empty() {
         let host = &config.public_host;
-        // Strip port suffix to get bare hostname/IP for DNS check
         let host_only = host.split(':').next().unwrap_or(host);
         let passed = if host_only.parse::<std::net::IpAddr>().is_ok() {
-            // Custom override is a bare IP — just verify internet is reachable
             ip_passed
         } else {
-            // Custom hostname — verify DNS resolves to this machine's IP
             match check_hostname_dns(host_only).await {
                 Some(matched) => matched,
-                None => ip_passed, // service unavailable — fall back
+                None => ip_passed,
             }
         };
         (host.clone(), passed)
     } else {
-        // No custom hostname — advertise the detected public IP
         let ip = ip_opt.as_deref().unwrap_or("unknown").to_string();
         (ip, ip_passed)
     };
@@ -304,16 +327,15 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: host_passed,
         label: format!("{} accessible to internet", hostname),
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
-    // 6. Port forwarding — checked via check.quip.network external probe
-    let port_passed = check_port_forwarded(port).await;
+    // 6. Port forwarding — not probed automatically; use the Recheck button.
     checks.push(CheckItem {
         id: "port".to_string(),
-        passed: port_passed,
-        label: format!("Port {} forwarded", port),
+        passed: false,
+        label: format!("Port {} — press Recheck to test", port),
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
     // 7. Local firewall
     let (fw_passed, fw_label) = check_local_firewall(port);
@@ -322,7 +344,15 @@ pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, Stri
         passed: fw_passed,
         label: fw_label,
     });
-    emit_check!(checks, app);
+    on_progress(&checks);
 
-    Ok(checks)
+    checks
+}
+
+#[tauri::command]
+pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, String> {
+    Ok(run_checklist_core(|checks| {
+        let _ = app.emit("checklist-update", checks);
+    })
+    .await)
 }
