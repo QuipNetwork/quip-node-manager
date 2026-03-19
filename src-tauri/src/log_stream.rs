@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::SyncSender;
 use tauri::Emitter;
 
 #[derive(Serialize, Clone, Debug)]
@@ -45,6 +46,38 @@ fn parse_log_line(line: &str) -> LogEntry {
             message: line.to_string(),
         }
     }
+}
+
+/// Start log streaming without Tauri — sends entries via mpsc channel.
+/// Call `*stop.lock().unwrap() = true` to stop the thread.
+pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
+    std::thread::spawn(move || {
+        let mut child = match Command::new("docker")
+            .args(["logs", "-f", "--tail", "100", "quip-node"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let reader = BufReader::new(stdout);
+
+        for line in reader.lines() {
+            if *stop.lock().unwrap() {
+                break;
+            }
+            if let Ok(line) = line {
+                let entry = parse_log_line(&line);
+                if tx.send(entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = child.kill();
+    });
 }
 
 #[tauri::command]

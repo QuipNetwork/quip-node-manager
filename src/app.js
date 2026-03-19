@@ -16,7 +16,8 @@ const state = {
   logLines: [],
   MAX_LOG_LINES: 500,
   pollInterval: null,
-  portPollInterval: null,
+  portCheckResult: null, // null=unchecked, true=forwarded, false=not reached
+  lastChecks: [],        // last checklist payload from backend
 };
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
@@ -284,6 +285,7 @@ function updateStartStopState() {
     !state.checksPassed || state.containerRunning;
   document.getElementById('btn-stop').disabled = !state.containerRunning;
   document.getElementById('btn-apply').disabled = !state.containerRunning;
+  // btn-save is always enabled; no state logic needed
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -316,9 +318,13 @@ function setStatus(stateStr) {
 // ─── Checklist update ─────────────────────────────────────────────────────────
 function updateChecklist(checks) {
   const TOTAL_CHECKS = 7;
+  state.lastChecks = checks;
   const allPassed =
-    checks.length === TOTAL_CHECKS && checks.every((c) => c.passed);
-  const failing = checks.filter((c) => !c.passed).length;
+    checks.length === TOTAL_CHECKS &&
+    checks.every((c) => c.id === 'port' ? state.portCheckResult === true : c.passed);
+  const failing = checks.filter((c) =>
+    c.id === 'port' ? state.portCheckResult !== true : !c.passed
+  ).length;
 
   state.checksPassed = allPassed;
 
@@ -351,11 +357,17 @@ function updateChecklist(checks) {
     );
     if (!item) return;
     const icon = item.querySelector('.check-icon');
-    icon.textContent = check.passed ? '\u2713' : '\u2717';
-    icon.style.color = check.passed ? 'var(--success)' : 'var(--error)';
-
     const label = item.querySelector('.check-label');
-    if (label && check.label) label.textContent = check.label;
+
+    if (check.id === 'port' && state.portCheckResult !== null) {
+      // Recheck result takes precedence over the background checklist placeholder.
+      icon.textContent = state.portCheckResult ? '\u2713' : '\u2717';
+      icon.style.color = state.portCheckResult ? 'var(--success)' : 'var(--error)';
+    } else {
+      icon.textContent = check.passed ? '\u2713' : '\u2717';
+      icon.style.color = check.passed ? 'var(--success)' : 'var(--error)';
+      if (label && check.label) label.textContent = check.label;
+    }
 
     const actionBtn = item.querySelector('.check-action');
     if (actionBtn && actionBtn.tagName === 'BUTTON') {
@@ -450,10 +462,7 @@ document.getElementById('btn-start').addEventListener('click', async () => {
   applyStatus.textContent = 'Starting\u2026';
   try {
     await invoke('update_settings', { settings: state.settings });
-    await invoke('start_node_container', {
-      config: state.settings.node_config,
-      imageTag: state.settings.image_tag,
-    });
+    await invoke('start_node_container');
     applyStatus.textContent = 'Node started.';
     await invoke('start_log_stream');
     await pollStatus();
@@ -485,16 +494,27 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
       applyStatus.textContent = 'Restarting\u2026';
       await invoke('stop_log_stream');
       await invoke('stop_node_container');
-      await invoke('start_node_container', {
-        config: state.settings.node_config,
-        imageTag: state.settings.image_tag,
-      });
+      await invoke('start_node_container');
       await invoke('start_log_stream');
     }
     applyStatus.textContent = 'Settings saved.';
     setTimeout(() => {
       applyStatus.textContent = '';
     }, 3000);
+  } catch (e) {
+    applyStatus.textContent = `Error: ${e}`;
+  }
+});
+
+// ─── Save ─────────────────────────────────────────────────────────────────────
+document.getElementById('btn-save').addEventListener('click', async () => {
+  applyFormToSettings();
+  const applyStatus = document.getElementById('apply-status');
+  applyStatus.textContent = 'Saving\u2026';
+  try {
+    await invoke('update_settings', { settings: state.settings });
+    applyStatus.textContent = 'Settings saved.';
+    setTimeout(() => { applyStatus.textContent = ''; }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
   }
@@ -513,21 +533,37 @@ async function pollStatus() {
   updateStartStopState();
 }
 
-async function pollPort() {
+// ─── Port recheck ─────────────────────────────────────────────────────────────
+document.getElementById('btn-port-recheck').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-port-recheck');
+  const item = document.querySelector('.checklist-item[data-id="port"]');
+  const icon = item.querySelector('.check-icon');
+  const label = item.querySelector('.check-label');
+  const port = state.settings?.node_config?.port ?? 20049;
+
+  btn.disabled = true;
+  btn.textContent = 'Checking\u2026';
+  icon.textContent = '\u25cb';
+  icon.style.color = '';
+  label.textContent = `Port ${port} \u2014 checking via public IP\u2026`;
+
   try {
-    const port = state.settings?.node_config?.port ?? 20049;
-    const ip = await invoke('detect_public_ip');
-    const ok = await invoke('check_port_forwarding', { ip, port });
-    const item = document.querySelector('.checklist-item[data-id="port"]');
-    if (item) {
-      const icon = item.querySelector('.check-icon');
-      icon.textContent = ok ? '\u2713' : '\u2717';
-      icon.style.color = ok ? 'var(--success)' : 'var(--error)';
-    }
-  } catch {
-    // ignore
+    const ok = await invoke('recheck_port_forwarding', { port });
+    state.portCheckResult = ok;
+    icon.textContent = ok ? '\u2713' : '\u2717';
+    icon.style.color = ok ? 'var(--success)' : 'var(--error)';
+    label.textContent = ok
+      ? `Port ${port} forwarded`
+      : `Port ${port} \u2014 not reachable`;
+    // Re-evaluate summary and start-button state using the stored checks.
+    updateChecklist(state.lastChecks);
+  } catch (e) {
+    label.textContent = `Port check error: ${e}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Recheck';
   }
-}
+});
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
 async function setupListeners() {
@@ -584,7 +620,6 @@ async function init() {
   await invoke('start_log_stream').catch(console.error);
 
   state.pollInterval = setInterval(pollStatus, 10_000);
-  state.portPollInterval = setInterval(pollPort, 60_000);
 }
 
 init().catch(console.error);

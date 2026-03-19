@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::settings::{ContainerStatus, GpuBackend, NodeConfig};
+use crate::settings::{ContainerStatus, GpuBackend};
 use serde::Serialize;
 use std::process::Command;
 
@@ -107,10 +107,13 @@ pub async fn pull_node_image(
 }
 
 #[tauri::command]
-pub async fn start_node_container(
-    config: NodeConfig,
-    image_tag: String,
-) -> Result<String, String> {
+pub async fn start_node_container() -> Result<String, String> {
+    // Load the saved settings from disk so the node always starts from the
+    // authoritative persisted config (call update_settings first to save).
+    let settings = crate::settings::load_settings();
+    let config = settings.node_config;
+    let image_tag = settings.image_tag;
+
     // Write config.toml before starting — entrypoint mounts /data/config.toml
     crate::config::write_config_toml(&config)?;
 

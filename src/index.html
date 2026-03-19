@@ -71,8 +71,8 @@
           </li>
           <li class="checklist-item" data-id="port">
             <span class="check-icon">&#9675;</span>
-            <span class="check-label">Port 20049 forwarded</span>
-            <span class="check-action"></span>
+            <span class="check-label">Port 20049 — press Recheck to test</span>
+            <button id="btn-port-recheck" class="btn btn-sm btn-secondary">Recheck</button>
           </li>
           <li class="checklist-item" data-id="firewall">
             <span class="check-icon">&#9675;</span>
@@ -243,8 +243,9 @@
             </div>
           </div>
 
-          <!-- Apply & Restart -->
+          <!-- Save / Apply & Restart -->
           <div style="display:flex;gap:8px;align-items:center;padding-top:4px;">
+            <button id="btn-save" class="btn btn-secondary">Save</button>
             <button id="btn-apply" class="btn btn-primary" disabled>Apply &amp; Restart</button>
             <span id="apply-status" style="font-size:13px;color:var(--text-faint);"></span>
           </div>

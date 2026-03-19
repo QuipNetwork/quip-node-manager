@@ -7,6 +7,9 @@ pub mod log_stream;
 pub mod network;
 pub mod secret;
 pub mod settings;
+pub mod tui_app;
+pub mod tui_input;
+pub mod tui_ui;
 pub mod update;
 
 use log_stream::LogStreamState;
@@ -31,7 +34,7 @@ pub fn run() {
             docker::detect_gpu_backend,
             docker::list_gpu_devices,
             network::detect_public_ip,
-            network::check_port_forwarding,
+            checklist::recheck_port_forwarding,
             update::check_app_update,
             update::check_image_update,
             log_stream::start_log_stream,
