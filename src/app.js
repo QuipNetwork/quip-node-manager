@@ -52,6 +52,13 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
   section.style.display = expanded ? 'none' : '';
 });
 
+// ─── Log drawer toggle ──────────────────────────────────────────────────────
+document.getElementById('log-drawer-handle').addEventListener('click', (e) => {
+  // Don't toggle if clicking Copy/Clear buttons inside the handle
+  if (e.target.closest('.btn')) return;
+  document.getElementById('log-drawer').classList.toggle('expanded');
+});
+
 // ─── Requirements toggle ─────────────────────────────────────────────────────
 document.getElementById('checklist-toggle').addEventListener('click', () => {
   const btn = document.getElementById('checklist-toggle');

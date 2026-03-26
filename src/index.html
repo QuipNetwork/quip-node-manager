@@ -359,18 +359,6 @@
         </div><!-- /config-section -->
       </div>
 
-      <!-- Log Panel -->
-      <div class="card">
-        <div class="log-toolbar">
-          <div class="section-heading" style="margin:0;">Node Logs</div>
-          <div style="display:flex;gap:8px;">
-            <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
-            <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
-          </div>
-        </div>
-        <div id="log-output" class="log-output"></div>
-      </div>
-
     </div>
 
     <!-- Dashboard Tab -->
@@ -378,6 +366,21 @@
       <div class="dashboard-placeholder">
         <span>Coming Soon</span>
       </div>
+    </div>
+
+    <!-- Log Drawer (fixed bottom) -->
+    <div id="log-drawer">
+      <div id="log-drawer-handle" class="log-drawer-handle">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span id="log-drawer-chevron" class="log-drawer-chevron"></span>
+          <div class="section-heading" style="margin:0;">Node Logs</div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
+          <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
+        </div>
+      </div>
+      <div id="log-output" class="log-output"></div>
     </div>
 
   </div>

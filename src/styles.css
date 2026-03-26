@@ -23,6 +23,7 @@
   --accent: #3b82f6;
   --border: #27272a;
   --border-input: #3f3f46;
+  --drawer-collapsed: 130px;
 }
 
 /* ─── Body ───────────────────────────────────────────────────────────────── */
@@ -90,6 +91,7 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 20px;
+  padding-bottom: calc(var(--drawer-collapsed) + 20px);
   display: none;
 }
 
@@ -571,24 +573,60 @@ button.check-action:disabled {
   align-items: center;
 }
 
-/* ─── Log Panel ──────────────────────────────────────────────────────────── */
-.log-toolbar {
+/* ─── Log Drawer ─────────────────────────────────────────────────────────── */
+#log-drawer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  height: var(--drawer-collapsed);
+  transition: height 0.25s ease;
+}
+
+#log-drawer.expanded {
+  height: 60vh;
+}
+
+.log-drawer-handle {
+  display: flex;
   align-items: center;
-  margin-bottom: 8px;
+  justify-content: space-between;
+  padding: 8px 16px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.log-drawer-chevron {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--text-faint);
+  border-bottom: 2px solid var(--text-faint);
+  transform: rotate(-135deg);
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+#log-drawer.expanded .log-drawer-chevron {
+  transform: rotate(45deg);
 }
 
 .log-output {
   background: #0d0d0f;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px;
-  height: 280px;
-  overflow-y: scroll;
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
   font-family: 'SF Mono', Menlo, monospace;
   font-size: 12px;
   line-height: 1.5;
+  min-height: 0;
 }
 
 .log-line {

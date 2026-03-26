@@ -4,7 +4,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 
-use crate::tui_app::{Action, EditMode, FocusId, Screen, TuiApp};
+use crate::tui_app::{Action, EditMode, FocusId, TuiApp};
 
 /// Handle a terminal event and return the resulting action.
 /// Pure state mutations; async work is done by the caller in `TuiApp::run`.
@@ -24,17 +24,7 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Action {
         return Action::Quit;
     }
 
-    match app.screen {
-        Screen::Logs => handle_key_logs(app, key),
-        Screen::Main => handle_key_main(app, key),
-    }
-}
-
-fn handle_key_logs(_app: &mut TuiApp, key: KeyEvent) -> Action {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::ExitLogs,
-        _ => Action::None,
-    }
+    handle_key_main(app, key)
 }
 
 fn handle_key_main(app: &mut TuiApp, key: KeyEvent) -> Action {
@@ -45,7 +35,7 @@ fn handle_key_main(app: &mut TuiApp, key: KeyEvent) -> Action {
 
     match key.code {
         KeyCode::Char('q') => Action::Quit,
-        KeyCode::Char('l') => Action::EnterLogs,
+        KeyCode::Char('l') => Action::ToggleLogs,
 
         // Navigation
         KeyCode::Up | KeyCode::BackTab => {
@@ -126,7 +116,6 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::SecretShow => Action::ToggleSecretVisible,
         FocusId::SecretRegenerate => Action::RegenerateSecret,
         FocusId::ApplyRestart => Action::ApplyRestart,
-        FocusId::ViewLogs => Action::EnterLogs,
 
         // Run Mode — cycle Docker/Native
         FocusId::RunMode => {
@@ -304,28 +293,16 @@ fn commit_edit(app: &mut TuiApp) {
 fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) -> Action {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
-            if app.screen == Screen::Logs {
-                // logs are always tail — no scroll needed
-            } else {
-                app.scroll_offset = app.scroll_offset.saturating_add(3);
-            }
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
             Action::None
         }
         MouseEventKind::ScrollUp => {
-            if app.screen == Screen::Main {
-                app.scroll_offset = app.scroll_offset.saturating_sub(3);
-            }
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
             Action::None
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.screen == Screen::Logs {
-                Action::None
-            } else {
-                // Without stored hit-test rects, we do basic row-based matching.
-                // The content starts at row 1 (inside the outer block border).
-                let row = mouse.row.saturating_sub(1) + app.scroll_offset;
-                handle_click(app, row)
-            }
+            let row = mouse.row.saturating_sub(1) + app.scroll_offset;
+            handle_click(app, row)
         }
         _ => Action::None,
     }

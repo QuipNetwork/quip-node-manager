@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::log_stream::LogEntry;
-use crate::tui_app::{EditMode, FocusId, Screen, TuiApp};
+use crate::tui_app::{EditMode, FocusId, TuiApp};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -17,32 +17,36 @@ const FAIL: Color = Color::Red;
 const WARN_COLOR: Color = Color::Yellow;
 
 pub fn render(frame: &mut Frame, app: &mut TuiApp) {
-    match app.screen {
-        Screen::Main => render_main(frame, app),
-        Screen::Logs => render_logs(frame, app),
-    }
-}
-
-// ─── Main view ────────────────────────────────────────────────────────────────
-
-fn render_main(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
+
+    // Layout: [main content] [log panel] [footer]
+    let log_height = if app.log_expanded {
+        Constraint::Percentage(60)
+    } else {
+        Constraint::Length(7) // 2 border + 5 log lines
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(6),   // main content
+            log_height,           // log panel
+            Constraint::Length(1), // footer
+        ])
         .split(area);
 
     let content_area = chunks[0];
-    let footer_area = chunks[1];
+    let log_area = chunks[1];
+    let footer_area = chunks[2];
 
-    render_footer(frame, footer_area, false);
+    render_footer(frame, footer_area);
+    render_log_panel(frame, app, log_area);
 
     // Build all content lines
     let mut lines: Vec<Line> = Vec::new();
     render_status_section(app, &mut lines);
     render_requirements_section(app, &mut lines);
     render_config_section(app, &mut lines);
-    render_logs_section(app, &mut lines);
 
     let total = lines.len() as u16;
     app.content_height = total;
@@ -477,26 +481,10 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     lines.push(Line::raw(""));
 }
 
-fn render_logs_section(app: &TuiApp, lines: &mut Vec<Line>) {
-    let log_style = focus_style(app, &FocusId::ViewLogs);
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        btn_span("[ View Logs ]", log_style),
-    ]));
-}
+// ─── Log panel (bottom drawer) ────────────────────────────────────────────────
 
-// ─── Log view ─────────────────────────────────────────────────────────────────
-
-fn render_logs(frame: &mut Frame, app: &TuiApp) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-
-    render_footer(frame, chunks[1], true);
-
-    let inner_height = chunks[0].height.saturating_sub(2) as usize;
+fn render_log_panel(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize; // borders
     let lines: Vec<Line> = app
         .log_buf
         .iter()
@@ -506,12 +494,14 @@ fn render_logs(frame: &mut Frame, app: &TuiApp) {
         .map(|e| log_line(e))
         .collect();
 
-    let text = Text::from(lines);
-    let block = Block::bordered().title(Span::styled(
-        " Node Logs ",
+    let arrow = if app.log_expanded { "▼" } else { "▶" };
+    let title = Span::styled(
+        format!(" {} Logs [l] ", arrow),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(text).block(block), chunks[0]);
+    );
+    let block = Block::bordered().title(title);
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn log_line(entry: &LogEntry) -> Line<'static> {
@@ -525,7 +515,6 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
     let ts = if entry.timestamp.is_empty() {
         String::new()
     } else {
-        // Show only time portion: "2024-01-01T12:00:00Z" → "12:00:00"
         entry.timestamp.chars().skip(11).take(8).collect::<String>()
     };
     Line::from(vec![
@@ -540,14 +529,9 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 
 // ─── Footer ───────────────────────────────────────────────────────────────────
 
-fn render_footer(frame: &mut Frame, area: Rect, in_logs: bool) {
-    let text = if in_logs {
-        " [q/Esc] Back "
-    } else {
-        " [↑↓/Tab] Navigate   [Enter] Select/Edit   [Space] Toggle   [l] Logs   [q] Quit "
-    };
+fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Span::styled(
-        text,
+        " [↑↓/Tab] Navigate   [Enter] Select/Edit   [Space] Toggle   [l] Logs   [q] Quit ",
         Style::default().fg(Color::Black).bg(ACCENT),
     ));
     frame.render_widget(para, area);

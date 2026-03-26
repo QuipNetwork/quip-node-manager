@@ -42,7 +42,6 @@ pub enum FocusId {
     QpuDailyBudget,
     ApplyRestart,
     AutoUpdate,
-    ViewLogs,
     // Advanced (inside Custom Settings)
     Timeout,
     HeartbeatInterval,
@@ -61,13 +60,7 @@ pub enum FocusId {
     HttpLog,
 }
 
-// ─── Screens / modes ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Screen {
-    Main,
-    Logs,
-}
+// ─── Edit mode ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
 pub enum EditMode {
@@ -86,8 +79,7 @@ pub enum Action {
     ToggleSecretVisible,
     RunChecklist,
     CheckPort,
-    EnterLogs,
-    ExitLogs,
+    ToggleLogs,
     None,
 }
 
@@ -250,7 +242,6 @@ impl FormState {
 // ─── App state ────────────────────────────────────────────────────────────────
 
 pub struct TuiApp {
-    pub screen: Screen,
     pub focus: FocusId,
     pub edit_mode: EditMode,
     pub settings: AppSettings,
@@ -262,10 +253,12 @@ pub struct TuiApp {
     pub port_checking: bool,
     port_check_rx: Option<mpsc::Receiver<bool>>,
     pub log_rx: mpsc::Receiver<LogEntry>,
+    #[allow(dead_code)] // Kept alive to prevent channel close
     log_tx: SyncSender<LogEntry>,
     pub log_buf: VecDeque<LogEntry>,
     pub log_stop: Arc<Mutex<bool>>,
     pub log_streaming: bool,
+    pub log_expanded: bool,
     pub checklist_expanded: bool,
     pub config_expanded: bool,
     pub custom_expanded: bool,
@@ -285,8 +278,14 @@ impl TuiApp {
         let form = FormState::from_settings(&settings);
         let (tx, rx) = mpsc::sync_channel(512);
         let secret = load_secret_sync();
+        let log_stop = Arc::new(Mutex::new(false));
+        // Start log streaming immediately so the bottom panel always has data
+        {
+            let stream_tx = tx.clone();
+            let stream_stop = Arc::clone(&log_stop);
+            crate::log_stream::start_log_stream_core(stream_tx, stream_stop);
+        }
         TuiApp {
-            screen: Screen::Main,
             focus: FocusId::StartNode,
             edit_mode: EditMode::None,
             form,
@@ -305,8 +304,9 @@ impl TuiApp {
             log_rx: rx,
             log_tx: tx,
             log_buf: VecDeque::with_capacity(500),
-            log_stop: Arc::new(Mutex::new(false)),
-            log_streaming: false,
+            log_stop,
+            log_streaming: true,
+            log_expanded: false,
             checklist_expanded: true,
             config_expanded: false,
             custom_expanded: false,
@@ -353,8 +353,9 @@ impl TuiApp {
                     }
                     Action::RunChecklist => self.start_checklist(),
                     Action::CheckPort => self.start_port_check(),
-                    Action::EnterLogs => self.enter_logs(),
-                    Action::ExitLogs => self.exit_logs(),
+                    Action::ToggleLogs => {
+                        self.log_expanded = !self.log_expanded;
+                    }
                     Action::None => {}
                 }
             }
@@ -714,23 +715,6 @@ impl TuiApp {
         });
     }
 
-    pub fn enter_logs(&mut self) {
-        self.screen = Screen::Logs;
-        if !self.log_streaming {
-            *self.log_stop.lock().unwrap() = false;
-            let tx = self.log_tx.clone();
-            let stop = Arc::clone(&self.log_stop);
-            crate::log_stream::start_log_stream_core(tx, stop);
-            self.log_streaming = true;
-        }
-    }
-
-    pub fn exit_logs(&mut self) {
-        self.screen = Screen::Main;
-        *self.log_stop.lock().unwrap() = true;
-        self.log_streaming = false;
-    }
-
     // ─── Navigation helpers ───────────────────────────────────────────────────
 
     /// Returns the ordered list of focusable elements given current expand state.
@@ -792,7 +776,6 @@ impl TuiApp {
             }
             list.push(FocusId::ApplyRestart);
         }
-        list.push(FocusId::ViewLogs);
         list
     }
 
