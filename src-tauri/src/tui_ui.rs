@@ -178,16 +178,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         return;
     }
 
-    // Image tag selector
-    let image_style = focus_style(app, &FocusId::ImageTag);
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("Image  [ cpu ]  [ cuda ]  (active: {})", app.form.image_tag),
-            image_style,
-        ),
-    ]));
-
     // Port
     lines.push(field_line(
         app, &FocusId::Port, "Port", &field_value(app, &FocusId::Port, &app.form.port),
@@ -290,11 +280,11 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             app, &FocusId::Fanout, "  Fanout",
             &field_value(app, &FocusId::Fanout, &fanout_display),
         ));
-        let ssl_check = if app.form.verify_ssl { "[x]" } else { "[ ]" };
+        let tls_check = if app.form.verify_ssl { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
             Span::raw("      "),
             Span::styled(
-                format!("{} Verify SSL", ssl_check),
+                format!("{} Verify TLS", tls_check),
                 focus_style(app, &FocusId::VerifySsl),
             ),
         ]));
@@ -318,22 +308,24 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         &field_value(app, &FocusId::CpuCores, &app.form.cpu_cores),
     ));
 
-    // GPU Enable checkbox
-    let gpu_check = if app.form.gpu_enabled { "[x]" } else { "[ ]" };
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("{} Enable GPU Mining", gpu_check),
-            focus_style(app, &FocusId::GpuEnable),
-        ),
-    ]));
-    if app.form.gpu_enabled {
-        let backends = ["local", "modal", "mps"];
-        let backend_val = backends
-            .get(app.form.gpu_backend_idx)
-            .copied()
-            .unwrap_or("local");
-        lines.push(field_line(app, &FocusId::GpuBackend, "  Backend", backend_val));
+    // GPU Devices
+    let gpu_devices = &app.settings.node_config.gpu_device_configs;
+    if gpu_devices.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    GPU: No GPUs detected",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for dev in gpu_devices {
+            let check = if dev.enabled { "[x]" } else { "[ ]" };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("{} GPU {}", check, dev.index),
+                    focus_style(app, &FocusId::GpuEnable),
+                ),
+            ]));
+        }
         lines.push(field_line(
             app,
             &FocusId::GpuUtilization,
@@ -360,22 +352,18 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
     ]));
     if app.qpu_expanded {
+        lines.push(Line::from(Span::styled(
+            "      Solver: Advantage2_System1.13 · Region: NA West 1",
+            Style::default().fg(DIM),
+        )));
         let masked_key = if app.form.qpu_api_key.is_empty() {
             String::new()
         } else {
             format!("{}…", &app.form.qpu_api_key[..4.min(app.form.qpu_api_key.len())])
         };
         lines.push(field_line(
-            app, &FocusId::QpuApiKey, "  API Key",
+            app, &FocusId::QpuApiKey, "  Token",
             &field_value(app, &FocusId::QpuApiKey, &masked_key),
-        ));
-        lines.push(field_line(
-            app, &FocusId::QpuSolver, "  Solver",
-            &field_value(app, &FocusId::QpuSolver, &app.form.qpu_solver),
-        ));
-        lines.push(field_line(
-            app, &FocusId::QpuRegionUrl, "  Region URL",
-            &field_value(app, &FocusId::QpuRegionUrl, &app.form.qpu_region_url),
         ));
         lines.push(field_line(
             app, &FocusId::QpuDailyBudget, "  Daily Budget",

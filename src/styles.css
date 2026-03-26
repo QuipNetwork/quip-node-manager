@@ -635,3 +635,68 @@ button.check-action:hover {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-input);
 }
+
+.run-mode-warning {
+  font-size: 12px;
+  color: var(--warning);
+  max-width: 400px;
+  line-height: 1.4;
+}
+
+/* ─── GPU Device Toggle Switch ──────────────────────────────────────────── */
+.gpu-toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.gpu-toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.gpu-toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-elevated);
+  border-radius: 20px;
+  transition: background 0.2s;
+}
+
+.gpu-toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--text-faint);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.gpu-toggle-switch input:checked + .gpu-toggle-slider {
+  background: var(--accent);
+}
+
+.gpu-toggle-switch input:checked + .gpu-toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+/* ─── Update Banner ─────────────────────────────────────────────────────── */
+.update-banner {
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--warning);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

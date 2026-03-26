@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 use tauri::Emitter;
 
-use crate::settings::data_dir;
+use crate::settings::{data_dir, RunMode};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct CheckItem {
@@ -259,27 +259,43 @@ fn check_local_firewall(port: u16) -> (bool, String) {
 
 // ─── Checklist runner ─────────────────────────────────────────────────────────
 
-pub async fn run_checklist_core<F>(on_progress: F) -> Vec<CheckItem>
+pub async fn run_checklist_core<F>(
+    run_mode: &RunMode,
+    on_progress: F,
+) -> Vec<CheckItem>
 where
     F: Fn(&[CheckItem]) + Send,
 {
     let mut checks = Vec::new();
 
-    // 1. Docker
-    checks.push(CheckItem {
-        id: "docker".to_string(),
-        passed: check_docker(),
-        label: "Docker installed & running".to_string(),
-    });
-    on_progress(&checks);
+    match run_mode {
+        RunMode::Docker => {
+            // 1. Docker
+            checks.push(CheckItem {
+                id: "docker".to_string(),
+                passed: check_docker(),
+                label: "Docker installed & running".to_string(),
+            });
+            on_progress(&checks);
 
-    // 2. Image
-    checks.push(CheckItem {
-        id: "image".to_string(),
-        passed: check_image_present(),
-        label: "Node image available".to_string(),
-    });
-    on_progress(&checks);
+            // 2. Image
+            checks.push(CheckItem {
+                id: "image".to_string(),
+                passed: check_image_present(),
+                label: "Node image available".to_string(),
+            });
+            on_progress(&checks);
+        }
+        RunMode::Native => {
+            // 1. Binary available
+            checks.push(CheckItem {
+                id: "binary".to_string(),
+                passed: crate::native::is_binary_available(),
+                label: "Node binary available".to_string(),
+            });
+            on_progress(&checks);
+        }
+    }
 
     // 3. Secret
     checks.push(CheckItem {
@@ -329,11 +345,16 @@ where
     });
     on_progress(&checks);
 
-    // 6. Port forwarding — not probed automatically; use the Recheck button.
+    // 6. Port forwarding
+    let port_ok = probe_port_forwarding(port).await;
     checks.push(CheckItem {
         id: "port".to_string(),
-        passed: false,
-        label: format!("Port {} — press Recheck to test", port),
+        passed: port_ok,
+        label: if port_ok {
+            format!("Port {} forwarded", port)
+        } else {
+            format!("Port {} not reachable from internet", port)
+        },
     });
     on_progress(&checks);
 
@@ -351,7 +372,9 @@ where
 
 #[tauri::command]
 pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, String> {
-    Ok(run_checklist_core(|checks| {
+    let settings = crate::settings::load_settings();
+    let run_mode = settings.run_mode;
+    Ok(run_checklist_core(&run_mode, |checks| {
         let _ = app.emit("checklist-update", checks);
     })
     .await)

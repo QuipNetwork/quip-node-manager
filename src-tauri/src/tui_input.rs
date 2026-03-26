@@ -140,19 +140,15 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
         FocusId::GpuEnable => {
-            app.form.gpu_enabled = !app.form.gpu_enabled;
+            // Toggle first GPU device enabled
+            if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
+                d.enabled = !d.enabled;
+            }
             app.dirty = true;
             Action::None
         }
         FocusId::GpuYielding => {
             app.form.gpu_yielding = !app.form.gpu_yielding;
-            app.dirty = true;
-            Action::None
-        }
-
-        // GPU Backend — cycle through options
-        FocusId::GpuBackend => {
-            app.form.gpu_backend_idx = (app.form.gpu_backend_idx + 1) % 3;
             app.dirty = true;
             Action::None
         }
@@ -165,18 +161,7 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
 
-        // Image tag — toggle cpu/cuda
-        FocusId::ImageTag => {
-            app.form.image_tag = if app.form.image_tag == "cpu" {
-                "cuda".to_string()
-            } else {
-                "cpu".to_string()
-            };
-            app.dirty = true;
-            Action::None
-        }
-
-        // Verify SSL checkbox
+        // Verify TLS checkbox
         FocusId::VerifySsl => {
             app.form.verify_ssl = !app.form.verify_ssl;
             app.dirty = true;
@@ -203,8 +188,6 @@ fn activate(app: &mut TuiApp) -> Action {
         | FocusId::Peers
         | FocusId::CpuCores
         | FocusId::QpuApiKey
-        | FocusId::QpuSolver
-        | FocusId::QpuRegionUrl
         | FocusId::QpuDailyBudget
         | FocusId::Timeout
         | FocusId::HeartbeatInterval
@@ -229,7 +212,10 @@ fn toggle_or_activate(app: &mut TuiApp) -> Action {
             Action::None
         }
         FocusId::GpuEnable => {
-            app.form.gpu_enabled = !app.form.gpu_enabled;
+            // Toggle first GPU device enabled
+            if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
+                d.enabled = !d.enabled;
+            }
             app.dirty = true;
             Action::None
         }
@@ -257,8 +243,6 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::Peers => app.form.peers.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
-        FocusId::QpuSolver => app.form.qpu_solver.clone(),
-        FocusId::QpuRegionUrl => app.form.qpu_region_url.clone(),
         FocusId::QpuDailyBudget => app.form.qpu_daily_budget.clone(),
         FocusId::Timeout => app.form.timeout.clone(),
         FocusId::HeartbeatInterval => app.form.heartbeat_interval.clone(),
@@ -280,8 +264,6 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::Peers => app.form.peers = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
-            FocusId::QpuSolver => app.form.qpu_solver = buf,
-            FocusId::QpuRegionUrl => app.form.qpu_region_url = buf,
             FocusId::QpuDailyBudget => app.form.qpu_daily_budget = buf,
             FocusId::Timeout => app.form.timeout = buf,
             FocusId::HeartbeatInterval => app.form.heartbeat_interval = buf,

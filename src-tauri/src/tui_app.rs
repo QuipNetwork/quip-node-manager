@@ -10,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::checklist::CheckItem;
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, ContainerStatus, GpuBackend, QpuConfig};
+use crate::settings::{AppSettings, ContainerStatus, DwaveConfig, RunMode};
 
 // ─── Focus IDs ────────────────────────────────────────────────────────────────
 
@@ -33,13 +33,10 @@ pub enum FocusId {
     Peers,
     CpuCores,
     GpuEnable,
-    GpuBackend,
     GpuUtilization,
     GpuYielding,
     QpuToggle,
     QpuApiKey,
-    QpuSolver,
-    QpuRegionUrl,
     QpuDailyBudget,
     ApplyRestart,
     ViewLogs,
@@ -50,8 +47,6 @@ pub enum FocusId {
     Fanout,
     VerifySsl,
     LogLevel,
-    // Node config
-    ImageTag,
 }
 
 // ─── Screens / modes ──────────────────────────────────────────────────────────
@@ -95,14 +90,10 @@ pub struct FormState {
     pub public_host: String,
     pub peers: String,
     pub cpu_cores: String,
-    pub gpu_enabled: bool,
-    pub gpu_backend_idx: usize, // 0=Local, 1=Modal, 2=Mps
     pub gpu_utilization: u8,
     pub gpu_yielding: bool,
     pub qpu_enabled: bool,
     pub qpu_api_key: String,
-    pub qpu_solver: String,
-    pub qpu_region_url: String,
     pub qpu_daily_budget: String,
     // Advanced settings
     pub timeout: String,
@@ -120,17 +111,12 @@ pub struct FormState {
 impl FormState {
     pub fn from_settings(s: &AppSettings) -> Self {
         let nc = &s.node_config;
-        let (qpu_enabled, qpu) = match &nc.qpu_config {
+        let (qpu_enabled, dw) = match &nc.dwave_config {
             Some(q) => (true, q.clone()),
-            None => (false, QpuConfig::default()),
+            None => (false, DwaveConfig::default()),
         };
-        let gpu_enabled = nc.gpu_device_configs.iter().any(|d| d.enabled);
-        let gpu_backend_idx = match nc.gpu_backend {
-            GpuBackend::Local => 0,
-            GpuBackend::Modal => 1,
-            GpuBackend::Mps => 2,
-        };
-        let first_gpu = nc.gpu_device_configs.first();
+        let first_gpu = nc.gpu_device_configs.iter().find(|d| d.enabled)
+            .or_else(|| nc.gpu_device_configs.first());
         FormState {
             port: nc.port.to_string(),
             node_name: nc.node_name.clone(),
@@ -139,20 +125,16 @@ impl FormState {
             public_host: nc.public_host.clone(),
             peers: nc.peers.join("\n"),
             cpu_cores: nc.num_cpus.to_string(),
-            gpu_enabled,
-            gpu_backend_idx,
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
             gpu_yielding: first_gpu.map(|d| d.yielding).unwrap_or(false),
             qpu_enabled,
-            qpu_api_key: qpu.api_key,
-            qpu_solver: qpu.solver,
-            qpu_region_url: qpu.region_url,
-            qpu_daily_budget: qpu.daily_budget,
+            qpu_api_key: dw.token,
+            qpu_daily_budget: dw.daily_budget,
             timeout: nc.timeout.to_string(),
             heartbeat_interval: nc.heartbeat_interval.to_string(),
             heartbeat_timeout: nc.heartbeat_timeout.to_string(),
             fanout: nc.fanout.map(|f| f.to_string()).unwrap_or_default(),
-            verify_ssl: nc.verify_ssl,
+            verify_ssl: nc.verify_tls,
             log_level: nc.log_level.clone(),
             image_tag: s.image_tag.clone(),
             edit_buf: String::new(),
@@ -160,7 +142,6 @@ impl FormState {
     }
 
     pub fn to_node_config(&self, base: &crate::settings::NodeConfig) -> crate::settings::NodeConfig {
-        use crate::settings::GpuDeviceConfig;
         let mut nc = base.clone();
         nc.port = self.port.parse().unwrap_or(20049);
         nc.node_name = self.node_name.clone();
@@ -178,37 +159,19 @@ impl FormState {
             .map(str::to_string)
             .collect();
         nc.num_cpus = self.cpu_cores.parse().unwrap_or(1);
-        nc.gpu_backend = match self.gpu_backend_idx {
-            1 => GpuBackend::Modal,
-            2 => GpuBackend::Mps,
-            _ => GpuBackend::Local,
-        };
-        if self.gpu_enabled {
-            if nc.gpu_device_configs.is_empty() {
-                nc.gpu_device_configs.push(GpuDeviceConfig {
-                    index: 0,
-                    enabled: true,
-                    utilization: self.gpu_utilization,
-                    yielding: self.gpu_yielding,
-                });
-            } else {
-                for d in &mut nc.gpu_device_configs {
-                    d.enabled = true;
-                    d.utilization = self.gpu_utilization;
-                    d.yielding = self.gpu_yielding;
-                }
-            }
-        } else {
-            for d in &mut nc.gpu_device_configs {
-                d.enabled = false;
-            }
+        // GPU: update utilization/yielding on existing device configs
+        for d in &mut nc.gpu_device_configs {
+            d.utilization = self.gpu_utilization;
+            d.yielding = self.gpu_yielding;
         }
-        nc.qpu_config = if self.qpu_enabled {
-            Some(QpuConfig {
-                api_key: self.qpu_api_key.clone(),
-                solver: self.qpu_solver.clone(),
-                region_url: self.qpu_region_url.clone(),
+        nc.dwave_config = if self.qpu_enabled {
+            Some(DwaveConfig {
+                token: self.qpu_api_key.clone(),
+                solver: "Advantage2_System1.13".to_string(),
+                dwave_region_url: "https://na-west-1.cloud.dwavesys.com/sapi/v2/".to_string(),
                 daily_budget: self.qpu_daily_budget.clone(),
+                qpu_min_blocks_for_estimation: None,
+                qpu_ema_alpha: None,
             })
         } else {
             None
@@ -217,7 +180,7 @@ impl FormState {
         nc.heartbeat_interval = self.heartbeat_interval.parse().unwrap_or(15);
         nc.heartbeat_timeout = self.heartbeat_timeout.parse().unwrap_or(300);
         nc.fanout = self.fanout.trim().parse().ok().filter(|&f: &u32| f > 0);
-        nc.verify_ssl = self.verify_ssl;
+        nc.verify_tls = self.verify_ssl;
         nc.log_level = self.log_level.clone();
         nc
     }
@@ -467,7 +430,7 @@ impl TuiApp {
     fn start_node(&mut self) {
         use std::process::Command;
         let config = self.form.to_node_config(&self.settings.node_config);
-        if let Err(e) = crate::config::write_config_toml(&config) {
+        if let Err(e) = crate::config::write_config_toml(&config, &RunMode::Docker) {
             self.set_status(format!("Config error: {}", e));
             return;
         }
@@ -597,7 +560,7 @@ impl TuiApp {
         self.checklist_rx = Some(rx);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let checks = rt.block_on(crate::checklist::run_checklist_core(|_| {}));
+            let checks = rt.block_on(crate::checklist::run_checklist_core(&RunMode::Docker, |_| {}));
             let _ = tx.send(checks);
         });
     }
@@ -634,7 +597,6 @@ impl TuiApp {
         }
         list.push(FocusId::ConfigToggle);
         if self.config_expanded {
-            list.push(FocusId::ImageTag);
             list.push(FocusId::Port);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
@@ -656,16 +618,13 @@ impl TuiApp {
             }
             list.push(FocusId::CpuCores);
             list.push(FocusId::GpuEnable);
-            if self.form.gpu_enabled {
-                list.push(FocusId::GpuBackend);
+            if !self.settings.node_config.gpu_device_configs.is_empty() {
                 list.push(FocusId::GpuUtilization);
                 list.push(FocusId::GpuYielding);
             }
             list.push(FocusId::QpuToggle);
             if self.qpu_expanded {
                 list.push(FocusId::QpuApiKey);
-                list.push(FocusId::QpuSolver);
-                list.push(FocusId::QpuRegionUrl);
                 list.push(FocusId::QpuDailyBudget);
             }
             list.push(FocusId::ApplyRestart);
