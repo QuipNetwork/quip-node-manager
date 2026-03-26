@@ -88,7 +88,13 @@ build-linux-x86_64:
 build-windows-x86_64:
   extends: .tauri_build
   tags: [windows, x86_64]
+  cache: {}
+  variables:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: "core.longPaths"
+    GIT_CONFIG_VALUE_0: "true"
   before_script:
+    - git config core.longPaths true
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
     - choco install nodejs-lts rust-ms -y --no-progress
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
