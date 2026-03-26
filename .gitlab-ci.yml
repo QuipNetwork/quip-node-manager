@@ -1,5 +1,5 @@
 # GitLab CI/CD for Quip Node Manager
-# Tauri v2 desktop app builds for macOS (arm64 + x86_64), Linux, Windows
+# Tauri v2 desktop app builds for macOS (universal), Linux, Windows
 
 stages:
   - build
@@ -15,51 +15,42 @@ stages:
     key: "${CI_JOB_NAME}"
     paths:
       - src-tauri/target
+      - .cargo-cache/registry
+      - .cargo-cache/git
+  variables:
+    CARGO_HOME: "${CI_PROJECT_DIR}/.cargo-cache"
   artifacts:
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - .gitlab-ci.yml
 
 # ---------------------------------------------------------------------------
-# macOS ARM64 (Apple Silicon)
+# macOS Universal (ARM64 + x86_64 fat binary)
 # ---------------------------------------------------------------------------
 
-build-macos-arm64:
+build-macos-universal:
   extends: .tauri_build
   tags: [macos, arm64]
   before_script:
-    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - rustup default stable 2>/dev/null || true
+    - rustup target add x86_64-apple-darwin
     - curl -fsSL https://bun.sh/install | bash || true
     - bun install
   script:
-    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
-    - bun run tauri build
+    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - bun run tauri build --target universal-apple-darwin
   artifacts:
     paths:
-      - src-tauri/target/release/bundle/dmg/*.dmg
-      - src-tauri/target/release/bundle/macos/*.app
-
-# ---------------------------------------------------------------------------
-# macOS x86_64 (Intel)
-# ---------------------------------------------------------------------------
-
-build-macos-x86_64:
-  extends: .tauri_build
-  tags: [macos, x86_64]
-  before_script:
-    - export PATH="/usr/local/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
-    - rustup default stable 2>/dev/null || true
-    - curl -fsSL https://bun.sh/install | bash || true
-    - bun install
-  script:
-    - export PATH="/usr/local/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
-    - bun run tauri build
-  artifacts:
-    paths:
-      - src-tauri/target/release/bundle/dmg/*.dmg
-      - src-tauri/target/release/bundle/macos/*.app
+      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+      - src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
 
 # ---------------------------------------------------------------------------
 # Linux x86_64 (AppImage + deb)
@@ -75,16 +66,15 @@ build-linux-x86_64:
         build-essential curl file git ca-certificates unzip
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
         librsvg2-dev patchelf pkg-config libssl-dev
-    # Install Rust via rustup (latest stable, satisfies 1.88+ requirement)
+    # Install Rust via rustup (uses CARGO_HOME from CI variables)
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - . "$HOME/.cargo/env"
+    - export PATH="$CARGO_HOME/bin:$PATH"
     # Install bun
     - curl -fsSL https://bun.sh/install | bash
     - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
-    - . "$HOME/.cargo/env"
-    - export PATH="$HOME/.bun/bin:$PATH"
+    - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
     - bun run tauri build
   artifacts:
     paths:
@@ -120,8 +110,7 @@ build-windows-x86_64:
 release-binaries:
   stage: release
   needs:
-    - build-macos-arm64
-    - build-macos-x86_64
+    - build-macos-universal
     - build-linux-x86_64
     - build-windows-x86_64
   rules:
@@ -133,12 +122,9 @@ release-binaries:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: "macOS ARM64 (Apple Silicon) DMG"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-arm64"
-          filepath: /quip-node-manager-macos-arm64.zip
-        - name: "macOS x86_64 (Intel) DMG"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-x86_64"
-          filepath: /quip-node-manager-macos-x86_64.zip
+        - name: "macOS Universal (ARM64 + x86_64) DMG"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-universal"
+          filepath: /quip-node-manager-macos-universal.zip
         - name: "Linux x86_64 (AppImage + deb)"
           url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-linux-x86_64"
           filepath: /quip-node-manager-linux-x86_64.zip
