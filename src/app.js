@@ -873,8 +873,16 @@ async function init() {
   await setupListeners();
   await pollStatus();
   await invoke('run_checklist').catch(console.error);
-  if (isDockerMode()) {
-    await invoke('start_log_stream').catch(console.error);
+
+  // If node is already running, collapse config and start log stream
+  const running = state.containerRunning || state.nativeRunning;
+  if (running) {
+    collapseConfig();
+    if (isDockerMode()) {
+      await invoke('start_log_stream').catch(console.error);
+    } else {
+      await invoke('start_native_log_tail').catch(console.error);
+    }
   }
 
   state.pollInterval = setInterval(pollStatus, 10_000);

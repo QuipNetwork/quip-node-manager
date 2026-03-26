@@ -2,8 +2,7 @@
 use crate::log_stream::LogEntry;
 use crate::settings::{data_dir, RunMode};
 use serde::Serialize;
-use std::io::BufRead;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
@@ -61,6 +60,10 @@ pub fn is_binary_available() -> bool {
 
 fn pid_file_path() -> std::path::PathBuf {
     data_dir().join("node.pid")
+}
+
+fn node_output_log_path() -> std::path::PathBuf {
+    data_dir().join("node-output.log")
 }
 
 fn write_pid(pid: u32) {
@@ -387,10 +390,19 @@ pub async fn start_native_node(
 
     let config_path = data_dir().join("config.toml");
 
+    // Redirect stdout+stderr to a log file so we can reconnect
+    // after app restarts (orphan adoption).
+    let log_file_path = node_output_log_path();
+    let log_file = std::fs::File::create(&log_file_path)
+        .map_err(|e| format!("Cannot create log file: {}", e))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| format!("Cannot clone log file: {}", e))?;
+
     let mut cmd = Command::new(&bin);
     cmd.args(["--config", &config_path.to_string_lossy()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(log_file)
+        .stderr(log_file_err);
 
     // Put the child in its own process group so we can kill the
     // entire tree (miner workers, QUIC handlers, etc.) at once.
@@ -400,7 +412,7 @@ pub async fn start_native_node(
         cmd.process_group(0);
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start node: {}", e))?;
 
@@ -429,55 +441,94 @@ pub async fn start_native_node(
         },
     );
 
-    // Stream both stdout and stderr to log panel via a merged reader.
-    // We take both pipes and read them in separate threads, both
-    // emitting to the same "node-log" event using parse_log_line.
+    // Start tailing the log file
     let stop_flag = Arc::clone(&state.stop_flag);
     *stop_flag.lock().unwrap() = false;
-
-    let stderr = child.stderr.take();
-    let stdout = child.stdout.take();
-
-    if let Some(stderr) = stderr {
-        let app_handle = app.clone();
-        let flag = Arc::clone(&stop_flag);
-        std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines() {
-                if *flag.lock().unwrap() {
-                    break;
-                }
-                if let Ok(text) = line {
-                    let entry =
-                        crate::log_stream::parse_log_line(&text);
-                    let _ = app_handle.emit("node-log", &entry);
-                }
-            }
-        });
-    }
-
-    if let Some(stdout) = stdout {
-        let app_handle = app.clone();
-        let flag = Arc::clone(&stop_flag);
-        std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                if *flag.lock().unwrap() {
-                    break;
-                }
-                if let Ok(text) = line {
-                    let entry =
-                        crate::log_stream::parse_log_line(&text);
-                    let _ = app_handle.emit("node-log", &entry);
-                }
-            }
-        });
-    }
+    start_log_tail(app.clone(), Arc::clone(&stop_flag));
 
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
     Ok(format!("Native node started (PID {})", pid))
+}
+
+/// Tail the node-output.log file, emitting lines to the UI.
+/// First reads existing content (last 200 lines), then follows new output.
+fn start_log_tail(
+    app: tauri::AppHandle,
+    stop_flag: Arc<Mutex<bool>>,
+) {
+    let log_path = node_output_log_path();
+    std::thread::spawn(move || {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // Wait briefly for the file to appear
+        for _ in 0..10 {
+            if log_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        let mut file = match std::fs::File::open(&log_path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        // Read existing content (backfill)
+        let mut existing = String::new();
+        let _ = file.read_to_string(&mut existing);
+        let lines: Vec<&str> = existing.lines().collect();
+        let start = lines.len().saturating_sub(200);
+        for line in &lines[start..] {
+            if *stop_flag.lock().unwrap() {
+                return;
+            }
+            let entry = crate::log_stream::parse_log_line(line);
+            let _ = app.emit("node-log", &entry);
+        }
+
+        // Now tail: seek to end, poll for new data
+        let _ = file.seek(SeekFrom::End(0));
+        let mut buf = String::new();
+        loop {
+            if *stop_flag.lock().unwrap() {
+                break;
+            }
+            buf.clear();
+            match file.read_to_string(&mut buf) {
+                Ok(0) => {
+                    // No new data — sleep and retry
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(250),
+                    );
+                }
+                Ok(_) => {
+                    for line in buf.lines() {
+                        if *stop_flag.lock().unwrap() {
+                            return;
+                        }
+                        let entry =
+                            crate::log_stream::parse_log_line(line);
+                        let _ = app.emit("node-log", &entry);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Start tailing native node logs (for orphan reconnect on app restart).
+#[tauri::command]
+pub async fn start_native_log_tail(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, NativeProcessState>,
+) -> Result<(), String> {
+    let stop_flag = Arc::clone(&state.stop_flag);
+    *stop_flag.lock().unwrap() = false;
+    start_log_tail(app, stop_flag);
+    Ok(())
 }
 
 #[tauri::command]

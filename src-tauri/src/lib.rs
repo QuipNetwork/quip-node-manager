@@ -49,6 +49,7 @@ pub fn run() {
             native::check_native_binary,
             native::download_native_binary,
             native::check_binary_update,
+            native::start_native_log_tail,
             // Network & checklist
             network::detect_public_ip,
             checklist::recheck_port_forwarding,
