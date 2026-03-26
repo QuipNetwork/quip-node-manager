@@ -35,7 +35,7 @@ impl NativeProcessState {
     }
 }
 
-fn binary_name() -> &'static str {
+pub fn binary_name() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "quip-network-node-macos-arm64"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
@@ -399,8 +399,13 @@ pub async fn start_native_node(
         .try_clone()
         .map_err(|e| format!("Cannot clone log file: {}", e))?;
 
+    let work_dir = data_dir();
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("Cannot create data dir: {}", e))?;
+
     let mut cmd = Command::new(&bin);
     cmd.args(["--config", &config_path.to_string_lossy()])
+        .current_dir(&work_dir)
         .stdout(log_file)
         .stderr(log_file_err);
 

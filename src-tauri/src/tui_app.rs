@@ -22,6 +22,7 @@ pub enum FocusId {
     RunChecklist,
     CheckPort,
     ConfigToggle,
+    RunMode,
     Port,
     SecretShow,
     SecretRegenerate,
@@ -30,6 +31,7 @@ pub enum FocusId {
     CustomToggle,
     PublicHostEnable,
     PublicHostInput,
+    PublicPortInput,
     Peers,
     CpuCores,
     GpuEnable,
@@ -39,14 +41,24 @@ pub enum FocusId {
     QpuApiKey,
     QpuDailyBudget,
     ApplyRestart,
+    AutoUpdate,
     ViewLogs,
     // Advanced (inside Custom Settings)
     Timeout,
     HeartbeatInterval,
     HeartbeatTimeout,
     Fanout,
-    VerifySsl,
+    VerifyTls,
     LogLevel,
+    TlsCertFile,
+    TlsKeyFile,
+    RestHost,
+    RestPort,
+    RestInsecurePort,
+    TelemetryEnabled,
+    TelemetryDir,
+    NodeLog,
+    HttpLog,
 }
 
 // ─── Screens / modes ──────────────────────────────────────────────────────────
@@ -86,8 +98,10 @@ pub struct FormState {
     pub port: String,
     pub node_name: String,
     pub auto_mine: bool,
+    pub run_mode_idx: usize, // 0=Docker, 1=Native
     pub public_host_enabled: bool,
     pub public_host: String,
+    pub public_port: String,
     pub peers: String,
     pub cpu_cores: String,
     pub gpu_utilization: u8,
@@ -100,8 +114,18 @@ pub struct FormState {
     pub heartbeat_interval: String,
     pub heartbeat_timeout: String,
     pub fanout: String, // empty string = None
-    pub verify_ssl: bool,
+    pub verify_tls: bool,
     pub log_level: String,
+    pub tls_cert_file: String,
+    pub tls_key_file: String,
+    pub rest_host: String,
+    pub rest_port: String,
+    pub rest_insecure_port: String,
+    pub telemetry_enabled: bool,
+    pub telemetry_dir: String,
+    pub node_log: String,
+    pub http_log: String,
+    pub auto_update: bool,
     // Image selector
     pub image_tag: String, // "cpu" or "cuda"
     /// Temporary buffer used while editing a text field.
@@ -117,12 +141,21 @@ impl FormState {
         };
         let first_gpu = nc.gpu_device_configs.iter().find(|d| d.enabled)
             .or_else(|| nc.gpu_device_configs.first());
+        let run_mode_idx = match s.run_mode {
+            RunMode::Docker => 0,
+            RunMode::Native => 1,
+        };
         FormState {
             port: nc.port.to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
-            public_host_enabled: !nc.public_host.is_empty(),
+            run_mode_idx,
+            public_host_enabled: !nc.public_host.is_empty()
+                || nc.public_port.is_some(),
             public_host: nc.public_host.clone(),
+            public_port: nc.public_port
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
             peers: nc.peers.join("\n"),
             cpu_cores: nc.num_cpus.to_string(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
@@ -134,11 +167,25 @@ impl FormState {
             heartbeat_interval: nc.heartbeat_interval.to_string(),
             heartbeat_timeout: nc.heartbeat_timeout.to_string(),
             fanout: nc.fanout.map(|f| f.to_string()).unwrap_or_default(),
-            verify_ssl: nc.verify_tls,
+            verify_tls: nc.verify_tls,
             log_level: nc.log_level.clone(),
+            tls_cert_file: nc.tls_cert_file.clone(),
+            tls_key_file: nc.tls_key_file.clone(),
+            rest_host: nc.rest_host.clone(),
+            rest_port: nc.rest_port.to_string(),
+            rest_insecure_port: nc.rest_insecure_port.to_string(),
+            telemetry_enabled: nc.telemetry_enabled,
+            telemetry_dir: nc.telemetry_dir.clone(),
+            node_log: nc.node_log.clone(),
+            http_log: nc.http_log.clone(),
+            auto_update: s.auto_update_enabled,
             image_tag: s.image_tag.clone(),
             edit_buf: String::new(),
         }
+    }
+
+    pub fn run_mode(&self) -> RunMode {
+        if self.run_mode_idx == 1 { RunMode::Native } else { RunMode::Docker }
     }
 
     pub fn to_node_config(&self, base: &crate::settings::NodeConfig) -> crate::settings::NodeConfig {
@@ -150,6 +197,11 @@ impl FormState {
             self.public_host.clone()
         } else {
             String::new()
+        };
+        nc.public_port = if self.public_host_enabled {
+            self.public_port.trim().parse().ok()
+        } else {
+            None
         };
         nc.peers = self
             .peers
@@ -180,8 +232,17 @@ impl FormState {
         nc.heartbeat_interval = self.heartbeat_interval.parse().unwrap_or(15);
         nc.heartbeat_timeout = self.heartbeat_timeout.parse().unwrap_or(300);
         nc.fanout = self.fanout.trim().parse().ok().filter(|&f: &u32| f > 0);
-        nc.verify_tls = self.verify_ssl;
+        nc.verify_tls = self.verify_tls;
         nc.log_level = self.log_level.clone();
+        nc.tls_cert_file = self.tls_cert_file.clone();
+        nc.tls_key_file = self.tls_key_file.clone();
+        nc.rest_host = self.rest_host.clone();
+        nc.rest_port = self.rest_port.parse().unwrap_or(-1);
+        nc.rest_insecure_port = self.rest_insecure_port.parse().unwrap_or(-1);
+        nc.telemetry_enabled = self.telemetry_enabled;
+        nc.telemetry_dir = self.telemetry_dir.clone();
+        nc.node_log = self.node_log.clone();
+        nc.http_log = self.http_log.clone();
         nc
     }
 }
@@ -386,66 +447,95 @@ impl TuiApp {
 
     pub fn refresh_status(&mut self) {
         use std::process::Command;
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--format",
-                "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
-                "quip-node",
-            ])
-            .output();
-        self.status = match output {
-            Ok(o) if o.status.success() => {
-                let line = String::from_utf8_lossy(&o.stdout);
-                let parts: Vec<&str> = line.trim().split('\t').collect();
-                if parts.len() >= 4 {
-                    ContainerStatus {
-                        running: parts[1] == "true",
-                        container_id: Some(
-                            parts[0][..12.min(parts[0].len())].to_string(),
-                        ),
-                        image: parts[2].to_string(),
-                        status_text: parts[3].to_string(),
+        match self.form.run_mode() {
+            RunMode::Native => {
+                let pid_path = crate::settings::data_dir().join("node.pid");
+                let running = if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        #[cfg(unix)]
+                        { unsafe { libc::kill(pid, 0) == 0 } }
+                        #[cfg(windows)]
+                        { true } // Assume running if PID file exists on Windows
+                    } else {
+                        false
                     }
                 } else {
-                    ContainerStatus {
+                    false
+                };
+                self.status = ContainerStatus {
+                    running,
+                    container_id: None,
+                    image: String::new(),
+                    status_text: if running { "running (native)".to_string() } else { "not running".to_string() },
+                };
+            }
+            RunMode::Docker => {
+                let output = Command::new("docker")
+                    .args([
+                        "inspect",
+                        "--format",
+                        "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
+                        "quip-node",
+                    ])
+                    .output();
+                self.status = match output {
+                    Ok(o) if o.status.success() => {
+                        let line = String::from_utf8_lossy(&o.stdout);
+                        let parts: Vec<&str> = line.trim().split('\t').collect();
+                        if parts.len() >= 4 {
+                            ContainerStatus {
+                                running: parts[1] == "true",
+                                container_id: Some(
+                                    parts[0][..12.min(parts[0].len())].to_string(),
+                                ),
+                                image: parts[2].to_string(),
+                                status_text: parts[3].to_string(),
+                            }
+                        } else {
+                            ContainerStatus {
+                                running: false,
+                                container_id: None,
+                                image: String::new(),
+                                status_text: "unknown".to_string(),
+                            }
+                        }
+                    }
+                    _ => ContainerStatus {
                         running: false,
                         container_id: None,
                         image: String::new(),
-                        status_text: "unknown".to_string(),
-                    }
-                }
+                        status_text: "not found".to_string(),
+                    },
+                };
             }
-            _ => ContainerStatus {
-                running: false,
-                container_id: None,
-                image: String::new(),
-                status_text: "not found".to_string(),
-            },
-        };
+        }
     }
 
     // ─── Actions ──────────────────────────────────────────────────────────────
 
     fn start_node(&mut self) {
-        use std::process::Command;
+        let run_mode = self.form.run_mode();
         let config = self.form.to_node_config(&self.settings.node_config);
-        if let Err(e) = crate::config::write_config_toml(&config, &RunMode::Docker) {
+        if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
             self.set_status(format!("Config error: {}", e));
             return;
         }
 
+        match run_mode {
+            RunMode::Native => self.start_node_native(&config),
+            RunMode::Docker => self.start_node_docker(&config),
+        }
+        self.config_expanded = false;
+    }
+
+    fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
+        use std::process::Command;
+
         // Remove any stale container first
         let _ = Command::new("docker").args(["rm", "-f", "quip-node"]).output();
 
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                self.set_status("Cannot determine home directory");
-                return;
-            }
-        };
-        let data_mount = format!("{}/quip-data:/data", home.display());
+        let data_dir = crate::settings::data_dir();
+        let data_mount = format!("{}:/data", data_dir.display());
         let image = format!(
             "{}:latest",
             crate::docker::image_for_tag(&self.settings.image_tag)
@@ -497,7 +587,7 @@ impl TuiApp {
 
         match Command::new("docker").args(&args).output() {
             Ok(o) if o.status.success() => {
-                self.set_status("Node started");
+                self.set_status("Node started (Docker)");
                 self.refresh_status();
             }
             Ok(o) => {
@@ -508,13 +598,69 @@ impl TuiApp {
         }
     }
 
+    fn start_node_native(&mut self, _config: &crate::settings::NodeConfig) {
+        if !crate::native::is_binary_available() {
+            self.set_status("No native binary found. Download it first.");
+            return;
+        }
+        // Use the async start via a blocking runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(async {
+            let data_dir = crate::settings::data_dir();
+            let bin = data_dir.join("bin").join(crate::native::binary_name());
+            let config_path = data_dir.join("config.toml");
+            let log_path = data_dir.join("node-output.log");
+            let log_file = std::fs::File::create(&log_path)
+                .map_err(|e| format!("Cannot create log file: {}", e))?;
+            let log_err = log_file.try_clone()
+                .map_err(|e| format!("Cannot clone log file: {}", e))?;
+            let child = std::process::Command::new(&bin)
+                .arg("--config")
+                .arg(&config_path)
+                .stdout(log_file)
+                .stderr(log_err)
+                .spawn()
+                .map_err(|e| format!("Spawn failed: {}", e))?;
+            let pid_path = data_dir.join("node.pid");
+            let _ = std::fs::write(&pid_path, child.id().to_string());
+            Ok::<(), String>(())
+        }) {
+            Ok(()) => {
+                self.set_status("Node started (Native)");
+                self.refresh_status();
+            }
+            Err(e) => self.set_status(format!("Start failed: {}", e)),
+        }
+    }
+
     fn stop_node(&mut self) {
         use std::process::Command;
-        let _ = Command::new("docker").args(["stop", "quip-node"]).output();
-        let _ = Command::new("docker")
-            .args(["rm", "-f", "quip-node"])
-            .output();
+        match self.form.run_mode() {
+            RunMode::Docker => {
+                let _ = Command::new("docker").args(["stop", "quip-node"]).output();
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", "quip-node"])
+                    .output();
+            }
+            RunMode::Native => {
+                let pid_path = crate::settings::data_dir().join("node.pid");
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        #[cfg(unix)]
+                        unsafe { libc::kill(-pid, libc::SIGTERM); }
+                        #[cfg(windows)]
+                        {
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/PID", &pid.to_string()])
+                                .output();
+                        }
+                    }
+                    let _ = std::fs::remove_file(&pid_path);
+                }
+            }
+        }
         self.set_status("Node stopped");
+        self.config_expanded = true;
         self.refresh_status();
     }
 
@@ -522,6 +668,8 @@ impl TuiApp {
         let config = self.form.to_node_config(&self.settings.node_config);
         self.settings.node_config = config;
         self.settings.image_tag = self.form.image_tag.clone();
+        self.settings.run_mode = self.form.run_mode();
+        self.settings.auto_update_enabled = self.form.auto_update;
         if let Err(e) = crate::settings::save_settings(&self.settings) {
             self.set_status(format!("Save error: {}", e));
             return;
@@ -558,9 +706,10 @@ impl TuiApp {
         self.checks = vec![];
         let (tx, rx) = mpsc::sync_channel::<Vec<CheckItem>>(1);
         self.checklist_rx = Some(rx);
+        let run_mode = self.form.run_mode();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let checks = rt.block_on(crate::checklist::run_checklist_core(&RunMode::Docker, |_| {}));
+            let checks = rt.block_on(crate::checklist::run_checklist_core(&run_mode, |_| {}));
             let _ = tx.send(checks);
         });
     }
@@ -597,6 +746,7 @@ impl TuiApp {
         }
         list.push(FocusId::ConfigToggle);
         if self.config_expanded {
+            list.push(FocusId::RunMode);
             list.push(FocusId::Port);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
@@ -607,14 +757,27 @@ impl TuiApp {
                 list.push(FocusId::PublicHostEnable);
                 if self.form.public_host_enabled {
                     list.push(FocusId::PublicHostInput);
+                    list.push(FocusId::PublicPortInput);
                 }
                 list.push(FocusId::Peers);
                 list.push(FocusId::Timeout);
                 list.push(FocusId::HeartbeatInterval);
                 list.push(FocusId::HeartbeatTimeout);
                 list.push(FocusId::Fanout);
-                list.push(FocusId::VerifySsl);
+                list.push(FocusId::VerifyTls);
                 list.push(FocusId::LogLevel);
+                list.push(FocusId::TlsCertFile);
+                list.push(FocusId::TlsKeyFile);
+                list.push(FocusId::RestHost);
+                list.push(FocusId::RestPort);
+                list.push(FocusId::RestInsecurePort);
+                list.push(FocusId::TelemetryEnabled);
+                if self.form.telemetry_enabled {
+                    list.push(FocusId::TelemetryDir);
+                }
+                list.push(FocusId::NodeLog);
+                list.push(FocusId::HttpLog);
+                list.push(FocusId::AutoUpdate);
             }
             list.push(FocusId::CpuCores);
             list.push(FocusId::GpuEnable);

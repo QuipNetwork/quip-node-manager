@@ -178,6 +178,25 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         return;
     }
 
+    // Storage Directory (read-only info)
+    let data_dir = crate::settings::data_dir();
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(format!("{:<16} ", "Storage Dir"), Style::default().fg(DIM)),
+        Span::styled(data_dir.display().to_string(), Style::default().fg(DIM)),
+    ]));
+
+    // Run Mode
+    let modes = ["Docker", "Native"];
+    let mode_display = modes[app.form.run_mode_idx.min(1)];
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{:<16} {}", "Run Mode", mode_display),
+            focus_style(app, &FocusId::RunMode),
+        ),
+    ]));
+
     // Port
     lines.push(field_line(
         app, &FocusId::Port, "Port", &field_value(app, &FocusId::Port, &app.form.port),
@@ -250,6 +269,17 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 "  Host",
                 &field_value(app, &FocusId::PublicHostInput, &app.form.public_host),
             ));
+            let port_display = if app.form.public_port.is_empty() {
+                "(default)".to_string()
+            } else {
+                app.form.public_port.clone()
+            };
+            lines.push(field_line(
+                app,
+                &FocusId::PublicPortInput,
+                "  Port",
+                &field_value(app, &FocusId::PublicPortInput, &port_display),
+            ));
         }
         lines.push(field_line(
             app,
@@ -280,12 +310,12 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             app, &FocusId::Fanout, "  Fanout",
             &field_value(app, &FocusId::Fanout, &fanout_display),
         ));
-        let tls_check = if app.form.verify_ssl { "[x]" } else { "[ ]" };
+        let tls_check = if app.form.verify_tls { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
             Span::raw("      "),
             Span::styled(
                 format!("{} Verify TLS", tls_check),
-                focus_style(app, &FocusId::VerifySsl),
+                focus_style(app, &FocusId::VerifyTls),
             ),
         ]));
         let log_levels = ["info", "debug", "warn", "error"];
@@ -298,6 +328,70 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             app, &FocusId::LogLevel, "  Log Level",
             &ll_display,
         ));
+
+        // TLS Certificates
+        lines.push(field_line(
+            app, &FocusId::TlsCertFile, "  TLS Cert",
+            &field_value(app, &FocusId::TlsCertFile,
+                &if app.form.tls_cert_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_cert_file.clone() }),
+        ));
+        lines.push(field_line(
+            app, &FocusId::TlsKeyFile, "  TLS Key",
+            &field_value(app, &FocusId::TlsKeyFile,
+                &if app.form.tls_key_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_key_file.clone() }),
+        ));
+
+        // REST API
+        lines.push(field_line(
+            app, &FocusId::RestHost, "  REST Host",
+            &field_value(app, &FocusId::RestHost, &app.form.rest_host),
+        ));
+        lines.push(field_line(
+            app, &FocusId::RestPort, "  REST HTTPS",
+            &field_value(app, &FocusId::RestPort, &app.form.rest_port),
+        ));
+        lines.push(field_line(
+            app, &FocusId::RestInsecurePort, "  REST HTTP",
+            &field_value(app, &FocusId::RestInsecurePort, &app.form.rest_insecure_port),
+        ));
+
+        // Telemetry
+        let telem_check = if app.form.telemetry_enabled { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                format!("{} Telemetry", telem_check),
+                focus_style(app, &FocusId::TelemetryEnabled),
+            ),
+        ]));
+        if app.form.telemetry_enabled {
+            lines.push(field_line(
+                app, &FocusId::TelemetryDir, "  Telemetry Dir",
+                &field_value(app, &FocusId::TelemetryDir, &app.form.telemetry_dir),
+            ));
+        }
+
+        // Log files
+        lines.push(field_line(
+            app, &FocusId::NodeLog, "  Node Log",
+            &field_value(app, &FocusId::NodeLog,
+                &if app.form.node_log.is_empty() { "(none)".to_string() } else { app.form.node_log.clone() }),
+        ));
+        lines.push(field_line(
+            app, &FocusId::HttpLog, "  HTTP Log",
+            &field_value(app, &FocusId::HttpLog,
+                &if app.form.http_log.is_empty() { "(none)".to_string() } else { app.form.http_log.clone() }),
+        ));
+
+        // Auto-update
+        let au_check = if app.form.auto_update { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                format!("{} Auto-update", au_check),
+                focus_style(app, &FocusId::AutoUpdate),
+            ),
+        ]));
     }
 
     // CPU Cores

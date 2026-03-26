@@ -264,6 +264,12 @@ button.check-action:hover {
   color: var(--text-primary);
 }
 
+button.check-action:disabled {
+  opacity: 0.7;
+  cursor: wait;
+  color: var(--text-faint);
+}
+
 /* ─── Mining Config ──────────────────────────────────────────────────────── */
 .mining-config-grid {
   display: grid;

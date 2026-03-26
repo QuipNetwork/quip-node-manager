@@ -128,6 +128,13 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::ApplyRestart => Action::ApplyRestart,
         FocusId::ViewLogs => Action::EnterLogs,
 
+        // Run Mode — cycle Docker/Native
+        FocusId::RunMode => {
+            app.form.run_mode_idx = (app.form.run_mode_idx + 1) % 2;
+            app.dirty = true;
+            Action::None
+        }
+
         // Checkboxes — toggle on Enter too
         FocusId::AutoMine => {
             app.form.auto_mine = !app.form.auto_mine;
@@ -140,7 +147,6 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
         FocusId::GpuEnable => {
-            // Toggle first GPU device enabled
             if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
                 d.enabled = !d.enabled;
             }
@@ -152,18 +158,26 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
+        FocusId::VerifyTls => {
+            app.form.verify_tls = !app.form.verify_tls;
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::TelemetryEnabled => {
+            app.form.telemetry_enabled = !app.form.telemetry_enabled;
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::AutoUpdate => {
+            app.form.auto_update = !app.form.auto_update;
+            app.dirty = true;
+            Action::None
+        }
 
         // GPU Utilization — increase by 10 (wraps at 100)
         FocusId::GpuUtilization => {
             app.form.gpu_utilization =
                 if app.form.gpu_utilization >= 100 { 10 } else { app.form.gpu_utilization + 10 };
-            app.dirty = true;
-            Action::None
-        }
-
-        // Verify TLS checkbox
-        FocusId::VerifySsl => {
-            app.form.verify_ssl = !app.form.verify_ssl;
             app.dirty = true;
             Action::None
         }
@@ -185,6 +199,7 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::Port
         | FocusId::NodeName
         | FocusId::PublicHostInput
+        | FocusId::PublicPortInput
         | FocusId::Peers
         | FocusId::CpuCores
         | FocusId::QpuApiKey
@@ -192,7 +207,15 @@ fn activate(app: &mut TuiApp) -> Action {
         | FocusId::Timeout
         | FocusId::HeartbeatInterval
         | FocusId::HeartbeatTimeout
-        | FocusId::Fanout => {
+        | FocusId::Fanout
+        | FocusId::TlsCertFile
+        | FocusId::TlsKeyFile
+        | FocusId::RestHost
+        | FocusId::RestPort
+        | FocusId::RestInsecurePort
+        | FocusId::TelemetryDir
+        | FocusId::NodeLog
+        | FocusId::HttpLog => {
             start_edit(app);
             Action::None
         }
@@ -201,34 +224,14 @@ fn activate(app: &mut TuiApp) -> Action {
 
 fn toggle_or_activate(app: &mut TuiApp) -> Action {
     match app.focus {
-        FocusId::AutoMine => {
-            app.form.auto_mine = !app.form.auto_mine;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::PublicHostEnable => {
-            app.form.public_host_enabled = !app.form.public_host_enabled;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::GpuEnable => {
-            // Toggle first GPU device enabled
-            if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
-                d.enabled = !d.enabled;
-            }
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::GpuYielding => {
-            app.form.gpu_yielding = !app.form.gpu_yielding;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::VerifySsl => {
-            app.form.verify_ssl = !app.form.verify_ssl;
-            app.dirty = true;
-            Action::None
-        }
+        FocusId::AutoMine
+        | FocusId::PublicHostEnable
+        | FocusId::GpuYielding
+        | FocusId::VerifyTls
+        | FocusId::TelemetryEnabled
+        | FocusId::AutoUpdate
+        | FocusId::RunMode
+        | FocusId::GpuEnable => activate(app),
         _ => activate(app),
     }
 }
@@ -240,6 +243,7 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::Port => app.form.port.clone(),
         FocusId::NodeName => app.form.node_name.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
+        FocusId::PublicPortInput => app.form.public_port.clone(),
         FocusId::Peers => app.form.peers.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
@@ -248,6 +252,14 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::HeartbeatInterval => app.form.heartbeat_interval.clone(),
         FocusId::HeartbeatTimeout => app.form.heartbeat_timeout.clone(),
         FocusId::Fanout => app.form.fanout.clone(),
+        FocusId::TlsCertFile => app.form.tls_cert_file.clone(),
+        FocusId::TlsKeyFile => app.form.tls_key_file.clone(),
+        FocusId::RestHost => app.form.rest_host.clone(),
+        FocusId::RestPort => app.form.rest_port.clone(),
+        FocusId::RestInsecurePort => app.form.rest_insecure_port.clone(),
+        FocusId::TelemetryDir => app.form.telemetry_dir.clone(),
+        FocusId::NodeLog => app.form.node_log.clone(),
+        FocusId::HttpLog => app.form.http_log.clone(),
         _ => return,
     };
     app.form.edit_buf = current;
@@ -261,6 +273,7 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::Port => app.form.port = buf,
             FocusId::NodeName => app.form.node_name = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
+            FocusId::PublicPortInput => app.form.public_port = buf,
             FocusId::Peers => app.form.peers = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
@@ -269,6 +282,14 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::HeartbeatInterval => app.form.heartbeat_interval = buf,
             FocusId::HeartbeatTimeout => app.form.heartbeat_timeout = buf,
             FocusId::Fanout => app.form.fanout = buf,
+            FocusId::TlsCertFile => app.form.tls_cert_file = buf,
+            FocusId::TlsKeyFile => app.form.tls_key_file = buf,
+            FocusId::RestHost => app.form.rest_host = buf,
+            FocusId::RestPort => app.form.rest_port = buf,
+            FocusId::RestInsecurePort => app.form.rest_insecure_port = buf,
+            FocusId::TelemetryDir => app.form.telemetry_dir = buf,
+            FocusId::NodeLog => app.form.node_log = buf,
+            FocusId::HttpLog => app.form.http_log = buf,
             _ => {}
         },
         EditMode::None => {}

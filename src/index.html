@@ -156,9 +156,18 @@
                 <div class="form-group">
                   <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                     <input type="checkbox" id="public-host-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host:Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
+                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
                   </div>
-                  <input type="text" id="public-host" placeholder="1.2.3.4:20049 or myhostname.com:20049" disabled />
+                  <div class="mining-config-grid">
+                    <div class="form-group" style="margin-bottom:0;">
+                      <label for="public-host">Host / IP</label>
+                      <input type="text" id="public-host" placeholder="1.2.3.4 or myhostname.com" disabled />
+                    </div>
+                    <div class="form-group" style="margin-bottom:0;">
+                      <label for="public-port">Port</label>
+                      <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" disabled />
+                    </div>
+                  </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
                 <div class="form-group">

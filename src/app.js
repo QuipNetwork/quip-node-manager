@@ -232,9 +232,12 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
 // ─── Public host enable toggle ────────────────────────────────────────────────
 document.getElementById('public-host-enable').addEventListener('change', () => {
   const enabled = document.getElementById('public-host-enable').checked;
-  const input = document.getElementById('public-host');
-  input.disabled = !enabled;
-  if (!enabled) input.value = '';
+  document.getElementById('public-host').disabled = !enabled;
+  document.getElementById('public-port').disabled = !enabled;
+  if (!enabled) {
+    document.getElementById('public-host').value = '';
+    document.getElementById('public-port').value = '';
+  }
 });
 
 // ─── QPU section toggle ───────────────────────────────────────────────────────
@@ -295,7 +298,9 @@ function collectConfig() {
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
       : '',
-    public_port: base.public_port ?? null,
+    public_port: document.getElementById('public-host-enable')?.checked
+      ? (parseInt(document.getElementById('public-port')?.value) || null)
+      : null,
     node_name: document.getElementById('node-name')?.value?.trim() ?? '',
     peers: document
       .getElementById('peers')
@@ -356,10 +361,13 @@ function populateForm(settings) {
   // Custom settings
   document.getElementById('node-name').value = c.node_name ?? '';
   const publicHost = c.public_host ?? '';
-  if (publicHost) {
+  const publicPort = c.public_port ?? null;
+  if (publicHost || publicPort) {
     document.getElementById('public-host-enable').checked = true;
     document.getElementById('public-host').disabled = false;
+    document.getElementById('public-port').disabled = false;
     document.getElementById('public-host').value = publicHost;
+    document.getElementById('public-port').value = publicPort ?? '';
   }
   document.getElementById('peers').value = (c.peers || []).join('\n');
   document.getElementById('timeout').value = c.timeout ?? 3;
@@ -386,7 +394,7 @@ function populateForm(settings) {
 
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
-    publicHost ||
+    publicHost || publicPort ||
     (c.peers || []).length > 0 ||
     c.timeout !== 3 ||
     c.heartbeat_interval !== 15 ||
@@ -572,21 +580,27 @@ document
 document
   .querySelector('[data-id="image"] .check-action')
   ?.addEventListener('click', async () => {
+    const btn = document.querySelector('[data-id="image"] .check-action');
     const tag = state.settings?.image_tag || 'cpu';
-    const statusEl = document.getElementById('apply-status');
-    statusEl.textContent = 'Pulling image\u2026';
+    btn.disabled = true;
+    btn.textContent = 'Pulling\u2026';
     try {
       await invoke('pull_node_image', { imageTag: tag });
-      statusEl.textContent = 'Image pulled.';
+      btn.style.display = 'none';
       await invoke('run_checklist');
     } catch (e) {
-      statusEl.textContent = `Pull failed: ${e}`;
+      btn.disabled = false;
+      btn.textContent = 'Retry Pull';
+      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
     }
   });
 
 document
   .querySelector('[data-id="secret"] .check-action')
   ?.addEventListener('click', async () => {
+    const btn = document.querySelector('[data-id="secret"] .check-action');
+    btn.disabled = true;
+    btn.textContent = 'Generating\u2026';
     try {
       const secret = await invoke('generate_node_secret');
       document.getElementById('secret-display').value = secret;
@@ -594,8 +608,11 @@ document
         state.settings.node_config.secret = secret;
         await invoke('update_settings', { settings: state.settings });
       }
+      btn.style.display = 'none';
       await invoke('run_checklist');
     } catch (e) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Secret';
       console.error(e);
     }
   });
