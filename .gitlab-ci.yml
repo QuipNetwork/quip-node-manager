@@ -32,14 +32,12 @@ variables:
 build-macos-arm64:
   extends: .tauri_build
   tags: [macos, arm64]
-  variables:
-    PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   before_script:
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
     - curl -fsSL https://bun.sh/install | bash || true
-    - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
-    - export PATH="$HOME/.bun/bin:$PATH"
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
     - bun run tauri build
   artifacts:
     paths:
@@ -53,14 +51,12 @@ build-macos-arm64:
 build-macos-x86_64:
   extends: .tauri_build
   tags: [macos, x86_64]
-  variables:
-    PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   before_script:
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
     - curl -fsSL https://bun.sh/install | bash || true
-    - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
-    - export PATH="$HOME/.bun/bin:$PATH"
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
     - bun run tauri build
   artifacts:
     paths:
