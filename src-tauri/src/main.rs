@@ -74,7 +74,13 @@ fn run_tui() {
     // windows_subsystem = "windows").
     #[cfg(target_os = "windows")]
     {
-        unsafe { winapi::um::wincon::AttachConsole(u32::MAX); }
+        extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
 
     let default_hook = panic::take_hook();
