@@ -27,10 +27,6 @@ libc = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 
-[[bin]]
-name = "quip-node-tui"
-path = "src/bin/tui.rs"
-
 [profile.dev]
 incremental = true
 
