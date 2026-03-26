@@ -72,7 +72,7 @@ build-linux-x86_64:
   before_script:
     # System deps for Tauri on Linux
     - apt-get update && apt-get install -y --no-install-recommends
-        build-essential curl file git ca-certificates
+        build-essential curl file git ca-certificates unzip
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
         librsvg2-dev patchelf pkg-config libssl-dev
     # Install Rust via rustup (latest stable, satisfies 1.88+ requirement)
@@ -103,9 +103,10 @@ build-windows-x86_64:
     - choco install nodejs-lts rust-ms -y --no-progress
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
     - npm install -g bun
+    - $env:Path = "$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:Path"
     - bun install
   script:
-    - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:USERPROFILE\.bun\bin;$env:Path"
+    - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\nodejs;$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
     - bun run tauri build
   artifacts:
     paths:
