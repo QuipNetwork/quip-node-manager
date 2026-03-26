@@ -5,9 +5,6 @@ stages:
   - build
   - release
 
-variables:
-  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
-
 # ---------------------------------------------------------------------------
 # Shared setup
 # ---------------------------------------------------------------------------
@@ -17,7 +14,6 @@ variables:
   cache:
     key: "${CI_JOB_NAME}"
     paths:
-      - .cargo/registry
       - src-tauri/target
   artifacts:
     expire_in: 30 days
@@ -71,18 +67,23 @@ build-macos-x86_64:
 
 build-linux-x86_64:
   extends: .tauri_build
-  image: rust:1.85-bookworm
+  image: ubuntu:22.04
   tags: [linux, x86_64]
   before_script:
     # System deps for Tauri on Linux
     - apt-get update && apt-get install -y --no-install-recommends
+        build-essential curl file git
         libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-        librsvg2-dev patchelf file
+        librsvg2-dev patchelf pkg-config libssl-dev
+    # Install Rust via rustup (latest stable, satisfies 1.88+ requirement)
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - . "$HOME/.cargo/env"
     # Install bun
     - curl -fsSL https://bun.sh/install | bash
     - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
+    - . "$HOME/.cargo/env"
     - export PATH="$HOME/.bun/bin:$PATH"
     - bun run tauri build
   artifacts:
@@ -98,7 +99,8 @@ build-windows-x86_64:
   extends: .tauri_build
   tags: [windows, x86_64]
   before_script:
-    - choco install nodejs-lts -y --no-progress 2>$null
+    - choco install nodejs-lts rust-ms -y --no-progress
+    - refreshenv
     - npm install -g bun
     - bun install
   script:
