@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod cmd;
 pub mod checklist;
 pub mod config;
 pub mod docker;

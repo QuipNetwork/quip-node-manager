@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::settings::RunMode;
 use serde::Serialize;
-use std::process::Command;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct GpuDevice {
@@ -29,7 +28,7 @@ pub fn is_apple_silicon() -> bool {
 }
 
 pub fn list_nvidia_gpus() -> Vec<GpuDevice> {
-    let output = Command::new("nvidia-smi")
+    let output = crate::cmd::new("nvidia-smi")
         .args([
             "--query-gpu=index,name,memory.total",
             "--format=csv,noheader,nounits",
@@ -62,7 +61,7 @@ fn detect_metal_gpu() -> Option<GpuDevice> {
     if !is_apple_silicon() {
         return None;
     }
-    let output = Command::new("system_profiler")
+    let output = crate::cmd::new("system_profiler")
         .args(["SPDisplaysDataType"])
         .output()
         .ok()?;
@@ -88,7 +87,7 @@ fn detect_metal_gpu() -> Option<GpuDevice> {
 }
 
 fn detect_docker_version() -> Option<String> {
-    let output = Command::new("docker")
+    let output = crate::cmd::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
         .output()
         .ok()?;
@@ -104,7 +103,7 @@ fn detect_docker_version() -> Option<String> {
 }
 
 fn detect_python() -> Option<String> {
-    let output = Command::new("python3")
+    let output = crate::cmd::new("python3")
         .args(["--version"])
         .output()
         .ok()?;

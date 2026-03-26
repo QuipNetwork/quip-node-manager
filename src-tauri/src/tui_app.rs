@@ -447,7 +447,6 @@ impl TuiApp {
     // ─── Docker status ────────────────────────────────────────────────────────
 
     pub fn refresh_status(&mut self) {
-        use std::process::Command;
         match self.form.run_mode() {
             RunMode::Native => {
                 let pid_path = crate::settings::data_dir().join("node.pid");
@@ -471,7 +470,7 @@ impl TuiApp {
                 };
             }
             RunMode::Docker => {
-                let output = Command::new("docker")
+                let output = crate::cmd::new("docker")
                     .args([
                         "inspect",
                         "--format",
@@ -530,10 +529,8 @@ impl TuiApp {
     }
 
     fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        use std::process::Command;
-
         // Remove any stale container first
-        let _ = Command::new("docker").args(["rm", "-f", "quip-node"]).output();
+        let _ = crate::cmd::new("docker").args(["rm", "-f", "quip-node"]).output();
 
         let data_dir = crate::settings::data_dir();
         let data_mount = format!("{}:/data", data_dir.display());
@@ -586,7 +583,7 @@ impl TuiApp {
         }
         args.push(image);
 
-        match Command::new("docker").args(&args).output() {
+        match crate::cmd::new("docker").args(&args).output() {
             Ok(o) if o.status.success() => {
                 self.set_status("Node started (Docker)");
                 self.refresh_status();
@@ -615,7 +612,7 @@ impl TuiApp {
                 .map_err(|e| format!("Cannot create log file: {}", e))?;
             let log_err = log_file.try_clone()
                 .map_err(|e| format!("Cannot clone log file: {}", e))?;
-            let child = std::process::Command::new(&bin)
+            let child = crate::cmd::new(&bin)
                 .arg("--config")
                 .arg(&config_path)
                 .stdout(log_file)
@@ -635,11 +632,10 @@ impl TuiApp {
     }
 
     fn stop_node(&mut self) {
-        use std::process::Command;
         match self.form.run_mode() {
             RunMode::Docker => {
-                let _ = Command::new("docker").args(["stop", "quip-node"]).output();
-                let _ = Command::new("docker")
+                let _ = crate::cmd::new("docker").args(["stop", "quip-node"]).output();
+                let _ = crate::cmd::new("docker")
                     .args(["rm", "-f", "quip-node"])
                     .output();
             }
@@ -651,7 +647,7 @@ impl TuiApp {
                         unsafe { libc::kill(-pid, libc::SIGTERM); }
                         #[cfg(windows)]
                         {
-                            let _ = Command::new("taskkill")
+                            let _ = crate::cmd::new("taskkill")
                                 .args(["/F", "/PID", &pid.to_string()])
                                 .output();
                         }

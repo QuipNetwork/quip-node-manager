@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::settings::{ContainerStatus, GpuBackend, RunMode};
-use std::process::Command;
 use tauri::Emitter;
 
 fn log_cmd(app: &tauri::AppHandle, cmd: &str) {
@@ -49,7 +48,7 @@ pub fn image_for_tag(image_tag: &str) -> &'static str {
 
 #[tauri::command]
 pub async fn check_docker_installed() -> Result<bool, String> {
-    let status = Command::new("docker")
+    let status = crate::cmd::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -58,7 +57,7 @@ pub async fn check_docker_installed() -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn check_docker_hello_world() -> Result<bool, String> {
-    let status = Command::new("docker")
+    let status = crate::cmd::new("docker")
         .args(["run", "--rm", "hello-world"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -72,7 +71,7 @@ pub async fn pull_node_image(
 ) -> Result<String, String> {
     let image = format!("{}:latest", image_for_tag(&image_tag));
     log_cmd(&app, &format!("docker pull {}", image));
-    let output = Command::new("docker")
+    let output = crate::cmd::new("docker")
         .args(["pull", &image])
         .output()
         .map_err(|e| e.to_string())?;
@@ -103,7 +102,7 @@ pub async fn start_node_container(
 
     // Remove any stale container first
     log_cmd(&app, "docker rm -f quip-node");
-    let rm_out = Command::new("docker")
+    let rm_out = crate::cmd::new("docker")
         .args(["rm", "-f", "quip-node"])
         .output();
     if let Ok(o) = &rm_out {
@@ -170,7 +169,7 @@ pub async fn start_node_container(
 
     log_cmd(&app, &format!("docker {}", args.join(" ")));
 
-    let output = Command::new("docker")
+    let output = crate::cmd::new("docker")
         .args(&args)
         .output()
         .map_err(|e| e.to_string())?;
@@ -196,7 +195,7 @@ pub async fn stop_node_container(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     log_cmd(&app, "docker stop quip-node");
-    let stop = Command::new("docker")
+    let stop = crate::cmd::new("docker")
         .args(["stop", "quip-node"])
         .output();
     if let Ok(o) = &stop {
@@ -209,7 +208,7 @@ pub async fn stop_node_container(
     }
 
     log_cmd(&app, "docker rm -f quip-node");
-    Command::new("docker")
+    crate::cmd::new("docker")
         .args(["rm", "-f", "quip-node"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -219,7 +218,7 @@ pub async fn stop_node_container(
 
 #[tauri::command]
 pub async fn get_container_status() -> Result<ContainerStatus, String> {
-    let output = Command::new("docker")
+    let output = crate::cmd::new("docker")
         .args([
             "inspect",
             "--format",
@@ -261,7 +260,7 @@ pub async fn get_container_status() -> Result<ContainerStatus, String> {
 
 #[tauri::command]
 pub async fn get_container_config() -> Result<String, String> {
-    let output = Command::new("docker")
+    let output = crate::cmd::new("docker")
         .args(["inspect", "quip-node"])
         .output()
         .map_err(|e| e.to_string())?;

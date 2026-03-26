@@ -2,7 +2,6 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::net::UdpSocket;
-use std::process::Command;
 use std::time::Duration;
 use tauri::Emitter;
 
@@ -16,7 +15,7 @@ pub struct CheckItem {
 }
 
 fn check_docker() -> bool {
-    Command::new("docker")
+    crate::cmd::new("docker")
         .args(["info"])
         .output()
         .map(|o| o.status.success())
@@ -26,7 +25,7 @@ fn check_docker() -> bool {
 fn check_image_present() -> bool {
     let cpu_image =
         "registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest";
-    Command::new("docker")
+    crate::cmd::new("docker")
         .args(["image", "inspect", cpu_image])
         .output()
         .map(|o| o.status.success())
@@ -163,7 +162,7 @@ async fn check_hostname_dns(hostname: &str) -> Option<bool> {
 
 #[cfg(target_os = "macos")]
 fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let out = Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
+    let out = crate::cmd::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
         .arg("--getglobalstate")
         .output()
         .ok()?;
@@ -182,7 +181,7 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
 
 #[cfg(target_os = "linux")]
 fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let out = Command::new("ufw").args(["status"]).output().ok()?;
+    let out = crate::cmd::new("ufw").args(["status"]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     if text.to_lowercase().contains("inactive") {
         return Some((true, "ufw inactive".to_string()));
@@ -202,7 +201,7 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
 
 #[cfg(target_os = "windows")]
 fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let state = Command::new("netsh")
+    let state = crate::cmd::new("netsh")
         .args(["advfirewall", "show", "allprofiles", "state"])
         .output()
         .ok()?;
@@ -214,7 +213,7 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
     if all_off {
         return Some((true, "Windows Firewall disabled".to_string()));
     }
-    let rule = Command::new("netsh")
+    let rule = crate::cmd::new("netsh")
         .args([
             "advfirewall",
             "firewall",

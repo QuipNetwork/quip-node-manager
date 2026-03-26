@@ -2,7 +2,7 @@
 use crate::log_stream::LogEntry;
 use crate::settings::{data_dir, RunMode};
 use serde::Serialize;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
@@ -91,8 +91,7 @@ fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::process::Command;
-        Command::new("tasklist")
+        crate::cmd::new("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .output()
             .map(|o| {
@@ -121,7 +120,7 @@ fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         // /T kills the process tree (all children)
-        let _ = std::process::Command::new("taskkill")
+        let _ = crate::cmd::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     }
@@ -145,7 +144,7 @@ pub fn installed_binary_version() -> Option<String> {
     if !bin.exists() {
         return None;
     }
-    let output = Command::new(&bin)
+    let output = crate::cmd::new(&bin)
         .args(["--version"])
         .output()
         .ok()?;
@@ -403,7 +402,7 @@ pub async fn start_native_node(
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| format!("Cannot create data dir: {}", e))?;
 
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::cmd::new(&bin);
     cmd.args(["--config", &config_path.to_string_lossy()])
         .current_dir(&work_dir)
         .stdout(log_file)

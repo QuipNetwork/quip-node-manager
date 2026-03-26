@@ -117,7 +117,7 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
     }
 
     // Get current local digest
-    let local_output = std::process::Command::new("docker")
+    let local_output = crate::cmd::new("docker")
         .args(["image", "inspect", "--format", "{{index .RepoDigests 0}}",
             &format!("registry.gitlab.com/piqued/quip-protocol/{}:latest", image_name)])
         .output()

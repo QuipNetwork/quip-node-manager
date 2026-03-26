@@ -47,10 +47,11 @@ build-macos-universal:
   script:
     - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - bun run tauri build --target universal-apple-darwin
+    - mkdir -p dist
+    - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
   artifacts:
     paths:
-      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-      - src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+      - dist/quip-node-manager-macos-universal.dmg
 
 # ---------------------------------------------------------------------------
 # Linux x86_64 (AppImage + deb)
@@ -76,13 +77,31 @@ build-linux-x86_64:
   script:
     - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
     - bun run tauri build
+    - mkdir -p dist
+    - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
+    - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
+    - |
+      cat > dist/README-linux.txt << 'HEREDOC'
+      Quip Node Manager — Linux
+
+      AppImage (any distro):
+        chmod +x quip-node-manager-linux-x86_64.AppImage
+        ./quip-node-manager-linux-x86_64.AppImage
+        # Add --cli for terminal UI mode
+
+      Debian/Ubuntu (.deb):
+        sudo dpkg -i quip-node-manager-linux-x86_64.deb
+        quip-node-manager
+        # Add --cli for terminal UI mode
+      HEREDOC
   artifacts:
     paths:
-      - src-tauri/target/release/bundle/appimage/*.AppImage
-      - src-tauri/target/release/bundle/deb/*.deb
+      - dist/quip-node-manager-linux-x86_64.AppImage
+      - dist/quip-node-manager-linux-x86_64.deb
+      - dist/README-linux.txt
 
 # ---------------------------------------------------------------------------
-# Windows x86_64 (NSIS installer)
+# Windows x86_64
 # ---------------------------------------------------------------------------
 
 build-windows-x86_64:
@@ -104,9 +123,11 @@ build-windows-x86_64:
   script:
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
     - bun run tauri build -- --no-bundle
+    - New-Item -ItemType Directory -Force -Path dist
+    - Copy-Item src-tauri\target\release\quip-node-manager.exe dist\quip-node-manager-windows-x86_64.exe
   artifacts:
     paths:
-      - src-tauri/target/release/quip-node-manager.exe
+      - dist/quip-node-manager-windows-x86_64.exe
 
 # ---------------------------------------------------------------------------
 # Release (tags only)
@@ -128,12 +149,15 @@ release-binaries:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: "macOS Universal (ARM64 + x86_64) DMG"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-universal"
-          filepath: /quip-node-manager-macos-universal.zip
-        - name: "Linux x86_64 (AppImage + deb)"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-linux-x86_64"
-          filepath: /quip-node-manager-linux-x86_64.zip
-        - name: "Windows x86_64 (exe)"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-windows-x86_64"
-          filepath: /quip-node-manager-windows-x86_64.zip
+        - name: "macOS Universal DMG"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal"
+          link_type: package
+        - name: "Linux x86_64 AppImage"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64"
+          link_type: package
+        - name: "Linux x86_64 deb"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64"
+          link_type: package
+        - name: "Windows x86_64 exe"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64"
+          link_type: package

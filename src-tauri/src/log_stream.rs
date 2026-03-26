@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::SyncSender;
 use tauri::Emitter;
@@ -93,7 +93,7 @@ pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
     std::thread::spawn(move || {
         // Use shell to merge stdout+stderr so we get both entrypoint
         // and Python logging output in one stream.
-        let mut child = match Command::new("sh")
+        let mut child = match crate::cmd::new("sh")
             .args(["-c", "docker logs -f --tail 100 quip-node 2>&1"])
             .stdout(Stdio::piped())
             .spawn()
@@ -138,7 +138,7 @@ pub async fn start_log_stream(
 
     let stop_flag = Arc::clone(&state.1);
     let handle = std::thread::spawn(move || {
-        let mut child = match Command::new("sh")
+        let mut child = match crate::cmd::new("sh")
             .args(["-c", "docker logs -f --tail 100 quip-node 2>&1"])
             .stdout(Stdio::piped())
             .spawn()
