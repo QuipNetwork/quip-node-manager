@@ -114,6 +114,7 @@ build-windows-x86_64:
 
 release-binaries:
   stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
     - build-macos-universal
     - build-linux-x86_64
@@ -133,6 +134,6 @@ release-binaries:
         - name: "Linux x86_64 (AppImage + deb)"
           url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-linux-x86_64"
           filepath: /quip-node-manager-linux-x86_64.zip
-        - name: "Windows x86_64 (NSIS + MSI)"
+        - name: "Windows x86_64 (exe)"
           url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-windows-x86_64"
           filepath: /quip-node-manager-windows-x86_64.zip
