@@ -472,7 +472,18 @@ fn start_log_tail(
 
         let mut file = match std::fs::File::open(&log_path) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                // No log file — node was started before log redirect.
+                let _ = app.emit(
+                    "node-log",
+                    &LogEntry {
+                        timestamp: String::new(),
+                        level: "WARN".to_string(),
+                        message: "Node is running but no log file found. Stop and restart to enable log capture.".to_string(),
+                    },
+                );
+                return;
+            }
         };
 
         // Read existing content (backfill)

@@ -1,0 +1,140 @@
+# GitLab CI/CD for Quip Node Manager
+# Tauri v2 desktop app builds for macOS (arm64 + x86_64), Linux, Windows
+
+stages:
+  - build
+  - release
+
+variables:
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+# ---------------------------------------------------------------------------
+# Shared setup
+# ---------------------------------------------------------------------------
+
+.tauri_build:
+  stage: build
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .cargo/registry
+      - src-tauri/target
+  artifacts:
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ---------------------------------------------------------------------------
+# macOS ARM64 (Apple Silicon)
+# ---------------------------------------------------------------------------
+
+build-macos-arm64:
+  extends: .tauri_build
+  tags: [macos, arm64]
+  before_script:
+    - curl -fsSL https://bun.sh/install | bash || true
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install
+    - rustup target add aarch64-apple-darwin
+  script:
+    - bun run tauri build --target aarch64-apple-darwin
+  artifacts:
+    paths:
+      - src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+      - src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+
+# ---------------------------------------------------------------------------
+# macOS x86_64 (Intel)
+# ---------------------------------------------------------------------------
+
+build-macos-x86_64:
+  extends: .tauri_build
+  tags: [macos, x86_64]
+  before_script:
+    - curl -fsSL https://bun.sh/install | bash || true
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install
+    - rustup target add x86_64-apple-darwin
+  script:
+    - bun run tauri build --target x86_64-apple-darwin
+  artifacts:
+    paths:
+      - src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+      - src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app
+
+# ---------------------------------------------------------------------------
+# Linux x86_64 (AppImage + deb)
+# ---------------------------------------------------------------------------
+
+build-linux-x86_64:
+  extends: .tauri_build
+  image: rust:1.82-bookworm
+  tags: [linux, x86_64]
+  before_script:
+    # System deps for Tauri on Linux
+    - apt-get update && apt-get install -y --no-install-recommends
+        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+        librsvg2-dev patchelf file
+    # Install bun
+    - curl -fsSL https://bun.sh/install | bash
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install
+  script:
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun run tauri build
+  artifacts:
+    paths:
+      - src-tauri/target/release/bundle/appimage/*.AppImage
+      - src-tauri/target/release/bundle/deb/*.deb
+
+# ---------------------------------------------------------------------------
+# Windows x86_64 (NSIS installer)
+# ---------------------------------------------------------------------------
+
+build-windows-x86_64:
+  extends: .tauri_build
+  tags: [windows, x86_64]
+  before_script:
+    - choco install nodejs-lts -y --no-progress 2>$null
+    - npm install -g bun
+    - bun install
+  script:
+    - bun run tauri build
+  artifacts:
+    paths:
+      - src-tauri/target/release/bundle/nsis/*.exe
+      - src-tauri/target/release/bundle/msi/*.msi
+
+# ---------------------------------------------------------------------------
+# Release (tags only)
+# ---------------------------------------------------------------------------
+
+release-binaries:
+  stage: release
+  needs:
+    - build-macos-arm64
+    - build-macos-x86_64
+    - build-linux-x86_64
+    - build-windows-x86_64
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "macOS ARM64 (Apple Silicon) DMG"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-arm64"
+          filepath: /quip-node-manager-macos-arm64.zip
+        - name: "macOS x86_64 (Intel) DMG"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-macos-x86_64"
+          filepath: /quip-node-manager-macos-x86_64.zip
+        - name: "Linux x86_64 (AppImage + deb)"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-linux-x86_64"
+          filepath: /quip-node-manager-linux-x86_64.zip
+        - name: "Windows x86_64 (NSIS + MSI)"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/download?job=build-windows-x86_64"
+          filepath: /quip-node-manager-windows-x86_64.zip

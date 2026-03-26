@@ -2,6 +2,14 @@
 use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
 use std::fs;
 
+const DEFAULT_PEERS: &[&str] = &[
+    "qpu-1.nodes.quip.network:20049",
+    "cpu-1.quip.carback.us:20049",
+    "gpu-1.quip.carback.us:20049",
+    "gpu-2.quip.carback.us:20050",
+    "nodes.quip.network:20049",
+];
+
 fn render_config_toml(
     config: &NodeConfig,
     run_mode: &RunMode,
@@ -36,10 +44,14 @@ fn render_config_toml(
         "genesis_config = \"{}\"\n",
         config.genesis_config
     ));
-    if !config.peers.is_empty() {
-        let peers: Vec<String> =
+    if config.peers.is_empty() {
+        let peer_strs: Vec<String> =
+            DEFAULT_PEERS.iter().map(|p| format!("\"{}\"", p)).collect();
+        out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
+    } else {
+        let peer_strs: Vec<String> =
             config.peers.iter().map(|p| format!("\"{}\"", p)).collect();
-        out.push_str(&format!("peer = [{}]\n", peers.join(", ")));
+        out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
     }
     out.push_str(&format!("timeout = {}\n", config.timeout));
     out.push_str(&format!(
