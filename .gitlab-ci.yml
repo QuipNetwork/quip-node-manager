@@ -103,8 +103,11 @@ build-windows-x86_64:
     - bun install
   script:
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
-    - $env:TAURI_NSIS_PATH = "C:\Program Files (x86)\NSIS"
-    - if (-not (Test-Path $env:TAURI_NSIS_PATH)) { $env:TAURI_NSIS_PATH = "C:\Program Files\NSIS" }
+    - $tauri_tools = "$env:LOCALAPPDATA\tauri"
+    - New-Item -ItemType Directory -Force -Path "$tauri_tools\NSIS" | Out-Null
+    - $nsis_src = if (Test-Path "C:\Program Files (x86)\NSIS") { "C:\Program Files (x86)\NSIS" } else { "C:\Program Files\NSIS" }
+    - Copy-Item -Path "$nsis_src\*" -Destination "$tauri_tools\NSIS\" -Recurse -Force
+    - Write-Host "NSIS copied to $tauri_tools\NSIS"
     - bun run tauri build -- --bundles nsis
   artifacts:
     paths:
