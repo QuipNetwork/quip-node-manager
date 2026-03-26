@@ -98,7 +98,7 @@ build-windows-x86_64:
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
     - choco install nodejs-lts rust-ms nsis vcredist140 -y --no-progress
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
-    - npm install -g bun
+    - if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { npm install -g bun }
     - $env:Path = "$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:Path"
     - bun install
   script:
