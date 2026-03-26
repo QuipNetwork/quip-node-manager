@@ -32,17 +32,19 @@ variables:
 build-macos-arm64:
   extends: .tauri_build
   tags: [macos, arm64]
+  variables:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   before_script:
     - curl -fsSL https://bun.sh/install | bash || true
     - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
-    - rustup target add aarch64-apple-darwin
   script:
-    - bun run tauri build --target aarch64-apple-darwin
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun run tauri build
   artifacts:
     paths:
-      - src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-      - src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+      - src-tauri/target/release/bundle/dmg/*.dmg
+      - src-tauri/target/release/bundle/macos/*.app
 
 # ---------------------------------------------------------------------------
 # macOS x86_64 (Intel)
@@ -51,17 +53,19 @@ build-macos-arm64:
 build-macos-x86_64:
   extends: .tauri_build
   tags: [macos, x86_64]
+  variables:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
   before_script:
     - curl -fsSL https://bun.sh/install | bash || true
     - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
-    - rustup target add x86_64-apple-darwin
   script:
-    - bun run tauri build --target x86_64-apple-darwin
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun run tauri build
   artifacts:
     paths:
-      - src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-      - src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app
+      - src-tauri/target/release/bundle/dmg/*.dmg
+      - src-tauri/target/release/bundle/macos/*.app
 
 # ---------------------------------------------------------------------------
 # Linux x86_64 (AppImage + deb)
@@ -69,7 +73,7 @@ build-macos-x86_64:
 
 build-linux-x86_64:
   extends: .tauri_build
-  image: rust:1.82-bookworm
+  image: rust:1.85-bookworm
   tags: [linux, x86_64]
   before_script:
     # System deps for Tauri on Linux
