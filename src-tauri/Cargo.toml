@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Quip Node Desktop Manager"
 authors = []
 edition = "2021"
+license = "AGPL-3.0-or-later"
 default-run = "quip-node-manager"
 
 [lib]
@@ -14,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

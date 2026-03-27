@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13,7 +14,14 @@
       <img src="quipv3.png" class="tab-logo" alt="Quip" />
       <button class="tab-btn active" data-tab="status">Status Monitor</button>
       <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-      <span id="app-version" class="app-version">v0.0.0</span>
+      <span id="app-version" class="app-version">
+        v0.0.0
+        <span id="update-dot" class="update-dot" style="display:none;"></span>
+        <div id="update-tooltip" class="update-tooltip" style="display:none;">
+          <span id="update-tooltip-text"></span>
+          <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
+        </div>
+      </span>
     </div>
 
     <!-- Status Monitor Tab -->

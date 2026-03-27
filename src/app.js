@@ -830,6 +830,7 @@ async function setupListeners() {
   await listen('app-update-available', (event) => {
     const info = event.payload;
     appendLog({ timestamp: '', level: 'INFO', message: `Node Manager v${info.version} available: ${info.url}` });
+    showUpdateBadge(info.version, info.url);
   });
 
   await listen('binary-download-progress', (event) => {
@@ -840,6 +841,29 @@ async function setupListeners() {
       if (statusEl) statusEl.textContent = `Downloading binary: ${pct}%`;
     }
   });
+}
+
+// ─── Update Badge ─────────────────────────────────────────────────────────────
+function showUpdateBadge(version, url) {
+  const dot = document.getElementById('update-dot');
+  const tooltip = document.getElementById('update-tooltip');
+  const tooltipText = document.getElementById('update-tooltip-text');
+  const tooltipLink = document.getElementById('update-tooltip-link');
+  const versionEl = document.getElementById('app-version');
+  if (!dot || !tooltip) return;
+
+  dot.style.display = 'inline-block';
+  tooltipText.textContent = `v${version} available`;
+  tooltipLink.href = url;
+  versionEl.classList.add('has-update');
+
+  versionEl.onclick = (e) => {
+    e.stopPropagation();
+    tooltip.style.display = tooltip.style.display === 'none' ? 'flex' : 'none';
+  };
+  document.addEventListener('click', () => {
+    tooltip.style.display = 'none';
+  }, { once: false });
 }
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
@@ -864,6 +888,12 @@ async function init() {
   } catch (e) {
     console.error('Failed to load settings:', e);
   }
+
+  // Display app version
+  try {
+    const ver = await invoke('get_app_version');
+    document.getElementById('app-version').childNodes[0].textContent = `v${ver} `;
+  } catch { /* ignore */ }
 
   // Load storage directory
   try {
@@ -910,6 +940,12 @@ async function init() {
   }
 
   state.pollInterval = setInterval(pollStatus, 10_000);
+
+  // Check for app updates on startup
+  try {
+    const update = await invoke('check_app_update');
+    if (update) showUpdateBadge(update.version, update.url);
+  } catch { /* ignore */ }
 }
 
 init().catch(console.error);

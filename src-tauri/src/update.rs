@@ -41,6 +41,11 @@ pub fn parse_semver(v: &str) -> (u64, u64, u64) {
 }
 
 #[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
 pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
     let current = env!("CARGO_PKG_VERSION");
     let client = reqwest::Client::builder()
@@ -155,6 +160,11 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         // Check for node-manager app updates
         if let Ok(Some(info)) = check_app_update().await {
             let _ = app.emit("app-update-available", &info);
+            crate::set_tray_update(
+                &app,
+                true,
+                &format!("Quip Node Manager — v{} available", info.version),
+            );
         }
 
         match settings.run_mode {

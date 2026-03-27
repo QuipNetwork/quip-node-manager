@@ -84,6 +84,55 @@ body {
   font-size: 12px;
   padding: 0 16px;
   align-self: center;
+  position: relative;
+  cursor: default;
+}
+
+.app-version.has-update {
+  cursor: pointer;
+}
+
+.update-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+  vertical-align: middle;
+  margin-left: 4px;
+  animation: pulse-update 2s infinite;
+}
+
+@keyframes pulse-update {
+  0%   { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.5); }
+  70%  { box-shadow: 0 0 0 5px rgba(234, 179, 8, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0); }
+}
+
+.update-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-input);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.update-tooltip a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.update-tooltip a:hover {
+  text-decoration: underline;
 }
 
 /* ─── Tab Content ────────────────────────────────────────────────────────── */
