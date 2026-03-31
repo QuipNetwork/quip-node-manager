@@ -11,6 +11,7 @@ const listen =
 const state = {
   settings: null,
   containerRunning: false,
+  nativeRunning: false,
   checksPassed: false,
   detectedGpus: [], // { index, name }
   logLines: [],
@@ -18,6 +19,7 @@ const state = {
   pollInterval: null,
   portCheckResult: null, // null=unchecked, true=forwarded, false=not reached
   lastChecks: [],        // last checklist payload from backend
+  hardwareSurvey: null,
 };
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
@@ -50,6 +52,13 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
   section.style.display = expanded ? 'none' : '';
 });
 
+// ─── Log drawer toggle ──────────────────────────────────────────────────────
+document.getElementById('log-drawer-handle').addEventListener('click', (e) => {
+  // Don't toggle if clicking Copy/Clear buttons inside the handle
+  if (e.target.closest('.btn')) return;
+  document.getElementById('log-drawer').classList.toggle('expanded');
+});
+
 // ─── Requirements toggle ─────────────────────────────────────────────────────
 document.getElementById('checklist-toggle').addEventListener('click', () => {
   const btn = document.getElementById('checklist-toggle');
@@ -76,6 +85,128 @@ document.getElementById('btn-custom-toggle').addEventListener('click', () => {
   const expanded = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!expanded));
   section.style.display = expanded ? 'none' : '';
+});
+
+// ─── Storage directory ───────────────────────────────────────────────────────
+document.getElementById('data-dir').addEventListener('input', () => {
+  const current = state._currentDataDir || '';
+  const val = document.getElementById('data-dir').value.trim();
+  const btn = document.getElementById('btn-data-dir-restart');
+  btn.style.display = val !== current ? '' : 'none';
+});
+
+document.getElementById('btn-data-dir-restart').addEventListener('click', async () => {
+  const val = document.getElementById('data-dir').value.trim();
+  const btn = document.getElementById('btn-data-dir-restart');
+  btn.disabled = true;
+  btn.textContent = 'Saving\u2026';
+  try {
+    await invoke('set_data_dir', { path: val });
+    await invoke('restart_app');
+  } catch (e) {
+    appendLog({ timestamp: '', level: 'ERROR', message: `Failed to set storage dir: ${e}` });
+    btn.disabled = false;
+    btn.textContent = 'Save & Restart';
+  }
+});
+
+// ─── Run mode select ─────────────────────────────────────────────────────────
+document.getElementById('run-mode-select').addEventListener('change', async () => {
+  if (!state.settings) return;
+  state.settings.run_mode = document.getElementById('run-mode-select').value;
+  updateRunModeUI();
+  await invoke('update_settings', { settings: state.settings }).catch(console.error);
+  await invoke('run_checklist').catch(console.error);
+});
+
+function updateRunModeUI() {
+  const mode = state.settings?.run_mode || 'docker';
+  const isDocker = mode === 'docker';
+
+  // Toggle checklist item visibility
+  document.querySelectorAll('.docker-only').forEach((el) => {
+    el.style.display = isDocker ? '' : 'none';
+  });
+  document.querySelectorAll('.native-only').forEach((el) => {
+    el.style.display = isDocker ? 'none' : '';
+  });
+
+  // Warnings
+  const warning = document.getElementById('run-mode-warning');
+  const survey = state.hardwareSurvey;
+  if (!isDocker && survey?.os !== 'macos') {
+    warning.textContent = '\u26A0 Docker provides better isolation and security.';
+    warning.style.display = '';
+  } else if (isDocker && survey?.os === 'macos') {
+    warning.textContent = '\u26A0 Mac Metal GPUs are not accessible in Docker.';
+    warning.style.display = '';
+  } else {
+    warning.style.display = 'none';
+  }
+
+  renderGpuDevices();
+}
+
+function renderGpuDevices() {
+  const list = document.getElementById('gpu-device-list');
+  const noDevices = document.getElementById('gpu-no-devices');
+  const globalSettings = document.getElementById('gpu-global-settings');
+  const survey = state.hardwareSurvey;
+  const devices = survey?.gpu_devices || [];
+
+  list.replaceChildren();
+
+  if (devices.length === 0) {
+    noDevices.style.display = '';
+    globalSettings.style.opacity = '0.4';
+    globalSettings.style.pointerEvents = 'none';
+    return;
+  }
+
+  noDevices.style.display = 'none';
+  globalSettings.style.opacity = '';
+  globalSettings.style.pointerEvents = '';
+
+  const savedConfigs = state.settings?.node_config?.gpu_device_configs || [];
+
+  devices.forEach((dev) => {
+    const saved = savedConfigs.find((c) => c.index === dev.index);
+    const enabled = saved ? saved.enabled : false;
+    const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
+    const backendLabel = survey.gpu_backend === 'metal' ? 'Metal' : 'CUDA';
+
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
+
+    const label = document.createElement('label');
+    label.className = 'gpu-toggle-switch';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'gpu-device-toggle';
+    checkbox.dataset.index = String(dev.index);
+    checkbox.checked = enabled;
+    const slider = document.createElement('span');
+    slider.className = 'gpu-toggle-slider';
+    label.appendChild(checkbox);
+    label.appendChild(slider);
+
+    const text = document.createElement('span');
+    text.style.fontSize = '13px';
+    text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
+
+    row.appendChild(label);
+    row.appendChild(text);
+    list.appendChild(row);
+  });
+}
+
+// ─── TLS guide toggle ────────────────────────────────────────────────────────
+document.getElementById('btn-tls-guide-toggle')?.addEventListener('click', () => {
+  const btn = document.getElementById('btn-tls-guide-toggle');
+  const guide = document.getElementById('tls-guide');
+  const expanded = btn.getAttribute('aria-expanded') === 'true';
+  btn.setAttribute('aria-expanded', String(!expanded));
+  guide.style.display = expanded ? 'none' : '';
 });
 
 // ─── Secret show/hide & regenerate ───────────────────────────────────────────
@@ -108,9 +239,12 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
 // ─── Public host enable toggle ────────────────────────────────────────────────
 document.getElementById('public-host-enable').addEventListener('change', () => {
   const enabled = document.getElementById('public-host-enable').checked;
-  const input = document.getElementById('public-host');
-  input.disabled = !enabled;
-  if (!enabled) input.value = '';
+  document.getElementById('public-host').disabled = !enabled;
+  document.getElementById('public-port').disabled = !enabled;
+  if (!enabled) {
+    document.getElementById('public-host').value = '';
+    document.getElementById('public-port').value = '';
+  }
 });
 
 // ─── QPU section toggle ───────────────────────────────────────────────────────
@@ -124,14 +258,7 @@ document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
     : 'Hide QPU Configuration';
 });
 
-// ─── GPU mining toggle & options ──────────────────────────────────────────────
-function updateGpuOptionsVisibility() {
-  const enabled = document.getElementById('gpu-enable').checked;
-  document.getElementById('gpu-options').style.display = enabled ? 'block' : 'none';
-}
-
-document.getElementById('gpu-enable').addEventListener('change', updateGpuOptionsVisibility);
-
+// ─── GPU utilization slider ──────────────────────────────────────────────────
 document.getElementById('gpu-utilization').addEventListener('input', () => {
   const val = document.getElementById('gpu-utilization').value;
   document.getElementById('gpu-util-display').textContent = `${val}%`;
@@ -139,23 +266,38 @@ document.getElementById('gpu-utilization').addEventListener('input', () => {
 
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
 function collectConfig() {
-  const gpuEnabled = document.getElementById('gpu-enable').checked;
-  const gpuBackend = document.getElementById('gpu-backend')?.value || 'local';
   const gpuUtilization = parseInt(document.getElementById('gpu-utilization')?.value) || 80;
   const gpuYielding = document.getElementById('gpu-yielding')?.checked ?? false;
+  const survey = state.hardwareSurvey;
+  const gpuBackend = survey?.gpu_backend === 'metal' ? 'mps' : 'local';
 
-  const qpuApiKey = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
-  const qpuConfig = qpuApiKey
+  // Build per-device configs from toggle checkboxes
+  const gpuDeviceConfigs = [];
+  document.querySelectorAll('.gpu-device-toggle').forEach((cb) => {
+    gpuDeviceConfigs.push({
+      index: parseInt(cb.dataset.index),
+      enabled: cb.checked,
+      utilization: gpuUtilization,
+      yielding: gpuYielding,
+    });
+  });
+
+  const qpuToken = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
+  const dwaveConfig = qpuToken
     ? {
-        api_key: qpuApiKey,
-        solver: document.getElementById('qpu-solver')?.value?.trim() ?? '',
-        region_url: document.getElementById('qpu-region-url')?.value?.trim() ?? '',
+        token: qpuToken,
+        solver: 'Advantage2_System1.13',
+        dwave_region_url: 'https://na-west-1.cloud.dwavesys.com/sapi/v2/',
         daily_budget: document.getElementById('qpu-daily-budget')?.value?.trim() ?? '',
+        qpu_min_blocks_for_estimation: null,
+        qpu_ema_alpha: null,
       }
     : null;
 
   const fanoutRaw = document.getElementById('fanout')?.value?.trim();
   const fanout = fanoutRaw ? (parseInt(fanoutRaw) || null) : null;
+
+  const base = state.settings?.node_config ?? {};
 
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
@@ -163,6 +305,9 @@ function collectConfig() {
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
       : '',
+    public_port: document.getElementById('public-host-enable')?.checked
+      ? (parseInt(document.getElementById('public-port')?.value) || null)
+      : null,
     node_name: document.getElementById('node-name')?.value?.trim() ?? '',
     peers: document
       .getElementById('peers')
@@ -171,20 +316,30 @@ function collectConfig() {
       .filter((s) => s.length > 0),
     auto_mine: document.getElementById('auto-mine')?.checked ?? false,
     secret: state.settings?.node_config?.secret ?? '',
+    genesis_config: base.genesis_config ?? 'genesis_block.json',
+    tofu: base.tofu ?? true,
+    trust_db: base.trust_db ?? '~/.quip/trust.db',
+    tls_cert_file: document.getElementById('tls-cert-file')?.value?.trim() ?? '',
+    tls_key_file: document.getElementById('tls-key-file')?.value?.trim() ?? '',
+    verify_tls: document.getElementById('verify-tls')?.checked ?? false,
+    rest_host: document.getElementById('rest-host')?.value?.trim() ?? '127.0.0.1',
+    rest_port: parseInt(document.getElementById('rest-port')?.value) ?? -1,
+    rest_insecure_port: parseInt(document.getElementById('rest-insecure-port')?.value) ?? -1,
+    telemetry_enabled: document.getElementById('telemetry-enabled')?.checked ?? true,
+    telemetry_dir: document.getElementById('telemetry-dir')?.value?.trim() ?? 'telemetry',
+    log_level: document.getElementById('log-level')?.value || 'info',
+    node_log: document.getElementById('node-log')?.value?.trim() ?? '',
+    http_log: document.getElementById('http-log')?.value?.trim() ?? '',
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
-    gpu_backend: gpuEnabled ? gpuBackend : 'local',
-    gpu_device_configs: gpuEnabled
-      ? [{ index: 0, enabled: true, utilization: gpuUtilization, yielding: gpuYielding }]
-      : [],
-    qpu_config: qpuConfig,
+    gpu_backend: gpuBackend,
+    gpu_device_configs: gpuDeviceConfigs,
+    dwave_config: dwaveConfig,
     timeout: parseInt(document.getElementById('timeout')?.value) || 3,
     heartbeat_interval:
       parseInt(document.getElementById('heartbeat-interval')?.value) || 15,
     heartbeat_timeout:
       parseInt(document.getElementById('heartbeat-timeout')?.value) || 300,
     fanout,
-    verify_ssl: document.getElementById('verify-ssl')?.checked ?? true,
-    log_level: document.getElementById('log-level')?.value || 'info',
   };
 }
 
@@ -192,11 +347,12 @@ function collectConfig() {
 function applyFormToSettings() {
   if (!state.settings) return;
   state.settings.node_config = collectConfig();
-  // cuda image only for NVIDIA CUDA; MPS uses cpu image (Metal requires native sidecar)
-  const gpuEnabled = document.getElementById('gpu-enable').checked;
-  const gpuBackend = document.getElementById('gpu-backend')?.value;
-  state.settings.image_tag =
-    gpuEnabled && gpuBackend === 'local' ? 'cuda' : 'cpu';
+  state.settings.auto_update_enabled =
+    document.getElementById('auto-update-enabled')?.checked ?? false;
+  // cuda image only when NVIDIA GPUs enabled in Docker mode
+  const hasEnabledCuda = (state.settings.node_config.gpu_device_configs || [])
+    .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
+  state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
 }
 
 // ─── Populate form from settings ─────────────────────────────────────────────
@@ -212,10 +368,13 @@ function populateForm(settings) {
   // Custom settings
   document.getElementById('node-name').value = c.node_name ?? '';
   const publicHost = c.public_host ?? '';
-  if (publicHost) {
+  const publicPort = c.public_port ?? null;
+  if (publicHost || publicPort) {
     document.getElementById('public-host-enable').checked = true;
     document.getElementById('public-host').disabled = false;
+    document.getElementById('public-port').disabled = false;
     document.getElementById('public-host').value = publicHost;
+    document.getElementById('public-port').value = publicPort ?? '';
   }
   document.getElementById('peers').value = (c.peers || []).join('\n');
   document.getElementById('timeout').value = c.timeout ?? 3;
@@ -227,18 +386,31 @@ function populateForm(settings) {
     document.getElementById('fanout').value = c.fanout;
   }
   document.getElementById('log-level').value = c.log_level ?? 'info';
-  document.getElementById('verify-ssl').checked = c.verify_ssl ?? true;
+  document.getElementById('verify-tls').checked = c.verify_tls ?? false;
+
+  // New fields
+  document.getElementById('telemetry-enabled').checked = c.telemetry_enabled ?? true;
+  document.getElementById('telemetry-dir').value = c.telemetry_dir ?? 'telemetry';
+  document.getElementById('tls-cert-file').value = c.tls_cert_file ?? '';
+  document.getElementById('tls-key-file').value = c.tls_key_file ?? '';
+  document.getElementById('rest-host').value = c.rest_host ?? '127.0.0.1';
+  document.getElementById('rest-port').value = c.rest_port ?? -1;
+  document.getElementById('rest-insecure-port').value = c.rest_insecure_port ?? -1;
+  document.getElementById('node-log').value = c.node_log ?? '';
+  document.getElementById('http-log').value = c.http_log ?? '';
 
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
-    publicHost ||
+    publicHost || publicPort ||
     (c.peers || []).length > 0 ||
     c.timeout !== 3 ||
     c.heartbeat_interval !== 15 ||
     c.heartbeat_timeout !== 300 ||
     c.fanout != null ||
     c.log_level !== 'info' ||
-    !(c.verify_ssl ?? true);
+    (c.verify_tls ?? false) ||
+    (c.tls_cert_file ?? '') ||
+    (c.rest_port ?? -1) > 0;
   if (hasCustom) {
     document.getElementById('btn-custom-toggle').setAttribute('aria-expanded', 'true');
     document.getElementById('custom-settings-section').style.display = '';
@@ -247,45 +419,34 @@ function populateForm(settings) {
   // CPU Miner
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
 
-  // GPU Miner
-  const gpuEnabled =
-    c.gpu_backend === 'mps' ||
-    (c.gpu_device_configs || []).some((d) => d.enabled);
-  document.getElementById('gpu-enable').checked = gpuEnabled;
-  document.getElementById('gpu-backend').value =
-    c.gpu_backend === 'mps' ? 'mps' : 'local';
-  const gpuCfg = (c.gpu_device_configs || [])[0];
+  // GPU Miner — utilization/yielding from first enabled device or defaults
+  const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
   const savedUtil = gpuCfg?.utilization ?? 80;
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
   document.getElementById('gpu-yielding').checked = gpuCfg?.yielding ?? false;
-  updateGpuOptionsVisibility();
 
-  // QPU Miner
-  const qpu = c.qpu_config;
-  if (qpu) {
-    document.getElementById('qpu-api-key').value = qpu.api_key ?? '';
-    document.getElementById('qpu-solver').value = qpu.solver ?? '';
-    document.getElementById('qpu-region-url').value = qpu.region_url ?? '';
-    document.getElementById('qpu-daily-budget').value = qpu.daily_budget ?? '';
-    if (qpu.api_key) {
+  // QPU / D-Wave
+  const dw = c.dwave_config;
+  if (dw) {
+    document.getElementById('qpu-api-key').value = dw.token ?? '';
+    document.getElementById('qpu-daily-budget').value = dw.daily_budget ?? '';
+    if (dw.token) {
       document.getElementById('qpu-section').style.display = 'block';
       document.getElementById('btn-qpu-toggle').textContent =
         'Hide QPU Configuration';
     }
   }
-
-  updateGpuDevicesVisibility();
   // GPU device list rendered after list_gpu_devices call in init
 }
 
 // ─── Start/Stop/Apply enable state ───────────────────────────────────────────
 function updateStartStopState() {
+  const running = state.containerRunning || state.nativeRunning;
   document.getElementById('btn-start').disabled =
-    !state.checksPassed || state.containerRunning;
-  document.getElementById('btn-stop').disabled = !state.containerRunning;
-  document.getElementById('btn-apply').disabled = !state.containerRunning;
-  // btn-save is always enabled; no state logic needed
+    !state.checksPassed || running;
+  document.getElementById('btn-stop').disabled = !running;
+  document.getElementById('btn-apply').disabled = !state.checksPassed;
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -317,13 +478,22 @@ function setStatus(stateStr) {
 
 // ─── Checklist update ─────────────────────────────────────────────────────────
 function updateChecklist(checks) {
-  const TOTAL_CHECKS = 7;
+  // Docker: docker + image + secret + ip + hostname + port + firewall = 7
+  // Native: binary + secret + ip + hostname + port + firewall = 6
+  const TOTAL_CHECKS = isDockerMode() ? 7 : 6;
   state.lastChecks = checks;
+  const portPassed = (c) =>
+    state.portCheckResult !== null ? state.portCheckResult : c.passed;
+  const checkPassed = (c) =>
+    c.id === 'port' ? portPassed(c) : c.passed;
   const allPassed =
     checks.length === TOTAL_CHECKS &&
-    checks.every((c) => c.id === 'port' ? state.portCheckResult === true : c.passed);
-  const failing = checks.filter((c) =>
-    c.id === 'port' ? state.portCheckResult !== true : !c.passed
+    checks.filter((c) => c.required !== false).every(checkPassed);
+  const requiredFailing = checks.filter(
+    (c) => c.required !== false && !checkPassed(c)
+  ).length;
+  const warnings = checks.filter(
+    (c) => c.required === false && !checkPassed(c)
   ).length;
 
   state.checksPassed = allPassed;
@@ -336,16 +506,20 @@ function updateChecklist(checks) {
     if (checks.length < TOTAL_CHECKS) {
       summary.textContent = 'Checking\u2026';
       summary.style.color = 'var(--text-faint)';
-    } else if (allPassed) {
+    } else if (allPassed && warnings === 0) {
       summary.textContent = '\u2713 All requirements met';
       summary.style.color = 'var(--success)';
-      // Auto-collapse when all pass
+      toggleBtn.setAttribute('aria-expanded', 'false');
+      checklistEl.style.display = 'none';
+    } else if (allPassed && warnings > 0) {
+      const s = warnings > 1 ? 's' : '';
+      summary.textContent = `\u2713 Ready (${warnings} warning${s})`;
+      summary.style.color = 'var(--warning)';
       toggleBtn.setAttribute('aria-expanded', 'false');
       checklistEl.style.display = 'none';
     } else {
-      summary.textContent = `\u2717 ${failing} not met`;
+      summary.textContent = `\u2717 ${requiredFailing} not met`;
       summary.style.color = 'var(--error)';
-      // Auto-expand when there are failures
       toggleBtn.setAttribute('aria-expanded', 'true');
       checklistEl.style.display = '';
     }
@@ -359,19 +533,17 @@ function updateChecklist(checks) {
     const icon = item.querySelector('.check-icon');
     const label = item.querySelector('.check-label');
 
-    if (check.id === 'port' && state.portCheckResult !== null) {
-      // Recheck result takes precedence over the background checklist placeholder.
-      icon.textContent = state.portCheckResult ? '\u2713' : '\u2717';
-      icon.style.color = state.portCheckResult ? 'var(--success)' : 'var(--error)';
-    } else {
-      icon.textContent = check.passed ? '\u2713' : '\u2717';
-      icon.style.color = check.passed ? 'var(--success)' : 'var(--error)';
-      if (label && check.label) label.textContent = check.label;
-    }
+    const passed = checkPassed(check);
+    const isWarning = !passed && check.required === false;
+    icon.textContent = passed ? '\u2713' : (isWarning ? '\u26A0' : '\u2717');
+    icon.style.color = passed
+      ? 'var(--success)'
+      : (isWarning ? 'var(--warning)' : 'var(--error)');
+    if (label && check.label) label.textContent = check.label;
 
     const actionBtn = item.querySelector('.check-action');
     if (actionBtn && actionBtn.tagName === 'BUTTON') {
-      actionBtn.style.display = check.passed ? 'none' : 'inline-flex';
+      actionBtn.style.display = passed ? 'none' : 'inline-flex';
     }
   });
 
@@ -427,21 +599,27 @@ document
 document
   .querySelector('[data-id="image"] .check-action')
   ?.addEventListener('click', async () => {
+    const btn = document.querySelector('[data-id="image"] .check-action');
     const tag = state.settings?.image_tag || 'cpu';
-    const statusEl = document.getElementById('apply-status');
-    statusEl.textContent = 'Pulling image\u2026';
+    btn.disabled = true;
+    btn.textContent = 'Pulling\u2026';
     try {
       await invoke('pull_node_image', { imageTag: tag });
-      statusEl.textContent = 'Image pulled.';
+      btn.style.display = 'none';
       await invoke('run_checklist');
     } catch (e) {
-      statusEl.textContent = `Pull failed: ${e}`;
+      btn.disabled = false;
+      btn.textContent = 'Retry Pull';
+      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
     }
   });
 
 document
   .querySelector('[data-id="secret"] .check-action')
   ?.addEventListener('click', async () => {
+    const btn = document.querySelector('[data-id="secret"] .check-action');
+    btn.disabled = true;
+    btn.textContent = 'Generating\u2026';
     try {
       const secret = await invoke('generate_node_secret');
       document.getElementById('secret-display').value = secret;
@@ -449,11 +627,78 @@ document
         state.settings.node_config.secret = secret;
         await invoke('update_settings', { settings: state.settings });
       }
+      btn.style.display = 'none';
       await invoke('run_checklist');
     } catch (e) {
+      btn.disabled = false;
+      btn.textContent = 'Generate Secret';
       console.error(e);
     }
   });
+
+// ─── Binary download action ──────────────────────────────────────────────────
+document
+  .querySelector('[data-id="binary"] .check-action')
+  ?.addEventListener('click', async () => {
+    const btn = document.querySelector('[data-id="binary"] .check-action');
+    const label = document.querySelector('[data-id="binary"] .check-label');
+    btn.disabled = true;
+    btn.textContent = 'Downloading\u2026';
+    label.textContent = 'Downloading node binary\u2026';
+    // Switch label to "Installing" once download completes (before invoke returns)
+    const progressCleanup = await listen('binary-download-progress', (event) => {
+      if (event.payload.done) {
+        label.textContent = 'Installing node binary\u2026';
+        btn.textContent = 'Installing\u2026';
+      }
+    });
+    try {
+      const version = await invoke('download_native_binary');
+      label.textContent = `Node binary v${version} installed`;
+      btn.style.display = 'none';
+      progressCleanup();
+      await invoke('run_checklist');
+    } catch (e) {
+      label.textContent = `Download failed: ${e}`;
+      btn.disabled = false;
+      btn.textContent = 'Retry Download & Install';
+      progressCleanup();
+    }
+  });
+
+// ─── Helpers for run-mode dispatch ────────────────────────────────────────────
+function isDockerMode() {
+  return (state.settings?.run_mode ?? 'docker') === 'docker';
+}
+
+function collapseConfig() {
+  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'false');
+  document.getElementById('config-section').style.display = 'none';
+}
+
+function expandConfig() {
+  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'true');
+  document.getElementById('config-section').style.display = '';
+}
+
+async function startNode() {
+  if (isDockerMode()) {
+    await invoke('start_node_container');
+    await invoke('start_log_stream');
+  } else {
+    await invoke('start_native_node');
+  }
+  collapseConfig();
+}
+
+async function stopNode() {
+  if (isDockerMode()) {
+    await invoke('stop_log_stream');
+    await invoke('stop_node_container');
+  } else {
+    await invoke('stop_native_node');
+  }
+}
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 document.getElementById('btn-start').addEventListener('click', async () => {
@@ -462,9 +707,8 @@ document.getElementById('btn-start').addEventListener('click', async () => {
   applyStatus.textContent = 'Starting\u2026';
   try {
     await invoke('update_settings', { settings: state.settings });
-    await invoke('start_node_container');
+    await startNode();
     applyStatus.textContent = 'Node started.';
-    await invoke('start_log_stream');
     await pollStatus();
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
@@ -473,11 +717,12 @@ document.getElementById('btn-start').addEventListener('click', async () => {
 
 document.getElementById('btn-stop').addEventListener('click', async () => {
   try {
-    await invoke('stop_log_stream');
-    await invoke('stop_node_container');
+    await stopNode();
     state.containerRunning = false;
+    state.nativeRunning = false;
     setStatus('stopped');
     updateStartStopState();
+    expandConfig();
   } catch (e) {
     console.error(e);
   }
@@ -490,14 +735,15 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
   applyStatus.textContent = 'Applying\u2026';
   try {
     await invoke('update_settings', { settings: state.settings });
-    if (state.containerRunning) {
+    const running = isDockerMode() ? state.containerRunning : state.nativeRunning;
+    if (running) {
       applyStatus.textContent = 'Restarting\u2026';
-      await invoke('stop_log_stream');
-      await invoke('stop_node_container');
-      await invoke('start_node_container');
-      await invoke('start_log_stream');
+      await stopNode();
     }
-    applyStatus.textContent = 'Settings saved.';
+    applyStatus.textContent = running ? 'Restarting\u2026' : 'Starting\u2026';
+    await startNode();
+    applyStatus.textContent = 'Node running.';
+    await pollStatus();
     setTimeout(() => {
       applyStatus.textContent = '';
     }, 3000);
@@ -523,11 +769,20 @@ document.getElementById('btn-save').addEventListener('click', async () => {
 // ─── Polling ──────────────────────────────────────────────────────────────────
 async function pollStatus() {
   try {
-    const status = await invoke('get_container_status');
-    state.containerRunning = status.running;
-    setStatus(status.running ? 'running' : 'stopped');
+    if (isDockerMode()) {
+      const status = await invoke('get_container_status');
+      state.containerRunning = status.running;
+      state.nativeRunning = false;
+      setStatus(status.running ? 'running' : 'stopped');
+    } else {
+      const status = await invoke('get_native_node_status');
+      state.nativeRunning = status.running;
+      state.containerRunning = false;
+      setStatus(status.running ? 'running' : 'stopped');
+    }
   } catch {
     state.containerRunning = false;
+    state.nativeRunning = false;
     setStatus('stopped');
   }
   updateStartStopState();
@@ -582,13 +837,101 @@ async function setupListeners() {
     setStatus(stateStr);
     updateStartStopState();
   });
+
+  // Update notifications
+  await listen('image-update-available', () => {
+    appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+  });
+
+  await listen('binary-update-available', (event) => {
+    const info = event.payload;
+    appendLog({ timestamp: '', level: 'INFO', message: `New binary v${info.version} available. Download to update.` });
+  });
+
+  await listen('app-update-available', (event) => {
+    const info = event.payload;
+    appendLog({ timestamp: '', level: 'INFO', message: `Node Manager v${info.version} available: ${info.url}` });
+    showUpdateBadge(info.version, info.url);
+  });
+
+  await listen('binary-download-progress', (event) => {
+    const { downloaded, total, done } = event.payload;
+    const statusEl = document.getElementById('apply-status');
+    if (done) {
+      if (statusEl) statusEl.textContent = 'Installing binary\u2026';
+    } else if (total) {
+      const pct = Math.round((downloaded / total) * 100);
+      if (statusEl) statusEl.textContent = `Downloading binary: ${pct}%`;
+    }
+  });
+}
+
+// ─── Update Badge ─────────────────────────────────────────────────────────────
+function showUpdateBadge(version, url) {
+  const dot = document.getElementById('update-dot');
+  const tooltip = document.getElementById('update-tooltip');
+  const tooltipText = document.getElementById('update-tooltip-text');
+  const tooltipLink = document.getElementById('update-tooltip-link');
+  const versionEl = document.getElementById('app-version');
+  if (!dot || !tooltip) return;
+
+  dot.style.display = 'inline-block';
+  tooltipText.textContent = `v${version} available`;
+  tooltipLink.href = url;
+  versionEl.classList.add('has-update');
+
+  versionEl.onclick = (e) => {
+    e.stopPropagation();
+    tooltip.style.display = tooltip.style.display === 'none' ? 'flex' : 'none';
+  };
+  document.addEventListener('click', () => {
+    tooltip.style.display = 'none';
+  }, { once: false });
+}
+
+// ─── First-boot prompt ────────────────────────────────────────────────────────
+async function checkFirstBoot() {
+  const firstBoot = await invoke('is_first_boot');
+  if (!firstBoot) return;
+
+  const defaultDir = await invoke('get_default_data_dir');
+  const input = document.getElementById('first-boot-dir');
+  input.value = defaultDir;
+
+  const modal = document.getElementById('first-boot-modal');
+  modal.style.display = '';
+
+  return new Promise((resolve) => {
+    document.getElementById('btn-first-boot-continue').addEventListener('click', async () => {
+      const dir = input.value.trim() || defaultDir;
+      try {
+        await invoke('set_data_dir', { path: dir });
+        modal.style.display = 'none';
+        resolve();
+      } catch (e) {
+        input.style.borderColor = 'var(--error)';
+        input.insertAdjacentHTML('afterend',
+          `<div style="color:var(--error);font-size:12px;margin-top:4px;">${e}</div>`);
+      }
+    });
+  });
 }
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
 async function init() {
+  await checkFirstBoot();
+
   try {
     state.settings = await invoke('get_settings');
     populateForm(state.settings);
+
+    // Set run mode select
+    const mode = state.settings.run_mode || 'docker';
+    document.getElementById('run-mode-select').value = mode;
+
+    // Auto-update toggle
+    document.getElementById('auto-update-enabled').checked =
+      state.settings.auto_update_enabled ?? false;
 
     if (state.settings.active_tab && state.settings.active_tab !== 'status') {
       document
@@ -597,6 +940,27 @@ async function init() {
     }
   } catch (e) {
     console.error('Failed to load settings:', e);
+  }
+
+  // Display app version
+  try {
+    const ver = await invoke('get_app_version');
+    document.getElementById('app-version').childNodes[0].textContent = `v${ver} `;
+  } catch { /* ignore */ }
+
+  // Load storage directory (track current value for change detection)
+  try {
+    const dir = await invoke('get_data_dir');
+    document.getElementById('data-dir').value = dir;
+    state._currentDataDir = dir;
+  } catch { /* ignore */ }
+
+  // Run hardware survey (prints to console log)
+  try {
+    state.hardwareSurvey = await invoke('run_hardware_survey');
+    updateRunModeUI();
+  } catch {
+    // ignore — survey is best-effort
   }
 
   // Auto-detect GPU backend (only if no saved GPU config yet)
@@ -617,9 +981,25 @@ async function init() {
   await setupListeners();
   await pollStatus();
   await invoke('run_checklist').catch(console.error);
-  await invoke('start_log_stream').catch(console.error);
+
+  // If node is already running, collapse config and start log stream
+  const running = state.containerRunning || state.nativeRunning;
+  if (running) {
+    collapseConfig();
+    if (isDockerMode()) {
+      await invoke('start_log_stream').catch(console.error);
+    } else {
+      await invoke('start_native_log_tail').catch(console.error);
+    }
+  }
 
   state.pollInterval = setInterval(pollStatus, 10_000);
+
+  // Check for app updates on startup
+  try {
+    const update = await invoke('check_app_update');
+    if (update) showUpdateBadge(update.version, update.url);
+  } catch { /* ignore */ }
 }
 
 init().catch(console.error);

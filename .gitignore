@@ -9,5 +9,8 @@ src-tauri/gen/
 # Bun
 bun.lockb
 
+# Runtime data
+src-tauri/telemetry/
+
 # Claude-specific (not for cross-tool sharing)
 CLAUDE.md

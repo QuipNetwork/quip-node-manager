@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::log_stream::LogEntry;
-use crate::tui_app::{EditMode, FocusId, Screen, TuiApp};
+use crate::tui_app::{EditMode, FocusId, TuiApp};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -17,32 +17,36 @@ const FAIL: Color = Color::Red;
 const WARN_COLOR: Color = Color::Yellow;
 
 pub fn render(frame: &mut Frame, app: &mut TuiApp) {
-    match app.screen {
-        Screen::Main => render_main(frame, app),
-        Screen::Logs => render_logs(frame, app),
-    }
-}
-
-// ─── Main view ────────────────────────────────────────────────────────────────
-
-fn render_main(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
+
+    // Layout: [main content] [log panel] [footer]
+    let log_height = if app.log_expanded {
+        Constraint::Percentage(60)
+    } else {
+        Constraint::Length(7) // 2 border + 5 log lines
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(6),   // main content
+            log_height,           // log panel
+            Constraint::Length(1), // footer
+        ])
         .split(area);
 
     let content_area = chunks[0];
-    let footer_area = chunks[1];
+    let log_area = chunks[1];
+    let footer_area = chunks[2];
 
-    render_footer(frame, footer_area, false);
+    render_footer(frame, footer_area);
+    render_log_panel(frame, app, log_area);
 
     // Build all content lines
     let mut lines: Vec<Line> = Vec::new();
     render_status_section(app, &mut lines);
     render_requirements_section(app, &mut lines);
     render_config_section(app, &mut lines);
-    render_logs_section(app, &mut lines);
 
     let total = lines.len() as u16;
     app.content_height = total;
@@ -178,13 +182,22 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         return;
     }
 
-    // Image tag selector
-    let image_style = focus_style(app, &FocusId::ImageTag);
+    // Storage Directory (read-only info)
+    let data_dir = crate::settings::data_dir();
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(format!("{:<16} ", "Storage Dir"), Style::default().fg(DIM)),
+        Span::styled(data_dir.display().to_string(), Style::default().fg(DIM)),
+    ]));
+
+    // Run Mode
+    let modes = ["Docker", "Native"];
+    let mode_display = modes[app.form.run_mode_idx.min(1)];
     lines.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
-            format!("Image  [ cpu ]  [ cuda ]  (active: {})", app.form.image_tag),
-            image_style,
+            format!("{:<16} {}", "Run Mode", mode_display),
+            focus_style(app, &FocusId::RunMode),
         ),
     ]));
 
@@ -260,6 +273,17 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 "  Host",
                 &field_value(app, &FocusId::PublicHostInput, &app.form.public_host),
             ));
+            let port_display = if app.form.public_port.is_empty() {
+                "(default)".to_string()
+            } else {
+                app.form.public_port.clone()
+            };
+            lines.push(field_line(
+                app,
+                &FocusId::PublicPortInput,
+                "  Port",
+                &field_value(app, &FocusId::PublicPortInput, &port_display),
+            ));
         }
         lines.push(field_line(
             app,
@@ -290,12 +314,12 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             app, &FocusId::Fanout, "  Fanout",
             &field_value(app, &FocusId::Fanout, &fanout_display),
         ));
-        let ssl_check = if app.form.verify_ssl { "[x]" } else { "[ ]" };
+        let tls_check = if app.form.verify_tls { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
             Span::raw("      "),
             Span::styled(
-                format!("{} Verify SSL", ssl_check),
-                focus_style(app, &FocusId::VerifySsl),
+                format!("{} Verify TLS", tls_check),
+                focus_style(app, &FocusId::VerifyTls),
             ),
         ]));
         let log_levels = ["info", "debug", "warn", "error"];
@@ -308,6 +332,70 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             app, &FocusId::LogLevel, "  Log Level",
             &ll_display,
         ));
+
+        // TLS Certificates
+        lines.push(field_line(
+            app, &FocusId::TlsCertFile, "  TLS Cert",
+            &field_value(app, &FocusId::TlsCertFile,
+                &if app.form.tls_cert_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_cert_file.clone() }),
+        ));
+        lines.push(field_line(
+            app, &FocusId::TlsKeyFile, "  TLS Key",
+            &field_value(app, &FocusId::TlsKeyFile,
+                &if app.form.tls_key_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_key_file.clone() }),
+        ));
+
+        // REST API
+        lines.push(field_line(
+            app, &FocusId::RestHost, "  REST Host",
+            &field_value(app, &FocusId::RestHost, &app.form.rest_host),
+        ));
+        lines.push(field_line(
+            app, &FocusId::RestPort, "  REST HTTPS",
+            &field_value(app, &FocusId::RestPort, &app.form.rest_port),
+        ));
+        lines.push(field_line(
+            app, &FocusId::RestInsecurePort, "  REST HTTP",
+            &field_value(app, &FocusId::RestInsecurePort, &app.form.rest_insecure_port),
+        ));
+
+        // Telemetry
+        let telem_check = if app.form.telemetry_enabled { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                format!("{} Telemetry", telem_check),
+                focus_style(app, &FocusId::TelemetryEnabled),
+            ),
+        ]));
+        if app.form.telemetry_enabled {
+            lines.push(field_line(
+                app, &FocusId::TelemetryDir, "  Telemetry Dir",
+                &field_value(app, &FocusId::TelemetryDir, &app.form.telemetry_dir),
+            ));
+        }
+
+        // Log files
+        lines.push(field_line(
+            app, &FocusId::NodeLog, "  Node Log",
+            &field_value(app, &FocusId::NodeLog,
+                &if app.form.node_log.is_empty() { "(none)".to_string() } else { app.form.node_log.clone() }),
+        ));
+        lines.push(field_line(
+            app, &FocusId::HttpLog, "  HTTP Log",
+            &field_value(app, &FocusId::HttpLog,
+                &if app.form.http_log.is_empty() { "(none)".to_string() } else { app.form.http_log.clone() }),
+        ));
+
+        // Auto-update
+        let au_check = if app.form.auto_update { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                format!("{} Auto-update", au_check),
+                focus_style(app, &FocusId::AutoUpdate),
+            ),
+        ]));
     }
 
     // CPU Cores
@@ -318,22 +406,24 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         &field_value(app, &FocusId::CpuCores, &app.form.cpu_cores),
     ));
 
-    // GPU Enable checkbox
-    let gpu_check = if app.form.gpu_enabled { "[x]" } else { "[ ]" };
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("{} Enable GPU Mining", gpu_check),
-            focus_style(app, &FocusId::GpuEnable),
-        ),
-    ]));
-    if app.form.gpu_enabled {
-        let backends = ["local", "modal", "mps"];
-        let backend_val = backends
-            .get(app.form.gpu_backend_idx)
-            .copied()
-            .unwrap_or("local");
-        lines.push(field_line(app, &FocusId::GpuBackend, "  Backend", backend_val));
+    // GPU Devices
+    let gpu_devices = &app.settings.node_config.gpu_device_configs;
+    if gpu_devices.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    GPU: No GPUs detected",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for dev in gpu_devices {
+            let check = if dev.enabled { "[x]" } else { "[ ]" };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("{} GPU {}", check, dev.index),
+                    focus_style(app, &FocusId::GpuEnable),
+                ),
+            ]));
+        }
         lines.push(field_line(
             app,
             &FocusId::GpuUtilization,
@@ -360,22 +450,18 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
     ]));
     if app.qpu_expanded {
+        lines.push(Line::from(Span::styled(
+            "      Solver: Advantage2_System1.13 · Region: NA West 1",
+            Style::default().fg(DIM),
+        )));
         let masked_key = if app.form.qpu_api_key.is_empty() {
             String::new()
         } else {
             format!("{}…", &app.form.qpu_api_key[..4.min(app.form.qpu_api_key.len())])
         };
         lines.push(field_line(
-            app, &FocusId::QpuApiKey, "  API Key",
+            app, &FocusId::QpuApiKey, "  Token",
             &field_value(app, &FocusId::QpuApiKey, &masked_key),
-        ));
-        lines.push(field_line(
-            app, &FocusId::QpuSolver, "  Solver",
-            &field_value(app, &FocusId::QpuSolver, &app.form.qpu_solver),
-        ));
-        lines.push(field_line(
-            app, &FocusId::QpuRegionUrl, "  Region URL",
-            &field_value(app, &FocusId::QpuRegionUrl, &app.form.qpu_region_url),
         ));
         lines.push(field_line(
             app, &FocusId::QpuDailyBudget, "  Daily Budget",
@@ -395,26 +481,10 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     lines.push(Line::raw(""));
 }
 
-fn render_logs_section(app: &TuiApp, lines: &mut Vec<Line>) {
-    let log_style = focus_style(app, &FocusId::ViewLogs);
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        btn_span("[ View Logs ]", log_style),
-    ]));
-}
+// ─── Log panel (bottom drawer) ────────────────────────────────────────────────
 
-// ─── Log view ─────────────────────────────────────────────────────────────────
-
-fn render_logs(frame: &mut Frame, app: &TuiApp) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-
-    render_footer(frame, chunks[1], true);
-
-    let inner_height = chunks[0].height.saturating_sub(2) as usize;
+fn render_log_panel(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize; // borders
     let lines: Vec<Line> = app
         .log_buf
         .iter()
@@ -424,12 +494,14 @@ fn render_logs(frame: &mut Frame, app: &TuiApp) {
         .map(|e| log_line(e))
         .collect();
 
-    let text = Text::from(lines);
-    let block = Block::bordered().title(Span::styled(
-        " Node Logs ",
+    let arrow = if app.log_expanded { "▼" } else { "▶" };
+    let title = Span::styled(
+        format!(" {} Logs [l] ", arrow),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(text).block(block), chunks[0]);
+    );
+    let block = Block::bordered().title(title);
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn log_line(entry: &LogEntry) -> Line<'static> {
@@ -443,7 +515,6 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
     let ts = if entry.timestamp.is_empty() {
         String::new()
     } else {
-        // Show only time portion: "2024-01-01T12:00:00Z" → "12:00:00"
         entry.timestamp.chars().skip(11).take(8).collect::<String>()
     };
     Line::from(vec![
@@ -458,14 +529,9 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 
 // ─── Footer ───────────────────────────────────────────────────────────────────
 
-fn render_footer(frame: &mut Frame, area: Rect, in_logs: bool) {
-    let text = if in_logs {
-        " [q/Esc] Back "
-    } else {
-        " [↑↓/Tab] Navigate   [Enter] Select/Edit   [Space] Toggle   [l] Logs   [q] Quit "
-    };
+fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Span::styled(
-        text,
+        " [↑↓/Tab] Navigate   [Enter] Select/Edit   [Space] Toggle   [l] Logs   [q] Quit ",
         Style::default().fg(Color::Black).bg(ACCENT),
     ));
     frame.render_widget(para, area);

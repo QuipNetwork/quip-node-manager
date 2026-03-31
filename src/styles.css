@@ -23,6 +23,7 @@
   --accent: #3b82f6;
   --border: #27272a;
   --border-input: #3f3f46;
+  --drawer-collapsed: 130px;
 }
 
 /* ─── Body ───────────────────────────────────────────────────────────────── */
@@ -83,6 +84,75 @@ body {
   font-size: 12px;
   padding: 0 16px;
   align-self: center;
+  position: relative;
+  cursor: default;
+}
+
+.app-version.has-update {
+  cursor: pointer;
+}
+
+.update-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+  vertical-align: middle;
+  margin-left: 4px;
+  animation: pulse-update 2s infinite;
+}
+
+@keyframes pulse-update {
+  0%   { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.5); }
+  70%  { box-shadow: 0 0 0 5px rgba(234, 179, 8, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0); }
+}
+
+.update-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-input);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.update-tooltip a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.update-tooltip a:hover {
+  text-decoration: underline;
+}
+
+/* ─── First-boot Modal ──────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 28px;
+  max-width: 480px;
+  width: 90%;
 }
 
 /* ─── Tab Content ────────────────────────────────────────────────────────── */
@@ -90,6 +160,7 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 20px;
+  padding-bottom: calc(var(--drawer-collapsed) + 20px);
   display: none;
 }
 
@@ -262,6 +333,12 @@ button.check-action {
 
 button.check-action:hover {
   color: var(--text-primary);
+}
+
+button.check-action:disabled {
+  opacity: 0.7;
+  cursor: wait;
+  color: var(--text-faint);
 }
 
 /* ─── Mining Config ──────────────────────────────────────────────────────── */
@@ -565,24 +642,60 @@ button.check-action:hover {
   align-items: center;
 }
 
-/* ─── Log Panel ──────────────────────────────────────────────────────────── */
-.log-toolbar {
+/* ─── Log Drawer ─────────────────────────────────────────────────────────── */
+#log-drawer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border);
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  height: var(--drawer-collapsed);
+  transition: height 0.25s ease;
+}
+
+#log-drawer.expanded {
+  height: 60vh;
+}
+
+.log-drawer-handle {
+  display: flex;
   align-items: center;
-  margin-bottom: 8px;
+  justify-content: space-between;
+  padding: 8px 16px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.log-drawer-chevron {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--text-faint);
+  border-bottom: 2px solid var(--text-faint);
+  transform: rotate(-135deg);
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+#log-drawer.expanded .log-drawer-chevron {
+  transform: rotate(45deg);
 }
 
 .log-output {
   background: #0d0d0f;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px;
-  height: 280px;
-  overflow-y: scroll;
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
   font-family: 'SF Mono', Menlo, monospace;
   font-size: 12px;
   line-height: 1.5;
+  min-height: 0;
 }
 
 .log-line {
@@ -634,4 +747,69 @@ button.check-action:hover {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-input);
+}
+
+.run-mode-warning {
+  font-size: 12px;
+  color: var(--warning);
+  max-width: 400px;
+  line-height: 1.4;
+}
+
+/* ─── GPU Device Toggle Switch ──────────────────────────────────────────── */
+.gpu-toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.gpu-toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.gpu-toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-elevated);
+  border-radius: 20px;
+  transition: background 0.2s;
+}
+
+.gpu-toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--text-faint);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.gpu-toggle-switch input:checked + .gpu-toggle-slider {
+  background: var(--accent);
+}
+
+.gpu-toggle-switch input:checked + .gpu-toggle-slider::before {
+  transform: translateX(16px);
+  background: #fff;
+}
+
+/* ─── Update Banner ─────────────────────────────────────────────────────── */
+.update-banner {
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--warning);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }

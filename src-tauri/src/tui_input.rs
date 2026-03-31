@@ -4,7 +4,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 
-use crate::tui_app::{Action, EditMode, FocusId, Screen, TuiApp};
+use crate::tui_app::{Action, EditMode, FocusId, TuiApp};
 
 /// Handle a terminal event and return the resulting action.
 /// Pure state mutations; async work is done by the caller in `TuiApp::run`.
@@ -24,17 +24,7 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Action {
         return Action::Quit;
     }
 
-    match app.screen {
-        Screen::Logs => handle_key_logs(app, key),
-        Screen::Main => handle_key_main(app, key),
-    }
-}
-
-fn handle_key_logs(_app: &mut TuiApp, key: KeyEvent) -> Action {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::ExitLogs,
-        _ => Action::None,
-    }
+    handle_key_main(app, key)
 }
 
 fn handle_key_main(app: &mut TuiApp, key: KeyEvent) -> Action {
@@ -45,7 +35,7 @@ fn handle_key_main(app: &mut TuiApp, key: KeyEvent) -> Action {
 
     match key.code {
         KeyCode::Char('q') => Action::Quit,
-        KeyCode::Char('l') => Action::EnterLogs,
+        KeyCode::Char('l') => Action::ToggleLogs,
 
         // Navigation
         KeyCode::Up | KeyCode::BackTab => {
@@ -126,7 +116,13 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::SecretShow => Action::ToggleSecretVisible,
         FocusId::SecretRegenerate => Action::RegenerateSecret,
         FocusId::ApplyRestart => Action::ApplyRestart,
-        FocusId::ViewLogs => Action::EnterLogs,
+
+        // Run Mode — cycle Docker/Native
+        FocusId::RunMode => {
+            app.form.run_mode_idx = (app.form.run_mode_idx + 1) % 2;
+            app.dirty = true;
+            Action::None
+        }
 
         // Checkboxes — toggle on Enter too
         FocusId::AutoMine => {
@@ -140,7 +136,9 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
         FocusId::GpuEnable => {
-            app.form.gpu_enabled = !app.form.gpu_enabled;
+            if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
+                d.enabled = !d.enabled;
+            }
             app.dirty = true;
             Action::None
         }
@@ -149,10 +147,18 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
-
-        // GPU Backend — cycle through options
-        FocusId::GpuBackend => {
-            app.form.gpu_backend_idx = (app.form.gpu_backend_idx + 1) % 3;
+        FocusId::VerifyTls => {
+            app.form.verify_tls = !app.form.verify_tls;
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::TelemetryEnabled => {
+            app.form.telemetry_enabled = !app.form.telemetry_enabled;
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::AutoUpdate => {
+            app.form.auto_update = !app.form.auto_update;
             app.dirty = true;
             Action::None
         }
@@ -161,24 +167,6 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::GpuUtilization => {
             app.form.gpu_utilization =
                 if app.form.gpu_utilization >= 100 { 10 } else { app.form.gpu_utilization + 10 };
-            app.dirty = true;
-            Action::None
-        }
-
-        // Image tag — toggle cpu/cuda
-        FocusId::ImageTag => {
-            app.form.image_tag = if app.form.image_tag == "cpu" {
-                "cuda".to_string()
-            } else {
-                "cpu".to_string()
-            };
-            app.dirty = true;
-            Action::None
-        }
-
-        // Verify SSL checkbox
-        FocusId::VerifySsl => {
-            app.form.verify_ssl = !app.form.verify_ssl;
             app.dirty = true;
             Action::None
         }
@@ -200,16 +188,23 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::Port
         | FocusId::NodeName
         | FocusId::PublicHostInput
+        | FocusId::PublicPortInput
         | FocusId::Peers
         | FocusId::CpuCores
         | FocusId::QpuApiKey
-        | FocusId::QpuSolver
-        | FocusId::QpuRegionUrl
         | FocusId::QpuDailyBudget
         | FocusId::Timeout
         | FocusId::HeartbeatInterval
         | FocusId::HeartbeatTimeout
-        | FocusId::Fanout => {
+        | FocusId::Fanout
+        | FocusId::TlsCertFile
+        | FocusId::TlsKeyFile
+        | FocusId::RestHost
+        | FocusId::RestPort
+        | FocusId::RestInsecurePort
+        | FocusId::TelemetryDir
+        | FocusId::NodeLog
+        | FocusId::HttpLog => {
             start_edit(app);
             Action::None
         }
@@ -218,31 +213,14 @@ fn activate(app: &mut TuiApp) -> Action {
 
 fn toggle_or_activate(app: &mut TuiApp) -> Action {
     match app.focus {
-        FocusId::AutoMine => {
-            app.form.auto_mine = !app.form.auto_mine;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::PublicHostEnable => {
-            app.form.public_host_enabled = !app.form.public_host_enabled;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::GpuEnable => {
-            app.form.gpu_enabled = !app.form.gpu_enabled;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::GpuYielding => {
-            app.form.gpu_yielding = !app.form.gpu_yielding;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::VerifySsl => {
-            app.form.verify_ssl = !app.form.verify_ssl;
-            app.dirty = true;
-            Action::None
-        }
+        FocusId::AutoMine
+        | FocusId::PublicHostEnable
+        | FocusId::GpuYielding
+        | FocusId::VerifyTls
+        | FocusId::TelemetryEnabled
+        | FocusId::AutoUpdate
+        | FocusId::RunMode
+        | FocusId::GpuEnable => activate(app),
         _ => activate(app),
     }
 }
@@ -254,16 +232,23 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::Port => app.form.port.clone(),
         FocusId::NodeName => app.form.node_name.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
+        FocusId::PublicPortInput => app.form.public_port.clone(),
         FocusId::Peers => app.form.peers.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
-        FocusId::QpuSolver => app.form.qpu_solver.clone(),
-        FocusId::QpuRegionUrl => app.form.qpu_region_url.clone(),
         FocusId::QpuDailyBudget => app.form.qpu_daily_budget.clone(),
         FocusId::Timeout => app.form.timeout.clone(),
         FocusId::HeartbeatInterval => app.form.heartbeat_interval.clone(),
         FocusId::HeartbeatTimeout => app.form.heartbeat_timeout.clone(),
         FocusId::Fanout => app.form.fanout.clone(),
+        FocusId::TlsCertFile => app.form.tls_cert_file.clone(),
+        FocusId::TlsKeyFile => app.form.tls_key_file.clone(),
+        FocusId::RestHost => app.form.rest_host.clone(),
+        FocusId::RestPort => app.form.rest_port.clone(),
+        FocusId::RestInsecurePort => app.form.rest_insecure_port.clone(),
+        FocusId::TelemetryDir => app.form.telemetry_dir.clone(),
+        FocusId::NodeLog => app.form.node_log.clone(),
+        FocusId::HttpLog => app.form.http_log.clone(),
         _ => return,
     };
     app.form.edit_buf = current;
@@ -277,16 +262,23 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::Port => app.form.port = buf,
             FocusId::NodeName => app.form.node_name = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
+            FocusId::PublicPortInput => app.form.public_port = buf,
             FocusId::Peers => app.form.peers = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
-            FocusId::QpuSolver => app.form.qpu_solver = buf,
-            FocusId::QpuRegionUrl => app.form.qpu_region_url = buf,
             FocusId::QpuDailyBudget => app.form.qpu_daily_budget = buf,
             FocusId::Timeout => app.form.timeout = buf,
             FocusId::HeartbeatInterval => app.form.heartbeat_interval = buf,
             FocusId::HeartbeatTimeout => app.form.heartbeat_timeout = buf,
             FocusId::Fanout => app.form.fanout = buf,
+            FocusId::TlsCertFile => app.form.tls_cert_file = buf,
+            FocusId::TlsKeyFile => app.form.tls_key_file = buf,
+            FocusId::RestHost => app.form.rest_host = buf,
+            FocusId::RestPort => app.form.rest_port = buf,
+            FocusId::RestInsecurePort => app.form.rest_insecure_port = buf,
+            FocusId::TelemetryDir => app.form.telemetry_dir = buf,
+            FocusId::NodeLog => app.form.node_log = buf,
+            FocusId::HttpLog => app.form.http_log = buf,
             _ => {}
         },
         EditMode::None => {}
@@ -301,28 +293,16 @@ fn commit_edit(app: &mut TuiApp) {
 fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) -> Action {
     match mouse.kind {
         MouseEventKind::ScrollDown => {
-            if app.screen == Screen::Logs {
-                // logs are always tail — no scroll needed
-            } else {
-                app.scroll_offset = app.scroll_offset.saturating_add(3);
-            }
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
             Action::None
         }
         MouseEventKind::ScrollUp => {
-            if app.screen == Screen::Main {
-                app.scroll_offset = app.scroll_offset.saturating_sub(3);
-            }
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
             Action::None
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.screen == Screen::Logs {
-                Action::None
-            } else {
-                // Without stored hit-test rects, we do basic row-based matching.
-                // The content starts at row 1 (inside the outer block border).
-                let row = mouse.row.saturating_sub(1) + app.scroll_offset;
-                handle_click(app, row)
-            }
+            let row = mouse.row.saturating_sub(1) + app.scroll_offset;
+            handle_click(app, row)
         }
         _ => Action::None,
     }

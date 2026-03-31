@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7,13 +8,36 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- First-boot modal -->
+  <div id="first-boot-modal" class="modal-overlay" style="display:none;">
+    <div class="modal-card">
+      <div class="section-heading" style="margin-bottom:8px;">Welcome to Quip Node Manager</div>
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">
+        Choose where to store node data (config, secrets, binaries, trust database).
+        You can change this later in settings.
+      </p>
+      <div class="form-group" style="margin-bottom:16px;">
+        <label for="first-boot-dir">Storage Directory</label>
+        <input type="text" id="first-boot-dir" style="width:100%;" />
+      </div>
+      <button id="btn-first-boot-continue" class="btn btn-primary" style="width:100%;">Continue</button>
+    </div>
+  </div>
+
   <div id="app">
     <!-- Tab Bar -->
     <div class="tab-bar">
       <img src="quipv3.png" class="tab-logo" alt="Quip" />
       <button class="tab-btn active" data-tab="status">Status Monitor</button>
       <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-      <span id="app-version" class="app-version">v0.0.0</span>
+      <span id="app-version" class="app-version">
+        v0.0.0
+        <span id="update-dot" class="update-dot" style="display:none;"></span>
+        <div id="update-tooltip" class="update-tooltip" style="display:none;">
+          <span id="update-tooltip-text"></span>
+          <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
+        </div>
+      </span>
     </div>
 
     <!-- Status Monitor Tab -->
@@ -44,16 +68,24 @@
           </div>
         </button>
         <ul id="checklist" class="checklist">
-          <li class="checklist-item" data-id="docker">
+          <!-- Docker-mode checks -->
+          <li class="checklist-item docker-only" data-id="docker">
             <span class="check-icon">&#9675;</span>
             <span class="check-label">Docker installed &amp; running</span>
             <button class="btn btn-sm btn-secondary check-action" style="display:none">Install Docker</button>
           </li>
-          <li class="checklist-item" data-id="image">
+          <li class="checklist-item docker-only" data-id="image">
             <span class="check-icon">&#9675;</span>
             <span class="check-label">Node image available</span>
             <button class="btn btn-sm btn-secondary check-action" style="display:none">Pull Image</button>
           </li>
+          <!-- Native-mode check -->
+          <li class="checklist-item native-only" data-id="binary" style="display:none;">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">Node binary available</span>
+            <button class="btn btn-sm btn-secondary check-action" style="display:none">Download &amp; Install</button>
+          </li>
+          <!-- Common checks -->
           <li class="checklist-item" data-id="secret">
             <span class="check-icon">&#9675;</span>
             <span class="check-label">Node secret configured</span>
@@ -84,16 +116,24 @@
 
       <!-- Configuration (collapsible) -->
       <div class="card">
-        <button id="btn-config-toggle" class="checklist-toggle flush" aria-expanded="false">
+        <button id="btn-config-toggle" class="checklist-toggle flush" aria-expanded="true">
           <div class="section-heading" style="margin:0;">Configuration</div>
           <span class="checklist-chevron"></span>
         </button>
 
-        <div id="config-section" style="display:none;">
+        <div id="config-section">
 
           <!-- Node Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">Node Configuration</div>
+            <div class="form-group" style="margin-bottom:12px;">
+              <label for="data-dir">Storage Directory</label>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input type="text" id="data-dir" style="flex:1;" />
+                <button id="btn-data-dir-restart" class="btn btn-sm btn-secondary" style="display:none;">Save &amp; Restart</button>
+              </div>
+              <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Changes will create a new directory. The previous directory will not be removed.</div>
+            </div>
             <div class="mining-config-grid">
               <div class="form-group">
                 <label for="port">Port (UDP)</label>
@@ -102,6 +142,14 @@
               <div class="form-group">
                 <label for="listen">Listen Address</label>
                 <input type="text" id="listen" value="::" readonly />
+              </div>
+              <div class="form-group">
+                <label for="run-mode-select">Run Mode</label>
+                <select id="run-mode-select">
+                  <option value="docker">Docker</option>
+                  <option value="native">Native</option>
+                </select>
+                <div id="run-mode-warning" class="run-mode-warning" style="display:none;margin-top:4px;"></div>
               </div>
             </div>
             <div class="form-group">
@@ -132,9 +180,18 @@
                 <div class="form-group">
                   <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                     <input type="checkbox" id="public-host-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host:Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
+                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
                   </div>
-                  <input type="text" id="public-host" placeholder="1.2.3.4:20049 or myhostname.com:20049" disabled />
+                  <div class="mining-config-grid">
+                    <div class="form-group" style="margin-bottom:0;">
+                      <label for="public-host">Host / IP</label>
+                      <input type="text" id="public-host" placeholder="1.2.3.4 or myhostname.com" disabled />
+                    </div>
+                    <div class="form-group" style="margin-bottom:0;">
+                      <label for="public-port">Port</label>
+                      <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" disabled />
+                    </div>
+                  </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
                 <div class="form-group">
@@ -168,9 +225,96 @@
                     </select>
                   </div>
                   <div class="form-group" style="display:flex;align-items:center;gap:10px;padding-top:18px;">
-                    <input type="checkbox" id="verify-ssl" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="verify-ssl" style="margin:0;cursor:pointer;">Verify SSL</label>
+                    <input type="checkbox" id="verify-tls" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                    <label for="verify-tls" style="margin:0;cursor:pointer;">Verify TLS</label>
                   </div>
+                </div>
+
+                <!-- Telemetry -->
+                <div style="margin-top:16px;">
+                  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                    <input type="checkbox" id="telemetry-enabled" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                    <label for="telemetry-enabled" style="margin:0;cursor:pointer;">Enable Telemetry</label>
+                  </div>
+                  <div class="form-group" style="max-width:300px;">
+                    <label for="telemetry-dir">Telemetry Directory</label>
+                    <input type="text" id="telemetry-dir" value="telemetry" />
+                  </div>
+                </div>
+
+                <!-- TLS Certificates -->
+                <div style="margin-top:16px;">
+                  <div class="section-heading" style="font-size:13px;">TLS Certificates</div>
+                  <div class="mining-config-grid">
+                    <div class="form-group">
+                      <label for="tls-cert-file">Cert File <span style="color:var(--text-faint);font-weight:400;">(leave empty for self-signed)</span></label>
+                      <input type="text" id="tls-cert-file" placeholder="Leave empty for self-signed" />
+                    </div>
+                    <div class="form-group">
+                      <label for="tls-key-file">Key File</label>
+                      <input type="text" id="tls-key-file" placeholder="Leave empty for self-signed" />
+                    </div>
+                  </div>
+                  <!-- TLS Walkthrough -->
+                  <button id="btn-tls-guide-toggle" class="checklist-toggle" style="padding:4px 0;" aria-expanded="false">
+                    <span style="font-size:12px;color:var(--text-dim);">TLS Certificate Setup Guide</span>
+                    <span class="checklist-chevron"></span>
+                  </button>
+                  <div id="tls-guide" style="display:none;padding:12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;color:var(--text-dim);margin-top:4px;">
+                    <p style="margin:0 0 8px;">By default, your node auto-generates <strong>self-signed certificates</strong> for encrypted peer-to-peer communication. This is sufficient for most users.</p>
+                    <p style="margin:0 0 8px;">For publicly-accessible nodes, use <strong>Let's Encrypt</strong> for trusted certs:</p>
+                    <p style="margin:0 0 4px;font-weight:600;">Docker Mode</p>
+                    <ul style="margin:0 0 8px;padding-left:20px;">
+                      <li>Set your public hostname above</li>
+                      <li>Set env: <code>CERT_EMAIL=you@example.com</code></li>
+                      <li>Expose port 80: <code>-p 80:80/tcp</code></li>
+                      <li>Certbot runs automatically on startup; renews daily at 3am</li>
+                    </ul>
+                    <p style="margin:0 0 4px;font-weight:600;">Native Mode</p>
+                    <ul style="margin:0;padding-left:20px;">
+                      <li>Obtain certs manually (certbot, acme.sh, etc.)</li>
+                      <li>Set the cert/key file paths above</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <!-- REST API -->
+                <div style="margin-top:16px;">
+                  <div class="section-heading" style="font-size:13px;">REST API <span style="color:var(--text-faint);font-weight:400;">(disabled by default)</span></div>
+                  <div class="mining-config-grid">
+                    <div class="form-group">
+                      <label for="rest-host">Host</label>
+                      <input type="text" id="rest-host" value="127.0.0.1" />
+                    </div>
+                    <div class="form-group">
+                      <label for="rest-port">HTTPS Port <span style="color:var(--text-faint);font-weight:400;">(-1 = disabled)</span></label>
+                      <input type="number" id="rest-port" value="-1" />
+                    </div>
+                    <div class="form-group">
+                      <label for="rest-insecure-port">HTTP Port <span style="color:var(--text-faint);font-weight:400;">(-1 = disabled)</span></label>
+                      <input type="number" id="rest-insecure-port" value="-1" />
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Log file paths -->
+                <div style="margin-top:16px;">
+                  <div class="mining-config-grid">
+                    <div class="form-group">
+                      <label for="node-log">Node Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                      <input type="text" id="node-log" placeholder="e.g. logs/quip-node.log" />
+                    </div>
+                    <div class="form-group">
+                      <label for="http-log">HTTP Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                      <input type="text" id="http-log" placeholder="e.g. logs/quip-http.log" />
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Auto-update toggle -->
+                <div style="margin-top:16px;display:flex;align-items:center;gap:10px;">
+                  <input type="checkbox" id="auto-update-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+                  <label for="auto-update-enabled" style="margin:0;cursor:pointer;">Auto-restart when new image available <span style="color:var(--text-faint);font-weight:400;">(Docker only)</span></label>
                 </div>
               </div>
             </div>
@@ -187,21 +331,12 @@
 
           <!-- GPU Miner Configuration -->
           <div class="config-section-divider">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-              <div class="section-heading" style="margin:0;">GPU Miner Configuration</div>
-              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">
-                <input type="checkbox" id="gpu-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                <span style="font-size:13px;color:var(--text-dim);">Enable GPU Mining</span>
-              </label>
+            <div class="section-heading">GPU Miner Configuration</div>
+            <div id="gpu-device-list"></div>
+            <div id="gpu-no-devices" style="display:none;color:var(--text-faint);font-size:13px;padding:8px 0;">
+              No GPUs detected
             </div>
-            <div id="gpu-options" style="display:none;margin-top:16px;">
-              <div class="form-group" style="max-width:260px;">
-                <label for="gpu-backend">GPU Backend</label>
-                <select id="gpu-backend">
-                  <option value="local">CUDA (NVIDIA GPU)</option>
-                  <option value="mps">Metal (Apple Silicon GPU)</option>
-                </select>
-              </div>
+            <div id="gpu-global-settings" style="margin-top:12px;">
               <div class="gpu-setting-row" style="margin-bottom:12px;">
                 <label>Utilization</label>
                 <input type="range" id="gpu-utilization" min="0" max="100" value="80" />
@@ -222,18 +357,13 @@
               <button id="btn-qpu-toggle" class="btn btn-sm btn-secondary">Have D-Wave / QPU Access? Click here</button>
             </div>
             <div id="qpu-section" style="display:none;margin-top:16px;">
+              <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
+                Solver: Advantage2_System1.13 &middot; Region: NA West 1
+              </div>
               <div class="mining-config-grid">
                 <div class="form-group">
-                  <label for="qpu-api-key">D-Wave API Key</label>
+                  <label for="qpu-api-key">D-Wave Token</label>
                   <input type="password" id="qpu-api-key" placeholder="DEV-..." />
-                </div>
-                <div class="form-group">
-                  <label for="qpu-solver">Solver <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                  <input type="text" id="qpu-solver" placeholder="Advantage_system6.4" />
-                </div>
-                <div class="form-group">
-                  <label for="qpu-region-url">Region URL <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                  <input type="text" id="qpu-region-url" placeholder="https://na-west-1.cloud.dwavesys.com/sapi/v2/" />
                 </div>
                 <div class="form-group">
                   <label for="qpu-daily-budget">Daily Budget <span style="color:var(--text-faint);font-weight:400;">(e.g. 60s, 5m)</span></label>
@@ -253,18 +383,6 @@
         </div><!-- /config-section -->
       </div>
 
-      <!-- Log Panel -->
-      <div class="card">
-        <div class="log-toolbar">
-          <div class="section-heading" style="margin:0;">Node Logs</div>
-          <div style="display:flex;gap:8px;">
-            <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
-            <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
-          </div>
-        </div>
-        <div id="log-output" class="log-output"></div>
-      </div>
-
     </div>
 
     <!-- Dashboard Tab -->
@@ -272,6 +390,21 @@
       <div class="dashboard-placeholder">
         <span>Coming Soon</span>
       </div>
+    </div>
+
+    <!-- Log Drawer (fixed bottom) -->
+    <div id="log-drawer">
+      <div id="log-drawer-handle" class="log-drawer-handle">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span id="log-drawer-chevron" class="log-drawer-chevron"></span>
+          <div class="section-heading" style="margin:0;">Node Logs</div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
+          <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
+        </div>
+      </div>
+      <div id="log-output" class="log-output"></div>
     </div>
 
   </div>
