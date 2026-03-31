@@ -1,0 +1,163 @@
+# GitLab CI/CD for Quip Node Manager
+# Tauri v2 desktop app builds for macOS (universal), Linux, Windows
+
+stages:
+  - build
+  - release
+
+# ---------------------------------------------------------------------------
+# Shared setup
+# ---------------------------------------------------------------------------
+
+.tauri_build:
+  stage: build
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - src-tauri/target
+      - .cargo-cache/registry
+      - .cargo-cache/git
+  variables:
+    CARGO_HOME: "${CI_PROJECT_DIR}/.cargo-cache"
+  artifacts:
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - .gitlab-ci.yml
+
+# ---------------------------------------------------------------------------
+# macOS Universal (ARM64 + x86_64 fat binary)
+# ---------------------------------------------------------------------------
+
+build-macos-universal:
+  extends: .tauri_build
+  tags: [macos, arm64]
+  before_script:
+    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - rustup default stable 2>/dev/null || true
+    - rustup target add x86_64-apple-darwin
+    - curl -fsSL https://bun.sh/install | bash || true
+    - bun install
+  script:
+    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - bun run tauri build --target universal-apple-darwin
+    - mkdir -p dist
+    - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
+  artifacts:
+    paths:
+      - dist/quip-node-manager-macos-universal.dmg
+
+# ---------------------------------------------------------------------------
+# Linux x86_64 (AppImage + deb)
+# ---------------------------------------------------------------------------
+
+build-linux-x86_64:
+  extends: .tauri_build
+  image: ubuntu:22.04
+  tags: [linux, x86_64]
+  before_script:
+    # System deps for Tauri on Linux
+    - apt-get update && apt-get install -y --no-install-recommends
+        build-essential curl file git ca-certificates unzip
+        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+        librsvg2-dev patchelf pkg-config libssl-dev
+    # Install Rust via rustup (uses CARGO_HOME from CI variables)
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    # Install bun
+    - curl -fsSL https://bun.sh/install | bash
+    - export PATH="$HOME/.bun/bin:$PATH"
+    - bun install
+  script:
+    - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
+    - bun run tauri build
+    - mkdir -p dist
+    - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
+    - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
+    - |
+      cat > dist/README-linux.txt << 'HEREDOC'
+      Quip Node Manager — Linux
+
+      AppImage (any distro):
+        chmod +x quip-node-manager-linux-x86_64.AppImage
+        ./quip-node-manager-linux-x86_64.AppImage
+        # Add --cli for terminal UI mode
+
+      Debian/Ubuntu (.deb):
+        sudo dpkg -i quip-node-manager-linux-x86_64.deb
+        quip-node-manager
+        # Add --cli for terminal UI mode
+      HEREDOC
+  artifacts:
+    paths:
+      - dist/quip-node-manager-linux-x86_64.AppImage
+      - dist/quip-node-manager-linux-x86_64.deb
+      - dist/README-linux.txt
+
+# ---------------------------------------------------------------------------
+# Windows x86_64
+# ---------------------------------------------------------------------------
+
+build-windows-x86_64:
+  extends: .tauri_build
+  tags: [windows, x86_64]
+  cache: {}
+  variables:
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: "core.longPaths"
+    GIT_CONFIG_VALUE_0: "true"
+  before_script:
+    - git config core.longPaths true
+    - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
+    - choco install nodejs-lts rust-ms nsis vcredist140 -y --no-progress
+    - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:USERPROFILE\.cargo\bin;$env:Path"
+    - if (-not (Get-Command bun -ErrorAction SilentlyContinue)) { npm install -g bun }
+    - $env:Path = "$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:Path"
+    - bun install
+  script:
+    - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
+    - bun run tauri build -- --no-bundle
+    - New-Item -ItemType Directory -Force -Path dist
+    - Copy-Item src-tauri\target\release\quip-node-manager.exe dist\quip-node-manager-windows-x86_64.exe
+  artifacts:
+    paths:
+      - dist/quip-node-manager-windows-x86_64.exe
+
+# ---------------------------------------------------------------------------
+# Release (tags only)
+# ---------------------------------------------------------------------------
+
+release-binaries:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - build-macos-universal
+    - build-linux-x86_64
+    - build-windows-x86_64
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "macOS Universal DMG"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal"
+          link_type: package
+        - name: "Linux x86_64 AppImage"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64"
+          link_type: package
+        - name: "Linux x86_64 deb"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64"
+          link_type: package
+        - name: "Windows x86_64 exe"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64"
+          link_type: package

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tauri::Emitter;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
@@ -30,13 +31,18 @@ struct ReleaseLinks {
     self_url: String,
 }
 
-fn parse_semver(v: &str) -> (u64, u64, u64) {
+pub fn parse_semver(v: &str) -> (u64, u64, u64) {
     let v = v.trim_start_matches('v');
     let parts: Vec<&str> = v.split('.').collect();
     let major = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
     let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     (major, minor, patch)
+}
+
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
@@ -116,7 +122,7 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
     }
 
     // Get current local digest
-    let local_output = std::process::Command::new("docker")
+    let local_output = crate::cmd::new("docker")
         .args(["image", "inspect", "--format", "{{index .RepoDigests 0}}",
             &format!("registry.gitlab.com/piqued/quip-protocol/{}:latest", image_name)])
         .output()
@@ -134,4 +140,107 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
         latest_digest: digest,
         update_available,
     }))
+}
+
+/// Background task that checks for updates every 30 minutes.
+/// - Docker mode: checks for new image digest
+/// - Native mode: checks for new binary release
+/// - Always: checks for new node-manager app release
+pub async fn background_update_monitor(app: tauri::AppHandle) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(30 * 60));
+    // Skip the first immediate tick
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        let settings = crate::settings::load_settings();
+
+        // Check for node-manager app updates
+        if let Ok(Some(info)) = check_app_update().await {
+            let _ = app.emit("app-update-available", &info);
+            crate::set_tray_update(
+                &app,
+                true,
+                &format!("Quip Node Manager — v{} available", info.version),
+            );
+        }
+
+        match settings.run_mode {
+            crate::settings::RunMode::Docker => {
+                let tag = settings.image_tag.clone();
+                let info = match check_image_update(tag).await {
+                    Ok(Some(info)) if info.update_available => info,
+                    _ => continue,
+                };
+
+                let _ =
+                    app.emit("image-update-available", &info);
+
+                if settings.auto_update_enabled {
+                    emit_log(
+                        &app,
+                        "[Auto-Update] New image detected, restarting...",
+                    );
+                    let _ = crate::docker::stop_node_container(
+                        app.clone(),
+                    )
+                    .await;
+                    let _ = crate::docker::pull_node_image(
+                        app.clone(),
+                        settings.image_tag.clone(),
+                    )
+                    .await;
+                    let _ =
+                        crate::docker::start_node_container(
+                            app.clone(),
+                        )
+                        .await;
+                    emit_log(
+                        &app,
+                        "[Auto-Update] Restart complete.",
+                    );
+                }
+            }
+            crate::settings::RunMode::Native => {
+                if let Ok(Some(info)) =
+                    crate::native::check_binary_update().await
+                {
+                    let _ = app
+                        .emit("binary-update-available", &info);
+
+                    if settings.auto_update_enabled {
+                        emit_log(
+                            &app,
+                            &format!(
+                                "[Auto-Update] New binary v{} available, downloading...",
+                                info.version
+                            ),
+                        );
+                        let _ =
+                            crate::native::download_native_binary(
+                                app.clone(),
+                            )
+                            .await;
+                        emit_log(
+                            &app,
+                            "[Auto-Update] Binary updated.",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_log(app: &tauri::AppHandle, msg: &str) {
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": "INFO",
+            "message": msg,
+        }),
+    );
 }

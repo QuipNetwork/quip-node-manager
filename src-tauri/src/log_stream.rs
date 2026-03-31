@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::SyncSender;
 use tauri::Emitter;
@@ -21,30 +21,69 @@ impl LogStreamState {
     }
 }
 
-fn parse_log_line(line: &str) -> LogEntry {
-    // Try to parse structured log: "2024-01-01T12:00:00Z INFO message"
-    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    if parts.len() == 3 {
-        let ts = parts[0];
-        let level = parts[1].to_uppercase();
-        let level = match level.as_str() {
-            "ERROR" | "ERR" => "ERROR",
-            "WARN" | "WARNING" => "WARN",
-            "INFO" => "INFO",
-            "DEBUG" => "DEBUG",
-            _ => "INFO",
+pub fn parse_log_line(line: &str) -> LogEntry {
+    // Format: [file.py:123][node] 2026-01-01T12:00:00+00:00 LEVEL - message
+    // Or Python: LEVEL:module:message
+    // Otherwise: pass through verbatim.
+
+    // Try structured quip-protocol format
+    if line.starts_with('[') {
+        // Find the timestamp after the ] ] prefix
+        if let Some(after_brackets) = line.find("] ").map(|i| {
+            let rest = &line[i + 2..];
+            // There might be a second bracket pair
+            if rest.starts_with('[') {
+                rest.find("] ").map(|j| &rest[j + 2..])
+            } else {
+                Some(rest)
+            }
+        }).flatten() {
+            let parts: Vec<&str> =
+                after_brackets.splitn(3, ' ').collect();
+            if parts.len() >= 2 {
+                let level = match parts[1].to_uppercase().as_str() {
+                    "ERROR" | "ERROR:" => "ERROR",
+                    "WARNING" | "WARNING:" | "WARN" => "WARN",
+                    "DEBUG" | "DEBUG:" => "DEBUG",
+                    _ => "INFO",
+                };
+                return LogEntry {
+                    timestamp: parts[0].to_string(),
+                    level: level.to_string(),
+                    message: parts
+                        .get(2)
+                        .map(|s| s.trim_start_matches("- "))
+                        .unwrap_or("")
+                        .to_string(),
+                };
+            }
+        }
+    }
+
+    // Try Python logging: "LEVEL:module:message"
+    if let Some(colon) = line.find(':') {
+        let prefix = &line[..colon];
+        let level = match prefix {
+            "ERROR" => Some("ERROR"),
+            "WARNING" => Some("WARN"),
+            "INFO" => Some("INFO"),
+            "DEBUG" => Some("DEBUG"),
+            _ => None,
         };
-        LogEntry {
-            timestamp: ts.to_string(),
-            level: level.to_string(),
-            message: parts[2].to_string(),
+        if let Some(lvl) = level {
+            return LogEntry {
+                timestamp: String::new(),
+                level: lvl.to_string(),
+                message: line[colon + 1..].to_string(),
+            };
         }
-    } else {
-        LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: line.to_string(),
-        }
+    }
+
+    // Plain text — pass through verbatim
+    LogEntry {
+        timestamp: String::new(),
+        level: "INFO".to_string(),
+        message: line.to_string(),
     }
 }
 
@@ -52,10 +91,11 @@ fn parse_log_line(line: &str) -> LogEntry {
 /// Call `*stop.lock().unwrap() = true` to stop the thread.
 pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
     std::thread::spawn(move || {
-        let mut child = match Command::new("docker")
-            .args(["logs", "-f", "--tail", "100", "quip-node"])
+        // Use shell to merge stdout+stderr so we get both entrypoint
+        // and Python logging output in one stream.
+        let mut child = match crate::cmd::new("sh")
+            .args(["-c", "docker logs -f --tail 100 quip-node 2>&1"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -98,10 +138,9 @@ pub async fn start_log_stream(
 
     let stop_flag = Arc::clone(&state.1);
     let handle = std::thread::spawn(move || {
-        let mut child = match Command::new("docker")
-            .args(["logs", "-f", "--tail", "100", "quip-node"])
+        let mut child = match crate::cmd::new("sh")
+            .args(["-c", "docker logs -f --tail 100 quip-node 2>&1"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
