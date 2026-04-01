@@ -1,6 +1,6 @@
 [package]
 name = "quip-node-manager"
-version = "0.0.0"
+version = "0.0.3"
 description = "Quip Node Desktop Manager"
 authors = []
 edition = "2021"

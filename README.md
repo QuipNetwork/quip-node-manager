@@ -1,34 +1,36 @@
 # Quip Node Manager
 
-Desktop application for running and monitoring [Quip](https://gitlab.com/piqued) network nodes. Supports Docker and native execution modes on macOS, Linux, and Windows.
+Desktop application for running and monitoring [Quip](https://gitlab.com/quip.network) network nodes. Supports Docker and native execution modes on macOS, Linux, and Windows.
 
 ## Quick Install
 
 **macOS / Linux:**
 
 ```sh
-curl -fsSL https://gitlab.com/piqued/quip-node-manager/-/raw/main/scripts/install.sh | sh
+curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://gitlab.com/piqued/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
+irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
 ```
 
 ## Manual Download
 
-Download the latest release from the [Releases page](https://gitlab.com/piqued/quip-node-manager/-/releases).
+Download the latest release from the [Releases page](https://gitlab.com/quip.network/quip-node-manager/-/releases).
 
 ### macOS
 
 Download the `.dmg`, open it, and drag the app to `/Applications`.
 
-Because the app is not yet notarized, macOS will quarantine it. Remove the quarantine flag:
+Because the app is not yet notarized, macOS will quarantine it. Open **Terminal** (Applications > Utilities > Terminal) and paste:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/Quip\ Node\ Manager.app
 ```
+
+Then launch the app from `/Applications`, not from the `.dmg` or Downloads folder.
 
 ### Linux
 
@@ -104,4 +106,4 @@ See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 
 [AGPL-3.0-or-later](LICENSE)
 
-Copyright (c) Piqued
+Copyright (c) Postquant Labs

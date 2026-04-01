@@ -34,9 +34,9 @@ fn log_err(app: &tauri::AppHandle, text: &str) {
 }
 
 const CPU_IMAGE: &str =
-    "registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu";
+    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu";
 const CUDA_IMAGE: &str =
-    "registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda";
+    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda";
 
 pub fn image_for_tag(image_tag: &str) -> &'static str {
     if image_tag == "cuda" {
@@ -218,15 +218,19 @@ pub async fn stop_node_container(
 
 #[tauri::command]
 pub async fn get_container_status() -> Result<ContainerStatus, String> {
-    let output = crate::cmd::new("docker")
-        .args([
-            "inspect",
-            "--format",
-            "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
-            "quip-node",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
+                "quip-node",
+            ])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
 
     if !output.status.success() {
         return Ok(ContainerStatus {

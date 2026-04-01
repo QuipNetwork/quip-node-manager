@@ -48,7 +48,7 @@ build-macos-universal:
     - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - bun run tauri build --target universal-apple-darwin
     - mkdir -p dist
-    - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
+    - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg "dist/quip-node-manager-macos-universal.dmg"
   artifacts:
     paths:
       - dist/quip-node-manager-macos-universal.dmg

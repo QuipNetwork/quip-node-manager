@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Quip Node Manager installer for Windows.
-# Usage: irm https://gitlab.com/piqued/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
+# Usage: irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "piqued%2Fquip-node-manager"
+$Repo = "quip.network%2Fquip-node-manager"
 $Api = "https://gitlab.com/api/v4/projects/$Repo/releases"
 
 function Info($msg)  { Write-Host "> $msg" -ForegroundColor Cyan }
@@ -27,7 +27,7 @@ if (-not $Tag) { Error "Could not determine latest release tag." }
 Info "Latest release: $Tag"
 
 # ── Build artifact URL ──────────────────────────────────────────────────────
-$Base = "https://gitlab.com/piqued/quip-node-manager/-/jobs/artifacts/$Tag/raw/dist"
+$Base = "https://gitlab.com/quip.network/quip-node-manager/-/jobs/artifacts/$Tag/raw/dist"
 $Artifact = "quip-node-manager-windows-x86_64.exe"
 $Url = "$Base/$Artifact`?job=build-windows-x86_64"
 

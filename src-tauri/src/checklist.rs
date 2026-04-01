@@ -25,7 +25,7 @@ fn check_docker() -> bool {
 
 fn check_image_present() -> bool {
     let cpu_image =
-        "registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest";
+        "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest";
     crate::cmd::new("docker")
         .args(["image", "inspect", cpu_image])
         .output()
@@ -127,6 +127,53 @@ async fn probe_hairpin(port: u16) -> bool {
     } else {
         matches!(
             tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// Port forwarding check reusing an already-fetched public IP.
+async fn probe_port_forwarding_with_ip(
+    port: u16,
+    public_ip: Option<String>,
+) -> bool {
+    let ip = match public_ip {
+        Some(ip) => ip,
+        None => return false,
+    };
+    if probe_hairpin_with_ip(port, &ip).await {
+        return true;
+    }
+    probe_external(port).await
+}
+
+/// Hairpin NAT test using a pre-fetched public IP.
+async fn probe_hairpin_with_ip(port: u16, public_ip: &str) -> bool {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let addr = format!("{}:{}", public_ip, port);
+    let listener =
+        TcpListener::bind(format!("0.0.0.0:{}", port)).await.ok();
+
+    if let Some(listener) = listener {
+        let connect_fut = tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(&addr),
+        );
+        let accept_fut = tokio::time::timeout(
+            Duration::from_secs(6),
+            listener.accept(),
+        );
+        let (conn, acc) = tokio::join!(connect_fut, accept_fut);
+        conn.map(|r| r.is_ok()).unwrap_or(false)
+            && acc.map(|r| r.is_ok()).unwrap_or(false)
+    } else {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                TcpStream::connect(&addr),
+            )
+            .await,
             Ok(Ok(_))
         )
     }
@@ -314,18 +361,25 @@ where
     match run_mode {
         RunMode::Docker => {
             // 1. Docker
+            let docker_ok = tokio::task::spawn_blocking(check_docker)
+                .await
+                .unwrap_or(false);
             checks.push(CheckItem {
                 id: "docker".to_string(),
-                passed: check_docker(),
+                passed: docker_ok,
                 label: "Docker installed & running".to_string(),
                 required: true,
             });
             on_progress(&checks);
 
             // 2. Image
+            let image_ok =
+                tokio::task::spawn_blocking(check_image_present)
+                    .await
+                    .unwrap_or(false);
             checks.push(CheckItem {
                 id: "image".to_string(),
-                passed: check_image_present(),
+                passed: image_ok,
                 label: "Node image available".to_string(),
                 required: true,
             });
@@ -333,15 +387,30 @@ where
         }
         RunMode::Native => {
             // 1. Binary available
+            let bin_ok = tokio::task::spawn_blocking(
+                crate::native::is_binary_available,
+            )
+            .await
+            .unwrap_or(false);
             checks.push(CheckItem {
                 id: "binary".to_string(),
-                passed: crate::native::is_binary_available(),
+                passed: bin_ok,
                 label: "Node binary available".to_string(),
                 required: true,
             });
             on_progress(&checks);
         }
     }
+
+    // Version check placeholder — real check runs in background.
+    // Mark passed:false so it doesn't show a misleading green check.
+    checks.push(CheckItem {
+        id: "version".to_string(),
+        passed: false,
+        label: "Checking node version\u{2026}".to_string(),
+        required: false,
+    });
+    on_progress(&checks);
 
     // 3. Secret
     checks.push(CheckItem {
@@ -352,8 +421,18 @@ where
     });
     on_progress(&checks);
 
-    // 4. Public IP
-    let ip_opt = fetch_public_ip().await;
+    // ── Phase 2: network/system checks (parallel) ────────────────────────
+    let config = crate::settings::load_settings().node_config;
+    let port = config.port;
+
+    // Run IP fetch and firewall check concurrently
+    let fw_port = port;
+    let fw_fut = tokio::task::spawn_blocking(move || {
+        check_local_firewall(fw_port)
+    });
+    let ip_fut = fetch_public_ip();
+    let (ip_opt, fw_result) = tokio::join!(ip_fut, fw_fut);
+
     let ip_passed = ip_opt.is_some();
     let ip_label = match &ip_opt {
         Some(ip) => format!("Public IP: {}", ip),
@@ -367,25 +446,38 @@ where
     });
     on_progress(&checks);
 
-    // 5. Hostname accessible to internet
-    let config = crate::settings::load_settings().node_config;
-    let port = config.port;
-    let (hostname, host_passed) = if !config.public_host.is_empty() {
-        let host = &config.public_host;
-        let host_only = host.split(':').next().unwrap_or(host);
-        let passed = if host_only.parse::<std::net::IpAddr>().is_ok() {
-            ip_passed
+    // Run hostname and port checks concurrently (both depend on ip_opt)
+    let public_host = config.public_host.clone();
+    let ip_clone = ip_opt.clone();
+    let host_fut = async move {
+        if !public_host.is_empty() {
+            let host_only = public_host
+                .split(':')
+                .next()
+                .unwrap_or(&public_host);
+            let passed =
+                if host_only.parse::<std::net::IpAddr>().is_ok() {
+                    ip_clone.is_some()
+                } else {
+                    match check_hostname_dns(host_only).await {
+                        Some(matched) => matched,
+                        None => ip_clone.is_some(),
+                    }
+                };
+            (public_host.clone(), passed)
         } else {
-            match check_hostname_dns(host_only).await {
-                Some(matched) => matched,
-                None => ip_passed,
-            }
-        };
-        (host.clone(), passed)
-    } else {
-        let ip = ip_opt.as_deref().unwrap_or("unknown").to_string();
-        (ip, ip_passed)
+            let ip = ip_clone
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            let passed = ip != "unknown";
+            (ip, passed)
+        }
     };
+    let port_fut = probe_port_forwarding_with_ip(port, ip_opt);
+    let ((hostname, host_passed), port_ok) =
+        tokio::join!(host_fut, port_fut);
+
     checks.push(CheckItem {
         id: "hostname".to_string(),
         passed: host_passed,
@@ -394,8 +486,6 @@ where
     });
     on_progress(&checks);
 
-    // 6. Port forwarding
-    let port_ok = probe_port_forwarding(port).await;
     checks.push(CheckItem {
         id: "port".to_string(),
         passed: port_ok,
@@ -408,8 +498,8 @@ where
     });
     on_progress(&checks);
 
-    // 7. Local firewall
-    let (fw_passed, fw_label) = check_local_firewall(port);
+    let (fw_passed, fw_label) =
+        fw_result.unwrap_or((false, "Firewall check failed".into()));
     checks.push(CheckItem {
         id: "firewall".to_string(),
         passed: fw_passed,
@@ -424,9 +514,115 @@ where
 #[tauri::command]
 pub async fn run_checklist(app: tauri::AppHandle) -> Result<Vec<CheckItem>, String> {
     let settings = crate::settings::load_settings();
-    let run_mode = settings.run_mode;
-    Ok(run_checklist_core(&run_mode, |checks| {
+    let run_mode = settings.run_mode.clone();
+    let checks = run_checklist_core(&run_mode, |checks| {
         let _ = app.emit("checklist-update", checks);
     })
-    .await)
+    .await;
+
+    // Spawn background version check — result arrives via event
+    let bg_app = app.clone();
+    let bg_settings = settings;
+    tokio::spawn(async move {
+        let log = |msg: &str| {
+            let _ = bg_app.emit(
+                "node-log",
+                serde_json::json!({
+                    "timestamp": "",
+                    "level": "INFO",
+                    "message": msg,
+                }),
+            );
+        };
+
+        log("[Version Check] Checking for updates\u{2026}");
+        let result = match bg_settings.run_mode {
+            RunMode::Docker => {
+                match crate::update::check_image_update(
+                    bg_settings.image_tag.clone(),
+                )
+                .await
+                {
+                    Ok(Some(info)) if info.update_available => {
+                        log("[Version Check] Image update available");
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: false,
+                            label:
+                                "Node image outdated \u{2014} pull latest"
+                                    .to_string(),
+                            required: false,
+                        }
+                    }
+                    Ok(_) => {
+                        log("[Version Check] Image is up to date");
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: true,
+                            label: "Node image up to date".to_string(),
+                            required: false,
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "[Version Check] Unable to check: {}",
+                            e
+                        ));
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: true,
+                            label: "Node version (unable to check)"
+                                .to_string(),
+                            required: false,
+                        }
+                    }
+                }
+            }
+            RunMode::Native => {
+                match crate::native::check_binary_update().await {
+                    Ok(Some(info)) => {
+                        log(&format!(
+                            "[Version Check] v{} available (update recommended)",
+                            info.version
+                        ));
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: false,
+                            label: format!(
+                                "Node outdated \u{2014} v{} available",
+                                info.version
+                            ),
+                            required: false,
+                        }
+                    }
+                    Ok(None) => {
+                        log("[Version Check] Binary is up to date");
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: true,
+                            label: "Node binary up to date"
+                                .to_string(),
+                            required: false,
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "[Version Check] Unable to check: {}",
+                            e
+                        ));
+                        CheckItem {
+                            id: "version".to_string(),
+                            passed: true,
+                            label: "Node version (unable to check)"
+                                .to_string(),
+                            required: false,
+                        }
+                    }
+                }
+            }
+        };
+        let _ = bg_app.emit("version-check-update", &result);
+    });
+
+    Ok(checks)
 }
