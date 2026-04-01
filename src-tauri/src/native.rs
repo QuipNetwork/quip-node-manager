@@ -6,7 +6,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
-const PROTOCOL_PROJECT: &str = "piqued%2Fquip-protocol";
+const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct NativeNodeStatus {
@@ -172,7 +172,7 @@ pub async fn download_native_binary(
 
     let name = binary_name();
     let url = format!(
-        "https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/{}",
+        "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
         name
     );
 
@@ -298,13 +298,19 @@ pub async fn download_native_binary(
 #[tauri::command]
 pub async fn check_binary_update(
 ) -> Result<Option<crate::update::UpdateInfo>, String> {
-    let current = match installed_binary_version() {
+    let current = match tokio::task::spawn_blocking(
+        installed_binary_version,
+    )
+    .await
+    .ok()
+    .flatten()
+    {
         Some(v) => v,
         None => return Ok(None),
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -340,7 +346,7 @@ pub async fn check_binary_update(
         Ok(Some(crate::update::UpdateInfo {
             version: tag.to_string(),
             url: format!(
-                "https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/{}",
+                "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
                 binary_name()
             ),
             notes: latest["description"]
@@ -445,7 +451,7 @@ pub async fn start_native_node(
         },
     );
 
-    // Start tailing the log file
+    // Start tailing node.log (the protocol's own log, not stdout)
     let stop_flag = Arc::clone(&state.stop_flag);
     *stop_flag.lock().unwrap() = false;
     start_log_tail(app.clone(), Arc::clone(&stop_flag));
@@ -456,82 +462,15 @@ pub async fn start_native_node(
     Ok(format!("Native node started (PID {})", pid))
 }
 
-/// Tail the node-output.log file, emitting lines to the UI.
-/// First reads existing content (last 200 lines), then follows new output.
+/// Tail node logs: starts with node-output.log (process stdout),
+/// then switches to node.log once the node creates it.
 fn start_log_tail(
     app: tauri::AppHandle,
     stop_flag: Arc<Mutex<bool>>,
 ) {
-    let log_path = node_output_log_path();
-    std::thread::spawn(move || {
-        use std::io::{Read, Seek, SeekFrom};
-
-        // Wait briefly for the file to appear
-        for _ in 0..10 {
-            if log_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-
-        let mut file = match std::fs::File::open(&log_path) {
-            Ok(f) => f,
-            Err(_) => {
-                // No log file — node was started before log redirect.
-                let _ = app.emit(
-                    "node-log",
-                    &LogEntry {
-                        timestamp: String::new(),
-                        level: "WARN".to_string(),
-                        message: "Node is running but no log file found. Stop and restart to enable log capture.".to_string(),
-                    },
-                );
-                return;
-            }
-        };
-
-        // Read existing content (backfill)
-        let mut existing = String::new();
-        let _ = file.read_to_string(&mut existing);
-        let lines: Vec<&str> = existing.lines().collect();
-        let start = lines.len().saturating_sub(200);
-        for line in &lines[start..] {
-            if *stop_flag.lock().unwrap() {
-                return;
-            }
-            let entry = crate::log_stream::parse_log_line(line);
-            let _ = app.emit("node-log", &entry);
-        }
-
-        // Now tail: seek to end, poll for new data
-        let _ = file.seek(SeekFrom::End(0));
-        let mut buf = String::new();
-        loop {
-            if *stop_flag.lock().unwrap() {
-                break;
-            }
-            buf.clear();
-            match file.read_to_string(&mut buf) {
-                Ok(0) => {
-                    // No new data — sleep and retry
-                    std::thread::sleep(
-                        std::time::Duration::from_millis(250),
-                    );
-                }
-                Ok(_) => {
-                    for line in buf.lines() {
-                        if *stop_flag.lock().unwrap() {
-                            return;
-                        }
-                        let entry =
-                            crate::log_stream::parse_log_line(line);
-                        let _ = app.emit("node-log", &entry);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    use crate::log_stream::{start_log_stream_for_app, FallbackSource};
+    let fallback = FallbackSource::File(node_output_log_path());
+    start_log_stream_for_app(app, stop_flag, fallback);
 }
 
 /// Start tailing native node logs (for orphan reconnect on app restart).

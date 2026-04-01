@@ -252,15 +252,15 @@ Binaries are attached to GitLab release tags. quip-node-manager downloads
 them using the permalink pattern:
 
 ```
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-{os}-{arch}
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-{os}-{arch}
 ```
 
 Examples:
 
 ```
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-macos-arm64
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-linux-arm64
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-windows-arm64.exe
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-linux-x86_64
-https://gitlab.com/piqued/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-windows-x86_64.exe
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-macos-arm64
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-linux-arm64
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-windows-arm64.exe
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-linux-x86_64
+https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/quip-network-node-windows-x86_64.exe
 ```

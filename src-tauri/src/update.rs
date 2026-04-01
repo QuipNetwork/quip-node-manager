@@ -46,6 +46,43 @@ pub fn get_app_version() -> String {
 }
 
 #[tauri::command]
+pub async fn get_node_version() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let settings = crate::settings::load_settings();
+        match settings.run_mode {
+            crate::settings::RunMode::Native => {
+                crate::native::installed_binary_version()
+            }
+            crate::settings::RunMode::Docker => {
+                let image = format!(
+                    "{}:latest",
+                    crate::docker::image_for_tag(&settings.image_tag)
+                );
+                let output = crate::cmd::new("docker")
+                    .args(["run", "--rm", &image, "--version"])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&output.stdout);
+                let version = text
+                    .trim()
+                    .rsplit(' ')
+                    .next()
+                    .unwrap_or(text.trim())
+                    .trim_start_matches('v')
+                    .to_string();
+                if version.is_empty() { None } else { Some(version) }
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tauri::command]
 pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
     let current = env!("CARGO_PKG_VERSION");
     let client = reqwest::Client::builder()
@@ -53,7 +90,7 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = "https://gitlab.com/api/v4/projects/piqued%2Fquip-node-manager/releases";
+    let url = "https://gitlab.com/api/v4/projects/quip.network%2Fquip-node-manager/releases";
     let releases: Vec<GitLabRelease> = match client
         .get(url)
         .header("User-Agent", "quip-node-manager")
@@ -91,12 +128,12 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
 
     let manifest_url = format!(
-        "https://registry.gitlab.com/v2/piqued/quip-protocol/{}/manifests/latest",
+        "https://registry.gitlab.com/v2/quip.network/quip-protocol/{}/manifests/latest",
         image_name
     );
 
@@ -121,19 +158,33 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
         return Ok(None);
     }
 
-    // Get current local digest
-    let local_output = crate::cmd::new("docker")
-        .args(["image", "inspect", "--format", "{{index .RepoDigests 0}}",
-            &format!("registry.gitlab.com/piqued/quip-protocol/{}:latest", image_name)])
-        .output()
-        .ok();
+    // Get current local digest (blocking subprocess — run off-thread)
+    let inspect_image = format!(
+        "registry.gitlab.com/quip.network/quip-protocol/{}:latest",
+        image_name
+    );
+    let current_digest = tokio::task::spawn_blocking(move || {
+        crate::cmd::new("docker")
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{index .RepoDigests 0}}",
+                &inspect_image,
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
 
-    let current_digest = local_output
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let update_available = !current_digest.is_empty() && !current_digest.contains(&digest);
+    let update_available =
+        !current_digest.is_empty() && !current_digest.contains(&digest);
 
     Ok(Some(ImageUpdateInfo {
         current_digest,

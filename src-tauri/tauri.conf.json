@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "quip-node-manager",
-  "version": "0.0.0",
-  "identifier": "com.piqued.quip-node-manager",
+  "productName": "Quip Node Manager",
+  "version": "0.0.3",
+  "identifier": "network.quip.node-manager",
   "build": {
     "frontendDist": "../src"
   },

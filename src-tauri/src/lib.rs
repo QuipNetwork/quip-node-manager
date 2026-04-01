@@ -94,6 +94,7 @@ pub fn run() {
             checklist::run_checklist,
             // Updates
             update::get_app_version,
+            update::get_node_version,
             update::check_app_update,
             update::check_image_update,
             // Log streaming

@@ -140,8 +140,16 @@ pub fn run_survey() -> HardwareSurvey {
         .map(|n| n.get() as u32)
         .unwrap_or(1);
 
-    let nvidia_gpus = list_nvidia_gpus();
-    let metal_gpu = detect_metal_gpu();
+    // Run all subprocess-based detections in parallel
+    let nvidia_h = std::thread::spawn(list_nvidia_gpus);
+    let metal_h = std::thread::spawn(detect_metal_gpu);
+    let docker_h = std::thread::spawn(detect_docker_version);
+    let python_h = std::thread::spawn(detect_python);
+
+    let nvidia_gpus = nvidia_h.join().unwrap_or_default();
+    let metal_gpu = metal_h.join().ok().flatten();
+    let docker_version = docker_h.join().ok().flatten();
+    let python_version = python_h.join().ok().flatten();
 
     let (gpu_backend, gpu_devices) = if !nvidia_gpus.is_empty() {
         ("cuda".to_string(), nvidia_gpus)
@@ -151,9 +159,7 @@ pub fn run_survey() -> HardwareSurvey {
         ("none".to_string(), vec![])
     };
 
-    let docker_version = detect_docker_version();
     let docker_available = docker_version.is_some();
-    let python_version = detect_python();
     let python_available = python_version.is_some();
 
     let recommended_mode = if cfg!(target_os = "macos") {
@@ -178,13 +184,17 @@ pub fn run_survey() -> HardwareSurvey {
 
 #[tauri::command]
 pub async fn detect_gpu_backend() -> Result<String, String> {
-    let survey = run_survey();
+    let survey = tokio::task::spawn_blocking(run_survey)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(survey.gpu_backend)
 }
 
 #[tauri::command]
 pub async fn list_gpu_devices() -> Result<Vec<GpuDevice>, String> {
-    let survey = run_survey();
+    let survey = tokio::task::spawn_blocking(run_survey)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(survey.gpu_devices)
 }
 
@@ -194,7 +204,9 @@ pub async fn run_hardware_survey(
 ) -> Result<HardwareSurvey, String> {
     use tauri::Emitter;
 
-    let survey = run_survey();
+    let survey = tokio::task::spawn_blocking(run_survey)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let log = |msg: String| {
         let entry = serde_json::json!({

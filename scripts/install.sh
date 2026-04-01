@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Quip Node Manager installer for macOS and Linux.
-# Usage: curl -fsSL https://gitlab.com/piqued/quip-node-manager/-/raw/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.sh | sh
 set -eu
 
-REPO="piqued%2Fquip-node-manager"
+REPO="quip.network%2Fquip-node-manager"
 API="https://gitlab.com/api/v4/projects/${REPO}/releases"
 
 info()  { printf '\033[1;34m>\033[0m %s\n' "$*"; }
@@ -33,7 +33,7 @@ TAG=$(curl -fsSL "$API" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4
 info "Latest release: $TAG"
 
 # ── Build artifact URL ──────────────────────────────────────────────────────
-BASE="https://gitlab.com/piqued/quip-node-manager/-/jobs/artifacts/${TAG}/raw/dist"
+BASE="https://gitlab.com/quip.network/quip-node-manager/-/jobs/artifacts/${TAG}/raw/dist"
 
 case "$PLATFORM" in
   macos)

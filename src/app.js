@@ -478,9 +478,9 @@ function setStatus(stateStr) {
 
 // ─── Checklist update ─────────────────────────────────────────────────────────
 function updateChecklist(checks) {
-  // Docker: docker + image + secret + ip + hostname + port + firewall = 7
-  // Native: binary + secret + ip + hostname + port + firewall = 6
-  const TOTAL_CHECKS = isDockerMode() ? 7 : 6;
+  // Docker: docker + image + version + secret + ip + hostname + port + firewall = 8
+  // Native: binary + version + secret + ip + hostname + port + firewall = 7
+  const TOTAL_CHECKS = isDockerMode() ? 8 : 7;
   state.lastChecks = checks;
   const portPassed = (c) =>
     state.portCheckResult !== null ? state.portCheckResult : c.passed;
@@ -493,7 +493,7 @@ function updateChecklist(checks) {
     (c) => c.required !== false && !checkPassed(c)
   ).length;
   const warnings = checks.filter(
-    (c) => c.required === false && !checkPassed(c)
+    (c) => c.required === false && !checkPassed(c) && !c.label?.includes('\u2026')
   ).length;
 
   state.checksPassed = allPassed;
@@ -534,16 +534,19 @@ function updateChecklist(checks) {
     const label = item.querySelector('.check-label');
 
     const passed = checkPassed(check);
-    const isWarning = !passed && check.required === false;
-    icon.textContent = passed ? '\u2713' : (isWarning ? '\u26A0' : '\u2717');
+    const isPending = !passed && check.label?.includes('\u2026');
+    const isWarning = !passed && !isPending && check.required === false;
+    icon.textContent = passed
+      ? '\u2713'
+      : isPending ? '\u25CB' : (isWarning ? '\u26A0' : '\u2717');
     icon.style.color = passed
       ? 'var(--success)'
-      : (isWarning ? 'var(--warning)' : 'var(--error)');
+      : isPending ? 'var(--text-faint)' : (isWarning ? 'var(--warning)' : 'var(--error)');
     if (label && check.label) label.textContent = check.label;
 
     const actionBtn = item.querySelector('.check-action');
     if (actionBtn && actionBtn.tagName === 'BUTTON') {
-      actionBtn.style.display = passed ? 'none' : 'inline-flex';
+      actionBtn.style.display = (passed || isPending) ? 'none' : 'inline-flex';
     }
   });
 
@@ -664,6 +667,16 @@ document
       btn.textContent = 'Retry Download & Install';
       progressCleanup();
     }
+  });
+
+// ─── Version update action (delegates to image pull or binary download) ──────
+document
+  .querySelector('[data-id="version"] .check-action')
+  ?.addEventListener('click', () => {
+    const target = isDockerMode()
+      ? document.querySelector('[data-id="image"] .check-action')
+      : document.querySelector('[data-id="binary"] .check-action');
+    if (target) target.click();
   });
 
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
@@ -838,14 +851,30 @@ async function setupListeners() {
     updateStartStopState();
   });
 
+  // Background version check result — patches the placeholder in the checklist
+  await listen('version-check-update', (event) => {
+    const result = event.payload;
+    const checks = state.lastChecks;
+    if (!checks) return;
+    const idx = checks.findIndex((c) => c.id === 'version');
+    if (idx >= 0) {
+      checks[idx] = result;
+    } else {
+      checks.push(result);
+    }
+    updateChecklist(checks);
+  });
+
   // Update notifications
   await listen('image-update-available', () => {
     appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+    refreshNodeVersion();
   });
 
   await listen('binary-update-available', (event) => {
     const info = event.payload;
     appendLog({ timestamp: '', level: 'INFO', message: `New binary v${info.version} available. Download to update.` });
+    refreshNodeVersion();
   });
 
   await listen('app-update-available', (event) => {
@@ -864,6 +893,16 @@ async function setupListeners() {
       if (statusEl) statusEl.textContent = `Downloading binary: ${pct}%`;
     }
   });
+}
+
+// ─── Version refresh ─────────────────────────────────────────────────────────
+async function refreshNodeVersion() {
+  try {
+    const ver = await invoke('get_app_version');
+    const nodeVer = await invoke('get_node_version').catch(() => null);
+    const label = nodeVer ? `v${ver} (node ${nodeVer})` : `v${ver}`;
+    document.getElementById('app-version').childNodes[0].textContent = `${label} `;
+  } catch { /* ignore */ }
 }
 
 // ─── Update Badge ─────────────────────────────────────────────────────────────
@@ -921,85 +960,87 @@ async function checkFirstBoot() {
 async function init() {
   await checkFirstBoot();
 
-  try {
-    state.settings = await invoke('get_settings');
-    populateForm(state.settings);
+  // Register listeners FIRST so no events are missed
+  await setupListeners();
 
-    // Set run mode select
-    const mode = state.settings.run_mode || 'docker';
-    document.getElementById('run-mode-select').value = mode;
-
-    // Auto-update toggle
-    document.getElementById('auto-update-enabled').checked =
-      state.settings.auto_update_enabled ?? false;
-
-    if (state.settings.active_tab && state.settings.active_tab !== 'status') {
-      document
-        .querySelector(`[data-tab="${state.settings.active_tab}"]`)
-        ?.click();
-    }
-  } catch (e) {
-    console.error('Failed to load settings:', e);
-  }
+  // Load settings (fast, file I/O only) then populate form
+  invoke('get_settings')
+    .then((settings) => {
+      state.settings = settings;
+      populateForm(settings);
+      document.getElementById('run-mode-select').value =
+        settings.run_mode || 'docker';
+      document.getElementById('auto-update-enabled').checked =
+        settings.auto_update_enabled ?? false;
+      if (settings.active_tab && settings.active_tab !== 'status') {
+        document
+          .querySelector(`[data-tab="${settings.active_tab}"]`)
+          ?.click();
+      }
+    })
+    .catch((e) => console.error('Failed to load settings:', e));
 
   // Display app version
-  try {
-    const ver = await invoke('get_app_version');
-    document.getElementById('app-version').childNodes[0].textContent = `v${ver} `;
-  } catch { /* ignore */ }
+  invoke('get_app_version')
+    .then((ver) => {
+      document.getElementById('app-version').childNodes[0].textContent =
+        `v${ver} `;
+      invoke('get_node_version')
+        .then((nodeVer) => {
+          if (nodeVer) {
+            document.getElementById('app-version').childNodes[0]
+              .textContent = `v${ver} (node ${nodeVer}) `;
+          }
+        })
+        .catch(() => {});
+    })
+    .catch(() => {});
 
-  // Load storage directory (track current value for change detection)
-  try {
-    const dir = await invoke('get_data_dir');
-    document.getElementById('data-dir').value = dir;
-    state._currentDataDir = dir;
-  } catch { /* ignore */ }
+  // Load storage directory
+  invoke('get_data_dir')
+    .then((dir) => {
+      document.getElementById('data-dir').value = dir;
+      state._currentDataDir = dir;
+    })
+    .catch(() => {});
 
-  // Run hardware survey (prints to console log)
-  try {
-    state.hardwareSurvey = await invoke('run_hardware_survey');
-    updateRunModeUI();
-  } catch {
-    // ignore — survey is best-effort
-  }
+  // All backend work fires concurrently — no awaits
+  invoke('run_hardware_survey')
+    .then((survey) => {
+      state.hardwareSurvey = survey;
+      updateRunModeUI();
+      const noSavedGpu =
+        !(state.settings?.node_config?.gpu_device_configs || []).some(
+          (d) => d.enabled
+        ) && state.settings?.node_config?.gpu_backend !== 'mps';
+      if (noSavedGpu && survey.gpu_backend !== 'none') {
+        document.getElementById('gpu-backend').value = survey.gpu_backend;
+      }
+    })
+    .catch(() => {});
 
-  // Auto-detect GPU backend (only if no saved GPU config yet)
-  try {
-    const noSavedGpu =
-      !(state.settings?.node_config?.gpu_device_configs || []).some((d) => d.enabled) &&
-      state.settings?.node_config?.gpu_backend !== 'mps';
-    if (noSavedGpu) {
-      const detectedBackend = await invoke('detect_gpu_backend');
-      if (detectedBackend !== 'none') {
-        document.getElementById('gpu-backend').value = detectedBackend;
+  invoke('run_checklist').catch(console.error);
+
+  invoke('check_app_update')
+    .then((update) => {
+      if (update) showUpdateBadge(update.version, update.url);
+    })
+    .catch(() => {});
+
+  // Poll status — also fire-and-forget, handles log stream reconnect
+  pollStatus().then(() => {
+    const running = state.containerRunning || state.nativeRunning;
+    if (running) {
+      collapseConfig();
+      if (isDockerMode()) {
+        invoke('start_log_stream').catch(console.error);
+      } else {
+        invoke('start_native_log_tail').catch(console.error);
       }
     }
-  } catch {
-    // ignore
-  }
-
-  await setupListeners();
-  await pollStatus();
-  await invoke('run_checklist').catch(console.error);
-
-  // If node is already running, collapse config and start log stream
-  const running = state.containerRunning || state.nativeRunning;
-  if (running) {
-    collapseConfig();
-    if (isDockerMode()) {
-      await invoke('start_log_stream').catch(console.error);
-    } else {
-      await invoke('start_native_log_tail').catch(console.error);
-    }
-  }
+  });
 
   state.pollInterval = setInterval(pollStatus, 10_000);
-
-  // Check for app updates on startup
-  try {
-    const update = await invoke('check_app_update');
-    if (update) showUpdateBadge(update.version, update.url);
-  } catch { /* ignore */ }
 }
 
 init().catch(console.error);

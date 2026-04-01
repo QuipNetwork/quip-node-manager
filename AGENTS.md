@@ -45,8 +45,8 @@ quip-node-manager/
 
 ## Docker Images
 
-- CPU: `registry.gitlab.com/piqued/quip-protocol/quip-network-node-cpu:latest`
-- CUDA: `registry.gitlab.com/piqued/quip-protocol/quip-network-node-cuda:latest`
+- CPU: `registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest`
+- CUDA: `registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest`
 - Selected via `AppSettings.image_tag` (`"cpu"` or `"cuda"`)
 
 ## Data Files (all in `~/quip-data/`)

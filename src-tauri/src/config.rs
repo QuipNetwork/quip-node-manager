@@ -106,12 +106,14 @@ fn render_config_toml(
         "log_level = \"{}\"\n",
         config.log_level
     ));
-    if !config.node_log.is_empty() {
-        out.push_str(&format!(
-            "node_log = \"{}\"\n",
-            config.node_log
-        ));
-    }
+    let node_log = if !config.node_log.is_empty() {
+        config.node_log.clone()
+    } else if is_docker {
+        "/data/node.log".to_string()
+    } else {
+        format!("{}/node.log", crate::settings::data_dir().display())
+    };
+    out.push_str(&format!("node_log = \"{}\"\n", node_log));
     if !config.http_log.is_empty() {
         out.push_str(&format!(
             "http_log = \"{}\"\n",
