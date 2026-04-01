@@ -139,20 +139,45 @@ pub fn detect_orphan_node() -> Option<u32> {
 }
 
 /// Get the installed binary version by running `--version`.
+/// Uses a 60-second timeout since some binary versions are slow to respond.
 pub fn installed_binary_version() -> Option<String> {
     let bin = binary_path();
     if !bin.exists() {
         return None;
     }
-    let output = crate::cmd::new(&bin)
+    let mut child = crate::cmd::new(&bin)
         .args(["--version"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+
+    let timeout = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Output is typically "quip-network-node 0.0.3" or just "0.0.3"
+
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut text);
+    }
     let version = text
         .trim()
         .rsplit(' ')
