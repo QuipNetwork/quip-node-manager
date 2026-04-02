@@ -147,22 +147,10 @@ release-binaries:
   script:
     - echo "Creating or updating release $CI_COMMIT_TAG"
     - |
-      ASSETS='[
-        {"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"},
-        {"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"},
-        {"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"},
-        {"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64","link_type":"package"}
-      ]'
-    - |
       release-cli create --name "$CI_COMMIT_TAG" \
         --tag-name "$CI_COMMIT_TAG" \
         --description "Release $CI_COMMIT_TAG" \
-        --assets-links="$ASSETS" || \
-      echo "Release already exists — adding asset links via API" && \
-      for row in $(echo "$ASSETS" | jq -c '.[]'); do
-        curl --silent --fail --request POST \
-          --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}" \
-          --header "Content-Type: application/json" \
-          --data "$row" \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases/${CI_COMMIT_TAG}/assets/links" || true
-      done
+        --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
+        --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
+        --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
+        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64","link_type":"package"}'
