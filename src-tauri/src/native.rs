@@ -405,7 +405,14 @@ pub async fn start_native_node(
     }
 
     let settings = crate::settings::load_settings();
-    let config = settings.node_config;
+    let mut config = settings.node_config;
+
+    // Auto-detect public IP when no public_host is configured
+    if config.public_host.is_empty() {
+        if let Ok(ip) = crate::network::detect_public_ip().await {
+            config.public_host = ip;
+        }
+    }
 
     // Write config.toml for native mode
     crate::config::write_config_toml(&config, &RunMode::Native)?;

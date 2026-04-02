@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "quip-node-manager"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "crossterm",
  "dirs 5.0.1",
