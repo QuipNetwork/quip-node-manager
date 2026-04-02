@@ -46,9 +46,10 @@ build-macos-universal:
     - bun install
   script:
     - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - rm -rf src-tauri/target/universal-apple-darwin/release/bundle
     - bun run tauri build --target universal-apple-darwin
     - mkdir -p dist
-    - for f in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do cp "$f" dist/quip-node-manager-macos-universal.dmg; done
+    - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
   artifacts:
     paths:
       - dist/quip-node-manager-macos-universal.dmg
@@ -76,10 +77,11 @@ build-linux-x86_64:
     - bun install
   script:
     - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
+    - rm -rf src-tauri/target/release/bundle
     - bun run tauri build
     - mkdir -p dist
-    - for f in src-tauri/target/release/bundle/appimage/*.AppImage; do cp "$f" dist/quip-node-manager-linux-x86_64.AppImage; done
-    - for f in src-tauri/target/release/bundle/deb/*.deb; do cp "$f" dist/quip-node-manager-linux-x86_64.deb; done
+    - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
+    - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
     - |
       cat > dist/README-linux.txt << 'HEREDOC'
       Quip Node Manager — Linux
