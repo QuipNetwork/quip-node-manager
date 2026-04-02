@@ -516,7 +516,18 @@ impl TuiApp {
 
     fn start_node(&mut self) {
         let run_mode = self.form.run_mode();
-        let config = self.form.to_node_config(&self.settings.node_config);
+        let mut config = self.form.to_node_config(&self.settings.node_config);
+
+        // Auto-detect public IP when no public_host is configured
+        if config.public_host.is_empty() {
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                if let Ok(ip) = rt.block_on(crate::network::detect_public_ip()) {
+                    self.set_status(format!("Auto-detected IP: {}", ip));
+                    config.public_host = ip;
+                }
+            }
+        }
+
         if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
             self.set_status(format!("Config error: {}", e));
             return;

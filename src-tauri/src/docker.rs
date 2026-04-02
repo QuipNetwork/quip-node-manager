@@ -93,8 +93,16 @@ pub async fn start_node_container(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let settings = crate::settings::load_settings();
-    let config = settings.node_config;
+    let mut config = settings.node_config;
     let image_tag = settings.image_tag;
+
+    // Auto-detect public IP when no public_host is configured
+    if config.public_host.is_empty() {
+        if let Ok(ip) = crate::network::detect_public_ip().await {
+            log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+            config.public_host = ip;
+        }
+    }
 
     // Write config.toml before starting
     log_cmd(&app, "Writing config.toml");
