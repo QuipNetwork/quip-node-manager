@@ -6,6 +6,9 @@ const invoke =
   (() => Promise.reject('Tauri not available'));
 const listen =
   window.__TAURI__?.event?.listen ?? (() => Promise.resolve(() => {}));
+const openUrl =
+  window.__TAURI__?.opener?.openUrl ??
+  ((url) => { window.open(url, '_blank'); });
 
 // App state
 const state = {
@@ -478,16 +481,15 @@ function setStatus(stateStr) {
 
 // ─── Checklist update ─────────────────────────────────────────────────────────
 function updateChecklist(checks) {
-  // Docker: docker + image + version + secret + ip + hostname + port + firewall = 8
-  // Native: binary + version + secret + ip + hostname + port + firewall = 7
-  const TOTAL_CHECKS = isDockerMode() ? 8 : 7;
+  // Checklist streams in progressively; complete once the last item arrives.
+  const complete = checks.some((c) => c.id === 'firewall');
   state.lastChecks = checks;
   const portPassed = (c) =>
     state.portCheckResult !== null ? state.portCheckResult : c.passed;
   const checkPassed = (c) =>
     c.id === 'port' ? portPassed(c) : c.passed;
   const allPassed =
-    checks.length === TOTAL_CHECKS &&
+    complete &&
     checks.filter((c) => c.required !== false).every(checkPassed);
   const requiredFailing = checks.filter(
     (c) => c.required !== false && !checkPassed(c)
@@ -503,7 +505,7 @@ function updateChecklist(checks) {
   const toggleBtn = document.getElementById('checklist-toggle');
 
   if (summary) {
-    if (checks.length < TOTAL_CHECKS) {
+    if (!complete) {
       summary.textContent = 'Checking\u2026';
       summary.style.color = 'var(--text-faint)';
     } else if (allPassed && warnings === 0) {
@@ -596,7 +598,7 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
 document
   .querySelector('[data-id="docker"] .check-action')
   ?.addEventListener('click', () => {
-    window.open('https://docs.docker.com/get-docker/', '_blank');
+    openUrl('https://docs.docker.com/get-docker/');
   });
 
 document
@@ -821,8 +823,8 @@ document.getElementById('btn-port-recheck').addEventListener('click', async () =
     icon.textContent = ok ? '\u2713' : '\u2717';
     icon.style.color = ok ? 'var(--success)' : 'var(--error)';
     label.textContent = ok
-      ? `Port ${port} forwarded`
-      : `Port ${port} \u2014 not reachable`;
+      ? `Port ${port} forwarded (ensure both UDP+TCP on router)`
+      : `Port ${port} \u2014 not reachable \u2014 forward UDP+TCP on router`;
     // Re-evaluate summary and start-button state using the stored checks.
     updateChecklist(state.lastChecks);
   } catch (e) {
@@ -955,6 +957,17 @@ async function checkFirstBoot() {
     });
   });
 }
+
+// ─── Open external links in system browser ────────────────────────────────────
+document.addEventListener('click', (e) => {
+  const anchor = e.target.closest('a[href]');
+  if (!anchor) return;
+  const href = anchor.getAttribute('href');
+  if (href && href.startsWith('http')) {
+    e.preventDefault();
+    openUrl(href);
+  }
+});
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
 async function init() {

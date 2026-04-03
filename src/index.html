@@ -74,6 +74,11 @@
             <span class="check-label">Docker installed &amp; running</span>
             <button class="btn btn-sm btn-secondary check-action" style="display:none">Install Docker</button>
           </li>
+          <li class="checklist-item docker-only" data-id="wsl" style="display:none;">
+            <span class="check-icon">&#9675;</span>
+            <span class="check-label">WSL installed with distro</span>
+            <span class="check-action"></span>
+          </li>
           <li class="checklist-item docker-only" data-id="image">
             <span class="check-icon">&#9675;</span>
             <span class="check-label">Node image available</span>
@@ -114,7 +119,7 @@
           </li>
           <li class="checklist-item" data-id="firewall">
             <span class="check-icon">&#9675;</span>
-            <span class="check-label">Local firewall allows port</span>
+            <span class="check-label">Local firewall allows port (UDP+TCP)</span>
             <span class="check-action"></span>
           </li>
         </ul>
@@ -142,7 +147,7 @@
             </div>
             <div class="mining-config-grid">
               <div class="form-group">
-                <label for="port">Port (UDP)</label>
+                <label for="port">Port (UDP+TCP)</label>
                 <input type="number" id="port" min="1024" max="65535" value="20049" />
               </div>
               <div class="form-group">
