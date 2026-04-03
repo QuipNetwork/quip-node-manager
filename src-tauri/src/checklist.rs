@@ -232,11 +232,14 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
     if text.contains("disabled") || text.contains("state = 0") {
-        Some((true, format!("macOS Firewall: Port {} open", port)))
+        Some((true, format!("macOS Firewall: Port {} open (UDP+TCP)", port)))
     } else if text.contains("enabled") || text.contains("state = 1") {
         Some((
             true,
-            format!("macOS Firewall: Port {} open (check Docker allowed)", port),
+            format!(
+                "macOS Firewall: Port {} open (ensure app allowed for UDP+TCP)",
+                port
+            ),
         ))
     } else {
         None
@@ -251,13 +254,27 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         return Some((true, "ufw inactive".to_string()));
     }
     if text.to_lowercase().contains("active") {
-        let port_udp = format!("{}/udp", port);
-        if text.contains(&port_udp) {
-            return Some((true, format!("ufw allows {}/udp", port)));
+        let has_udp = text.contains(&format!("{}/udp", port));
+        let has_tcp = text.contains(&format!("{}/tcp", port));
+        if has_udp && has_tcp {
+            return Some((
+                true,
+                format!("ufw allows {}/udp and {}/tcp", port, port),
+            ));
+        }
+        let mut missing = Vec::new();
+        if !has_udp {
+            missing.push(format!("{}/udp", port));
+        }
+        if !has_tcp {
+            missing.push(format!("{}/tcp", port));
         }
         return Some((
             false,
-            format!("ufw active \u{2014} run: sudo ufw allow {}/udp", port),
+            format!(
+                "ufw active \u{2014} run: sudo ufw allow {}",
+                missing.join(" && sudo ufw allow ")
+            ),
         ));
     }
     None
@@ -286,19 +303,23 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         .ok()?;
     let rule_text = String::from_utf8_lossy(&rule.stdout);
     let port_str = port.to_string();
-    let mut is_udp = false;
+    let mut found_udp = false;
+    let mut found_tcp = false;
+    let mut cur_proto = String::new();
     let mut port_match = false;
     let mut is_allow = false;
     for line in rule_text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if is_udp && port_match && is_allow {
-                return Some((
-                    true,
-                    format!("Windows Firewall allows {}/udp", port),
-                ));
+            if port_match && is_allow {
+                if cur_proto == "udp" {
+                    found_udp = true;
+                }
+                if cur_proto == "tcp" {
+                    found_tcp = true;
+                }
             }
-            is_udp = false;
+            cur_proto.clear();
             port_match = false;
             is_allow = false;
             continue;
@@ -306,8 +327,8 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         if let Some((key, val)) = trimmed.split_once(':') {
             let key = key.trim().to_lowercase();
             let val = val.trim().to_lowercase();
-            if key == "protocol" && val == "udp" {
-                is_udp = true;
+            if key == "protocol" {
+                cur_proto = val;
             }
             if key == "localport" && val.contains(&port_str) {
                 port_match = true;
@@ -317,13 +338,33 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
             }
         }
     }
-    if is_udp && port_match && is_allow {
-        Some((true, format!("Windows Firewall allows {}/udp", port)))
+    if port_match && is_allow {
+        if cur_proto == "udp" {
+            found_udp = true;
+        }
+        if cur_proto == "tcp" {
+            found_tcp = true;
+        }
+    }
+    if found_udp && found_tcp {
+        Some((
+            true,
+            format!("Windows Firewall allows {}/udp and {}/tcp", port, port),
+        ))
     } else {
+        let mut missing = Vec::new();
+        if !found_udp {
+            missing.push("UDP");
+        }
+        if !found_tcp {
+            missing.push("TCP");
+        }
         Some((
             false,
             format!(
-                "Windows Firewall may block {}/udp \u{2014} add inbound UDP rule",
+                "Windows Firewall may block {} \u{2014} add inbound {} rule(s) for port {}",
+                missing.join("+"),
+                missing.join(" and "),
                 port
             ),
         ))
@@ -341,9 +382,26 @@ fn check_local_firewall(port: u16) -> (bool, String) {
     }
     let addr: std::net::SocketAddr =
         format!("0.0.0.0:{}", port).parse().unwrap();
-    match UdpSocket::bind(addr) {
-        Ok(_) => (true, format!("Port {}/udp bindable locally", port)),
-        Err(e) => (false, format!("Cannot bind {}/udp: {}", port, e)),
+    let udp_ok = UdpSocket::bind(addr).is_ok();
+    let tcp_ok =
+        std::net::TcpListener::bind(addr).is_ok();
+    match (udp_ok, tcp_ok) {
+        (true, true) => (
+            true,
+            format!("Port {} bindable locally (UDP+TCP)", port),
+        ),
+        (true, false) => (
+            false,
+            format!("Port {}: UDP bindable but TCP blocked", port),
+        ),
+        (false, true) => (
+            false,
+            format!("Port {}: TCP bindable but UDP blocked", port),
+        ),
+        (false, false) => (
+            false,
+            format!("Cannot bind port {} (UDP+TCP)", port),
+        ),
     }
 }
 
@@ -490,9 +548,12 @@ where
         id: "port".to_string(),
         passed: port_ok,
         label: if port_ok {
-            format!("Port {} forwarded", port)
+            format!("Port {} forwarded (ensure both UDP+TCP on router)", port)
         } else {
-            format!("Port {} not reachable from internet", port)
+            format!(
+                "Port {} not reachable \u{2014} forward UDP+TCP on router",
+                port
+            )
         },
         required: false,
     });

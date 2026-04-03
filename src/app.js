@@ -821,8 +821,8 @@ document.getElementById('btn-port-recheck').addEventListener('click', async () =
     icon.textContent = ok ? '\u2713' : '\u2717';
     icon.style.color = ok ? 'var(--success)' : 'var(--error)';
     label.textContent = ok
-      ? `Port ${port} forwarded`
-      : `Port ${port} \u2014 not reachable`;
+      ? `Port ${port} forwarded (ensure both UDP+TCP on router)`
+      : `Port ${port} \u2014 not reachable \u2014 forward UDP+TCP on router`;
     // Re-evaluate summary and start-button state using the stored checks.
     updateChecklist(state.lastChecks);
   } catch (e) {
