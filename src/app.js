@@ -481,16 +481,15 @@ function setStatus(stateStr) {
 
 // ─── Checklist update ─────────────────────────────────────────────────────────
 function updateChecklist(checks) {
-  // Docker: docker + image + version + secret + ip + hostname + port + firewall = 8
-  // Native: binary + version + secret + ip + hostname + port + firewall = 7
-  const TOTAL_CHECKS = isDockerMode() ? 8 : 7;
+  // Checklist streams in progressively; complete once the last item arrives.
+  const complete = checks.some((c) => c.id === 'firewall');
   state.lastChecks = checks;
   const portPassed = (c) =>
     state.portCheckResult !== null ? state.portCheckResult : c.passed;
   const checkPassed = (c) =>
     c.id === 'port' ? portPassed(c) : c.passed;
   const allPassed =
-    checks.length === TOTAL_CHECKS &&
+    complete &&
     checks.filter((c) => c.required !== false).every(checkPassed);
   const requiredFailing = checks.filter(
     (c) => c.required !== false && !checkPassed(c)
@@ -506,7 +505,7 @@ function updateChecklist(checks) {
   const toggleBtn = document.getElementById('checklist-toggle');
 
   if (summary) {
-    if (checks.length < TOTAL_CHECKS) {
+    if (!complete) {
       summary.textContent = 'Checking\u2026';
       summary.style.color = 'var(--text-faint)';
     } else if (allPassed && warnings === 0) {

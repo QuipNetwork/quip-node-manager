@@ -23,6 +23,37 @@ fn check_docker() -> bool {
         .unwrap_or(false)
 }
 
+// ─── WSL check (Windows only) ────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn check_wsl() -> (bool, String) {
+    let status = crate::cmd::new("wsl")
+        .args(["--status"])
+        .output();
+    let Ok(out) = status else {
+        return (false, "WSL not installed \u{2014} run: wsl --install".into());
+    };
+    if !out.status.success() {
+        return (false, "WSL not installed \u{2014} run: wsl --install".into());
+    }
+    let list = crate::cmd::new("wsl")
+        .args(["--list", "--quiet"])
+        .output();
+    let has_distro = list
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.lines().any(|l| !l.trim().is_empty())
+        })
+        .unwrap_or(false);
+    if !has_distro {
+        return (
+            false,
+            "WSL installed but no distro \u{2014} run: wsl --install".into(),
+        );
+    }
+    (true, "WSL installed with distro".into())
+}
+
 fn check_image_present() -> bool {
     let cpu_image =
         "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest";
@@ -429,6 +460,22 @@ where
                 required: true,
             });
             on_progress(&checks);
+
+            // 1b. WSL (Windows only)
+            #[cfg(target_os = "windows")]
+            {
+                let (wsl_ok, wsl_label) =
+                    tokio::task::spawn_blocking(check_wsl)
+                        .await
+                        .unwrap_or((false, "WSL check failed".into()));
+                checks.push(CheckItem {
+                    id: "wsl".to_string(),
+                    passed: wsl_ok,
+                    label: wsl_label,
+                    required: true,
+                });
+                on_progress(&checks);
+            }
 
             // 2. Image
             let image_ok =
