@@ -6,6 +6,9 @@ const invoke =
   (() => Promise.reject('Tauri not available'));
 const listen =
   window.__TAURI__?.event?.listen ?? (() => Promise.resolve(() => {}));
+const openUrl =
+  window.__TAURI__?.opener?.openUrl ??
+  ((url) => { window.open(url, '_blank'); });
 
 // App state
 const state = {
@@ -596,7 +599,7 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
 document
   .querySelector('[data-id="docker"] .check-action')
   ?.addEventListener('click', () => {
-    window.open('https://docs.docker.com/get-docker/', '_blank');
+    openUrl('https://docs.docker.com/get-docker/');
   });
 
 document
@@ -955,6 +958,17 @@ async function checkFirstBoot() {
     });
   });
 }
+
+// ─── Open external links in system browser ────────────────────────────────────
+document.addEventListener('click', (e) => {
+  const anchor = e.target.closest('a[href]');
+  if (!anchor) return;
+  const href = anchor.getAttribute('href');
+  if (href && href.startsWith('http')) {
+    e.preventDefault();
+    openUrl(href);
+  }
+});
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
 async function init() {

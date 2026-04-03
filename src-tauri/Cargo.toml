@@ -27,6 +27,7 @@ dirs = "5"
 libc = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
+tauri-plugin-opener = "2.5.3"
 
 [profile.dev]
 incremental = true
