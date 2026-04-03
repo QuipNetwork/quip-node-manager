@@ -123,6 +123,20 @@ document.getElementById('run-mode-select').addEventListener('change', async () =
 });
 
 function updateRunModeUI() {
+  const survey = state.hardwareSurvey;
+  const isMac = survey?.os === 'macos';
+
+  // Run Mode toggle is only available on macOS
+  const runModeGroup = document.getElementById('run-mode-group');
+  if (runModeGroup) {
+    runModeGroup.style.display = isMac ? '' : 'none';
+  }
+
+  // Force Docker on non-macOS
+  if (!isMac && state.settings) {
+    state.settings.run_mode = 'docker';
+  }
+
   const mode = state.settings?.run_mode || 'docker';
   const isDocker = mode === 'docker';
 
@@ -134,13 +148,9 @@ function updateRunModeUI() {
     el.style.display = isDocker ? 'none' : '';
   });
 
-  // Warnings
+  // Warnings (only relevant on macOS where the toggle exists)
   const warning = document.getElementById('run-mode-warning');
-  const survey = state.hardwareSurvey;
-  if (!isDocker && survey?.os !== 'macos') {
-    warning.textContent = '\u26A0 Docker provides better isolation and security.';
-    warning.style.display = '';
-  } else if (isDocker && survey?.os === 'macos') {
+  if (isDocker && isMac) {
     warning.textContent = '\u26A0 Mac Metal GPUs are not accessible in Docker.';
     warning.style.display = '';
   } else {
