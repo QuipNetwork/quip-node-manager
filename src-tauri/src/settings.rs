@@ -328,11 +328,16 @@ fn settings_path() -> PathBuf {
 
 pub fn load_settings() -> AppSettings {
     let path = settings_path();
-    if let Ok(content) = fs::read_to_string(&path) {
+    let mut settings = if let Ok(content) = fs::read_to_string(&path) {
         serde_json::from_str(&content).unwrap_or_default()
     } else {
         AppSettings::default()
+    };
+    // Native mode is only supported on macOS
+    if !cfg!(target_os = "macos") {
+        settings.run_mode = RunMode::Docker;
     }
+    settings
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
@@ -350,8 +355,12 @@ pub async fn get_settings() -> Result<AppSettings, String> {
 
 #[tauri::command]
 pub async fn update_settings(
-    settings: AppSettings,
+    mut settings: AppSettings,
 ) -> Result<(), String> {
+    // Native mode is only supported on macOS
+    if !cfg!(target_os = "macos") {
+        settings.run_mode = RunMode::Docker;
+    }
     save_settings(&settings)
 }
 

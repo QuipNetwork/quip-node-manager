@@ -53,6 +53,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.0.7
+
+### Changes
+
+- **Native mode restricted to macOS**: Run Mode toggle is now only shown on macOS. Windows and Linux default to Docker mode with no option to switch. Backend enforces this on both load and save.
+
 ## v0.0.6
 
 ### New Features

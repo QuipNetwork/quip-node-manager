@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "quip-node-manager"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "crossterm",
  "dirs 5.0.1",
