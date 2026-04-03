@@ -145,11 +145,20 @@ release-binaries:
   rules:
     - if: $CI_COMMIT_TAG
   script:
-    - echo "Creating or updating release $CI_COMMIT_TAG"
+    - echo "Creating release $CI_COMMIT_TAG"
+    # Extract release notes: everything from top of CHANGELOG.md up to
+    # the second "## v" heading (install instructions + current version).
+    # Strip the leading "# Changelog" title line.
+    - |
+      DESCRIPTION=$(awk '
+        /^## v/ { n++ }
+        n >= 2  { exit }
+        { print }
+      ' CHANGELOG.md | tail -n +2)
     - |
       release-cli create --name "$CI_COMMIT_TAG" \
         --tag-name "$CI_COMMIT_TAG" \
-        --description "Release $CI_COMMIT_TAG" \
+        --description "$DESCRIPTION" \
         --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
