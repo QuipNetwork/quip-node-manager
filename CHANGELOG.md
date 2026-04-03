@@ -55,8 +55,15 @@ Click **More info**, then **Run anyway**.
 
 ## v0.0.6
 
+### New Features
+
+- **WSL pre-flight check (Windows)**: Docker mode now verifies WSL is installed with a distro before starting, with actionable fix instructions
+- **External links open in system browser**: Links in the app now open in the default browser instead of being swallowed by the webview (via tauri-plugin-opener)
+
 ### Improvements
 
+- **UDP+TCP firewall checks**: Firewall and port forwarding checks now verify both UDP and TCP on all platforms, reporting exactly which protocol is missing
+- **CLI firewall instructions**: Added step-by-step firewall setup (ufw on Linux, New-NetFirewallRule on Windows) and router forwarding notes to CLI docs
 - **Automated release notes**: CI now reads release description from CHANGELOG.md (install instructions + current version's changelog)
 
 ## v0.0.5
