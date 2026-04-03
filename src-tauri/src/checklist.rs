@@ -359,7 +359,7 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
             let key = key.trim().to_lowercase();
             let val = val.trim().to_lowercase();
             if key == "protocol" {
-                cur_proto = val;
+                cur_proto = val.clone();
             }
             if key == "localport" && val.contains(&port_str) {
                 port_match = true;
