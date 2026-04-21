@@ -225,8 +225,29 @@ fn stream_with_fallback<F>(
                 };
 
                 let stdout = child.stdout.take().unwrap();
-                // Drop stderr so it doesn't block
-                drop(child.stderr.take());
+                let stderr = child.stderr.take().unwrap();
+
+                // Stream stderr on a second thread. quip-protocol's
+                // console logger writes to stderr, so without this the
+                // UI would see nothing until ~/quip-data/node.log
+                // materialised via the Phase 2 poller.
+                let stop_err = Arc::clone(&stop2);
+                let fallback_stop_err = Arc::clone(&fallback_stop2);
+                let emit_err = Arc::clone(&emit2);
+                let stderr_thread = std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines() {
+                        if *stop_err.lock().unwrap()
+                            || *fallback_stop_err.lock().unwrap()
+                        {
+                            break;
+                        }
+                        if let Ok(line) = line {
+                            if !emit_err(parse_log_line(&line)) {
+                                break;
+                            }
+                        }
+                    }
+                });
 
                 for line in BufReader::new(stdout).lines() {
                     if check_stop() { break; }
@@ -235,6 +256,7 @@ fn stream_with_fallback<F>(
                     }
                 }
                 let _ = child.kill();
+                let _ = stderr_thread.join();
             }
             FallbackSource::File(path) => {
                 // Tail the fallback file until told to stop
