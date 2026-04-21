@@ -26,32 +26,53 @@ fn check_docker() -> bool {
 // ─── WSL check (Windows only) ────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
+fn decode_wsl_output(bytes: &[u8]) -> String {
+    // wsl.exe emits UTF-16LE with BOM on Windows; fall back to UTF-8 otherwise.
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let u16s: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn check_wsl() -> (bool, String) {
-    let status = crate::cmd::new("wsl")
-        .args(["--status"])
-        .output();
-    let Ok(out) = status else {
-        return (false, "WSL not installed \u{2014} run: wsl --install".into());
-    };
-    if !out.status.success() {
-        return (false, "WSL not installed \u{2014} run: wsl --install".into());
+    // Probe 1: `wsl --list --verbose` — most reliable, works for Store-WSL
+    // in non-admin shells where `--status` may return nonzero.
+    if let Ok(out) = crate::cmd::new("wsl").args(["--list", "--verbose"]).output() {
+        if out.status.success() {
+            let text = decode_wsl_output(&out.stdout);
+            // Skip header row; any remaining non-empty line = a distro.
+            let has_distro = text.lines().skip(1).any(|l| !l.trim().is_empty());
+            if has_distro {
+                return (true, "WSL installed with distro".into());
+            }
+            return (
+                false,
+                "WSL installed but no distro \u{2014} run: wsl --install -d Ubuntu".into(),
+            );
+        }
     }
-    let list = crate::cmd::new("wsl")
-        .args(["--list", "--quiet"])
-        .output();
-    let has_distro = list
-        .map(|o| {
-            let text = String::from_utf8_lossy(&o.stdout);
-            text.lines().any(|l| !l.trim().is_empty())
-        })
-        .unwrap_or(false);
-    if !has_distro {
-        return (
-            false,
-            "WSL installed but no distro \u{2014} run: wsl --install".into(),
-        );
+    // Probe 2: `wsl --version` — Store-WSL often succeeds here when --status fails.
+    if let Ok(out) = crate::cmd::new("wsl").args(["--version"]).output() {
+        if out.status.success() {
+            return (true, "WSL detected (distro list unavailable)".into());
+        }
     }
-    (true, "WSL installed with distro".into())
+    // Probe 3: `wsl --status` — legacy fallback.
+    if let Ok(out) = crate::cmd::new("wsl").args(["--status"]).output() {
+        if out.status.success() {
+            return (true, "WSL detected (distro list unavailable)".into());
+        }
+    }
+    (
+        false,
+        "WSL not detected (Docker Desktop will confirm) \u{2014} run: wsl --install".into(),
+    )
 }
 
 fn check_image_present() -> bool {
@@ -472,7 +493,8 @@ where
                     id: "wsl".to_string(),
                     passed: wsl_ok,
                     label: wsl_label,
-                    required: true,
+                    // Non-blocking: Docker's own check fails first if WSL is truly missing.
+                    required: false,
                 });
                 on_progress(&checks);
             }

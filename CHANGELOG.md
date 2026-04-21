@@ -53,6 +53,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.1
+
+### Fixes
+
+- **WSL pre-flight check (Windows)**: No longer falsely reports "WSL not installed" for non-admin users with Microsoft Store WSL. Detection now probes `wsl --list --verbose`, `wsl --version`, and `wsl --status` in sequence, and decodes the UTF-16LE output `wsl.exe` emits on Windows. The check is also demoted from a blocking requirement to a warning, since Docker Desktop's own check already fails first if WSL2 is truly missing.
+
 ## v0.0.7
 
 ### Changes
