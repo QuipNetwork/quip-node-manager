@@ -88,6 +88,24 @@ pub async fn pull_node_image(
     }
 }
 
+/// Host uid/gid for the PUID/PGID env vars passed to the node container.
+///
+/// The node image's entrypoint (quip-protocol v0.1.7+) uses these to chown
+/// `/data` so bind-mounted files are owned by the host user, not root.
+/// On Windows, Docker Desktop's VM has no meaningful mapping to Windows
+/// users — 1000:1000 matches the compose recipe's default.
+fn host_uid_gid() -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
+        unsafe { (libc::getuid(), libc::getgid()) }
+    }
+    #[cfg(not(unix))]
+    {
+        (1000, 1000)
+    }
+}
+
 #[tauri::command]
 pub async fn start_node_container(
     app: tauri::AppHandle,
@@ -157,6 +175,14 @@ pub async fn start_node_container(
         "-v".to_string(),
         data_mount,
     ];
+
+    // Pass host uid/gid so the entrypoint chowns /data to the host user.
+    // Matches the compose recipe's PUID/PGID env scheme (nodes.quip.network).
+    let (puid, pgid) = host_uid_gid();
+    args.push("-e".to_string());
+    args.push(format!("PUID={}", puid));
+    args.push("-e".to_string());
+    args.push(format!("PGID={}", pgid));
 
     if !config.public_host.is_empty() {
         args.push("-e".to_string());
