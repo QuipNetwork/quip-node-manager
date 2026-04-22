@@ -15,6 +15,7 @@ pub mod tui_input;
 pub mod tui_ui;
 pub mod update;
 
+use checklist::ChecklistState;
 use log_stream::LogStreamState;
 use native::NativeProcessState;
 use std::sync::Mutex;
@@ -55,6 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(LogStreamState::new())
         .manage(NativeProcessState::new())
+        .manage(ChecklistState::new())
         .manage(TrayState {
             id: Mutex::new(None),
         })
@@ -91,8 +93,8 @@ pub fn run() {
             native::start_native_log_tail,
             // Network & checklist
             network::detect_public_ip,
-            checklist::recheck_port_forwarding,
-            checklist::run_checklist,
+            checklist::get_checklist,
+            checklist::recheck,
             // Updates
             update::get_app_version,
             update::get_node_version,
@@ -174,8 +176,11 @@ pub fn run() {
                                     crate::settings::RunMode::Native => {
                                         let state = handle
                                             .state::<NativeProcessState>();
-                                        native::stop_native_node(state)
-                                            .await
+                                        native::stop_native_node(
+                                            handle.clone(),
+                                            state,
+                                        )
+                                        .await
                                     }
                                 };
                             });

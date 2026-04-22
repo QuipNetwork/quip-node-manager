@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::log_stream::LogStreamState;
 use crate::settings::{ContainerStatus, GpuBackend, RunMode};
-use tauri::Emitter;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 fn log_cmd(app: &tauri::AppHandle, cmd: &str) {
     let entry = serde_json::json!({
@@ -64,6 +66,14 @@ pub async fn check_docker_hello_world() -> Result<bool, String> {
     Ok(status.status.success())
 }
 
+/// Default timeout for `docker pull`. Large CUDA images can legitimately
+/// take several minutes on slow links, but past 5 min we're almost always
+/// stalled, not progressing.
+const PULL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Stream `docker pull` stdout/stderr to the UI line by line, enforce a
+/// timeout, and emit start/complete events so the frontend never sits on
+/// a frozen "Pulling…" button.
 #[tauri::command]
 pub async fn pull_node_image(
     app: tauri::AppHandle,
@@ -71,21 +81,141 @@ pub async fn pull_node_image(
 ) -> Result<String, String> {
     let image = format!("{}:latest", image_for_tag(&image_tag));
     log_cmd(&app, &format!("docker pull {}", image));
-    let output = crate::cmd::new("docker")
-        .args(["pull", &image])
-        .output()
-        .map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !stdout.trim().is_empty() {
-        log_output(&app, stdout.trim());
+    let _ = app.emit(
+        "pull-started",
+        serde_json::json!({ "image": &image }),
+    );
+
+    let result = pull_streaming(&app, &image).await;
+
+    match &result {
+        Ok(()) => {
+            let _ = app.emit(
+                "pull-complete",
+                serde_json::json!({
+                    "image": &image,
+                    "success": true,
+                }),
+            );
+        }
+        Err(err) => {
+            log_err(&app, err);
+            let _ = app.emit(
+                "pull-complete",
+                serde_json::json!({
+                    "image": &image,
+                    "success": false,
+                    "error": err,
+                }),
+            );
+        }
     }
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        log_err(&app, stderr.trim());
-        Err(format!("docker pull failed: {}", stderr))
-    }
+
+    // Auto-recheck affected items regardless of outcome — a failed pull
+    // still flips the image check from Running back to Fail, which is
+    // exactly what the user needs to see.
+    let rc_app = app.clone();
+    tokio::spawn(async move {
+        crate::checklist::trigger_recheck_auto(
+            rc_app,
+            vec!["image".into(), "version".into()],
+        )
+        .await;
+    });
+
+    result.map(|_| image)
+}
+
+async fn pull_streaming(
+    app: &tauri::AppHandle,
+    image: &str,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let app = app.clone();
+    let image = image.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut child = crate::cmd::new("docker")
+            .args(["pull", &image])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        let app_out = app.clone();
+        let image_out = image.clone();
+        let stdout_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = app_out.emit(
+                    "pull-progress",
+                    serde_json::json!({
+                        "image": &image_out,
+                        "line": &line,
+                    }),
+                );
+                let entry = serde_json::json!({
+                    "timestamp": "",
+                    "level": "INFO",
+                    "message": &line,
+                });
+                let _ = app_out.emit("node-log", entry);
+            }
+        });
+
+        let app_err = app.clone();
+        let stderr_thread = std::thread::spawn(move || {
+            let mut last = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let entry = serde_json::json!({
+                    "timestamp": "",
+                    "level": "ERROR",
+                    "message": &line,
+                });
+                let _ = app_err.emit("node-log", entry);
+                last = line;
+            }
+            last
+        });
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = stdout_thread.join();
+                    let stderr_tail = stderr_thread.join().unwrap_or_default();
+                    return if status.success() {
+                        Ok(())
+                    } else if !stderr_tail.is_empty() {
+                        Err(format!("docker pull failed: {}", stderr_tail))
+                    } else {
+                        Err(format!("docker pull exited with {}", status))
+                    };
+                }
+                Ok(None) => {
+                    if start.elapsed() > PULL_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Err(format!(
+                            "docker pull timed out after {}s",
+                            PULL_TIMEOUT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -200,30 +330,144 @@ pub async fn start_node_container(
     }
 }
 
+/// Grace period passed to `docker stop` (SIGTERM → SIGKILL after this).
+const STOP_GRACE: Duration = Duration::from_secs(10);
+/// Outer deadline for `docker stop` to return. Deliberately just above the
+/// grace period so we escalate quickly if the daemon itself is wedged.
+const STOP_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Stop and remove the quip-node container, with:
+/// 1. Log-streamer child killed first (unblocks BufReader::lines)
+/// 2. `docker stop -t 10` with an outer 12s deadline
+/// 3. Post-stop inspection; escalate to `docker kill` if still running
+/// 4. `docker rm -f` + final existence check
+/// 5. `stop-complete` event with success flag for the UI
 #[tauri::command]
 pub async fn stop_node_container(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    log_cmd(&app, "docker stop quip-node");
-    let stop = crate::cmd::new("docker")
-        .args(["stop", "quip-node"])
-        .output();
-    if let Ok(o) = &stop {
-        if !o.status.success() {
+    let _ = app.emit("stop-started", serde_json::json!({}));
+
+    // (1) Kill the log-streamer child first. This releases the container's
+    // log handle immediately; without it, `docker stop` can block waiting
+    // for its own log pipe to be drained, and the BufReader on our side
+    // sits on a blocking read.
+    let log_state = app.state::<LogStreamState>();
+    log_state.kill_child();
+    *log_state.stop_flag.lock().unwrap() = true;
+
+    // (2) Graceful stop with outer deadline. We don't propagate a failure
+    // here — if `docker stop` times out or errors, we fall through to the
+    // kill/rm escalation below.
+    log_cmd(&app, &format!("docker stop -t {} quip-node", STOP_GRACE.as_secs()));
+    let grace_secs = STOP_GRACE.as_secs().to_string();
+    let stop_fut = tokio::task::spawn_blocking(move || {
+        crate::cmd::new("docker")
+            .args(["stop", "-t", &grace_secs, "quip-node"])
+            .output()
+    });
+    match tokio::time::timeout(STOP_DEADLINE, stop_fut).await {
+        Ok(Ok(Ok(o))) if !o.status.success() => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             if !stderr.trim().is_empty() {
                 log_err(&app, stderr.trim());
             }
         }
+        Ok(Ok(Err(e))) => log_err(&app, &format!("docker stop error: {}", e)),
+        Err(_) => log_err(&app, "docker stop did not return within deadline"),
+        _ => {}
     }
 
+    // (3) Verify. If still running, escalate.
+    if is_container_running().await {
+        log_err(
+            &app,
+            "container still running after docker stop — escalating to docker kill",
+        );
+        log_cmd(&app, "docker kill quip-node");
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::cmd::new("docker")
+                .args(["kill", "quip-node"])
+                .output()
+        })
+        .await;
+    }
+
+    // (4) Force-remove. Handles "exited but still present" too.
     log_cmd(&app, "docker rm -f quip-node");
-    crate::cmd::new("docker")
-        .args(["rm", "-f", "quip-node"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    log_output(&app, "Container removed.");
-    Ok(())
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["rm", "-f", "quip-node"])
+            .output()
+    })
+    .await;
+
+    // (5) Final verification.
+    let success = !container_exists().await;
+
+    if success {
+        log_output(&app, "Container removed.");
+        let _ = app.emit(
+            "stop-complete",
+            serde_json::json!({ "success": true }),
+        );
+        let _ = app.emit(
+            "container-status",
+            serde_json::json!({
+                "running": false,
+                "container_id": serde_json::Value::Null,
+                "image": "",
+                "status_text": "not found",
+            }),
+        );
+
+        // Follow-on recheck. Container state doesn't directly affect any
+        // check today, but the hook is useful (e.g. image is unchanged,
+        // version is unchanged — fast no-op) and it exercises the same
+        // recheck path so users see a consistent console trace.
+        let rc_app = app.clone();
+        tokio::spawn(async move {
+            crate::checklist::trigger_recheck_auto(rc_app, vec!["image".into()]).await;
+        });
+
+        Ok(())
+    } else {
+        let msg = "container still present after rm -f — manual cleanup may be needed";
+        log_err(&app, msg);
+        let _ = app.emit(
+            "stop-complete",
+            serde_json::json!({ "success": false, "error": msg }),
+        );
+        Err(msg.to_string())
+    }
+}
+
+async fn is_container_running() -> bool {
+    match tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["inspect", "--format", "{{.State.Running}}", "quip-node"])
+            .output()
+    })
+    .await
+    {
+        Ok(Ok(o)) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim() == "true"
+        }
+        _ => false,
+    }
+}
+
+async fn container_exists() -> bool {
+    match tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["ps", "-a", "--filter", "name=quip-node", "-q"])
+            .output()
+    })
+    .await
+    {
+        Ok(Ok(o)) => !o.stdout.is_empty(),
+        _ => false,
+    }
 }
 
 #[tauri::command]
