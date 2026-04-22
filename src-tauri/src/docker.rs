@@ -92,13 +92,23 @@ pub async fn pull_node_image(
 ///
 /// The node image's entrypoint (quip-protocol v0.1.7+) uses these to chown
 /// `/data` so bind-mounted files are owned by the host user, not root.
+///
+/// Gids below 1000 are clamped up to 1000 to sidestep a collision with
+/// Alpine's system groups: macOS users default to gid=20 (staff), but
+/// gid=20 is already taken by the `games` group inside the node image,
+/// and the entrypoint's `groupmod -g $PGID quip` fails without `-o`.
+/// Keeping the real uid preserves host-side file ownership; the gid
+/// just won't have a friendly name (cosmetic).
+///
 /// On Windows, Docker Desktop's VM has no meaningful mapping to Windows
 /// users — 1000:1000 matches the compose recipe's default.
 fn host_uid_gid() -> (u32, u32) {
     #[cfg(unix)]
     {
         // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
-        unsafe { (libc::getuid(), libc::getgid()) }
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        (uid, gid.max(1000))
     }
     #[cfg(not(unix))]
     {
