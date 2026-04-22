@@ -20,9 +20,36 @@ const state = {
   logLines: [],
   MAX_LOG_LINES: 500,
   pollInterval: null,
-  portCheckResult: null, // null=unchecked, true=forwarded, false=not reached
-  lastChecks: [],        // last checklist payload from backend
+  // Map<id, CheckItem> — single source of truth for the checklist UI.
+  // Merged from `checklist-update` events; rendered by renderChecklist().
+  checks: new Map(),
   hardwareSurvey: null,
+};
+
+// Render order; filtered by run-mode in renderChecklist().
+const CHECK_ORDER = [
+  'docker', 'wsl', 'image', 'binary', 'version',
+  'secret', 'ip', 'hostname', 'port', 'firewall',
+];
+
+// State-to-icon mapping for the checklist. CSS class `state-<state>`
+// drives colour and (for running) the spin animation.
+const STATE_ICON = {
+  idle:    '○', // ○
+  running: '◌', // ◌
+  pass:    '✓', // ✓
+  warn:    '⚠', // ⚠
+  fail:    '✗', // ✗
+  skip:    '—', // —
+};
+
+// Fix button labels, keyed by FixKind.kind.
+const FIX_LABELS = {
+  InstallDocker:   'Install Docker',
+  PullImage:       'Pull Image',
+  DownloadBinary:  'Download & Install',
+  GenerateSecret:  'Generate Secret',
+  Delegate:        'Update',
 };
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
@@ -71,13 +98,13 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   list.style.display = expanded ? 'none' : '';
 });
 
-// ─── Port change → re-run checklist ──────────────────────────────────────────
+// ─── Port change → re-run port-related checks ────────────────────────────────
 document.getElementById('port').addEventListener('change', async () => {
   const port = parseInt(document.getElementById('port').value) || 20049;
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('run_checklist').catch(console.error);
+    await invoke('recheck', { ids: ['port', 'firewall'] }).catch(console.error);
   }
 });
 
@@ -119,7 +146,9 @@ document.getElementById('run-mode-select').addEventListener('change', async () =
   state.settings.run_mode = document.getElementById('run-mode-select').value;
   updateRunModeUI();
   await invoke('update_settings', { settings: state.settings }).catch(console.error);
-  await invoke('run_checklist').catch(console.error);
+  // Mode change invalidates the whole cache — backend reseeds and reruns.
+  state.checks.clear();
+  await invoke('recheck').catch(console.error);
 });
 
 function updateRunModeUI() {
@@ -140,13 +169,10 @@ function updateRunModeUI() {
   const mode = state.settings?.run_mode || 'docker';
   const isDocker = mode === 'docker';
 
-  // Toggle checklist item visibility
-  document.querySelectorAll('.docker-only').forEach((el) => {
-    el.style.display = isDocker ? '' : 'none';
-  });
-  document.querySelectorAll('.native-only').forEach((el) => {
-    el.style.display = isDocker ? 'none' : '';
-  });
+  // Checklist items are filtered by mode inside renderChecklist(); re-render
+  // here because mode and the hardware survey (WSL visibility) can land
+  // in either order during init.
+  renderChecklist();
 
   // Warnings (only relevant on macOS where the toggle exists)
   const warning = document.getElementById('run-mode-warning');
@@ -243,7 +269,7 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
       state.settings.node_config.secret = secret;
       await invoke('update_settings', { settings: state.settings });
     }
-    await invoke('run_checklist').catch(console.error);
+    await invoke('recheck', { ids: ['secret'] }).catch(console.error);
   } catch (e) {
     console.error('Failed to regenerate secret:', e);
   }
@@ -489,81 +515,213 @@ function setStatus(stateStr) {
   }
 }
 
-// ─── Checklist update ─────────────────────────────────────────────────────────
-function updateChecklist(checks) {
-  // Checklist streams in progressively; complete once the last item arrives.
-  const complete = checks.some((c) => c.id === 'firewall');
-  state.lastChecks = checks;
-  const portPassed = (c) =>
-    state.portCheckResult !== null ? state.portCheckResult : c.passed;
-  const checkPassed = (c) =>
-    c.id === 'port' ? portPassed(c) : c.passed;
-  const allPassed =
-    complete &&
-    checks.filter((c) => c.required !== false).every(checkPassed);
-  const requiredFailing = checks.filter(
-    (c) => c.required !== false && !checkPassed(c)
+// ─── Checklist render (FSM) ──────────────────────────────────────────────────
+//
+// The backend emits one CheckItem per `checklist-update` event. We merge
+// by id into state.checks and repaint. No per-item listener churn:
+// everything routes through one delegated click handler at the bottom
+// of this section.
+
+function visibleInMode(id, runMode) {
+  const isDocker = (runMode || 'docker') === 'docker';
+  if (id === 'docker' || id === 'image') return isDocker;
+  if (id === 'wsl') return isDocker && (state.hardwareSurvey?.os === 'windows');
+  if (id === 'binary') return !isDocker;
+  return true;
+}
+
+function renderChecklistItem(item) {
+  const li = document.createElement('li');
+  li.className = 'checklist-item';
+  li.dataset.id = item.id;
+
+  const icon = document.createElement('span');
+  icon.className = `check-icon state-${item.state}`;
+  icon.textContent = STATE_ICON[item.state] || STATE_ICON.idle;
+
+  const label = document.createElement('span');
+  label.className = 'check-label';
+  label.textContent = item.label;
+  if (item.detail) label.title = item.detail;
+
+  const actions = document.createElement('div');
+  actions.className = 'check-actions';
+
+  const recheckBtn = document.createElement('button');
+  recheckBtn.type = 'button';
+  recheckBtn.className = 'btn btn-sm btn-secondary check-action';
+  recheckBtn.dataset.action = 'recheck';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Recheck';
+  recheckBtn.disabled = item.state === 'running';
+  actions.appendChild(recheckBtn);
+
+  if (item.fixable && (item.state === 'fail' || item.state === 'warn')) {
+    const fixBtn = document.createElement('button');
+    fixBtn.type = 'button';
+    fixBtn.className = 'btn btn-sm btn-secondary check-action';
+    fixBtn.dataset.action = 'fix';
+    fixBtn.textContent = FIX_LABELS[item.fixable.kind] || 'Fix';
+    actions.appendChild(fixBtn);
+  }
+
+  li.append(icon, label, actions);
+  return li;
+}
+
+function renderChecklist() {
+  const runMode = state.settings?.run_mode || 'docker';
+  const ul = document.getElementById('checklist');
+  const visible = CHECK_ORDER.filter((id) => visibleInMode(id, runMode));
+
+  const rows = visible.map((id) => {
+    const item = state.checks.get(id) || {
+      id, state: 'idle', label: defaultLabel(id), required: false, fixable: null,
+    };
+    return renderChecklistItem(item);
+  });
+  ul.replaceChildren(...rows);
+
+  updateChecklistSummary(visible);
+}
+
+function defaultLabel(id) {
+  const port = state.settings?.node_config?.port ?? 20049;
+  switch (id) {
+    case 'docker':   return 'Docker installed & running';
+    case 'wsl':      return 'WSL installed with distro';
+    case 'image':    return 'Node image available';
+    case 'binary':   return 'Node binary available';
+    case 'version':  return 'Node version up to date';
+    case 'secret':   return 'Node secret configured';
+    case 'ip':       return 'Public IP reachable';
+    case 'hostname': return 'Hostname accessible to internet';
+    case 'port':     return `Port ${port} — press Recheck to test`;
+    case 'firewall': return 'Local firewall allows port (UDP+TCP)';
+    default:         return id;
+  }
+}
+
+function updateChecklistSummary(visibleIds) {
+  const items = visibleIds.map((id) => state.checks.get(id)).filter(Boolean);
+  const allRun = items.length === visibleIds.length &&
+                 items.every((i) => i.state !== 'idle' && i.state !== 'running');
+
+  const requiredFailing = items.filter(
+    (i) => i.required === true && i.state === 'fail'
   ).length;
-  const warnings = checks.filter(
-    (c) => c.required === false && !checkPassed(c) && !c.label?.includes('\u2026')
+  const warnings = items.filter(
+    (i) => i.state === 'warn' || (i.required !== true && i.state === 'fail')
   ).length;
 
-  state.checksPassed = allPassed;
+  state.checksPassed = allRun && requiredFailing === 0;
 
   const summary = document.getElementById('checklist-summary');
   const checklistEl = document.getElementById('checklist');
   const toggleBtn = document.getElementById('checklist-toggle');
+  if (!summary || !toggleBtn) return;
 
-  if (summary) {
-    if (!complete) {
-      summary.textContent = 'Checking\u2026';
-      summary.style.color = 'var(--text-faint)';
-    } else if (allPassed && warnings === 0) {
-      summary.textContent = '\u2713 All requirements met';
-      summary.style.color = 'var(--success)';
-      toggleBtn.setAttribute('aria-expanded', 'false');
-      checklistEl.style.display = 'none';
-    } else if (allPassed && warnings > 0) {
-      const s = warnings > 1 ? 's' : '';
-      summary.textContent = `\u2713 Ready (${warnings} warning${s})`;
-      summary.style.color = 'var(--warning)';
-      toggleBtn.setAttribute('aria-expanded', 'false');
-      checklistEl.style.display = 'none';
-    } else {
-      summary.textContent = `\u2717 ${requiredFailing} not met`;
-      summary.style.color = 'var(--error)';
-      toggleBtn.setAttribute('aria-expanded', 'true');
-      checklistEl.style.display = '';
-    }
+  if (!allRun) {
+    summary.textContent = 'Checking…';
+    summary.style.color = 'var(--text-faint)';
+  } else if (requiredFailing === 0 && warnings === 0) {
+    summary.textContent = '✓ All requirements met';
+    summary.style.color = 'var(--success)';
+    toggleBtn.setAttribute('aria-expanded', 'false');
+    checklistEl.style.display = 'none';
+  } else if (requiredFailing === 0) {
+    const s = warnings > 1 ? 's' : '';
+    summary.textContent = `✓ Ready (${warnings} warning${s})`;
+    summary.style.color = 'var(--warning)';
+    toggleBtn.setAttribute('aria-expanded', 'false');
+    checklistEl.style.display = 'none';
+  } else {
+    summary.textContent = `✗ ${requiredFailing} not met`;
+    summary.style.color = 'var(--error)';
+    toggleBtn.setAttribute('aria-expanded', 'true');
+    checklistEl.style.display = '';
   }
-
-  checks.forEach((check) => {
-    const item = document.querySelector(
-      `.checklist-item[data-id="${check.id}"]`
-    );
-    if (!item) return;
-    const icon = item.querySelector('.check-icon');
-    const label = item.querySelector('.check-label');
-
-    const passed = checkPassed(check);
-    const isPending = !passed && check.label?.includes('\u2026');
-    const isWarning = !passed && !isPending && check.required === false;
-    icon.textContent = passed
-      ? '\u2713'
-      : isPending ? '\u25CB' : (isWarning ? '\u26A0' : '\u2717');
-    icon.style.color = passed
-      ? 'var(--success)'
-      : isPending ? 'var(--text-faint)' : (isWarning ? 'var(--warning)' : 'var(--error)');
-    if (label && check.label) label.textContent = check.label;
-
-    const actionBtn = item.querySelector('.check-action');
-    if (actionBtn && actionBtn.tagName === 'BUTTON') {
-      actionBtn.style.display = (passed || isPending) ? 'none' : 'inline-flex';
-    }
-  });
 
   updateStartStopState();
 }
+
+function mergeCheckUpdate(item) {
+  state.checks.set(item.id, item);
+  renderChecklist();
+
+  // The version check resolves the "v<app> (node <node>)" label in the
+  // header. When version transitions to a terminal state the node version
+  // may have changed (pull/download fixes), so refresh the display.
+  if (item.id === 'version' && item.state !== 'idle' && item.state !== 'running') {
+    refreshNodeVersion();
+  }
+}
+
+// ─── Fix action dispatcher ──────────────────────────────────────────────────
+async function runFix(id) {
+  const item = state.checks.get(id);
+  if (!item || !item.fixable) return;
+
+  const fix = item.fixable;
+  switch (fix.kind) {
+    case 'InstallDocker':
+      openUrl('https://docs.docker.com/get-docker/');
+      return;
+
+    case 'PullImage': {
+      const tag = state.settings?.image_tag || 'cpu';
+      try {
+        await invoke('pull_node_image', { imageTag: tag });
+      } catch (e) {
+        console.error('Pull failed:', e);
+      }
+      return;
+    }
+
+    case 'DownloadBinary':
+      try {
+        await invoke('download_native_binary');
+      } catch (e) {
+        appendLog({ timestamp: '', level: 'ERROR', message: `Download failed: ${e}` });
+      }
+      return;
+
+    case 'GenerateSecret':
+      try {
+        const secret = await invoke('generate_node_secret');
+        document.getElementById('secret-display').value = secret;
+        if (state.settings) {
+          state.settings.node_config.secret = secret;
+          await invoke('update_settings', { settings: state.settings });
+        }
+        await invoke('recheck', { ids: ['secret'] }).catch(console.error);
+      } catch (e) {
+        console.error('Failed to generate secret:', e);
+      }
+      return;
+
+    case 'Delegate':
+      return runFix(fix.arg);
+  }
+}
+
+// ─── Checklist event delegation ──────────────────────────────────────────────
+document.getElementById('checklist').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const li = btn.closest('.checklist-item');
+  const id = li?.dataset.id;
+  if (!id) return;
+  if (btn.dataset.action === 'recheck') {
+    invoke('recheck', { ids: [id] }).catch(console.error);
+  } else if (btn.dataset.action === 'fix') {
+    runFix(id);
+  }
+});
+
+// ─── Global Recheck All ──────────────────────────────────────────────────────
+document.getElementById('btn-recheck-all').addEventListener('click', () => {
+  invoke('recheck').catch(console.error);
+});
 
 // ─── Log panel ────────────────────────────────────────────────────────────────
 function escHtml(str) {
@@ -603,93 +761,6 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
   state.logLines = [];
   document.getElementById('log-output').innerHTML = '';
 });
-
-// ─── Checklist action buttons ──────────────────────────────────────────────────
-document
-  .querySelector('[data-id="docker"] .check-action')
-  ?.addEventListener('click', () => {
-    openUrl('https://docs.docker.com/get-docker/');
-  });
-
-document
-  .querySelector('[data-id="image"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="image"] .check-action');
-    const tag = state.settings?.image_tag || 'cpu';
-    btn.disabled = true;
-    btn.textContent = 'Pulling\u2026';
-    try {
-      await invoke('pull_node_image', { imageTag: tag });
-      btn.style.display = 'none';
-      await invoke('run_checklist');
-    } catch (e) {
-      btn.disabled = false;
-      btn.textContent = 'Retry Pull';
-      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
-    }
-  });
-
-document
-  .querySelector('[data-id="secret"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="secret"] .check-action');
-    btn.disabled = true;
-    btn.textContent = 'Generating\u2026';
-    try {
-      const secret = await invoke('generate_node_secret');
-      document.getElementById('secret-display').value = secret;
-      if (state.settings) {
-        state.settings.node_config.secret = secret;
-        await invoke('update_settings', { settings: state.settings });
-      }
-      btn.style.display = 'none';
-      await invoke('run_checklist');
-    } catch (e) {
-      btn.disabled = false;
-      btn.textContent = 'Generate Secret';
-      console.error(e);
-    }
-  });
-
-// ─── Binary download action ──────────────────────────────────────────────────
-document
-  .querySelector('[data-id="binary"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="binary"] .check-action');
-    const label = document.querySelector('[data-id="binary"] .check-label');
-    btn.disabled = true;
-    btn.textContent = 'Downloading\u2026';
-    label.textContent = 'Downloading node binary\u2026';
-    // Switch label to "Installing" once download completes (before invoke returns)
-    const progressCleanup = await listen('binary-download-progress', (event) => {
-      if (event.payload.done) {
-        label.textContent = 'Installing node binary\u2026';
-        btn.textContent = 'Installing\u2026';
-      }
-    });
-    try {
-      const version = await invoke('download_native_binary');
-      label.textContent = `Node binary v${version} installed`;
-      btn.style.display = 'none';
-      progressCleanup();
-      await invoke('run_checklist');
-    } catch (e) {
-      label.textContent = `Download failed: ${e}`;
-      btn.disabled = false;
-      btn.textContent = 'Retry Download & Install';
-      progressCleanup();
-    }
-  });
-
-// ─── Version update action (delegates to image pull or binary download) ──────
-document
-  .querySelector('[data-id="version"] .check-action')
-  ?.addEventListener('click', () => {
-    const target = isDockerMode()
-      ? document.querySelector('[data-id="image"] .check-action')
-      : document.querySelector('[data-id="binary"] .check-action');
-    if (target) target.click();
-  });
 
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
 function isDockerMode() {
@@ -813,46 +884,15 @@ async function pollStatus() {
   updateStartStopState();
 }
 
-// ─── Port recheck ─────────────────────────────────────────────────────────────
-document.getElementById('btn-port-recheck').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-port-recheck');
-  const item = document.querySelector('.checklist-item[data-id="port"]');
-  const icon = item.querySelector('.check-icon');
-  const label = item.querySelector('.check-label');
-  const port = state.settings?.node_config?.port ?? 20049;
-
-  btn.disabled = true;
-  btn.textContent = 'Checking\u2026';
-  icon.textContent = '\u25cb';
-  icon.style.color = '';
-  label.textContent = `Port ${port} \u2014 checking via public IP\u2026`;
-
-  try {
-    const ok = await invoke('recheck_port_forwarding', { port });
-    state.portCheckResult = ok;
-    icon.textContent = ok ? '\u2713' : '\u2717';
-    icon.style.color = ok ? 'var(--success)' : 'var(--error)';
-    label.textContent = ok
-      ? `Port ${port} forwarded (ensure both UDP+TCP on router)`
-      : `Port ${port} \u2014 not reachable \u2014 forward UDP+TCP on router`;
-    // Re-evaluate summary and start-button state using the stored checks.
-    updateChecklist(state.lastChecks);
-  } catch (e) {
-    label.textContent = `Port check error: ${e}`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Recheck';
-  }
-});
-
 // ─── Event listeners ──────────────────────────────────────────────────────────
 async function setupListeners() {
   await listen('node-log', (event) => {
     appendLog(event.payload);
   });
 
+  // Single CheckItem per event — merged into state.checks by id.
   await listen('checklist-update', (event) => {
-    updateChecklist(event.payload);
+    mergeCheckUpdate(event.payload);
   });
 
   await listen('node-status', (event) => {
@@ -863,18 +903,30 @@ async function setupListeners() {
     updateStartStopState();
   });
 
-  // Background version check result — patches the placeholder in the checklist
-  await listen('version-check-update', (event) => {
-    const result = event.payload;
-    const checks = state.lastChecks;
-    if (!checks) return;
-    const idx = checks.findIndex((c) => c.id === 'version');
-    if (idx >= 0) {
-      checks[idx] = result;
-    } else {
-      checks.push(result);
+  // Docker pull lifecycle — pull-complete always triggers a backend-side
+  // recheck of image+version, so the UI auto-updates without us doing
+  // anything here beyond logging terminal outcomes.
+  await listen('pull-complete', (event) => {
+    const { success, error } = event.payload || {};
+    if (!success) {
+      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
-    updateChecklist(checks);
+  });
+
+  // Stop lifecycle — update the status pill immediately; backend also
+  // emits container-status so we don't have to wait for the next poll.
+  await listen('stop-complete', (event) => {
+    const { success, error } = event.payload || {};
+    if (!success) {
+      appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${error || 'unknown error'}` });
+    }
+  });
+
+  await listen('container-status', (event) => {
+    const s = event.payload;
+    state.containerRunning = !!s?.running;
+    setStatus(s?.running ? 'running' : 'stopped');
+    updateStartStopState();
   });
 
   // Update notifications
@@ -1042,7 +1094,16 @@ async function init() {
     })
     .catch(() => {});
 
-  invoke('run_checklist').catch(console.error);
+  // Seed placeholders from the cache, then kick off a full recheck.
+  invoke('get_checklist')
+    .then((checks) => {
+      for (const c of checks) state.checks.set(c.id, c);
+      renderChecklist();
+    })
+    .catch(console.error)
+    .finally(() => {
+      invoke('recheck').catch(console.error);
+    });
 
   invoke('check_app_update')
     .then((update) => {

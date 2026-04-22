@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::checklist::CheckItem;
+use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
 use crate::settings::{AppSettings, ContainerStatus, DwaveConfig, RunMode};
 
@@ -389,7 +389,7 @@ impl TuiApp {
                 // Update the port check item in the checks list.
                 let port = self.settings.node_config.port;
                 if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
-                    item.passed = passed;
+                    item.state = if passed { CheckState::Pass } else { CheckState::Warn };
                     item.label = if passed {
                         format!("Port {} forwarded", port)
                     } else {
@@ -412,14 +412,17 @@ impl TuiApp {
         let port = self.settings.node_config.port;
         // Show checking status immediately.
         if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
+            item.state = CheckState::Running;
             item.label = format!("Port {} — checking via public IP…", port);
         } else {
-            // No checklist run yet — insert a placeholder.
-            self.checks.push(crate::checklist::CheckItem {
+            self.checks.push(CheckItem {
                 id: "port".to_string(),
-                passed: false,
+                state: CheckState::Running,
                 label: format!("Port {} — checking via public IP…", port),
+                detail: None,
                 required: false,
+                fixable: None,
+                updated_at_ms: 0,
             });
         }
         self.set_status(format!("Checking port {} via public IP…", port));
@@ -428,7 +431,9 @@ impl TuiApp {
         self.port_check_rx = Some(rx);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let passed = rt.block_on(crate::checklist::probe_port_forwarding(port));
+            let passed = rt.block_on(
+                crate::checklist::probe_port_forwarding_with_default_ip(port),
+            );
             let _ = tx.send(passed);
         });
     }
@@ -718,7 +723,7 @@ impl TuiApp {
         let run_mode = self.form.run_mode();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let checks = rt.block_on(crate::checklist::run_checklist_core(&run_mode, |_| {}));
+            let checks = rt.block_on(crate::checklist::run_all_checks(&run_mode));
             let _ = tx.send(checks);
         });
     }
