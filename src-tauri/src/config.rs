@@ -138,30 +138,46 @@ fn render_config_toml(
     out.push('\n');
 
     // ── GPU sections ────────────────────────────────────────────────────
+    // [gpu] holds global defaults inherited by every backend section
+    // ([cuda.N], [metal], [modal]). See quip-protocol/quip-node.example.toml.
     let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
         .gpu_device_configs
         .iter()
         .filter(|d| d.enabled)
         .collect();
 
+    let using_gpu_backend = matches!(
+        config.gpu_backend,
+        GpuBackend::Local | GpuBackend::Mps | GpuBackend::Modal
+    );
+    let (gpu_util, gpu_yield) = enabled_devices
+        .first()
+        .map(|d| (d.utilization, d.yielding))
+        .unwrap_or((100, false));
+
+    if using_gpu_backend && !enabled_devices.is_empty() {
+        out.push_str("[gpu]\n");
+        out.push_str(&format!("utilization = {}\n", gpu_util));
+        out.push_str(&format!("yielding = {}\n", gpu_yield));
+        out.push('\n');
+    }
+
     match config.gpu_backend {
         GpuBackend::Local if !enabled_devices.is_empty() => {
-            // [gpu] global defaults
-            if let Some(first) = enabled_devices.first() {
-                out.push_str("[gpu]\n");
-                out.push_str(&format!(
-                    "utilization = {}\n",
-                    first.utilization
-                ));
-                out.push_str(&format!(
-                    "yielding = {}\n",
-                    first.yielding
-                ));
-                out.push('\n');
-            }
-            // [cuda.N] per-device sections
             for dev in &enabled_devices {
                 out.push_str(&format!("[cuda.{}]\n", dev.index));
+                if dev.utilization != gpu_util {
+                    out.push_str(&format!(
+                        "utilization = {}\n",
+                        dev.utilization
+                    ));
+                }
+                if dev.yielding != gpu_yield {
+                    out.push_str(&format!(
+                        "yielding = {}\n",
+                        dev.yielding
+                    ));
+                }
                 out.push('\n');
             }
         }
@@ -222,4 +238,94 @@ pub async fn generate_config_toml(
     run_mode: RunMode,
 ) -> Result<String, String> {
     Ok(render_config_toml(&config, &run_mode))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::GpuDeviceConfig;
+
+    fn cfg_with_gpu(
+        backend: GpuBackend,
+        devices: Vec<GpuDeviceConfig>,
+    ) -> NodeConfig {
+        NodeConfig {
+            gpu_backend: backend,
+            gpu_device_configs: devices,
+            ..NodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn mps_backend_emits_gpu_globals_before_metal() {
+        let cfg = cfg_with_gpu(
+            GpuBackend::Mps,
+            vec![GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 5,
+                yielding: true,
+            }],
+        );
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+        let gpu = toml.find("[gpu]").expect("[gpu] section missing");
+        let metal = toml.find("[metal]").expect("[metal] section missing");
+        assert!(gpu < metal, "[gpu] must precede [metal]");
+        assert!(toml[gpu..metal].contains("utilization = 5"));
+        assert!(toml[gpu..metal].contains("yielding = true"));
+    }
+
+    #[test]
+    fn modal_backend_emits_gpu_globals_before_modal() {
+        let cfg = cfg_with_gpu(
+            GpuBackend::Modal,
+            vec![GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 80,
+                yielding: false,
+            }],
+        );
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+        assert!(toml.contains("[gpu]\nutilization = 80\nyielding = false"));
+        assert!(toml.contains("[modal]"));
+    }
+
+    #[test]
+    fn cuda_per_device_emits_only_deltas() {
+        let cfg = cfg_with_gpu(
+            GpuBackend::Local,
+            vec![
+                GpuDeviceConfig {
+                    index: 0,
+                    enabled: true,
+                    utilization: 80,
+                    yielding: false,
+                },
+                GpuDeviceConfig {
+                    index: 1,
+                    enabled: true,
+                    utilization: 50,
+                    yielding: true,
+                },
+            ],
+        );
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+        let cuda0 = toml.find("[cuda.0]").unwrap();
+        let cuda1 = toml.find("[cuda.1]").unwrap();
+        // [cuda.0] matches globals → no overrides
+        assert!(!toml[cuda0..cuda1].contains("utilization"));
+        assert!(!toml[cuda0..cuda1].contains("yielding"));
+        // [cuda.1] differs → both fields emitted
+        assert!(toml[cuda1..].contains("utilization = 50"));
+        assert!(toml[cuda1..].contains("yielding = true"));
+    }
+
+    #[test]
+    fn mps_without_devices_skips_gpu_section() {
+        let cfg = cfg_with_gpu(GpuBackend::Mps, vec![]);
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+        assert!(!toml.contains("[gpu]"));
+        assert!(toml.contains("[metal]"));
+    }
 }
