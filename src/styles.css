@@ -290,6 +290,18 @@ body {
 }
 
 /* ─── Checklist ──────────────────────────────────────────────────────────── */
+.checklist-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.checklist-header .checklist-toggle {
+  flex: 1;
+  margin-bottom: 0;
+}
+
 .checklist {
   list-style: none;
   padding: 0;
@@ -312,11 +324,34 @@ body {
   width: 20px;
   text-align: center;
   font-size: 14px;
+  color: var(--text-faint);
+}
+
+/* Per-state icon colours. Default (Idle) inherits the faint colour above. */
+.check-icon.state-pass { color: var(--success); }
+.check-icon.state-warn { color: var(--warning); }
+.check-icon.state-fail { color: var(--error); }
+.check-icon.state-skip { color: var(--text-faint); }
+.check-icon.state-running {
+  color: var(--accent, var(--text-primary));
+  display: inline-block;
+  animation: checklist-spin 1.2s linear infinite;
+}
+
+@keyframes checklist-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .check-label {
   flex: 1;
   font-size: 14px;
+}
+
+.check-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 button.check-action {

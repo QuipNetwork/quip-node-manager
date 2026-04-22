@@ -60,69 +60,17 @@
 
       <!-- Requirements Checklist -->
       <div class="card">
-        <button id="checklist-toggle" class="checklist-toggle" aria-expanded="true">
-          <div class="section-heading" style="margin:0;">Requirements</div>
-          <div style="display:flex;align-items:center;gap:10px;">
-            <div id="checklist-summary" class="checklist-summary">Checking&hellip;</div>
-            <span class="checklist-chevron"></span>
-          </div>
-        </button>
-        <ul id="checklist" class="checklist">
-          <!-- Docker-mode checks -->
-          <li class="checklist-item docker-only" data-id="docker">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Docker installed &amp; running</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Install Docker</button>
-          </li>
-          <li class="checklist-item docker-only" data-id="wsl" style="display:none;">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">WSL installed with distro</span>
-            <span class="check-action"></span>
-          </li>
-          <li class="checklist-item docker-only" data-id="image">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Node image available</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Pull Image</button>
-          </li>
-          <!-- Native-mode check -->
-          <li class="checklist-item native-only" data-id="binary" style="display:none;">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Node binary available</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Download &amp; Install</button>
-          </li>
-          <!-- Version check (both modes) -->
-          <li class="checklist-item" data-id="version">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Node version up to date</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Update</button>
-          </li>
-          <!-- Common checks -->
-          <li class="checklist-item" data-id="secret">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Node secret configured</span>
-            <button class="btn btn-sm btn-secondary check-action" style="display:none">Generate Secret</button>
-          </li>
-          <li class="checklist-item" data-id="ip">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Public IP reachable</span>
-            <span class="check-action"></span>
-          </li>
-          <li class="checklist-item" data-id="hostname">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Hostname accessible to internet</span>
-            <span class="check-action"></span>
-          </li>
-          <li class="checklist-item" data-id="port">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Port 20049 — press Recheck to test</span>
-            <button id="btn-port-recheck" class="btn btn-sm btn-secondary">Recheck</button>
-          </li>
-          <li class="checklist-item" data-id="firewall">
-            <span class="check-icon">&#9675;</span>
-            <span class="check-label">Local firewall allows port (UDP+TCP)</span>
-            <span class="check-action"></span>
-          </li>
-        </ul>
+        <div class="checklist-header">
+          <button id="checklist-toggle" class="checklist-toggle" aria-expanded="true">
+            <div class="section-heading" style="margin:0;">Requirements</div>
+            <div style="display:flex;align-items:center;gap:10px;">
+              <div id="checklist-summary" class="checklist-summary">Checking&hellip;</div>
+              <span class="checklist-chevron"></span>
+            </div>
+          </button>
+          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Recheck All</button>
+        </div>
+        <ul id="checklist" class="checklist"></ul>
       </div>
 
       <!-- Configuration (collapsible) -->

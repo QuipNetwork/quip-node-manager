@@ -501,8 +501,10 @@ fn start_log_tail(
     stop_flag: Arc<Mutex<bool>>,
 ) {
     use crate::log_stream::{start_log_stream_for_app, FallbackSource};
+    // Native path has no `docker logs` child, so the PID slot goes unused.
+    let child_pid = Arc::new(Mutex::new(None));
     let fallback = FallbackSource::File(node_output_log_path());
-    start_log_stream_for_app(app, stop_flag, fallback);
+    start_log_stream_for_app(app, stop_flag, child_pid, fallback);
 }
 
 /// Start tailing native node logs (for orphan reconnect on app restart).
@@ -517,28 +519,91 @@ pub async fn start_native_log_tail(
     Ok(())
 }
 
+/// Outer deadline for the native stop path. `kill_pid` itself takes ~2s
+/// (SIGTERM → sleep → SIGKILL on Unix) so 5s gives real escalation room
+/// without letting a stuck process block the UI forever.
+const NATIVE_STOP_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Stop the native node process with verify + auto-recheck.
+///
+/// Mirrors the Docker stop path: emits stop-started/complete events,
+/// verifies the process is actually gone via `kill(pid, 0)`, enforces an
+/// outer deadline so a stuck `child.wait()` can't hang the UI, and fires
+/// a follow-on recheck of binary+version on success.
 #[tauri::command]
 pub async fn stop_native_node(
+    app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
+    let _ = app.emit("stop-started", serde_json::json!({}));
     *state.stop_flag.lock().unwrap() = true;
 
-    let mut guard = state.child.lock().unwrap();
-    if let Some(ref mut child) = *guard {
-        // Kill the entire process group
-        kill_pid(child.id());
-        let _ = child.wait();
-    }
-    *guard = None;
-    drop(guard);
+    // Snapshot PIDs we need to kill. Drops the guards before awaiting.
+    let (child_pid, child_opt) = {
+        let mut guard = state.child.lock().unwrap();
+        let pid = guard.as_ref().map(|c| c.id());
+        (pid, guard.take())
+    };
+    let orphan_pid = read_pid().filter(|pid| {
+        child_pid.map(|cp| cp != *pid).unwrap_or(true) && is_process_alive(*pid)
+    });
 
-    // Also kill any orphan process group from a previous session
-    if let Some(pid) = read_pid() {
-        if is_process_alive(pid) {
-            kill_pid(pid);
-        }
-    }
+    // Do the blocking kill work in a bounded thread so the async runtime
+    // stays responsive and we can time out cleanly.
+    let kill_result = tokio::time::timeout(
+        NATIVE_STOP_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            if let Some(pid) = child_pid {
+                kill_pid(pid);
+            }
+            if let Some(mut child) = child_opt {
+                let _ = child.wait();
+            }
+            if let Some(pid) = orphan_pid {
+                if is_process_alive(pid) {
+                    kill_pid(pid);
+                }
+            }
+        }),
+    )
+    .await;
+
     remove_pid();
+
+    let timed_out = kill_result.is_err();
+    let still_alive = child_pid
+        .map(is_process_alive)
+        .unwrap_or(false)
+        || orphan_pid.map(is_process_alive).unwrap_or(false);
+
+    if timed_out || still_alive {
+        let msg = if timed_out {
+            "native stop exceeded deadline — process may still be running"
+        } else {
+            "native process still alive after SIGKILL — manual kill required"
+        };
+        let _ = app.emit(
+            "stop-complete",
+            serde_json::json!({ "success": false, "error": msg }),
+        );
+        return Err(msg.to_string());
+    }
+
+    let _ = app.emit(
+        "stop-complete",
+        serde_json::json!({ "success": true }),
+    );
+
+    let rc_app = app.clone();
+    tokio::spawn(async move {
+        crate::checklist::trigger_recheck_auto(
+            rc_app,
+            vec!["binary".into(), "version".into()],
+        )
+        .await;
+    });
+
     Ok(())
 }
 
