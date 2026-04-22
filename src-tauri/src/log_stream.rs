@@ -185,8 +185,22 @@ fn stream_with_fallback<F>(
     let log_path = node_log_path();
     let emit = Arc::new(emit);
 
-    // If node.log already exists and has content, skip the fallback
-    if log_path.exists() {
+    // node.log is only valid for Phase 2 if it was written during this
+    // streamer's lifetime — otherwise it's leftover from a previous run
+    // with different settings (e.g. an old node_log = "..." config) and
+    // backfilling it would flood the UI with days-old content. Compare
+    // against stream start so the file has to have been touched by the
+    // current process to count.
+    let stream_start = std::time::SystemTime::now();
+    let is_current = |path: &std::path::Path| -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime >= stream_start)
+            .unwrap_or(false)
+    };
+
+    // Fast-path: node.log already being actively written when we started
+    if is_current(&log_path) {
         if let Ok(meta) = std::fs::metadata(&log_path) {
             if meta.len() > 0 {
                 tail_file(&log_path, &stop, &*emit);
@@ -268,10 +282,11 @@ fn stream_with_fallback<F>(
         }
     });
 
-    // Poll for node.log to appear with content
+    // Poll for node.log to be touched by the current run. A stale file
+    // from a previous session (mtime before stream_start) is ignored.
     loop {
         if *stop.lock().unwrap() { break; }
-        if log_path.exists() {
+        if is_current(&log_path) {
             if let Ok(meta) = std::fs::metadata(&log_path) {
                 if meta.len() > 0 { break; }
             }
