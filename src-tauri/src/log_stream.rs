@@ -229,12 +229,17 @@ fn stream_with_fallback<F>(
     let log_path = node_log_path();
     let emit = Arc::new(emit);
 
-    // node.log is only valid for Phase 2 when the user has asked the
-    // node to write it (node_log configured) AND the file has been
-    // touched during this streamer's lifetime. The mtime guard protects
-    // against stale files from prior runs with different settings; the
-    // config guard avoids spinning a poll loop for a file nothing in
-    // this run will ever write.
+    // node.log is only valid for Phase 2 if it was written during this
+    // streamer's lifetime — otherwise it's leftover from a previous run
+    // (e.g. an old node_log config) and backfilling it would flood the
+    // UI with days-old content. Compare against stream start so the
+    // file has to have been touched by the current process to count.
+    //
+    // This intentionally does *not* gate on `node_log` being set in
+    // settings: the binary may write to ~/quip-data/node.log via its own
+    // default even when the TOML field is omitted, and in that case we
+    // still want Phase 2 to engage so the UI sees the real log stream
+    // instead of an empty stdout capture.
     let stream_start = std::time::SystemTime::now();
     let is_current = |path: &std::path::Path| -> bool {
         std::fs::metadata(path)
@@ -242,11 +247,9 @@ fn stream_with_fallback<F>(
             .map(|mtime| mtime >= stream_start)
             .unwrap_or(false)
     };
-    let node_log_active =
-        !crate::settings::load_settings().node_config.node_log.is_empty();
 
     // Fast-path: node.log already being actively written when we started
-    if node_log_active && is_current(&log_path) {
+    if is_current(&log_path) {
         if let Ok(meta) = std::fs::metadata(&log_path) {
             if meta.len() > 0 {
                 tail_file(&log_path, &stop, &*emit);
@@ -331,32 +334,28 @@ fn stream_with_fallback<F>(
         }
     });
 
-    // Poll for node.log to be touched by the current run, but only when
-    // the user has configured `node_log` — otherwise nothing in this run
-    // will write to it and the fallback is the source of truth.
-    if node_log_active {
-        loop {
-            if *stop.lock().unwrap() { break; }
-            if is_current(&log_path) {
-                if let Ok(meta) = std::fs::metadata(&log_path) {
-                    if meta.len() > 0 { break; }
-                }
+    // Poll for node.log to be touched by the current run. A stale file
+    // from a previous session (mtime before stream_start) is ignored,
+    // so this loop naturally stays in fallback mode when nothing in
+    // this run writes to node.log.
+    loop {
+        if *stop.lock().unwrap() { break; }
+        if is_current(&log_path) {
+            if let Ok(meta) = std::fs::metadata(&log_path) {
+                if meta.len() > 0 { break; }
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-
-        // Signal fallback to stop and wait for it
-        *fallback_stop.lock().unwrap() = true;
-        let _ = fallback_handle.join();
-
-        if *stop.lock().unwrap() { return; }
-
-        // Phase 2: tail node.log
-        tail_file(&log_path, &stop, &*emit);
-    } else {
-        // No node_log configured — stay on the fallback source until stop.
-        let _ = fallback_handle.join();
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+
+    // Signal fallback to stop and wait for it
+    *fallback_stop.lock().unwrap() = true;
+    let _ = fallback_handle.join();
+
+    if *stop.lock().unwrap() { return; }
+
+    // Phase 2: tail node.log
+    tail_file(&log_path, &stop, &*emit);
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
