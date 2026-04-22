@@ -125,9 +125,11 @@ pub async fn start_node_container(
     // Always pull latest image before starting (cache-bust :latest)
     pull_node_image(app.clone(), image_tag.clone()).await?;
 
-    let home =
-        dirs::home_dir().ok_or("cannot determine home directory")?;
-    let data_dir = home.join("quip-data");
+    // Honor the user's custom storage directory (bootstrap.json).
+    // Ensure it exists before Docker tries to bind-mount it, otherwise
+    // the daemon silently creates a root-owned directory on the host.
+    crate::settings::ensure_data_dir()?;
+    let data_dir = crate::settings::data_dir();
     let data_mount = format!("{}:/data", data_dir.display());
     let image = format!("{}:latest", image_for_tag(&image_tag));
 
