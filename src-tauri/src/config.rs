@@ -125,9 +125,17 @@ fn render_config_toml(
         config.telemetry_enabled
     ));
     if config.telemetry_enabled {
+        // In Docker the node process runs with cwd=/app as a non-root user,
+        // so a relative path like "telemetry" resolves to /app/telemetry
+        // which isn't writable. Force an absolute path under /data.
+        let telemetry_dir = if is_docker {
+            "/data/telemetry".to_string()
+        } else {
+            config.telemetry_dir.clone()
+        };
         out.push_str(&format!(
             "telemetry_dir = \"{}\"\n",
-            config.telemetry_dir
+            telemetry_dir
         ));
     }
     out.push('\n');
