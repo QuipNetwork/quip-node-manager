@@ -229,8 +229,14 @@ fn stream_with_fallback<F>(
     let log_path = node_log_path();
     let emit = Arc::new(emit);
 
-    // If node.log already exists and has content, skip the fallback
-    if log_path.exists() {
+    // Only consider ~/quip-data/node.log a valid target when the user
+    // has explicitly configured `node_log` — otherwise a stale file from
+    // a prior session (when `node_log` was set) will silently hijack the
+    // tailer and hide the live stdout stream written to node-output.log.
+    let node_log_active =
+        !crate::settings::load_settings().node_config.node_log.is_empty();
+
+    if node_log_active && log_path.exists() {
         if let Ok(meta) = std::fs::metadata(&log_path) {
             if meta.len() > 0 {
                 tail_file(&log_path, &stop, &*emit);
@@ -315,25 +321,32 @@ fn stream_with_fallback<F>(
         }
     });
 
-    // Poll for node.log to appear with content
-    loop {
-        if *stop.lock().unwrap() { break; }
-        if log_path.exists() {
-            if let Ok(meta) = std::fs::metadata(&log_path) {
-                if meta.len() > 0 { break; }
+    // Poll for node.log to appear with content, but only if the user has
+    // configured `node_log` — otherwise we'd never see it get written and
+    // the fallback would still be the source of truth.
+    if node_log_active {
+        loop {
+            if *stop.lock().unwrap() { break; }
+            if log_path.exists() {
+                if let Ok(meta) = std::fs::metadata(&log_path) {
+                    if meta.len() > 0 { break; }
+                }
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Signal fallback to stop and wait for it
+        *fallback_stop.lock().unwrap() = true;
+        let _ = fallback_handle.join();
+
+        if *stop.lock().unwrap() { return; }
+
+        // Phase 2: tail node.log
+        tail_file(&log_path, &stop, &*emit);
+    } else {
+        // No node_log configured — stay on the fallback source until stop.
+        let _ = fallback_handle.join();
     }
-
-    // Signal fallback to stop and wait for it
-    *fallback_stop.lock().unwrap() = true;
-    let _ = fallback_handle.join();
-
-    if *stop.lock().unwrap() { return; }
-
-    // Phase 2: tail node.log
-    tail_file(&log_path, &stop, &*emit);
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -374,6 +387,14 @@ pub async fn start_log_stream(
     app: tauri::AppHandle,
     state: tauri::State<'_, LogStreamState>,
 ) -> Result<(), String> {
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": "INFO",
+            "message": "[log-stream] starting docker logs -f quip-node",
+        }),
+    );
     // Stop any existing streamer first, including killing its child.
     state.kill_child();
     *state.stop_flag.lock().unwrap() = true;

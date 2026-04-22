@@ -501,9 +501,18 @@ fn start_log_tail(
     stop_flag: Arc<Mutex<bool>>,
 ) {
     use crate::log_stream::{start_log_stream_for_app, FallbackSource};
+    let path = node_output_log_path();
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": "INFO",
+            "message": format!("[log-stream] tailing {}", path.display()),
+        }),
+    );
     // Native path has no `docker logs` child, so the PID slot goes unused.
     let child_pid = Arc::new(Mutex::new(None));
-    let fallback = FallbackSource::File(node_output_log_path());
+    let fallback = FallbackSource::File(path);
     start_log_stream_for_app(app, stop_flag, child_pid, fallback);
 }
 
@@ -513,6 +522,14 @@ pub async fn start_native_log_tail(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": "INFO",
+            "message": "[log-stream] starting native tail (node-output.log \u{2192} node.log)",
+        }),
+    );
     let stop_flag = Arc::clone(&state.stop_flag);
     *stop_flag.lock().unwrap() = false;
     start_log_tail(app, stop_flag);
