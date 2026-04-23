@@ -26,14 +26,29 @@ fn render_config_toml(
         ));
     }
     out.push_str(&format!("listen = \"{}\"\n", config.listen));
-    out.push_str(&format!("port = {}\n", config.port));
+    // Docker mode: the node always binds the container-internal port (20049)
+    // and compose remaps the host side. Native mode: the node binds whatever
+    // the user configured, since there's no container in between.
+    let bind_port = if is_docker { 20049 } else { config.port };
+    out.push_str(&format!("port = {}\n", bind_port));
     if !config.public_host.is_empty() {
         out.push_str(&format!(
             "public_host = \"{}\"\n",
             config.public_host
         ));
     }
-    if let Some(pp) = config.public_port {
+    // public_port tells peers which port to dial back on. Explicit user
+    // value wins; otherwise, in Docker mode, announce the user-facing port
+    // whenever it differs from the internal bind (i.e. the host side of the
+    // publish has been remapped).
+    let effective_public_port = config.public_port.or_else(|| {
+        if bind_port != config.port {
+            Some(config.port)
+        } else {
+            None
+        }
+    });
+    if let Some(pp) = effective_public_port {
         out.push_str(&format!("public_port = {}\n", pp));
     }
     if !config.secret.is_empty() {
