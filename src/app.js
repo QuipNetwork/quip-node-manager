@@ -93,20 +93,24 @@ function refreshDashboardTab() {
   // would otherwise override `hidden` and keep both elements visible.
   const show = (el, display) => { el.style.display = display; };
 
+  // Compare against the raw content attribute, not the IDL `frame.src`
+  // getter — the latter returns the URL-normalized form (trailing slash
+  // appended to `http://host:port`) and would differ from our computed
+  // string on every tick, reloading the iframe and resetting the user's
+  // place on the page.
+  const currentSrc = frame.getAttribute('src');
   if (!url) {
     if (msg) msg.textContent = 'Dashboard disabled — enable it in the Status tab.';
     show(empty, 'flex');
     show(frame, 'none');
-    if (frame.src !== 'about:blank') frame.src = 'about:blank';
+    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
   } else if (!dashRunning) {
     if (msg) msg.textContent = 'Starting dashboard…';
     show(empty, 'flex');
     show(frame, 'none');
-    if (frame.src !== 'about:blank') frame.src = 'about:blank';
+    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
   } else {
-    // Only reload the iframe when the URL actually changes — prevents
-    // flicker on every poll tick.
-    if (frame.src !== url) frame.src = url;
+    if (currentSrc !== url) frame.src = url;
     show(empty, 'none');
     show(frame, 'block');
   }
