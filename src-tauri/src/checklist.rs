@@ -141,6 +141,10 @@ pub struct CheckCtx {
     pub has_dwave_config: bool,
     /// `true` iff the [dwave] block has a non-empty token.
     pub dwave_token_set: bool,
+    /// AppHandle for emitting diagnostic log lines (e.g. raw responses from
+    /// check.quip.network). `None` when the ctx is constructed from a
+    /// non-Tauri caller like the TUI — probes then run silently.
+    pub app: Option<AppHandle>,
     public_ip: OnceCell<Option<String>>,
     /// `true` iff `docker compose ps` reports any service as running — our
     /// own stack legitimately holds ports 20080 / 80 / 443 in that case, so
@@ -149,7 +153,7 @@ pub struct CheckCtx {
 }
 
 impl CheckCtx {
-    fn from_settings() -> Self {
+    fn from_settings(app: Option<AppHandle>) -> Self {
         let settings = crate::settings::load_settings();
         let native_rest_port =
             crate::compose::native_rest_port(&settings.node_config);
@@ -170,9 +174,23 @@ impl CheckCtx {
             native_rest_port,
             has_dwave_config,
             dwave_token_set,
+            app,
             public_ip: OnceCell::new(),
             stack_running: OnceCell::new(),
         }
+    }
+
+    /// Emit a diagnostic log line to the `node-log` event so users see the
+    /// probe details in the app's console drawer. No-op when `app` is None
+    /// (TUI / tests).
+    fn log_probe(&self, level: &str, message: impl Into<String>) {
+        let Some(app) = &self.app else { return };
+        let entry = serde_json::json!({
+            "timestamp": "",
+            "level": level,
+            "message": format!("[probe] {}", message.into()),
+        });
+        let _ = app.emit("node-log", entry);
     }
 
     /// Memoised public-IP fetch. First caller pays the network cost;
@@ -343,57 +361,252 @@ async fn fetch_ip_ipify() -> Option<String> {
     if ip.is_empty() { None } else { Some(ip) }
 }
 
-/// Port forwarding check. Tries hairpin NAT first (fast when router supports
-/// it), then falls back to asking check.quip.network to probe us from outside.
-pub async fn probe_port_forwarding(port: u16, public_ip: Option<String>) -> bool {
-    let ip = match public_ip {
-        Some(ip) => ip,
-        None => return false,
-    };
-    if probe_hairpin(port, &ip).await {
-        return true;
-    }
-    probe_external(port).await
+/// Outcome of `probe_port_forwarding`. The probe picks between a TCP
+/// forward check and a full QUIC handshake check based on whether the
+/// node is already bound to the port — that determines what we can
+/// actually verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortProbeResult {
+    /// Node is running and a full QUIC/QUIP handshake completed over UDP.
+    /// End-to-end reachability is verified.
+    Verified,
+    /// Node is running but the QUIC handshake failed. UDP is likely not
+    /// forwarded, a firewall is blocking it, or the node isn't speaking
+    /// QUIP correctly.
+    QuicHandshakeFailed,
+    /// Node isn't running; the router is forwarding TCP to this host
+    /// (verified via a temp listener). Once the node starts, a recheck
+    /// should escalate this to `Verified`.
+    ForwardReady,
+    /// Node isn't running and TCP forwarding doesn't work either. The
+    /// router isn't reflecting traffic to this host or a firewall is
+    /// dropping it.
+    Unreachable,
+    /// check.quip.network rate-limited the request. We can't verify right
+    /// now but the port may well be fine — treat as passing until the
+    /// cool-down expires and a real recheck can run.
+    RateLimited {
+        /// Seconds until the ban is expected to lift, per the service's
+        /// `retry_after_seconds` field.
+        retry_after_secs: u64,
+        /// Which endpoint got limited: "checkport" or "checkconn".
+        endpoint: &'static str,
+    },
 }
 
-async fn probe_hairpin(port: u16, public_ip: &str) -> bool {
-    use tokio::net::{TcpListener, TcpStream};
-
-    let addr = format!("{}:{}", public_ip, port);
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.ok();
-
-    if let Some(listener) = listener {
-        let connect_fut =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr));
-        let accept_fut =
-            tokio::time::timeout(Duration::from_secs(6), listener.accept());
-        let (conn, acc) = tokio::join!(connect_fut, accept_fut);
-        conn.map(|r| r.is_ok()).unwrap_or(false)
-            && acc.map(|r| r.is_ok()).unwrap_or(false)
-    } else {
-        // Port in use (node running) — just attempt outbound connect.
+impl PortProbeResult {
+    pub fn is_externally_reachable(self) -> bool {
         matches!(
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await,
-            Ok(Ok(_))
+            self,
+            Self::Verified | Self::ForwardReady | Self::RateLimited { .. }
         )
     }
 }
 
-async fn probe_external(port: u16) -> bool {
-    let client = match make_client(10) {
-        Some(c) => c,
-        None => return false,
+/// Result of a single call to `/checkport` or `/checkconn`. Distinguishes
+/// "no response from the host at all" (definitive fail) from "host
+/// responded, just not as expected" (router forwards — pass) and from
+/// service-side errors we shouldn't blame the user for.
+enum ProbeOutcome {
+    /// Service returned success-key=true OR success-key=false with an
+    /// error indicating the host *did* respond (protocol-level mismatch,
+    /// RST, handshake succeeded but status response missing, etc.). From
+    /// the router-forwarding perspective these are all passing cases.
+    HostResponded,
+    /// Service returned success-key=false AND the error indicates no
+    /// response at the UDP/TCP layer (timeout, unreachable, no route).
+    Timeout,
+    /// HTTP 429 with `retry_after_seconds`. We can't verify right now,
+    /// so we optimistically pass but preserve the retry time for the UX.
+    RateLimited(u64),
+    /// Any other failure — HTTP 5xx, non-JSON body, client-side network
+    /// error. Treated as lenient-pass (not the user's fault).
+    ServiceError,
+}
+
+/// Classify an `error` string from check.quip.network as a pure
+/// connect-level timeout (no response from the host) vs any other kind
+/// of failure (host responded, just not with a full protocol success).
+///
+/// Conservative heuristic — when in doubt, treat as responded. That
+/// matches the "only failure to connect is a fail" rule.
+fn is_connect_timeout(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("unreachable")
+        || lower.contains("no route")
+}
+
+/// Port forwarding check. One probe runs, not two:
+///
+///   - If something is already bound to `port` locally (i.e. we can't
+///     `TcpListener::bind` it), the node is presumably running — so we
+///     ask `check.quip.network/checkconn` to do a real QUIP handshake.
+///     A pass there proves UDP forwarding + node health end-to-end.
+///
+///   - If the port is free, the node isn't running and a QUIC handshake
+///     can't possibly succeed. We instead verify the TCP forward by
+///     holding a temp listener for the duration of `/checkport`. Users
+///     can click Recheck after starting the node to escalate to the
+///     QUIC verification path.
+/// GUI-facing entry point. `ctx.app` is used to emit the full check.quip.network
+/// request URL, HTTP status, and response body into `node-log` so users can
+/// copy/paste the raw output when asking for support.
+async fn probe_port_forwarding_with_ctx(
+    ctx: &CheckCtx,
+    port: u16,
+) -> PortProbeResult {
+    use tokio::net::TcpListener;
+
+    match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        Err(e) => {
+            ctx.log_probe(
+                "INFO",
+                format!(
+                    "port {} in use locally ({}) \u{2014} assuming node is up; using QUIC probe",
+                    port, e
+                ),
+            );
+            match probe_external_quic(ctx, port).await {
+                ProbeOutcome::HostResponded => PortProbeResult::Verified,
+                ProbeOutcome::Timeout => PortProbeResult::QuicHandshakeFailed,
+                ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
+                    retry_after_secs: retry,
+                    endpoint: "checkconn",
+                },
+                // Lenient-pass on service error: we can't blame the user
+                // when check.quip.network is down, misbehaving, or
+                // unreachable from our end. The port is locally bound,
+                // which is the best signal we have.
+                ProbeOutcome::ServiceError => PortProbeResult::Verified,
+            }
+        }
+        Ok(listener) => {
+            ctx.log_probe(
+                "INFO",
+                format!(
+                    "port {} is free locally \u{2014} holding temp listener, using TCP probe",
+                    port
+                ),
+            );
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    if listener.accept().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let outcome = probe_external_tcp(ctx, port).await;
+            accept_task.abort();
+            match outcome {
+                ProbeOutcome::HostResponded => PortProbeResult::ForwardReady,
+                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
+                ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
+                    retry_after_secs: retry,
+                    endpoint: "checkport",
+                },
+                // Lenient-pass on service error — no connectivity signal
+                // either way when check.quip.network isn't cooperating.
+                ProbeOutcome::ServiceError => PortProbeResult::ForwardReady,
+            }
+        }
+    }
+}
+
+/// Plain wrapper for callers without a `CheckCtx` (TUI). Runs silently.
+pub async fn probe_port_forwarding(port: u16) -> PortProbeResult {
+    let ctx = CheckCtx::from_settings(None);
+    probe_port_forwarding_with_ctx(&ctx, port).await
+}
+
+async fn probe_external_quic(ctx: &CheckCtx, port: u16) -> ProbeOutcome {
+    fetch_probe_json(ctx, "checkconn", port, "quip", 15).await
+}
+
+async fn probe_external_tcp(ctx: &CheckCtx, port: u16) -> ProbeOutcome {
+    fetch_probe_json(ctx, "checkport", port, "reachable", 10).await
+}
+
+/// Shared HTTP fetcher for `/checkport` and `/checkconn`. Every step
+/// (URL, network error, HTTP status, response body) is emitted to
+/// `node-log` via `ctx.log_probe` so users can see service-side errors
+/// like `"handshake timeout"`, `"alpn mismatch"`, or `"connection refused"`
+/// without having to reproduce the request by hand.
+///
+/// Classifies the result into `ProbeOutcome` — callers use that to
+/// decide which `PortProbeResult` variant to surface.
+async fn fetch_probe_json(
+    ctx: &CheckCtx,
+    endpoint: &str,
+    port: u16,
+    success_key: &str,
+    timeout_secs: u64,
+) -> ProbeOutcome {
+    let url = format!("{}/{}?port={}", CHECK_SERVICE, endpoint, port);
+    ctx.log_probe("INFO", format!("GET {}", url));
+
+    let Some(client) = make_client(timeout_secs) else {
+        ctx.log_probe("ERROR", format!("{}: failed to build HTTP client", endpoint));
+        return ProbeOutcome::ServiceError;
     };
-    let url = format!("{}/checkport?port={}", CHECK_SERVICE, port);
+
     let resp = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return false,
+        Ok(r) => r,
+        Err(e) => {
+            ctx.log_probe(
+                "ERROR",
+                format!("{}: network error talking to check.quip.network: {}", endpoint, e),
+            );
+            return ProbeOutcome::ServiceError;
+        }
     };
-    let json: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return false,
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<body read error: {}>", e));
+    let body_for_log = if body.len() > 1024 {
+        format!("{}\u{2026}(truncated, {} bytes total)", &body[..1024], body.len())
+    } else {
+        body.clone()
     };
-    json["reachable"].as_bool().unwrap_or(false)
+    ctx.log_probe(
+        if status.is_success() { "INFO" } else { "ERROR" },
+        format!("{} \u{2192} HTTP {} {}", endpoint, status.as_u16(), body_for_log),
+    );
+
+    if status.as_u16() == 429 {
+        let retry = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|j| j.get("retry_after_seconds").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        return ProbeOutcome::RateLimited(retry);
+    }
+    if !status.is_success() {
+        return ProbeOutcome::ServiceError;
+    }
+
+    let Ok(json) = serde_json::from_str::<Value>(&body) else {
+        return ProbeOutcome::ServiceError;
+    };
+    let success = json.get(success_key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if success {
+        return ProbeOutcome::HostResponded;
+    }
+    // success-key is false — classify by the error string. A pure connect
+    // timeout means the host didn't respond at all. Anything else (ALPN
+    // mismatch, RST, TLS error, banner timeout, etc.) means the host IS
+    // reachable at the transport layer, so the router forward is working.
+    let error_str = json
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if is_connect_timeout(error_str) {
+        ProbeOutcome::Timeout
+    } else {
+        ProbeOutcome::HostResponded
+    }
 }
 
 async fn check_hostname_dns(hostname: &str) -> Option<bool> {
@@ -795,19 +1008,40 @@ async fn run_check_hostname(ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port", ctx);
-    let ip_opt = ctx.public_ip().await;
     let port = ctx.port;
-    let ok = probe_port_forwarding(port, ip_opt).await;
-    let (state, label) = if ok {
-        (
+    let (state, label) = match probe_port_forwarding_with_ctx(ctx, port).await {
+        PortProbeResult::Verified => (
             CheckState::Pass,
-            format!("Port {} forwarded (ensure both UDP+TCP on router)", port),
-        )
-    } else {
-        (
+            format!("Port {} verified (host responded)", port),
+        ),
+        PortProbeResult::QuicHandshakeFailed => (
             CheckState::Warn,
-            format!("Port {} not reachable \u{2014} forward UDP+TCP on router", port),
-        )
+            format!(
+                "Port {} node is running but UDP/QUIC timed out \u{2014} check UDP forward + firewall",
+                port
+            ),
+        ),
+        PortProbeResult::ForwardReady => (
+            CheckState::Pass,
+            format!(
+                "Port {} TCP forward ready \u{2014} start the node and recheck to verify QUIC",
+                port
+            ),
+        ),
+        PortProbeResult::Unreachable => (
+            CheckState::Warn,
+            format!(
+                "Port {} not reachable \u{2014} check router forward + firewall",
+                port
+            ),
+        ),
+        PortProbeResult::RateLimited { retry_after_secs, endpoint } => (
+            CheckState::Pass,
+            format!(
+                "Port {} (couldn't verify: rate-limited by check.quip.network via /{} \u{2014} retry in {}s)",
+                port, endpoint, retry_after_secs
+            ),
+        ),
     };
     base.with_state(state).with_label(label)
 }
@@ -1040,7 +1274,7 @@ async fn seed_cache(state: &ChecklistState, ctx: &CheckCtx) {
 /// `trigger_recheck_auto` helper used by docker/native action handlers.
 async fn run_recheck(app: AppHandle, ids: Option<Vec<String>>, auto: bool) -> Result<(), String> {
     let state: tauri::State<'_, ChecklistState> = app.state();
-    let ctx = Arc::new(CheckCtx::from_settings());
+    let ctx = Arc::new(CheckCtx::from_settings(Some(app.clone())));
 
     let ids = match ids {
         Some(ids) if !ids.is_empty() => ids,
@@ -1075,7 +1309,7 @@ pub async fn get_checklist(
     state: tauri::State<'_, ChecklistState>,
 ) -> Result<Vec<CheckItem>, String> {
     let cache = state.cache.lock().await;
-    let ctx = CheckCtx::from_settings();
+    let ctx = CheckCtx::from_settings(None);
     let ids = visible_ids(&ctx);
     Ok(ids
         .into_iter()
@@ -1129,6 +1363,7 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         native_rest_port,
         has_dwave_config,
         dwave_token_set,
+        app: None,
         public_ip: OnceCell::new(),
         stack_running: OnceCell::new(),
     };
@@ -1139,8 +1374,8 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     results
 }
 
-/// Convenience for TUI port-only recheck: fetches the public IP internally.
+/// Convenience for TUI port-only recheck. Returns a plain bool since the
+/// TUI doesn't render the richer four-state diagnostic the GUI uses.
 pub async fn probe_port_forwarding_with_default_ip(port: u16) -> bool {
-    let ip = fetch_public_ip().await;
-    probe_port_forwarding(port, ip).await
+    probe_port_forwarding(port).await.is_externally_reachable()
 }
