@@ -130,10 +130,14 @@ pub fn compose_services(
 
 // ── Native REST port ───────────────────────────────────────────────────────
 
-/// Port the native node exposes for the dashboard to poll when Native +
-/// dashboard is enabled. Uses the user-configured `rest_insecure_port` if
-/// positive, otherwise a sensible default. Dashboard reaches this via
-/// `host.docker.internal:<port>` from inside the container.
+/// Port the node exposes for the dashboard to poll. Used for both modes:
+///   - Native + dashboard: host binds `127.0.0.1:<port>`; dashboard reaches
+///     it via `host.docker.internal:<port>` from inside the container.
+///   - Docker + dashboard: node container binds `0.0.0.0:<port>`; dashboard
+///     reaches it via the `quip-node` compose network alias.
+/// Honors the user-configured `rest_insecure_port` when set; otherwise falls
+/// back to 20100 (non-privileged — the containerized node runs as the host
+/// PUID, so ports <1024 are out of reach without capabilities).
 pub fn native_rest_port(cfg: &NodeConfig) -> u16 {
     if cfg.rest_insecure_port > 0 {
         cfg.rest_insecure_port as u16
@@ -193,14 +197,19 @@ fn write_env_file(settings: &AppSettings) -> Result<(), String> {
         format!("POSTGRES_PASSWORD={pg_password}"),
     ];
 
-    // Native mode: dashboard polls the host-bound native binary rather than
-    // the compose network alias. host.docker.internal is Docker Desktop's
-    // magic DNS name that resolves to the host from inside containers.
-    if settings.run_mode == RunMode::Native {
+    // Point the dashboard at the node's REST endpoint. The compose default
+    // is `http://quip-node:80`, but port 80 would require the containerized
+    // node to run as root. Override to a non-privileged port that we also
+    // force on the node side below.
+    //   - Native : host-bound binary reached via host.docker.internal
+    //   - Docker : node container reached via the `quip-node` compose alias
+    if settings.dashboard_enabled {
         let port = native_rest_port(&settings.node_config);
-        lines.push(format!(
-            "QUIP_NODE_URL=http://host.docker.internal:{port}"
-        ));
+        let host = match settings.run_mode {
+            RunMode::Native => "host.docker.internal",
+            RunMode::Docker => "quip-node",
+        };
+        lines.push(format!("QUIP_NODE_URL=http://{host}:{port}"));
     }
 
     let path = stack_project_dir().join(".env");
@@ -435,17 +444,27 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // (3) Native + dashboard: bind REST on loopback only. Docker Desktop's
-    // vpnkit proxies host.docker.internal requests from containers through
-    // to the host's 127.0.0.1, so 0.0.0.0 isn't needed — and 127.0.0.1
-    // avoids leaking this unauthenticated admin port onto the LAN. This
-    // relies on Docker Desktop (macOS/Windows) behaviour; Linux Docker CE
-    // would need a bridge-interface bind + --add-host instead, but Native
-    // mode is macOS-only (see settings.rs).
+    // (3) Force REST on whenever the dashboard is enabled — it's how the
+    // dashboard polls telemetry. The default NodeConfig has REST disabled
+    // (rest_insecure_port = -1), so without this override the dashboard
+    // silently can't reach the node.
+    //   - Native : bind 127.0.0.1. Docker Desktop's vpnkit proxies
+    //              host.docker.internal to the host's loopback, so 0.0.0.0
+    //              isn't needed — and 127.0.0.1 avoids leaking this
+    //              unauthenticated admin port onto the LAN. (Native mode is
+    //              macOS-only; Linux Docker CE would need a different bind.)
+    //   - Docker : bind 0.0.0.0 inside the container so the dashboard can
+    //              reach it across the compose network via the `quip-node`
+    //              alias. The port isn't published to the host, so LAN
+    //              exposure isn't a concern.
     // We mutate the in-memory copy only — app-settings.json on disk is
     // untouched.
-    if settings.run_mode == RunMode::Native && settings.dashboard_enabled {
-        settings.node_config.rest_host = "127.0.0.1".to_string();
+    if settings.dashboard_enabled {
+        let bind = match settings.run_mode {
+            RunMode::Native => "127.0.0.1",
+            RunMode::Docker => "0.0.0.0",
+        };
+        settings.node_config.rest_host = bind.to_string();
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
 
