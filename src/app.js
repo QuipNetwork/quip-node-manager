@@ -6,9 +6,13 @@ const invoke =
   (() => Promise.reject('Tauri not available'));
 const listen =
   window.__TAURI__?.event?.listen ?? (() => Promise.resolve(() => {}));
-const openUrl =
-  window.__TAURI__?.opener?.openUrl ??
-  ((url) => { window.open(url, '_blank'); });
+// Route external URLs through the tauri-plugin-opener Rust command.
+// window.__TAURI__.opener.openUrl only exists if the plugin's JS wrapper
+// is bundled into the frontend (we ship raw JS, so it isn't). invoke()
+// goes straight to the Rust side, which shells out to `open(1)` / etc.
+const openUrl = (url) =>
+  invoke('plugin:opener|open_url', { url })
+    .catch((e) => console.error('openUrl failed:', e));
 
 // App state
 const state = {
