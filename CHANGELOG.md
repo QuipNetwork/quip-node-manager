@@ -53,7 +53,7 @@ Click **More info**, then **Run anyway**.
 
 ---
 
-## v0.2
+## v0.1.1
 
 ### New Features
 
