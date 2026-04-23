@@ -10,7 +10,18 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, ContainerStatus, DwaveConfig, RunMode};
+use crate::settings::{AppSettings, DwaveConfig, RunMode};
+
+// Legacy single-container status used by the TUI's inline `docker run` flow.
+// The TUI is a fallback for the GUI and doesn't yet drive the compose stack;
+// the GUI's StackStatus replaced this shape for Tauri-facing callers.
+#[derive(Clone, Debug)]
+pub struct ContainerStatus {
+    pub running: bool,
+    pub container_id: Option<String>,
+    pub image: String,
+    pub status_text: String,
+}
 
 // ─── Focus IDs ────────────────────────────────────────────────────────────────
 
@@ -119,7 +130,7 @@ pub struct FormState {
     pub http_log: String,
     pub auto_update: bool,
     // Image selector
-    pub image_tag: String, // "cpu" or "cuda"
+    pub image_tag: crate::settings::ImageTag,
     /// Temporary buffer used while editing a text field.
     pub edit_buf: String,
 }
@@ -171,7 +182,7 @@ impl FormState {
             node_log: nc.node_log.clone(),
             http_log: nc.http_log.clone(),
             auto_update: s.auto_update_enabled,
-            image_tag: s.image_tag.clone(),
+            image_tag: s.image_tag,
             edit_buf: String::new(),
         }
     }
@@ -553,11 +564,11 @@ impl TuiApp {
         let data_mount = format!("{}:/data", data_dir.display());
         let image = format!(
             "{}:latest",
-            crate::docker::image_for_tag(&self.settings.image_tag)
+            crate::compose::image_for_tag(self.settings.image_tag)
         );
 
         let quip_mode = if config.gpu_device_configs.iter().any(|d| d.enabled)
-            && self.settings.image_tag == "cuda"
+            && self.settings.image_tag == crate::settings::ImageTag::Cuda
         {
             "gpu"
         } else {
@@ -681,7 +692,7 @@ impl TuiApp {
     fn apply_and_restart(&mut self) {
         let config = self.form.to_node_config(&self.settings.node_config);
         self.settings.node_config = config;
-        self.settings.image_tag = self.form.image_tag.clone();
+        self.settings.image_tag = self.form.image_tag;
         self.settings.run_mode = self.form.run_mode();
         self.settings.auto_update_enabled = self.form.auto_update;
         if let Err(e) = crate::settings::save_settings(&self.settings) {

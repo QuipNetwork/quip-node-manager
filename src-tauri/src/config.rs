@@ -148,56 +148,74 @@ fn render_config_toml(
     // ── GPU sections ────────────────────────────────────────────────────
     // [gpu] holds global defaults inherited by every backend section
     // ([cuda.N], [metal], [modal]). See quip-protocol/quip-node.example.toml.
+    //
+    // Emission rules:
+    //   - A backend section is only written if the user has at least one
+    //     GPU device enabled. With zero devices enabled, emitting an
+    //     empty [metal] / [modal] still activates that backend in the
+    //     node — which then fails to build its (zero) miners.
+    //   - Metal is unavailable in Linux containers regardless of what
+    //     the Mac host reports. In Docker mode we suppress Mps.
     let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
         .gpu_device_configs
         .iter()
         .filter(|d| d.enabled)
         .collect();
 
-    let using_gpu_backend = matches!(
-        config.gpu_backend,
-        GpuBackend::Local | GpuBackend::Mps | GpuBackend::Modal
-    );
+    // Effective backend: Mps is clamped to "no backend" in Docker mode
+    // because the container is Linux and has no Metal access.
+    let effective_backend =
+        if is_docker && config.gpu_backend == GpuBackend::Mps {
+            None
+        } else {
+            Some(config.gpu_backend.clone())
+        };
+
     let (gpu_util, gpu_yield) = enabled_devices
         .first()
         .map(|d| (d.utilization, d.yielding))
         .unwrap_or((100, false));
 
-    if using_gpu_backend && !enabled_devices.is_empty() {
+    let emit_backend =
+        effective_backend.is_some() && !enabled_devices.is_empty();
+
+    if emit_backend {
         out.push_str("[gpu]\n");
         out.push_str(&format!("utilization = {}\n", gpu_util));
         out.push_str(&format!("yielding = {}\n", gpu_yield));
         out.push('\n');
     }
 
-    match config.gpu_backend {
-        GpuBackend::Local if !enabled_devices.is_empty() => {
-            for dev in &enabled_devices {
-                out.push_str(&format!("[cuda.{}]\n", dev.index));
-                if dev.utilization != gpu_util {
-                    out.push_str(&format!(
-                        "utilization = {}\n",
-                        dev.utilization
-                    ));
+    if emit_backend {
+        match effective_backend {
+            Some(GpuBackend::Local) => {
+                for dev in &enabled_devices {
+                    out.push_str(&format!("[cuda.{}]\n", dev.index));
+                    if dev.utilization != gpu_util {
+                        out.push_str(&format!(
+                            "utilization = {}\n",
+                            dev.utilization
+                        ));
+                    }
+                    if dev.yielding != gpu_yield {
+                        out.push_str(&format!(
+                            "yielding = {}\n",
+                            dev.yielding
+                        ));
+                    }
+                    out.push('\n');
                 }
-                if dev.yielding != gpu_yield {
-                    out.push_str(&format!(
-                        "yielding = {}\n",
-                        dev.yielding
-                    ));
-                }
+            }
+            Some(GpuBackend::Mps) => {
+                out.push_str("[metal]\n");
                 out.push('\n');
             }
+            Some(GpuBackend::Modal) => {
+                out.push_str("[modal]\n");
+                out.push('\n');
+            }
+            None => {}
         }
-        GpuBackend::Mps => {
-            out.push_str("[metal]\n");
-            out.push('\n');
-        }
-        GpuBackend::Modal => {
-            out.push_str("[modal]\n");
-            out.push('\n');
-        }
-        _ => {}
     }
 
     // ── [dwave] ─────────────────────────────────────────────────────────
@@ -236,8 +254,20 @@ pub fn write_config_toml(
 ) -> Result<(), String> {
     crate::settings::ensure_data_dir()?;
     let content = render_config_toml(config, run_mode);
-    fs::write(data_dir().join("config.toml"), content)
-        .map_err(|e| e.to_string())
+    // Docker mode: compose bind-mounts `./data:/data` (relative to the
+    // project-directory), so the container sees `/data/config.toml` as
+    // `<data_dir>/data/config.toml` on the host. Writing to the bare
+    // `<data_dir>/config.toml` (native's location) would land it outside
+    // the mount and the node would never read it — falling back to
+    // auto-detected defaults like `num_cpus = os.cpu_count()`.
+    let path = match run_mode {
+        RunMode::Docker => data_dir().join("data").join("config.toml"),
+        RunMode::Native => data_dir().join("config.toml"),
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(path, content).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

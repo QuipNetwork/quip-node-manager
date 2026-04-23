@@ -53,6 +53,43 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2
+
+### New Features
+
+- **Full compose stack**: replaces the single `docker run quip-node` path with `docker compose` orchestration of the upstream `nodes.quip.network` stack (node + dashboard + postgres, optional Caddy for TLS). Container names now match the reference (`quip-cpu` / `quip-cuda` / `quip-qpu`) with a `quip-node` network alias for dashboard discovery.
+- **Dashboard tab embedded**: the running dashboard container's UI is rendered in-app on the Dashboard tab via an iframe; URL derived from settings (plain HTTP on localhost, ACME HTTPS when a DNS hostname is configured).
+- **Stack Configuration panel**: dashboard toggle, TLS toggle, and TLS subsettings (hostname, ACME email, ZeroSSL key). Image type is auto-derived from GPU configuration — CUDA when any NVIDIA device is enabled, CPU otherwise. QPU mining rides on the CPU image via `[dwave]` config.
+- **Native mode hybrid** (macOS): native binary still runs the node on the host; the compose stack supplies dashboard + postgres (+ Caddy if TLS), wired to the host via `host.docker.internal` with a Caddyfile patched at stage time. Node REST binds 127.0.0.1 so the port isn't LAN-reachable.
+- **Multi-service status**: `get_stack_status` parses `docker compose ps` (both JSONL and JSON-array outputs) and reports per-service running/health state plus a rolled-up `Running | Degraded | Unhealthy | Stopped`.
+- **Multi-image update monitor**: per-image digest polling for the node image and the dashboard image; auto-update stops and restarts the stack as a unit.
+
+### Pre-flight checks
+
+Seven new profile-aware check items replace the old `image` / `port` checks:
+- `docker-compose` — Docker Compose v2+ plugin installed
+- `stack-assets` — compose.yml + Caddyfile staged in `~/quip-data/`
+- `stack-images` — all images the current profile needs are pulled
+- `port-dashboard` — TCP 20080 bindable (when dashboard on, TLS off)
+- `port-tls` — TCP 80 + 443 bindable (when TLS on)
+- `rest-port-native` — native REST port free on the host (Native + dashboard only)
+- `dwave-key` — D-Wave API token set when `[dwave]` is configured
+
+### Fixes
+
+- **Config.toml inside compose bind-mount**: `write_config_toml` now targets `~/quip-data/data/config.toml` in Docker mode so the node container sees it. Previously landed outside the `./data:/data` bind-mount, causing the node to fall back to `num_cpus = os.cpu_count()`.
+- **GPU backend gating**: `[metal]` / `[modal]` sections are only emitted when at least one GPU device is enabled, mirroring the `[cuda.N]` gating. Metal is also suppressed in Docker mode — it can't run in a Linux container.
+- **`confident_lehmann` rogue node**: `get_node_version` no longer runs `docker run --rm <image> --version` in Docker mode. The image entrypoint didn't exit on `--version`, so the anonymous container became a live node alongside the compose stack. `stop_stack` also sweeps orphan node-image runners after `docker compose down`.
+- **Stop Node reliability**: `stop_stack` force-removes each of the six declared container names (`quip-cpu`/`cuda`/`qpu`/`dashboard`/`postgres`/`caddy`) after `docker compose down` as a backstop for project-label mismatches.
+- **Docker Compose detection**: check now uses exit-status rather than string-matching `"Docker Compose version v2."`. Docker 29 ships Compose v5, which broke the previous parse.
+
+### Removals
+
+- `src-tauri/src/docker.rs` — deleted. All single-container orchestration is gone.
+- `ContainerStatus` no longer a shared type — TUI keeps a local copy for its inline docker-run fallback path.
+
+---
+
 ## v0.1
 
 ### Fixes

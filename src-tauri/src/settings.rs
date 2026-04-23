@@ -38,6 +38,34 @@ impl Default for GpuBackend {
     }
 }
 
+// ─── Image tag ──────────────────────────────────────────────────────────────
+
+/// Which node image flavour the compose stack should run. Maps 1:1 to
+/// compose `container_name`: Cpu → quip-cpu, Cuda → quip-cuda.
+///
+/// QPU is *not* a separate image — D-Wave mining activates via the
+/// `[dwave]` section in config.toml on top of the CPU image, so the
+/// operator's choice reduces to "do I have an NVIDIA GPU or not".
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageTag {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+impl ImageTag {
+    /// Compose service name (= container_name sans `quip-` prefix).
+    pub fn service(&self) -> &'static str {
+        match self {
+            ImageTag::Cpu => "cpu",
+            ImageTag::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GpuDeviceConfig {
     pub index: u32,
@@ -238,12 +266,45 @@ impl Default for NodeConfig {
 
 // ─── App settings ───────────────────────────────────────────────────────────
 
+fn default_true() -> bool { true }
+fn default_dashboard_hostname() -> String {
+    "localhost:20080".to_string()
+}
+
+/// Accept the old `"qpu"` string (briefly shipped to users) as an alias for
+/// Cpu, so app-settings.json files from that window still load cleanly.
+/// Without this, the outer `unwrap_or_default()` in `load_settings` would
+/// wipe every stored setting on first load after upgrade.
+fn deserialize_image_tag_compat<'de, D>(d: D) -> Result<ImageTag, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s = String::deserialize(d)?;
+    match s.as_str() {
+        "cpu" | "qpu" => Ok(ImageTag::Cpu),
+        "cuda" => Ok(ImageTag::Cuda),
+        other => Err(D::Error::custom(format!("unknown image_tag: {other}"))),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppSettings {
     pub node_config: NodeConfig,
     pub active_tab: String,
     pub window_maximized: bool,
-    pub image_tag: String,
+    #[serde(default, deserialize_with = "deserialize_image_tag_compat")]
+    pub image_tag: ImageTag,
+    #[serde(default = "default_true")]
+    pub dashboard_enabled: bool,
+    #[serde(default)]
+    pub tls_enabled: bool,
+    #[serde(default = "default_dashboard_hostname")]
+    pub dashboard_hostname: String,
+    #[serde(default)]
+    pub cert_email: String,
+    #[serde(default)]
+    pub zerossl_api_key: String,
     #[serde(default)]
     pub run_mode: RunMode,
     #[serde(default)]
@@ -256,29 +317,66 @@ impl Default for AppSettings {
             node_config: NodeConfig::default(),
             active_tab: "status".to_string(),
             window_maximized: false,
-            image_tag: "cpu".to_string(),
+            image_tag: ImageTag::default(),
+            dashboard_enabled: true,
+            tls_enabled: false,
+            dashboard_hostname: default_dashboard_hostname(),
+            cert_email: String::new(),
+            zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
             auto_update_enabled: false,
         }
     }
 }
 
-// ─── Container status ───────────────────────────────────────────────────────
+// ─── Stack status ───────────────────────────────────────────────────────────
 
+/// Per-service state from `docker compose ps --format json`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ContainerStatus {
+pub struct ServiceStatus {
+    /// container_name (e.g. `quip-cpu`, `quip-dashboard`)
+    pub name: String,
+    /// compose service key (e.g. `cpu`, `dashboard`)
+    pub service: String,
     pub running: bool,
-    pub container_id: Option<String>,
-    pub image: String,
+    /// `healthy` | `unhealthy` | `starting` | null
+    #[serde(default)]
+    pub health: Option<String>,
     pub status_text: String,
+    pub image: String,
+}
+
+/// Aggregate roll-up of the compose stack, exposed to the frontend as a
+/// single `stack-status` event / `get_stack_status` response.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StackStatus {
+    pub services: Vec<ServiceStatus>,
+    pub overall: StackHealth,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StackHealth {
+    /// every expected service running AND (no healthcheck OR healthy)
+    Running,
+    /// ≥1 service running, ≥1 not running
+    Degraded,
+    /// ≥1 healthcheck reports unhealthy
+    Unhealthy,
+    /// no services running (or all exited)
+    Stopped,
 }
 
 /// Bootstrap config stored at a fixed OS-standard location.
-/// Only contains the storage directory path override.
+/// Holds install-level state that shouldn't live in app-settings.json
+/// (e.g. the Postgres password, which must not appear in support bundles
+/// or screenshots of the settings file).
 #[derive(Serialize, Deserialize, Default)]
 struct BootstrapConfig {
     #[serde(default)]
     data_dir: Option<String>,
+    #[serde(default)]
+    postgres_password: Option<String>,
 }
 
 fn bootstrap_path() -> PathBuf {
@@ -320,6 +418,25 @@ pub fn data_dir() -> PathBuf {
 
 pub fn ensure_data_dir() -> Result<(), String> {
     fs::create_dir_all(data_dir()).map_err(|e| e.to_string())
+}
+
+/// Postgres password for the dashboard's database, generated once on first
+/// access and persisted in bootstrap.json. Never regenerated — rotating
+/// would desync from the existing `quip-pgdata` volume.
+pub fn postgres_password() -> String {
+    let mut cfg = load_bootstrap();
+    if let Some(p) = cfg.postgres_password.as_ref().filter(|s| !s.is_empty()) {
+        return p.clone();
+    }
+    let bytes: [u8; 16] = rand::random();
+    let pw = hex::encode(bytes);
+    cfg.postgres_password = Some(pw.clone());
+    // Save is best-effort — if it fails, we'll regenerate next start (and
+    // break the DB). Log via stderr so it surfaces in the terminal.
+    if let Err(e) = save_bootstrap(&cfg) {
+        eprintln!("warning: failed to persist postgres password: {e}");
+    }
+    pw
 }
 
 fn settings_path() -> PathBuf {
@@ -396,5 +513,9 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
         })?;
         Some(path)
     };
-    save_bootstrap(&BootstrapConfig { data_dir: new_dir })
+    // Load-modify-save so we don't wipe postgres_password when changing the
+    // data dir.
+    let mut cfg = load_bootstrap();
+    cfg.data_dir = new_dir;
+    save_bootstrap(&cfg)
 }

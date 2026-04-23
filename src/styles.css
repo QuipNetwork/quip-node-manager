@@ -766,6 +766,23 @@ button.check-action:disabled {
   font-size: 18px;
 }
 
+/* Dashboard tab: the embedded iframe fills the tab edge-to-edge except for
+   the bottom margin that keeps it above the collapsed log drawer. When the
+   drawer expands it overlays the iframe temporarily — matches the rest of
+   the app's behaviour and avoids a relayout jump. */
+#tab-dashboard.active {
+  padding: 0;
+  padding-bottom: var(--drawer-collapsed);
+  display: flex;
+  flex-direction: column;
+}
+
+#tab-dashboard iframe,
+#tab-dashboard .dashboard-placeholder {
+  flex: 1;
+  min-height: 0;
+}
+
 /* ─── Scrollbar ──────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
   width: 8px;
