@@ -32,10 +32,6 @@
       "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
-    ],
-    "resources": {
-      "../vendor/nodes.quip.network/docker-compose.yml": "stack/docker-compose.yml",
-      "../vendor/nodes.quip.network/caddy/Caddyfile": "stack/caddy/Caddyfile"
-    }
+    ]
   }
 }

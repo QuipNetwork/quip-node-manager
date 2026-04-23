@@ -383,7 +383,6 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 
     // Ensure assets are staged before compose tries to read the compose file.
     sync_stack_assets(
-        &app,
         &settings.run_mode,
         native_rest_port(&settings.node_config),
     )?;
@@ -431,7 +430,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let rest_port = native_rest_port(&settings.node_config);
 
     // (1) Stage assets.
-    sync_stack_assets(&app, &settings.run_mode, rest_port)?;
+    sync_stack_assets(&settings.run_mode, rest_port)?;
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
