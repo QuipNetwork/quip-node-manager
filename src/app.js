@@ -15,6 +15,9 @@ const state = {
   settings: null,
   containerRunning: false,
   nativeRunning: false,
+  // Full StackStatus returned by get_stack_status:
+  // { services: [{name, service, running, health, status_text, image}], overall }
+  stack: null,
   checksPassed: false,
   detectedGpus: [], // { index, name }
   logLines: [],
@@ -26,10 +29,93 @@ const state = {
   hardwareSurvey: null,
 };
 
-// Render order; filtered by run-mode in renderChecklist().
+// ─── Stack Configuration UI ─────────────────────────────────────────────────
+
+// Show the TLS subsettings block only when both dashboard and TLS are on.
+// TLS without the dashboard is meaningless (Caddy only fronts the dashboard
+// in this stack) so we disable the TLS checkbox when dashboard is off.
+function updateStackUiVisibility() {
+  const dashEl = document.getElementById('dashboard-enabled');
+  const tlsEl = document.getElementById('tls-enabled');
+  const subs = document.getElementById('tls-subsettings');
+  if (!dashEl || !tlsEl || !subs) return;
+
+  const dash = dashEl.checked;
+  tlsEl.disabled = !dash;
+  if (!dash) tlsEl.checked = false;
+  subs.style.display = dash && tlsEl.checked ? '' : 'none';
+}
+
+document.addEventListener('change', (e) => {
+  if (!e.target) return;
+  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+    updateStackUiVisibility();
+  }
+  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+    // These settings change the compose profile; refresh the checklist so
+    // the user sees profile-specific items (rest-port-native, port-tls, …)
+    // without waiting for the next recheck cycle.
+    invoke('recheck').catch(() => {});
+  }
+});
+
+// ─── Dashboard tab iframe wiring ────────────────────────────────────────────
+
+function dashboardUrl(settings) {
+  if (!settings?.dashboard_enabled) return null;
+  const hostname = settings.dashboard_hostname || 'localhost:20080';
+  // ACME via Caddy only when TLS is on AND the hostname is a real DNS name
+  // (localhost can't get a public cert). In every other case plain HTTP on
+  // whatever port was configured.
+  if (settings.tls_enabled && !hostname.startsWith('localhost')) {
+    return `https://${hostname.replace(/:.*/, '')}`;
+  }
+  return `http://${hostname}`;
+}
+
+function refreshDashboardTab() {
+  const frame = document.getElementById('dashboard-frame');
+  const empty = document.getElementById('dashboard-empty');
+  const msg = document.getElementById('dashboard-empty-msg');
+  if (!frame || !empty) return; // tab markup not present on first load
+
+  const url = dashboardUrl(state.settings);
+  const dashRunning = state.stack?.services?.some(
+    (s) => (s.service === 'dashboard' || s.service === 'dashboard-direct') && s.running,
+  );
+
+  // Toggle via style.display rather than the `hidden` attribute — the
+  // placeholder has `display: flex` in CSS (for its centered layout) which
+  // would otherwise override `hidden` and keep both elements visible.
+  const show = (el, display) => { el.style.display = display; };
+
+  if (!url) {
+    if (msg) msg.textContent = 'Dashboard disabled — enable it in the Status tab.';
+    show(empty, 'flex');
+    show(frame, 'none');
+    if (frame.src !== 'about:blank') frame.src = 'about:blank';
+  } else if (!dashRunning) {
+    if (msg) msg.textContent = 'Starting dashboard…';
+    show(empty, 'flex');
+    show(frame, 'none');
+    if (frame.src !== 'about:blank') frame.src = 'about:blank';
+  } else {
+    // Only reload the iframe when the URL actually changes — prevents
+    // flicker on every poll tick.
+    if (frame.src !== url) frame.src = url;
+    show(empty, 'none');
+    show(frame, 'block');
+  }
+}
+
+// Render order; the backend decides visibility, so this array can safely
+// include ids that don't appear in state.checks for the current settings
+// combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
-  'docker', 'wsl', 'image', 'binary', 'version',
-  'secret', 'ip', 'hostname', 'port', 'firewall',
+  'docker', 'docker-compose', 'stack-assets', 'wsl',
+  'stack-images', 'binary', 'version', 'secret',
+  'ip', 'hostname', 'port', 'port-dashboard', 'port-tls',
+  'rest-port-native', 'firewall', 'dwave-key',
 ];
 
 // State-to-icon mapping for the checklist. CSS class `state-<state>`
@@ -70,6 +156,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
         console.error
       );
     }
+    if (tab === 'dashboard') refreshDashboardTab();
   });
 });
 
@@ -388,10 +475,25 @@ function applyFormToSettings() {
   state.settings.node_config = collectConfig();
   state.settings.auto_update_enabled =
     document.getElementById('auto-update-enabled')?.checked ?? false;
-  // cuda image only when NVIDIA GPUs enabled in Docker mode
+
+  // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
+  // enabled, CPU otherwise. QPU mining is a config.toml [dwave] concern, not
+  // a separate image — so there's no QPU option to pick here.
   const hasEnabledCuda = (state.settings.node_config.gpu_device_configs || [])
     .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
   state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
+
+  state.settings.dashboard_enabled =
+    document.getElementById('dashboard-enabled')?.checked ?? true;
+  state.settings.tls_enabled =
+    document.getElementById('tls-enabled')?.checked ?? false;
+  state.settings.dashboard_hostname =
+    document.getElementById('dashboard-hostname')?.value?.trim() ||
+    'localhost:20080';
+  state.settings.cert_email =
+    document.getElementById('cert-email')?.value?.trim() || '';
+  state.settings.zerossl_api_key =
+    document.getElementById('zerossl-api-key')?.value ?? '';
 }
 
 // ─── Populate form from settings ─────────────────────────────────────────────
@@ -437,6 +539,18 @@ function populateForm(settings) {
   document.getElementById('rest-insecure-port').value = c.rest_insecure_port ?? -1;
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
+
+  // Stack Configuration (image_tag is auto-derived, no UI control)
+  document.getElementById('dashboard-enabled').checked =
+    settings.dashboard_enabled ?? true;
+  document.getElementById('tls-enabled').checked =
+    settings.tls_enabled ?? false;
+  document.getElementById('dashboard-hostname').value =
+    settings.dashboard_hostname ?? 'localhost:20080';
+  document.getElementById('cert-email').value = settings.cert_email ?? '';
+  document.getElementById('zerossl-api-key').value =
+    settings.zerossl_api_key ?? '';
+  updateStackUiVisibility();
 
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
@@ -522,12 +636,43 @@ function setStatus(stateStr) {
 // everything routes through one delegated click handler at the bottom
 // of this section.
 
+// Mirror of checklist.rs::visible_for_mode — which ids render for the
+// current settings. Backend already filters this way; duplicating the
+// logic here prevents the frontend from ever drawing a placeholder for
+// a check that can't apply to the current profile.
 function visibleInMode(id, runMode) {
+  const s = state.settings;
   const isDocker = (runMode || 'docker') === 'docker';
-  if (id === 'docker' || id === 'image') return isDocker;
-  if (id === 'wsl') return isDocker && (state.hardwareSurvey?.os === 'windows');
-  if (id === 'binary') return !isDocker;
-  return true;
+  const dashboard = s?.dashboard_enabled ?? true;
+  const tls = s?.tls_enabled ?? false;
+  const hasDwave = !!s?.node_config?.dwave_config;
+  // Compose runs whenever we're in Docker mode, OR Native mode with the
+  // dashboard on (dashboard+postgres[+caddy] run via compose even when
+  // the node runs as a host binary).
+  const composeWillRun = isDocker || dashboard;
+
+  switch (id) {
+    case 'docker':
+    case 'docker-compose':
+    case 'stack-assets':
+    case 'stack-images':
+      return composeWillRun;
+    case 'wsl':
+      return isDocker && state.hardwareSurvey?.os === 'windows';
+    case 'binary':
+      return !isDocker;
+    case 'port-dashboard':
+      return composeWillRun && dashboard && !tls;
+    case 'port-tls':
+      return composeWillRun && dashboard && tls;
+    case 'rest-port-native':
+      return !isDocker && dashboard;
+    case 'dwave-key':
+      return hasDwave;
+    // version / secret / ip / hostname / port / firewall — always shown.
+    default:
+      return true;
+  }
 }
 
 function renderChecklistItem(item) {
@@ -587,17 +732,23 @@ function renderChecklist() {
 function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
   switch (id) {
-    case 'docker':   return 'Docker installed & running';
-    case 'wsl':      return 'WSL installed with distro';
-    case 'image':    return 'Node image available';
-    case 'binary':   return 'Node binary available';
-    case 'version':  return 'Node version up to date';
-    case 'secret':   return 'Node secret configured';
-    case 'ip':       return 'Public IP reachable';
-    case 'hostname': return 'Hostname accessible to internet';
-    case 'port':     return `Port ${port} — press Recheck to test`;
-    case 'firewall': return 'Local firewall allows port (UDP+TCP)';
-    default:         return id;
+    case 'docker':            return 'Docker installed & running';
+    case 'docker-compose':    return 'Docker Compose v2 available';
+    case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
+    case 'wsl':               return 'WSL installed with distro';
+    case 'stack-images':      return 'Stack images available';
+    case 'binary':            return 'Node binary available';
+    case 'version':           return 'Node version up to date';
+    case 'secret':            return 'Node secret configured';
+    case 'ip':                return 'Public IP reachable';
+    case 'hostname':          return 'Hostname accessible to internet';
+    case 'port':              return `Port ${port} — press Recheck to test`;
+    case 'port-dashboard':    return 'Dashboard port 20080 available';
+    case 'port-tls':          return 'TLS ports 80 + 443 available';
+    case 'rest-port-native':  return 'Native REST port available';
+    case 'firewall':          return 'Local firewall allows port (UDP+TCP)';
+    case 'dwave-key':         return 'D-Wave API token configured';
+    default:                  return id;
   }
 }
 
@@ -668,9 +819,11 @@ async function runFix(id) {
       return;
 
     case 'PullImage': {
-      const tag = state.settings?.image_tag || 'cpu';
+      // Pulls every image in the current profile (node + dashboard +
+      // postgres + caddy as applicable). The old tag-specific call is
+      // obsolete — image selection happens inside compose now.
       try {
-        await invoke('pull_node_image', { imageTag: tag });
+        await invoke('pull_compose_images');
       } catch (e) {
         console.error('Pull failed:', e);
       }
@@ -779,10 +932,16 @@ function expandConfig() {
 
 async function startNode() {
   if (isDockerMode()) {
-    await invoke('start_node_container');
+    await invoke('start_stack');
     await invoke('start_log_stream');
   } else {
+    // Native mode: run the binary on the host + (optionally) the
+    // compose stack's non-node services (dashboard+postgres+caddy) so
+    // the user still gets the dashboard UI.
     await invoke('start_native_node');
+    if (state.settings?.dashboard_enabled) {
+      try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
+    }
   }
   collapseConfig();
 }
@@ -790,9 +949,12 @@ async function startNode() {
 async function stopNode() {
   if (isDockerMode()) {
     await invoke('stop_log_stream');
-    await invoke('stop_node_container');
+    await invoke('stop_stack');
   } else {
     await invoke('stop_native_node');
+    if (state.settings?.dashboard_enabled) {
+      try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
+    }
   }
 }
 
@@ -863,13 +1025,36 @@ document.getElementById('btn-save').addEventListener('click', async () => {
 });
 
 // ─── Polling ──────────────────────────────────────────────────────────────────
+// `containerRunning` now means "the compose stack's node service is up" in
+// Docker mode, or "the compose stack has services up" as a proxy for "the
+// manager is managing something" in Native mode.
+function stackRunningInMode() {
+  const s = state.stack;
+  if (!s) return false;
+  if (isDockerMode()) {
+    // Node container must be one of the running services in Docker mode.
+    const nodeRunning = s.services?.some(
+      (x) => ['cpu', 'cuda', 'qpu'].includes(x.service) && x.running,
+    );
+    return !!nodeRunning;
+  }
+  return s.services?.some((x) => x.running);
+}
+
 async function pollStatus() {
   try {
+    // Stack status is valid in both Docker and Native modes (Native runs a
+    // subset — dashboard+postgres[+caddy]).
+    try {
+      state.stack = await invoke('get_stack_status');
+    } catch {
+      state.stack = null;
+    }
+
     if (isDockerMode()) {
-      const status = await invoke('get_container_status');
-      state.containerRunning = status.running;
+      state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
-      setStatus(status.running ? 'running' : 'stopped');
+      setStatus(state.containerRunning ? 'running' : 'stopped');
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
@@ -882,6 +1067,7 @@ async function pollStatus() {
     setStatus('stopped');
   }
   updateStartStopState();
+  refreshDashboardTab();
 }
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
@@ -922,11 +1108,11 @@ async function setupListeners() {
     }
   });
 
-  await listen('container-status', (event) => {
-    const s = event.payload;
-    state.containerRunning = !!s?.running;
-    setStatus(s?.running ? 'running' : 'stopped');
-    updateStartStopState();
+  await listen('stack-status', (event) => {
+    // Backend may emit lifecycle events in future; for now we just re-poll
+    // to refresh state.stack and the dashboard iframe visibility.
+    void event;
+    pollStatus();
   });
 
   // Update notifications
@@ -1038,22 +1224,28 @@ async function init() {
   // Register listeners FIRST so no events are missed
   await setupListeners();
 
-  // Load settings (fast, file I/O only) then populate form
-  invoke('get_settings')
-    .then((settings) => {
-      state.settings = settings;
-      populateForm(settings);
-      document.getElementById('run-mode-select').value =
-        settings.run_mode || 'docker';
-      document.getElementById('auto-update-enabled').checked =
-        settings.auto_update_enabled ?? false;
-      if (settings.active_tab && settings.active_tab !== 'status') {
-        document
-          .querySelector(`[data-tab="${settings.active_tab}"]`)
-          ?.click();
-      }
-    })
-    .catch((e) => console.error('Failed to load settings:', e));
+  // Load settings FIRST, before anything that branches on run_mode.
+  // pollStatus() reads isDockerMode() synchronously before its first
+  // await, so if settings haven't resolved by then it falls back to the
+  // 'docker' default — a native-mode user whose node is already running
+  // would be probed via get_stack_status, see no running services, and
+  // the log-tail reconnect below would be skipped for the entire session.
+  try {
+    const settings = await invoke('get_settings');
+    state.settings = settings;
+    populateForm(settings);
+    document.getElementById('run-mode-select').value =
+      settings.run_mode || 'docker';
+    document.getElementById('auto-update-enabled').checked =
+      settings.auto_update_enabled ?? false;
+    if (settings.active_tab && settings.active_tab !== 'status') {
+      document
+        .querySelector(`[data-tab="${settings.active_tab}"]`)
+        ?.click();
+    }
+  } catch (e) {
+    console.error('Failed to load settings:', e);
+  }
 
   // Display app version
   invoke('get_app_version')

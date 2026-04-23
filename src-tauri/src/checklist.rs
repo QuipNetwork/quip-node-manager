@@ -126,20 +126,46 @@ impl Default for ChecklistState {
 /// Shared read-only input to every check, plus memoised network lookups.
 pub struct CheckCtx {
     pub run_mode: RunMode,
-    pub image_tag: String,
+    pub image_tag: crate::settings::ImageTag,
     pub port: u16,
     pub public_host: String,
+    /// "Is the compose stack expected to be running?" — drives visibility of
+    /// dashboard/TLS/postgres-related checks.
+    pub dashboard_enabled: bool,
+    pub tls_enabled: bool,
+    /// The port the native binary exposes for dashboard telemetry in Native
+    /// mode. Passed into `rest-port-native` without recomputing defaults.
+    pub native_rest_port: u16,
+    /// `true` iff the user has a [dwave] block in their NodeConfig (i.e.
+    /// they're intending QPU mining). Controls visibility of `dwave-key`.
+    pub has_dwave_config: bool,
+    /// `true` iff the [dwave] block has a non-empty token.
+    pub dwave_token_set: bool,
     public_ip: OnceCell<Option<String>>,
 }
 
 impl CheckCtx {
     fn from_settings() -> Self {
         let settings = crate::settings::load_settings();
+        let native_rest_port =
+            crate::compose::native_rest_port(&settings.node_config);
+        let has_dwave_config = settings.node_config.dwave_config.is_some();
+        let dwave_token_set = settings
+            .node_config
+            .dwave_config
+            .as_ref()
+            .map(|d| !d.token.trim().is_empty())
+            .unwrap_or(false);
         CheckCtx {
             run_mode: settings.run_mode,
             image_tag: settings.image_tag,
             port: settings.node_config.port,
             public_host: settings.node_config.public_host,
+            dashboard_enabled: settings.dashboard_enabled,
+            tls_enabled: settings.tls_enabled,
+            native_rest_port,
+            has_dwave_config,
+            dwave_token_set,
             public_ip: OnceCell::new(),
         }
     }
@@ -151,6 +177,12 @@ impl CheckCtx {
             .get_or_init(fetch_public_ip)
             .await
             .clone()
+    }
+
+    /// Whether `docker compose` is expected to have anything to run. False
+    /// only when Native mode + dashboard disabled.
+    fn compose_will_run(&self) -> bool {
+        self.run_mode != RunMode::Native || self.dashboard_enabled
     }
 }
 
@@ -209,13 +241,45 @@ fn check_wsl() -> (bool, String) {
     )
 }
 
-fn check_image_present(image_tag: &str) -> bool {
-    let image = format!("{}:latest", crate::docker::image_for_tag(image_tag));
+/// `docker image inspect <ref>` — true iff the image is already present on
+/// the local daemon. Used by the stack-images aggregator.
+fn docker_image_present(image_ref: &str) -> bool {
     crate::cmd::new("docker")
-        .args(["image", "inspect", &image])
+        .args(["image", "inspect", image_ref])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Images the current profile + service list expects to find locally.
+/// In Native mode the node image is excluded (the binary runs on the host).
+fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
+    let mut images = Vec::new();
+    if ctx.run_mode == RunMode::Docker {
+        images.push(format!(
+            "{}:latest",
+            crate::compose::image_for_tag(ctx.image_tag)
+        ));
+    }
+    if ctx.dashboard_enabled {
+        images.push(
+            "registry.gitlab.com/quip.network/dashboard.quip.network:latest"
+                .into(),
+        );
+        images.push("postgres:16".into());
+        if ctx.tls_enabled {
+            images.push("caddy:2-alpine".into());
+        }
+    }
+    images
+}
+
+/// Bindability test for a TCP port. Used by port-dashboard / port-tls /
+/// rest-port-native to flag conflicts before the user presses Start.
+fn tcp_port_bindable(port: u16) -> bool {
+    let addr: std::net::SocketAddr =
+        format!("0.0.0.0:{}", port).parse().unwrap();
+    std::net::TcpListener::bind(addr).is_ok()
 }
 
 fn check_secret_exists() -> bool {
@@ -468,29 +532,66 @@ fn check_local_firewall(port: u16) -> (bool, String) {
 
 // ─── Check registry ───────────────────────────────────────────────────────────
 
-/// IDs of all checks in render order. Filter by mode with `visible_for_mode`.
+/// IDs of all checks in render order. Filter by `visible_for_mode`.
 pub const ALL_CHECK_IDS: &[&str] = &[
-    "docker", "wsl", "image", "binary", "version", "secret", "ip", "hostname", "port",
+    "docker",
+    "docker-compose",
+    "stack-assets",
+    "wsl",
+    "stack-images",
+    "binary",
+    "version",
+    "secret",
+    "ip",
+    "hostname",
+    "port",
+    "port-dashboard",
+    "port-tls",
+    "rest-port-native",
     "firewall",
+    "dwave-key",
 ];
 
-pub fn visible_for_mode(id: &str, run_mode: &RunMode) -> bool {
-    match (id, run_mode) {
-        ("docker", RunMode::Docker) => true,
-        ("wsl", RunMode::Docker) => cfg!(target_os = "windows"),
-        ("image", RunMode::Docker) => true,
-        ("binary", RunMode::Native) => true,
-        // Common to both modes
-        ("version", _) | ("secret", _) | ("ip", _) | ("hostname", _) | ("port", _)
-        | ("firewall", _) => true,
+/// Whether `id` is shown to the user for the current settings + run_mode.
+pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
+    match id {
+        // Docker daemon + compose itself — required whenever compose will run.
+        "docker" | "docker-compose" | "stack-assets" | "stack-images" => {
+            ctx.compose_will_run()
+        }
+        // Windows-only WSL probe. Docker mode only (Native is macOS-only).
+        "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
+        // Binary is native-mode only.
+        "binary" => ctx.run_mode == RunMode::Native,
+        // New per-port bind checks. Only applicable when compose will run AND
+        // that profile actually binds the port.
+        "port-dashboard" => {
+            ctx.compose_will_run()
+                && ctx.dashboard_enabled
+                && !ctx.tls_enabled
+        }
+        "port-tls" => {
+            ctx.compose_will_run() && ctx.dashboard_enabled && ctx.tls_enabled
+        }
+        // Native + dashboard makes the native binary bind a REST port that
+        // Docker containers reach via host.docker.internal.
+        "rest-port-native" => {
+            ctx.run_mode == RunMode::Native && ctx.dashboard_enabled
+        }
+        // Visible whenever the user has a [dwave] block in NodeConfig
+        // (i.e. they've opted into QPU mining). Passes if the token is
+        // non-empty, fails otherwise.
+        "dwave-key" => ctx.has_dwave_config,
+        // Everything else is always visible.
+        "version" | "secret" | "ip" | "hostname" | "port" | "firewall" => true,
         _ => false,
     }
 }
 
-pub fn visible_ids(run_mode: &RunMode) -> Vec<String> {
+pub fn visible_ids(ctx: &CheckCtx) -> Vec<String> {
     ALL_CHECK_IDS
         .iter()
-        .filter(|id| visible_for_mode(id, run_mode))
+        .filter(|id| visible_for_mode(id, ctx))
         .map(|s| s.to_string())
         .collect()
 }
@@ -501,18 +602,24 @@ pub fn visible_ids(run_mode: &RunMode) -> Vec<String> {
 fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
     match id {
         "docker" => CheckItem::new(id, "Docker installed & running", true, Some(FixKind::InstallDocker)),
+        "docker-compose" => CheckItem::new(id, "Docker Compose v2 available", true, Some(FixKind::InstallDocker)),
+        "stack-assets" => CheckItem::new(id, "Stack files staged (compose.yml + Caddyfile)", true, None),
         "wsl" => CheckItem::new(id, "WSL installed with distro", false, None),
-        "image" => CheckItem::new(id, "Node image available", true, Some(FixKind::PullImage)),
+        "stack-images" => CheckItem::new(id, "Stack images available", true, Some(FixKind::PullImage)),
         "binary" => CheckItem::new(id, "Node binary available", true, Some(FixKind::DownloadBinary)),
         "version" => CheckItem::new(id, "Node version up to date", false, Some(FixKind::Delegate(match ctx.run_mode {
-            RunMode::Docker => "image".into(),
+            RunMode::Docker => "stack-images".into(),
             RunMode::Native => "binary".into(),
         }))),
         "secret" => CheckItem::new(id, "Node secret configured", true, Some(FixKind::GenerateSecret)),
         "ip" => CheckItem::new(id, "Public IP reachable", false, None),
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(id, &format!("Port {} — press Recheck to test", ctx.port), false, None),
+        "port-dashboard" => CheckItem::new(id, "Dashboard port 20080 available", false, None),
+        "port-tls" => CheckItem::new(id, "TLS ports 80 + 443 available", false, None),
+        "rest-port-native" => CheckItem::new(id, &format!("Native REST port {} available", ctx.native_rest_port), false, None),
         "firewall" => CheckItem::new(id, "Local firewall allows port (UDP+TCP)", false, None),
+        "dwave-key" => CheckItem::new(id, "D-Wave API token configured", true, None),
         _ => CheckItem::new(id, id, false, None),
     }
 }
@@ -548,16 +655,64 @@ async fn run_check_wsl(ctx: &CheckCtx) -> CheckItem {
     idle_item("wsl", ctx).with_state(CheckState::Skip).with_detail("non-Windows platform")
 }
 
-async fn run_check_image(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("image", ctx);
-    let image_tag = ctx.image_tag.clone();
-    let ok = tokio::task::spawn_blocking(move || check_image_present(&image_tag))
-        .await
-        .unwrap_or(false);
+async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("docker-compose", ctx);
+    // `docker compose version` exits 0 iff the v2+ CLI plugin is installed.
+    // The legacy v1 was a separate `docker-compose` (hyphen) binary and
+    // couldn't be invoked as `docker compose`, so we don't need to parse
+    // the output string (Docker has already rev'd past v2 — e.g. v5.1.2
+    // in Docker 29).
+    let ok = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
     if ok {
         base.with_state(CheckState::Pass)
     } else {
-        base.with_state(CheckState::Fail).with_detail("run Pull Image to download")
+        base.with_state(CheckState::Fail).with_detail(
+            "install Docker Desktop, which ships with the `docker compose` CLI plugin",
+        )
+    }
+}
+
+async fn run_check_stack_assets(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("stack-assets", ctx);
+    let ok = crate::stack_assets::stack_compose_file().exists()
+        && crate::stack_assets::stack_caddyfile().exists();
+    if ok {
+        base.with_state(CheckState::Pass)
+    } else {
+        base.with_state(CheckState::Warn).with_detail(
+            "stack files not staged yet — they'll be written on next Start",
+        )
+    }
+}
+
+async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("stack-images", ctx);
+    let images = required_stack_images(ctx);
+    if images.is_empty() {
+        return base.with_state(CheckState::Skip)
+            .with_detail("no compose images needed for this profile");
+    }
+    let missing: Vec<String> = tokio::task::spawn_blocking(move || {
+        images
+            .into_iter()
+            .filter(|img| !docker_image_present(img))
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    if missing.is_empty() {
+        base.with_state(CheckState::Pass)
+    } else {
+        base.with_state(CheckState::Fail)
+            .with_detail(format!("missing: {}", missing.join(", ")))
     }
 }
 
@@ -645,11 +800,72 @@ async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
     base.with_state(state).with_label(label)
 }
 
+async fn run_check_port_dashboard(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("port-dashboard", ctx);
+    let ok = tokio::task::spawn_blocking(|| tcp_port_bindable(20080))
+        .await
+        .unwrap_or(false);
+    if ok {
+        base.with_state(CheckState::Pass)
+    } else {
+        base.with_state(CheckState::Warn).with_detail(
+            "TCP 20080 already in use — another service will conflict with the dashboard",
+        )
+    }
+}
+
+async fn run_check_port_tls(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("port-tls", ctx);
+    let (ok_80, ok_443) = tokio::task::spawn_blocking(|| {
+        (tcp_port_bindable(80), tcp_port_bindable(443))
+    })
+    .await
+    .unwrap_or((false, false));
+    match (ok_80, ok_443) {
+        (true, true) => base.with_state(CheckState::Pass),
+        (false, true) => base.with_state(CheckState::Warn).with_detail(
+            "TCP :80 in use — Caddy's ACME HTTP-01 challenge will fail",
+        ),
+        (true, false) => base.with_state(CheckState::Warn).with_detail(
+            "TCP :443 in use — Caddy cannot serve HTTPS",
+        ),
+        (false, false) => base.with_state(CheckState::Warn).with_detail(
+            "TCP :80 and :443 both in use — free them before enabling TLS",
+        ),
+    }
+}
+
+async fn run_check_rest_port_native(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("rest-port-native", ctx);
+    let port = ctx.native_rest_port;
+    let ok = tokio::task::spawn_blocking(move || tcp_port_bindable(port))
+        .await
+        .unwrap_or(false);
+    if ok {
+        base.with_state(CheckState::Pass).with_detail(
+            "Native node binds 127.0.0.1; dashboard reaches it via Docker Desktop's host.docker.internal",
+        )
+    } else {
+        base.with_state(CheckState::Warn)
+            .with_detail(format!("TCP {} already in use", port))
+    }
+}
+
+async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("dwave-key", ctx);
+    if ctx.dwave_token_set {
+        base.with_state(CheckState::Pass)
+    } else {
+        base.with_state(CheckState::Fail)
+            .with_detail("set the D-Wave API token in [dwave] before starting a QPU node")
+    }
+}
+
 async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("version", ctx);
     match ctx.run_mode {
         RunMode::Docker => {
-            match crate::update::check_image_update(ctx.image_tag.clone()).await {
+            match crate::update::check_image_update(ctx.image_tag).await {
                 Ok(Some(info)) if info.update_available => base
                     .with_state(CheckState::Warn)
                     .with_label("Node image outdated \u{2014} pull latest"),
@@ -677,15 +893,21 @@ async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
 async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
     match id {
         "docker" => run_check_docker(ctx).await,
+        "docker-compose" => run_check_docker_compose(ctx).await,
+        "stack-assets" => run_check_stack_assets(ctx).await,
         "wsl" => run_check_wsl(ctx).await,
-        "image" => run_check_image(ctx).await,
+        "stack-images" => run_check_stack_images(ctx).await,
         "binary" => run_check_binary(ctx).await,
         "secret" => run_check_secret(ctx).await,
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
+        "port-dashboard" => run_check_port_dashboard(ctx).await,
+        "port-tls" => run_check_port_tls(ctx).await,
+        "rest-port-native" => run_check_rest_port_native(ctx).await,
         "firewall" => run_check_firewall(ctx).await,
         "version" => run_check_version(ctx).await,
+        "dwave-key" => run_check_dwave_key(ctx).await,
         _ => idle_item(id, ctx).with_state(CheckState::Skip).with_detail("unknown check id"),
     }
 }
@@ -778,7 +1000,7 @@ async fn recheck_one(
 async fn seed_cache(state: &ChecklistState, ctx: &CheckCtx) {
     let mut cache = state.cache.lock().await;
     cache.clear();
-    for id in visible_ids(&ctx.run_mode) {
+    for id in visible_ids(ctx) {
         cache.insert(id.clone(), idle_item(&id, ctx));
     }
 }
@@ -794,7 +1016,7 @@ async fn run_recheck(app: AppHandle, ids: Option<Vec<String>>, auto: bool) -> Re
         _ => {
             // Global recheck: seed the cache for the current mode, then run all.
             seed_cache(&state, &ctx).await;
-            visible_ids(&ctx.run_mode)
+            visible_ids(&ctx)
         }
     };
 
@@ -822,15 +1044,15 @@ pub async fn get_checklist(
     state: tauri::State<'_, ChecklistState>,
 ) -> Result<Vec<CheckItem>, String> {
     let cache = state.cache.lock().await;
-    let settings = crate::settings::load_settings();
-    let ids = visible_ids(&settings.run_mode);
+    let ctx = CheckCtx::from_settings();
+    let ids = visible_ids(&ctx);
     Ok(ids
         .into_iter()
         .map(|id| {
             cache
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| idle_item(&id, &CheckCtx::from_settings()))
+                .unwrap_or_else(|| idle_item(&id, &ctx))
         })
         .collect())
 }
@@ -857,15 +1079,29 @@ pub async fn trigger_recheck_auto(app: AppHandle, ids: Vec<String>) {
 /// final CheckItems. For non-Tauri callers (TUI).
 pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     let settings = crate::settings::load_settings();
+    let native_rest_port =
+        crate::compose::native_rest_port(&settings.node_config);
+    let dwave_token_set = settings
+        .node_config
+        .dwave_config
+        .as_ref()
+        .map(|d| !d.token.trim().is_empty())
+        .unwrap_or(false);
+    let has_dwave_config = settings.node_config.dwave_config.is_some();
     let ctx = CheckCtx {
         run_mode: run_mode.clone(),
         image_tag: settings.image_tag,
         port: settings.node_config.port,
         public_host: settings.node_config.public_host,
+        dashboard_enabled: settings.dashboard_enabled,
+        tls_enabled: settings.tls_enabled,
+        native_rest_port,
+        has_dwave_config,
+        dwave_token_set,
         public_ip: OnceCell::new(),
     };
     let mut results = Vec::new();
-    for id in visible_ids(run_mode) {
+    for id in visible_ids(&ctx) {
         results.push(run_check_by_id(&id, &ctx).await);
     }
     results

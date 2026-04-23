@@ -279,6 +279,37 @@
             </div>
           </div>
 
+          <!-- Stack Configuration -->
+          <div class="config-section-divider">
+            <div class="section-heading">Stack Configuration</div>
+            <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
+              Image is auto-selected: CUDA when any NVIDIA GPU is enabled (see GPU Miner Configuration below), CPU otherwise. Setting a D-Wave token in QPU Miner Configuration activates QPU mining on top of the CPU image.
+            </div>
+            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+              <input type="checkbox" id="dashboard-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+              <label for="dashboard-enabled" style="margin:0;cursor:pointer;">Enable dashboard <span style="color:var(--text-faint);font-weight:400;">(telemetry UI + Postgres)</span></label>
+            </div>
+            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+              <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+              <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>
+            </div>
+            <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
+              <div class="form-group">
+                <label for="dashboard-hostname">Dashboard Hostname</label>
+                <input type="text" id="dashboard-hostname" placeholder="localhost:20080" />
+                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Use <code>localhost:20080</code> for local HTTP, or a real DNS name to trigger automatic Let's Encrypt certs.</div>
+              </div>
+              <div class="form-group">
+                <label for="cert-email">ACME Email <span style="color:var(--text-faint);font-weight:400;">(required for Let's Encrypt)</span></label>
+                <input type="email" id="cert-email" placeholder="you@example.com" />
+              </div>
+              <div class="form-group" style="margin-bottom:0;">
+                <label for="zerossl-api-key">ZeroSSL API Key <span style="color:var(--text-faint);font-weight:400;">(optional fallback)</span></label>
+                <input type="password" id="zerossl-api-key" placeholder="Leave empty to use Let's Encrypt" />
+              </div>
+            </div>
+          </div>
+
           <!-- CPU Miner Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">CPU Miner Configuration</div>
@@ -346,9 +377,14 @@
 
     <!-- Dashboard Tab -->
     <div id="tab-dashboard" class="tab-content">
-      <div class="dashboard-placeholder">
-        <span>Coming Soon</span>
+      <div id="dashboard-empty" class="dashboard-placeholder" style="display:none;">
+        <span id="dashboard-empty-msg">Dashboard disabled — enable it in the Status tab to see metrics here.</span>
       </div>
+      <iframe
+        id="dashboard-frame"
+        title="Quip Dashboard"
+        sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
+        style="display:none;width:100%;border:0;"></iframe>
     </div>
 
     <!-- Log Drawer (fixed bottom) -->
