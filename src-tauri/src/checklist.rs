@@ -142,6 +142,10 @@ pub struct CheckCtx {
     /// `true` iff the [dwave] block has a non-empty token.
     pub dwave_token_set: bool,
     public_ip: OnceCell<Option<String>>,
+    /// `true` iff `docker compose ps` reports any service as running — our
+    /// own stack legitimately holds ports 20080 / 80 / 443 in that case, so
+    /// the port-conflict checks should pass rather than warn.
+    stack_running: OnceCell<bool>,
 }
 
 impl CheckCtx {
@@ -167,6 +171,7 @@ impl CheckCtx {
             has_dwave_config,
             dwave_token_set,
             public_ip: OnceCell::new(),
+            stack_running: OnceCell::new(),
         }
     }
 
@@ -177,6 +182,23 @@ impl CheckCtx {
             .get_or_init(fetch_public_ip)
             .await
             .clone()
+    }
+
+    /// Memoised "is our compose stack currently up?" probe. Any service
+    /// reporting `running=true` counts — covers healthy, starting, and
+    /// unhealthy-but-running cases, all of which hold their published
+    /// ports. Errors (docker missing, stack never started) fall back to
+    /// `false` so the port bind-test runs as before.
+    async fn stack_running(&self) -> bool {
+        *self
+            .stack_running
+            .get_or_init(|| async {
+                crate::compose::get_stack_status()
+                    .await
+                    .map(|s| s.services.iter().any(|svc| svc.running))
+                    .unwrap_or(false)
+            })
+            .await
     }
 
     /// Whether `docker compose` is expected to have anything to run. False
@@ -802,6 +824,11 @@ async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_port_dashboard(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port-dashboard", ctx);
+    // Our own stack holds 20080 when up — a bind failure then is expected,
+    // not a conflict. Skip the bind test and pass.
+    if ctx.stack_running().await {
+        return base.with_state(CheckState::Pass);
+    }
     let ok = tokio::task::spawn_blocking(|| tcp_port_bindable(20080))
         .await
         .unwrap_or(false);
@@ -816,6 +843,10 @@ async fn run_check_port_dashboard(ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_port_tls(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port-tls", ctx);
+    // Our own caddy holds 80/443 when up — ditto port-dashboard.
+    if ctx.stack_running().await {
+        return base.with_state(CheckState::Pass);
+    }
     let (ok_80, ok_443) = tokio::task::spawn_blocking(|| {
         (tcp_port_bindable(80), tcp_port_bindable(443))
     })
@@ -1099,6 +1130,7 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         has_dwave_config,
         dwave_token_set,
         public_ip: OnceCell::new(),
+        stack_running: OnceCell::new(),
     };
     let mut results = Vec::new();
     for id in visible_ids(&ctx) {
