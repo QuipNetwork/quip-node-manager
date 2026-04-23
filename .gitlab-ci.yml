@@ -5,6 +5,12 @@ stages:
   - build
   - release
 
+# Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
+# as Tauri resources) before any job runs. Default is `none`, which would
+# leave the submodule dir empty and fail the Tauri resource-path check.
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
 # ---------------------------------------------------------------------------
 # Shared setup
 # ---------------------------------------------------------------------------
