@@ -56,17 +56,13 @@ fn check_wsl() -> (bool, String) {
 
 fn check_image_present() -> bool {
     let settings = crate::settings::load_settings();
-    let miner_image = match settings.run_mode {
-        RunMode::Docker => settings.image_tag.as_str(),
-        RunMode::Native => "cpu",
-    };
     let mut images = vec![
-        crate::docker::image_ref_for_tag(miner_image),
         crate::docker::validator_image_ref(),
         crate::docker::caddy_image_ref(),
+        crate::docker::bootstrap_image_ref(),
     ];
     if settings.run_mode == RunMode::Docker && settings.image_tag != "cpu" {
-        images.push(crate::docker::image_ref_for_tag("cpu"));
+        images.push(crate::docker::image_ref_for_tag(&settings.image_tag));
     }
 
     images.iter().all(|image| {
@@ -499,7 +495,11 @@ where
     checks.push(CheckItem {
         id: "image".to_string(),
         passed: image_ok,
-        label: "v0.2 runtime images available".to_string(),
+        label: match run_mode {
+            RunMode::Docker => "v0.2 Docker runtime images available",
+            RunMode::Native => "v0.2 Docker support images available",
+        }
+        .to_string(),
         required: true,
     });
     on_progress(&checks);

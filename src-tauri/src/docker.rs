@@ -69,6 +69,12 @@ pub fn image_ref_for_tag(image_tag: &str) -> String {
     format!("{}:{}", image_for_tag(image_tag), MINER_TAG)
 }
 
+pub fn bootstrap_image_ref() -> String {
+    // Upstream packages the bootstrap CLI in the CPU miner image. In native
+    // mode this is only a short-lived sidecar; mining still runs via Metal.
+    image_ref_for_tag("cpu")
+}
+
 pub fn validator_image_ref() -> String {
     format!("{}:{}", VALIDATOR_IMAGE, VALIDATOR_TAG)
 }
@@ -325,7 +331,7 @@ fn start_caddy(app: &tauri::AppHandle, run_mode: &RunMode) -> Result<String, Str
 
 async fn run_bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     remove_container(app, BOOTSTRAP_CONTAINER);
-    let image = image_ref_for_tag("cpu");
+    let image = bootstrap_image_ref();
     for attempt in 1..=60 {
         log_output(
             app,
@@ -469,7 +475,7 @@ pub async fn start_support_containers(
 
     pull_image(&app, &validator_image_ref())?;
     pull_image(&app, &caddy_image_ref())?;
-    pull_image(&app, &image_ref_for_tag("cpu"))?;
+    pull_image(&app, &bootstrap_image_ref())?;
 
     start_validator(&app)?;
     start_caddy(&app, &run_mode)?;
@@ -513,7 +519,7 @@ pub async fn pull_node_image(
         caddy_image_ref(),
     ];
     if image_tag != "cpu" {
-        images.push(image_ref_for_tag("cpu"));
+        images.push(bootstrap_image_ref());
     }
     for image in images {
         output.push_str(&pull_image(&app, &image)?);
