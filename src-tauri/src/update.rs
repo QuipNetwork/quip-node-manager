@@ -54,10 +54,8 @@ pub async fn get_node_version() -> Option<String> {
                 crate::native::installed_binary_version()
             }
             crate::settings::RunMode::Docker => {
-                let image = format!(
-                    "{}:latest",
-                    crate::docker::image_for_tag(&settings.image_tag)
-                );
+                let image =
+                    crate::docker::image_ref_for_tag(&settings.image_tag);
                 let output = crate::cmd::new("docker")
                     .args(["run", "--rm", &image, "--version"])
                     .output()
@@ -122,9 +120,9 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
     // For now: attempt HEAD request to registry to get digest
     // GitLab registry requires auth for manifests, so gracefully degrade
     let image_name = if image_tag == "cuda" {
-        "quip-network-node-cuda"
+        "quip-miner-cuda"
     } else {
-        "quip-network-node-cpu"
+        "quip-miner-cpu"
     };
 
     let client = reqwest::Client::builder()
@@ -133,8 +131,8 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
         .map_err(|e| e.to_string())?;
 
     let manifest_url = format!(
-        "https://registry.gitlab.com/v2/quip.network/quip-protocol/{}/manifests/latest",
-        image_name
+        "https://registry.gitlab.com/v2/quip.network/quip-protocol/{}/manifests/v0.2-preview",
+        image_name,
     );
 
     let resp = match client
@@ -159,10 +157,7 @@ pub async fn check_image_update(image_tag: String) -> Result<Option<ImageUpdateI
     }
 
     // Get current local digest (blocking subprocess — run off-thread)
-    let inspect_image = format!(
-        "registry.gitlab.com/quip.network/quip-protocol/{}:latest",
-        image_name
-    );
+    let inspect_image = crate::docker::image_ref_for_tag(&image_tag);
     let current_digest = tokio::task::spawn_blocking(move || {
         crate::cmd::new("docker")
             .args([

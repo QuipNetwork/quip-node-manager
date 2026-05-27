@@ -55,17 +55,35 @@ fn check_wsl() -> (bool, String) {
 }
 
 fn check_image_present() -> bool {
-    let cpu_image =
-        "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest";
-    crate::cmd::new("docker")
-        .args(["image", "inspect", cpu_image])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let settings = crate::settings::load_settings();
+    let miner_image = match settings.run_mode {
+        RunMode::Docker => settings.image_tag.as_str(),
+        RunMode::Native => "cpu",
+    };
+    let mut images = vec![
+        crate::docker::image_ref_for_tag(miner_image),
+        crate::docker::validator_image_ref(),
+        crate::docker::caddy_image_ref(),
+    ];
+    if settings.run_mode == RunMode::Docker && settings.image_tag != "cpu" {
+        images.push(crate::docker::image_ref_for_tag("cpu"));
+    }
+
+    images.iter().all(|image| {
+        crate::cmd::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
 }
 
-fn check_secret_exists() -> bool {
-    data_dir().join("node-secret.json").exists()
+fn signer_key_label() -> String {
+    if data_dir().join("keystore.json").exists() {
+        "Signer key configured".to_string()
+    } else {
+        "Signer key will be generated on first start".to_string()
+    }
 }
 
 const CHECK_SERVICE: &str = "https://check.quip.network";
@@ -447,64 +465,58 @@ where
 {
     let mut checks = Vec::new();
 
-    match run_mode {
-        RunMode::Docker => {
-            // 1. Docker
-            let docker_ok = tokio::task::spawn_blocking(check_docker)
+    // Docker is required in both modes because validator/Caddy/bootstrap
+    // remain containerized even when the miner itself runs natively.
+    let docker_ok = tokio::task::spawn_blocking(check_docker)
+        .await
+        .unwrap_or(false);
+    checks.push(CheckItem {
+        id: "docker".to_string(),
+        passed: docker_ok,
+        label: "Docker installed & running".to_string(),
+        required: true,
+    });
+    on_progress(&checks);
+
+    #[cfg(target_os = "windows")]
+    {
+        let (wsl_ok, wsl_label) =
+            tokio::task::spawn_blocking(check_wsl)
                 .await
-                .unwrap_or(false);
-            checks.push(CheckItem {
-                id: "docker".to_string(),
-                passed: docker_ok,
-                label: "Docker installed & running".to_string(),
-                required: true,
-            });
-            on_progress(&checks);
+                .unwrap_or((false, "WSL check failed".into()));
+        checks.push(CheckItem {
+            id: "wsl".to_string(),
+            passed: wsl_ok,
+            label: wsl_label,
+            required: true,
+        });
+        on_progress(&checks);
+    }
 
-            // 1b. WSL (Windows only)
-            #[cfg(target_os = "windows")]
-            {
-                let (wsl_ok, wsl_label) =
-                    tokio::task::spawn_blocking(check_wsl)
-                        .await
-                        .unwrap_or((false, "WSL check failed".into()));
-                checks.push(CheckItem {
-                    id: "wsl".to_string(),
-                    passed: wsl_ok,
-                    label: wsl_label,
-                    required: true,
-                });
-                on_progress(&checks);
-            }
+    let image_ok = tokio::task::spawn_blocking(check_image_present)
+        .await
+        .unwrap_or(false);
+    checks.push(CheckItem {
+        id: "image".to_string(),
+        passed: image_ok,
+        label: "v0.2 runtime images available".to_string(),
+        required: true,
+    });
+    on_progress(&checks);
 
-            // 2. Image
-            let image_ok =
-                tokio::task::spawn_blocking(check_image_present)
-                    .await
-                    .unwrap_or(false);
-            checks.push(CheckItem {
-                id: "image".to_string(),
-                passed: image_ok,
-                label: "Node image available".to_string(),
-                required: true,
-            });
-            on_progress(&checks);
-        }
-        RunMode::Native => {
-            // 1. Binary available
-            let bin_ok = tokio::task::spawn_blocking(
-                crate::native::is_binary_available,
-            )
-            .await
-            .unwrap_or(false);
-            checks.push(CheckItem {
-                id: "binary".to_string(),
-                passed: bin_ok,
-                label: "Node binary available".to_string(),
-                required: true,
-            });
-            on_progress(&checks);
-        }
+    if *run_mode == RunMode::Native {
+        let bin_ok = tokio::task::spawn_blocking(
+            crate::native::is_binary_available,
+        )
+        .await
+        .unwrap_or(false);
+        checks.push(CheckItem {
+            id: "binary".to_string(),
+            passed: bin_ok,
+            label: "Native miner binary available".to_string(),
+            required: true,
+        });
+        on_progress(&checks);
     }
 
     // Version check placeholder — real check runs in background.
@@ -517,12 +529,12 @@ where
     });
     on_progress(&checks);
 
-    // 3. Secret
+    // 3. Signer key
     checks.push(CheckItem {
         id: "secret".to_string(),
-        passed: check_secret_exists(),
-        label: "Node secret configured".to_string(),
-        required: true,
+        passed: true,
+        label: signer_key_label(),
+        required: false,
     });
     on_progress(&checks);
 

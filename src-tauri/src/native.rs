@@ -414,9 +414,6 @@ pub async fn start_native_node(
         }
     }
 
-    // Write config.toml for native mode
-    crate::config::write_config_toml(&config, &RunMode::Native)?;
-
     let bin = binary_path();
     if !bin.exists() {
         return Err(format!(
@@ -424,6 +421,11 @@ pub async fn start_native_node(
             bin.display()
         ));
     }
+
+    // Write config.toml for native mode, then start shared v0.2 support.
+    crate::config::write_config_toml(&config, &RunMode::Native)?;
+    crate::docker::start_support_containers(app.clone(), RunMode::Native)
+        .await?;
 
     let config_path = data_dir().join("config.toml");
 
@@ -539,6 +541,7 @@ pub async fn stop_native_node(
         }
     }
     remove_pid();
+    crate::docker::stop_support_containers_no_log();
     Ok(())
 }
 

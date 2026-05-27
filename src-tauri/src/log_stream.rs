@@ -93,7 +93,7 @@ pub fn parse_log_line(line: &str) -> LogEntry {
 }
 
 fn node_log_path() -> PathBuf {
-    crate::settings::data_dir().join("node.log")
+    crate::settings::data_dir().join("logs").join("quip-node.log")
 }
 
 // ─── File tailing ────────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ fn tail_file<F>(
 
 /// The source to stream while waiting for node.log to appear.
 pub enum FallbackSource {
-    /// Stream `docker logs -f quip-node`
+    /// Stream `docker logs -f` for the configured miner container.
     DockerLogs,
     /// Tail a file (e.g. node-output.log for native stdout capture)
     File(PathBuf),
@@ -212,9 +212,16 @@ fn stream_with_fallback<F>(
 
         match fallback {
             FallbackSource::DockerLogs => {
+                let settings = crate::settings::load_settings();
+                let container =
+                    crate::docker::miner_container_for_tag(&settings.image_tag);
                 let mut child = match crate::cmd::new("docker")
                     .args([
-                        "logs", "-f", "--tail", "100", "quip-node",
+                        "logs",
+                        "-f",
+                        "--tail",
+                        "100",
+                        container,
                     ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
