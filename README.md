@@ -77,13 +77,15 @@ Click **More info**, then **Run anyway**.
 
 ### Setup
 
-This repo vendors the compose stack via a git submodule. After cloning:
+This repo vendors the compose stack via a git submodule. After cloning, fetch the
+submodule at the commit locked by this repo:
 
 ```sh
-git submodule update --init --recursive
+make fetch-submodules
 ```
 
-(Or clone with `git clone --recurse-submodules` to do this in one step.)
+(Equivalent to `git submodule update --init --recursive`, or clone with
+`git clone --recurse-submodules` to do this in one step.)
 
 ### Commands
 
