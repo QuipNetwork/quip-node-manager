@@ -1,0 +1,3 @@
+[submodule "vendor/nodes.quip.network"]
+	path = vendor/nodes.quip.network
+	url = https://gitlab.com/quip.network/nodes.quip.network.git

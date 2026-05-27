@@ -14,17 +14,56 @@ pub struct LogEntry {
     pub message: String,
 }
 
-pub struct LogStreamState(
-    pub Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-    pub Arc<Mutex<bool>>,
-);
+/// Shared state for the Docker logs streamer.
+///
+/// `child_pid` holds the PID of the in-flight `docker logs -f` process
+/// whenever one is running. Killing this child at stop time unblocks
+/// `BufReader::lines()` immediately instead of waiting for the next log
+/// line — critical because Docker stop isn't visible to the streamer
+/// until the daemon closes the pipe.
+pub struct LogStreamState {
+    pub handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    pub stop_flag: Arc<Mutex<bool>>,
+    pub child_pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl Default for LogStreamState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LogStreamState {
     pub fn new() -> Self {
-        LogStreamState(
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(false)),
-        )
+        LogStreamState {
+            handle: Arc::new(Mutex::new(None)),
+            stop_flag: Arc::new(Mutex::new(false)),
+            child_pid: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Kill the in-flight `docker logs` child (if any) and clear the PID.
+    /// Safe to call when no child is running.
+    pub fn kill_child(&self) {
+        if let Some(pid) = self.child_pid.lock().unwrap().take() {
+            kill_log_child(pid);
+        }
+    }
+}
+
+/// Kill a single child process by PID (not its process group).
+/// The docker logs CLI has no workers we need to clean up, so a
+/// simple single-process kill is sufficient.
+fn kill_log_child(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = crate::cmd::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
     }
 }
 
@@ -93,7 +132,9 @@ pub fn parse_log_line(line: &str) -> LogEntry {
 }
 
 fn node_log_path() -> PathBuf {
-    crate::settings::data_dir().join("node.log")
+    // compose mounts `./data:/data` from the project dir, so `/data/node.log`
+    // inside the container lands at `<data_dir>/data/node.log` on the host.
+    crate::settings::data_dir().join("data").join("node.log")
 }
 
 // ─── File tailing ────────────────────────────────────────────────────────────
@@ -167,17 +208,24 @@ fn tail_file<F>(
 
 /// The source to stream while waiting for node.log to appear.
 pub enum FallbackSource {
-    /// Stream `docker logs -f quip-node`
-    DockerLogs,
+    /// Stream `docker compose logs -f --no-log-prefix <service>`. The
+    /// service name is one of `cpu`, `cuda`, `qpu` — resolved from the
+    /// caller's current `image_tag`.
+    ComposeLogs { service: String },
     /// Tail a file (e.g. node-output.log for native stdout capture)
     File(PathBuf),
 }
 
 /// Stream from the fallback source until node.log appears, then
 /// switch to tailing node.log for the real mining activity.
+///
+/// `child_pid` is populated with the PID of the `docker logs -f` child
+/// (when `fallback == DockerLogs`) so the owner can kill it explicitly
+/// at stop time. For file-based fallbacks the slot stays `None`.
 fn stream_with_fallback<F>(
     fallback: FallbackSource,
     stop: Arc<Mutex<bool>>,
+    child_pid: Arc<Mutex<Option<u32>>>,
     emit: F,
 ) where
     F: Fn(LogEntry) -> bool + Send + Sync + 'static,
@@ -185,8 +233,27 @@ fn stream_with_fallback<F>(
     let log_path = node_log_path();
     let emit = Arc::new(emit);
 
-    // If node.log already exists and has content, skip the fallback
-    if log_path.exists() {
+    // node.log is only valid for Phase 2 if it was written during this
+    // streamer's lifetime — otherwise it's leftover from a previous run
+    // (e.g. an old node_log config) and backfilling it would flood the
+    // UI with days-old content. Compare against stream start so the
+    // file has to have been touched by the current process to count.
+    //
+    // This intentionally does *not* gate on `node_log` being set in
+    // settings: the binary may write to ~/quip-data/node.log via its own
+    // default even when the TOML field is omitted, and in that case we
+    // still want Phase 2 to engage so the UI sees the real log stream
+    // instead of an empty stdout capture.
+    let stream_start = std::time::SystemTime::now();
+    let is_current = |path: &std::path::Path| -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime >= stream_start)
+            .unwrap_or(false)
+    };
+
+    // Fast-path: node.log already being actively written when we started
+    if is_current(&log_path) {
         if let Ok(meta) = std::fs::metadata(&log_path) {
             if meta.len() > 0 {
                 tail_file(&log_path, &stop, &*emit);
@@ -211,10 +278,25 @@ fn stream_with_fallback<F>(
         };
 
         match fallback {
-            FallbackSource::DockerLogs => {
+            FallbackSource::ComposeLogs { service } => {
+                // Compose file / project-directory live in <data_dir>.
+                // `--no-log-prefix` strips compose's `cpu  |` column so the
+                // existing parse_log_line regex still works.
+                let compose_file = crate::stack_assets::stack_compose_file()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let project_dir = crate::stack_assets::stack_project_dir()
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 let mut child = match crate::cmd::new("docker")
                     .args([
-                        "logs", "-f", "--tail", "100", "quip-node",
+                        "compose",
+                        "-f", &compose_file,
+                        "--project-directory", &project_dir,
+                        "--project-name", "quip",
+                        "logs", "-f", "--no-log-prefix",
+                        "--tail", "100",
+                        &service,
                     ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -224,9 +306,32 @@ fn stream_with_fallback<F>(
                     Err(_) => return,
                 };
 
+                *child_pid.lock().unwrap() = Some(child.id());
+
                 let stdout = child.stdout.take().unwrap();
-                // Drop stderr so it doesn't block
-                drop(child.stderr.take());
+                let stderr = child.stderr.take().unwrap();
+
+                // Stream stderr on a second thread. quip-protocol's
+                // console logger writes to stderr, so without this the
+                // UI would see nothing until ~/quip-data/node.log
+                // materialised via the Phase 2 poller.
+                let stop_err = Arc::clone(&stop2);
+                let fallback_stop_err = Arc::clone(&fallback_stop2);
+                let emit_err = Arc::clone(&emit2);
+                let stderr_thread = std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines() {
+                        if *stop_err.lock().unwrap()
+                            || *fallback_stop_err.lock().unwrap()
+                        {
+                            break;
+                        }
+                        if let Ok(line) = line {
+                            if !emit_err(parse_log_line(&line)) {
+                                break;
+                            }
+                        }
+                    }
+                });
 
                 for line in BufReader::new(stdout).lines() {
                     if check_stop() { break; }
@@ -235,6 +340,8 @@ fn stream_with_fallback<F>(
                     }
                 }
                 let _ = child.kill();
+                *child_pid.lock().unwrap() = None;
+                let _ = stderr_thread.join();
             }
             FallbackSource::File(path) => {
                 // Tail the fallback file until told to stop
@@ -246,10 +353,13 @@ fn stream_with_fallback<F>(
         }
     });
 
-    // Poll for node.log to appear with content
+    // Poll for node.log to be touched by the current run. A stale file
+    // from a previous session (mtime before stream_start) is ignored,
+    // so this loop naturally stays in fallback mode when nothing in
+    // this run writes to node.log.
     loop {
         if *stop.lock().unwrap() { break; }
-        if log_path.exists() {
+        if is_current(&log_path) {
             if let Ok(meta) = std::fs::metadata(&log_path) {
                 if meta.len() > 0 { break; }
             }
@@ -274,10 +384,11 @@ fn stream_with_fallback<F>(
 pub fn start_log_stream_for_app(
     app: tauri::AppHandle,
     stop: Arc<Mutex<bool>>,
+    child_pid: Arc<Mutex<Option<u32>>>,
     fallback: FallbackSource,
 ) {
     std::thread::spawn(move || {
-        stream_with_fallback(fallback, stop, move |entry| {
+        stream_with_fallback(fallback, stop, child_pid, move |entry| {
             app.emit("node-log", &entry).is_ok()
         });
     });
@@ -288,10 +399,14 @@ pub fn start_log_stream_core(
     tx: SyncSender<LogEntry>,
     stop: Arc<Mutex<bool>>,
 ) {
+    let child_pid = Arc::new(Mutex::new(None));
+    let service =
+        crate::settings::load_settings().image_tag.service().to_string();
     std::thread::spawn(move || {
         stream_with_fallback(
-            FallbackSource::DockerLogs,
+            FallbackSource::ComposeLogs { service },
             stop,
+            child_pid,
             move |entry| tx.send(entry).is_ok(),
         );
     });
@@ -302,26 +417,36 @@ pub async fn start_log_stream(
     app: tauri::AppHandle,
     state: tauri::State<'_, LogStreamState>,
 ) -> Result<(), String> {
-    {
-        let mut stop = state.1.lock().unwrap();
-        *stop = true;
-    }
+    let service =
+        crate::settings::load_settings().image_tag.service().to_string();
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": "INFO",
+            "message": format!(
+                "[log-stream] starting docker compose logs -f {service}"
+            ),
+        }),
+    );
+    // Stop any existing streamer first, including killing its child.
+    state.kill_child();
+    *state.stop_flag.lock().unwrap() = true;
     std::thread::sleep(std::time::Duration::from_millis(200));
-    {
-        let mut stop = state.1.lock().unwrap();
-        *stop = false;
-    }
+    *state.stop_flag.lock().unwrap() = false;
 
-    let stop_flag = Arc::clone(&state.1);
+    let stop_flag = Arc::clone(&state.stop_flag);
+    let child_pid = Arc::clone(&state.child_pid);
     let handle = std::thread::spawn(move || {
         stream_with_fallback(
-            FallbackSource::DockerLogs,
+            FallbackSource::ComposeLogs { service },
             stop_flag,
+            child_pid,
             move |entry| app.emit("node-log", &entry).is_ok(),
         );
     });
 
-    *state.0.lock().unwrap() = Some(handle);
+    *state.handle.lock().unwrap() = Some(handle);
     Ok(())
 }
 
@@ -329,7 +454,8 @@ pub async fn start_log_stream(
 pub async fn stop_log_stream(
     state: tauri::State<'_, LogStreamState>,
 ) -> Result<(), String> {
-    let mut stop = state.1.lock().unwrap();
-    *stop = true;
+    // Kill the child FIRST so BufReader::lines() unblocks immediately.
+    state.kill_child();
+    *state.stop_flag.lock().unwrap() = true;
     Ok(())
 }

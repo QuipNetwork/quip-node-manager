@@ -123,7 +123,17 @@ fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
 fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
     let toggle_style = focus_style(app, &FocusId::ChecklistToggle);
     let arrow = if app.checklist_expanded { "▼" } else { "▶" };
-    let passed = app.checks.iter().filter(|c| c.passed).count();
+    let passed = app
+        .checks
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state,
+                crate::checklist::CheckState::Pass
+                    | crate::checklist::CheckState::Skip
+            )
+        })
+        .count();
     let total = app.checks.len();
     let summary = if total == 0 {
         if app.checklist_running { " (running…)".to_string() } else { String::new() }
@@ -140,7 +150,14 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
 
     if app.checklist_expanded {
         for check in &app.checks {
-            let (sym, col) = if check.passed { ("✓", PASS) } else { ("✗", FAIL) };
+            let (sym, col) = match check.state {
+                crate::checklist::CheckState::Pass => ("✓", PASS),
+                crate::checklist::CheckState::Skip => ("—", Color::DarkGray),
+                crate::checklist::CheckState::Warn => ("⚠", WARN_COLOR),
+                crate::checklist::CheckState::Running => ("◌", Color::Cyan),
+                crate::checklist::CheckState::Idle => ("○", Color::DarkGray),
+                crate::checklist::CheckState::Fail => ("✗", FAIL),
+            };
             if check.id == "port" {
                 // Port item gets an inline Recheck button.
                 let recheck_style = focus_style(app, &FocusId::CheckPort);

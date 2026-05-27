@@ -2,19 +2,21 @@
 
 pub mod cmd;
 pub mod checklist;
+pub mod compose;
 pub mod config;
-pub mod docker;
 pub mod hardware;
 pub mod log_stream;
 pub mod native;
 pub mod network;
 pub mod secret;
 pub mod settings;
+pub mod stack_assets;
 pub mod tui_app;
 pub mod tui_input;
 pub mod tui_ui;
 pub mod update;
 
+use checklist::ChecklistState;
 use log_stream::LogStreamState;
 use native::NativeProcessState;
 use std::sync::Mutex;
@@ -55,6 +57,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(LogStreamState::new())
         .manage(NativeProcessState::new())
+        .manage(ChecklistState::new())
         .manage(TrayState {
             id: Mutex::new(None),
         })
@@ -69,14 +72,15 @@ pub fn run() {
             secret::get_node_secret,
             secret::generate_node_secret,
             config::generate_config_toml,
-            // Docker
-            docker::check_docker_installed,
-            docker::check_docker_hello_world,
-            docker::pull_node_image,
-            docker::start_node_container,
-            docker::stop_node_container,
-            docker::get_container_status,
-            docker::get_container_config,
+            // Compose stack
+            compose::check_docker_installed,
+            compose::check_docker_hello_world,
+            compose::check_docker_compose_installed,
+            compose::pull_compose_images,
+            compose::start_stack,
+            compose::stop_stack,
+            compose::get_stack_status,
+            compose::get_stack_config,
             // Hardware
             hardware::detect_gpu_backend,
             hardware::list_gpu_devices,
@@ -91,13 +95,14 @@ pub fn run() {
             native::start_native_log_tail,
             // Network & checklist
             network::detect_public_ip,
-            checklist::recheck_port_forwarding,
-            checklist::run_checklist,
+            checklist::get_checklist,
+            checklist::recheck,
             // Updates
             update::get_app_version,
             update::get_node_version,
             update::check_app_update,
             update::check_image_update,
+            update::check_dashboard_image_update,
             // Log streaming
             log_stream::start_log_stream,
             log_stream::stop_log_stream,
@@ -138,23 +143,30 @@ pub fn run() {
                             tauri::async_runtime::spawn(async move {
                                 let settings =
                                     crate::settings::load_settings();
+                                // Native: run the binary + (if dashboard) the
+                                // compose stack's non-node services.
+                                // Docker: run the full compose stack.
                                 let _ = match settings.run_mode {
                                     crate::settings::RunMode::Docker => {
-                                        docker::start_node_container(
-                                            handle,
-                                        )
-                                        .await
-                                        .map(|_| ())
+                                        compose::start_stack(handle).await
                                     }
                                     crate::settings::RunMode::Native => {
                                         let state = handle
                                             .state::<NativeProcessState>();
-                                        native::start_native_node(
-                                            handle.clone(),
-                                            state,
-                                        )
-                                        .await
-                                        .map(|_| ())
+                                        let native_res =
+                                            native::start_native_node(
+                                                handle.clone(),
+                                                state,
+                                            )
+                                            .await
+                                            .map(|_| ());
+                                        if settings.dashboard_enabled {
+                                            let _ = compose::start_stack(
+                                                handle.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        native_res
                                     }
                                 };
                             });
@@ -166,16 +178,24 @@ pub fn run() {
                                     crate::settings::load_settings();
                                 let _ = match settings.run_mode {
                                     crate::settings::RunMode::Docker => {
-                                        docker::stop_node_container(
-                                            handle,
-                                        )
-                                        .await
+                                        compose::stop_stack(handle).await
                                     }
                                     crate::settings::RunMode::Native => {
                                         let state = handle
                                             .state::<NativeProcessState>();
-                                        native::stop_native_node(state)
-                                            .await
+                                        let native_res =
+                                            native::stop_native_node(
+                                                handle.clone(),
+                                                state,
+                                            )
+                                            .await;
+                                        if settings.dashboard_enabled {
+                                            let _ = compose::stop_stack(
+                                                handle.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        native_res
                                     }
                                 };
                             });

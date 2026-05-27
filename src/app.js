@@ -6,23 +6,144 @@ const invoke =
   (() => Promise.reject('Tauri not available'));
 const listen =
   window.__TAURI__?.event?.listen ?? (() => Promise.resolve(() => {}));
-const openUrl =
-  window.__TAURI__?.opener?.openUrl ??
-  ((url) => { window.open(url, '_blank'); });
+// Route external URLs through the tauri-plugin-opener Rust command.
+// window.__TAURI__.opener.openUrl only exists if the plugin's JS wrapper
+// is bundled into the frontend (we ship raw JS, so it isn't). invoke()
+// goes straight to the Rust side, which shells out to `open(1)` / etc.
+const openUrl = (url) =>
+  invoke('plugin:opener|open_url', { url })
+    .catch((e) => console.error('openUrl failed:', e));
 
 // App state
 const state = {
   settings: null,
   containerRunning: false,
   nativeRunning: false,
+  // Full StackStatus returned by get_stack_status:
+  // { services: [{name, service, running, health, status_text, image}], overall }
+  stack: null,
   checksPassed: false,
   detectedGpus: [], // { index, name }
   logLines: [],
   MAX_LOG_LINES: 500,
   pollInterval: null,
-  portCheckResult: null, // null=unchecked, true=forwarded, false=not reached
-  lastChecks: [],        // last checklist payload from backend
+  // Map<id, CheckItem> — single source of truth for the checklist UI.
+  // Merged from `checklist-update` events; rendered by renderChecklist().
+  checks: new Map(),
   hardwareSurvey: null,
+};
+
+// ─── Stack Configuration UI ─────────────────────────────────────────────────
+
+// Show the TLS subsettings block only when both dashboard and TLS are on.
+// TLS without the dashboard is meaningless (Caddy only fronts the dashboard
+// in this stack) so we disable the TLS checkbox when dashboard is off.
+function updateStackUiVisibility() {
+  const dashEl = document.getElementById('dashboard-enabled');
+  const tlsEl = document.getElementById('tls-enabled');
+  const subs = document.getElementById('tls-subsettings');
+  if (!dashEl || !tlsEl || !subs) return;
+
+  const dash = dashEl.checked;
+  tlsEl.disabled = !dash;
+  if (!dash) tlsEl.checked = false;
+  subs.style.display = dash && tlsEl.checked ? '' : 'none';
+}
+
+document.addEventListener('change', (e) => {
+  if (!e.target) return;
+  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+    updateStackUiVisibility();
+  }
+  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+    // These settings change the compose profile; refresh the checklist so
+    // the user sees profile-specific items (rest-port-native, port-tls, …)
+    // without waiting for the next recheck cycle.
+    invoke('recheck').catch(() => {});
+  }
+});
+
+// ─── Dashboard tab iframe wiring ────────────────────────────────────────────
+
+function dashboardUrl(settings) {
+  if (!settings?.dashboard_enabled) return null;
+  const hostname = settings.dashboard_hostname || 'localhost:20080';
+  // ACME via Caddy only when TLS is on AND the hostname is a real DNS name
+  // (localhost can't get a public cert). In every other case plain HTTP on
+  // whatever port was configured.
+  if (settings.tls_enabled && !hostname.startsWith('localhost')) {
+    return `https://${hostname.replace(/:.*/, '')}`;
+  }
+  return `http://${hostname}`;
+}
+
+function refreshDashboardTab() {
+  const frame = document.getElementById('dashboard-frame');
+  const empty = document.getElementById('dashboard-empty');
+  const msg = document.getElementById('dashboard-empty-msg');
+  if (!frame || !empty) return; // tab markup not present on first load
+
+  const url = dashboardUrl(state.settings);
+  const dashRunning = state.stack?.services?.some(
+    (s) => (s.service === 'dashboard' || s.service === 'dashboard-direct') && s.running,
+  );
+
+  // Toggle via style.display rather than the `hidden` attribute — the
+  // placeholder has `display: flex` in CSS (for its centered layout) which
+  // would otherwise override `hidden` and keep both elements visible.
+  const show = (el, display) => { el.style.display = display; };
+
+  // Compare against the raw content attribute, not the IDL `frame.src`
+  // getter — the latter returns the URL-normalized form (trailing slash
+  // appended to `http://host:port`) and would differ from our computed
+  // string on every tick, reloading the iframe and resetting the user's
+  // place on the page.
+  const currentSrc = frame.getAttribute('src');
+  if (!url) {
+    if (msg) msg.textContent = 'Dashboard disabled — enable it in the Status tab.';
+    show(empty, 'flex');
+    show(frame, 'none');
+    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
+  } else if (!dashRunning) {
+    if (msg) msg.textContent = 'Starting dashboard…';
+    show(empty, 'flex');
+    show(frame, 'none');
+    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
+  } else {
+    if (currentSrc !== url) frame.src = url;
+    show(empty, 'none');
+    show(frame, 'block');
+  }
+}
+
+// Render order; the backend decides visibility, so this array can safely
+// include ids that don't appear in state.checks for the current settings
+// combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
+const CHECK_ORDER = [
+  'docker', 'docker-compose', 'stack-assets', 'wsl',
+  'stack-images', 'binary', 'version', 'secret',
+  'ip', 'hostname', 'port', 'port-dashboard', 'port-tls',
+  'rest-port-native', 'firewall', 'dwave-key',
+];
+
+// State-to-icon mapping for the checklist. CSS class `state-<state>`
+// drives colour and (for running) the spin animation.
+const STATE_ICON = {
+  idle:    '○', // ○
+  running: '◌', // ◌
+  pass:    '✓', // ✓
+  warn:    '⚠', // ⚠
+  fail:    '✗', // ✗
+  skip:    '—', // —
+};
+
+// Fix button labels, keyed by FixKind.kind.
+const FIX_LABELS = {
+  InstallDocker:   'Install Docker',
+  PullImage:       'Pull Image',
+  DownloadBinary:  'Download & Install',
+  GenerateSecret:  'Generate Secret',
+  Delegate:        'Update',
 };
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
@@ -43,6 +164,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
         console.error
       );
     }
+    if (tab === 'dashboard') refreshDashboardTab();
   });
 });
 
@@ -71,13 +193,13 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   list.style.display = expanded ? 'none' : '';
 });
 
-// ─── Port change → re-run checklist ──────────────────────────────────────────
+// ─── Port change → re-run port-related checks ────────────────────────────────
 document.getElementById('port').addEventListener('change', async () => {
   const port = parseInt(document.getElementById('port').value) || 20049;
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('run_checklist').catch(console.error);
+    await invoke('recheck', { ids: ['port', 'firewall'] }).catch(console.error);
   }
 });
 
@@ -119,7 +241,9 @@ document.getElementById('run-mode-select').addEventListener('change', async () =
   state.settings.run_mode = document.getElementById('run-mode-select').value;
   updateRunModeUI();
   await invoke('update_settings', { settings: state.settings }).catch(console.error);
-  await invoke('run_checklist').catch(console.error);
+  // Mode change invalidates the whole cache — backend reseeds and reruns.
+  state.checks.clear();
+  await invoke('recheck').catch(console.error);
 });
 
 function updateRunModeUI() {
@@ -140,13 +264,10 @@ function updateRunModeUI() {
   const mode = state.settings?.run_mode || 'docker';
   const isDocker = mode === 'docker';
 
-  // Toggle checklist item visibility
-  document.querySelectorAll('.docker-only').forEach((el) => {
-    el.style.display = isDocker ? '' : 'none';
-  });
-  document.querySelectorAll('.native-only').forEach((el) => {
-    el.style.display = isDocker ? 'none' : '';
-  });
+  // Checklist items are filtered by mode inside renderChecklist(); re-render
+  // here because mode and the hardware survey (WSL visibility) can land
+  // in either order during init.
+  renderChecklist();
 
   // Warnings (only relevant on macOS where the toggle exists)
   const warning = document.getElementById('run-mode-warning');
@@ -243,7 +364,7 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
       state.settings.node_config.secret = secret;
       await invoke('update_settings', { settings: state.settings });
     }
-    await invoke('run_checklist').catch(console.error);
+    await invoke('recheck', { ids: ['secret'] }).catch(console.error);
   } catch (e) {
     console.error('Failed to regenerate secret:', e);
   }
@@ -362,10 +483,25 @@ function applyFormToSettings() {
   state.settings.node_config = collectConfig();
   state.settings.auto_update_enabled =
     document.getElementById('auto-update-enabled')?.checked ?? false;
-  // cuda image only when NVIDIA GPUs enabled in Docker mode
+
+  // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
+  // enabled, CPU otherwise. QPU mining is a config.toml [dwave] concern, not
+  // a separate image — so there's no QPU option to pick here.
   const hasEnabledCuda = (state.settings.node_config.gpu_device_configs || [])
     .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
   state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
+
+  state.settings.dashboard_enabled =
+    document.getElementById('dashboard-enabled')?.checked ?? true;
+  state.settings.tls_enabled =
+    document.getElementById('tls-enabled')?.checked ?? false;
+  state.settings.dashboard_hostname =
+    document.getElementById('dashboard-hostname')?.value?.trim() ||
+    'localhost:20080';
+  state.settings.cert_email =
+    document.getElementById('cert-email')?.value?.trim() || '';
+  state.settings.zerossl_api_key =
+    document.getElementById('zerossl-api-key')?.value ?? '';
 }
 
 // ─── Populate form from settings ─────────────────────────────────────────────
@@ -411,6 +547,18 @@ function populateForm(settings) {
   document.getElementById('rest-insecure-port').value = c.rest_insecure_port ?? -1;
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
+
+  // Stack Configuration (image_tag is auto-derived, no UI control)
+  document.getElementById('dashboard-enabled').checked =
+    settings.dashboard_enabled ?? true;
+  document.getElementById('tls-enabled').checked =
+    settings.tls_enabled ?? false;
+  document.getElementById('dashboard-hostname').value =
+    settings.dashboard_hostname ?? 'localhost:20080';
+  document.getElementById('cert-email').value = settings.cert_email ?? '';
+  document.getElementById('zerossl-api-key').value =
+    settings.zerossl_api_key ?? '';
+  updateStackUiVisibility();
 
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
@@ -489,81 +637,252 @@ function setStatus(stateStr) {
   }
 }
 
-// ─── Checklist update ─────────────────────────────────────────────────────────
-function updateChecklist(checks) {
-  // Checklist streams in progressively; complete once the last item arrives.
-  const complete = checks.some((c) => c.id === 'firewall');
-  state.lastChecks = checks;
-  const portPassed = (c) =>
-    state.portCheckResult !== null ? state.portCheckResult : c.passed;
-  const checkPassed = (c) =>
-    c.id === 'port' ? portPassed(c) : c.passed;
-  const allPassed =
-    complete &&
-    checks.filter((c) => c.required !== false).every(checkPassed);
-  const requiredFailing = checks.filter(
-    (c) => c.required !== false && !checkPassed(c)
+// ─── Checklist render (FSM) ──────────────────────────────────────────────────
+//
+// The backend emits one CheckItem per `checklist-update` event. We merge
+// by id into state.checks and repaint. No per-item listener churn:
+// everything routes through one delegated click handler at the bottom
+// of this section.
+
+// Mirror of checklist.rs::visible_for_mode — which ids render for the
+// current settings. Backend already filters this way; duplicating the
+// logic here prevents the frontend from ever drawing a placeholder for
+// a check that can't apply to the current profile.
+function visibleInMode(id, runMode) {
+  const s = state.settings;
+  const isDocker = (runMode || 'docker') === 'docker';
+  const dashboard = s?.dashboard_enabled ?? true;
+  const tls = s?.tls_enabled ?? false;
+  const hasDwave = !!s?.node_config?.dwave_config;
+  // Compose runs whenever we're in Docker mode, OR Native mode with the
+  // dashboard on (dashboard+postgres[+caddy] run via compose even when
+  // the node runs as a host binary).
+  const composeWillRun = isDocker || dashboard;
+
+  switch (id) {
+    case 'docker':
+    case 'docker-compose':
+    case 'stack-assets':
+    case 'stack-images':
+      return composeWillRun;
+    case 'wsl':
+      return isDocker && state.hardwareSurvey?.os === 'windows';
+    case 'binary':
+      return !isDocker;
+    case 'port-dashboard':
+      return composeWillRun && dashboard && !tls;
+    case 'port-tls':
+      return composeWillRun && dashboard && tls;
+    case 'rest-port-native':
+      return !isDocker && dashboard;
+    case 'dwave-key':
+      return hasDwave;
+    // version / secret / ip / hostname / port / firewall — always shown.
+    default:
+      return true;
+  }
+}
+
+function renderChecklistItem(item) {
+  const li = document.createElement('li');
+  li.className = 'checklist-item';
+  li.dataset.id = item.id;
+
+  const icon = document.createElement('span');
+  icon.className = `check-icon state-${item.state}`;
+  icon.textContent = STATE_ICON[item.state] || STATE_ICON.idle;
+
+  const label = document.createElement('span');
+  label.className = 'check-label';
+  label.textContent = item.label;
+  if (item.detail) label.title = item.detail;
+
+  const actions = document.createElement('div');
+  actions.className = 'check-actions';
+
+  const recheckBtn = document.createElement('button');
+  recheckBtn.type = 'button';
+  recheckBtn.className = 'btn btn-sm btn-secondary check-action';
+  recheckBtn.dataset.action = 'recheck';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Recheck';
+  recheckBtn.disabled = item.state === 'running';
+  actions.appendChild(recheckBtn);
+
+  if (item.fixable && (item.state === 'fail' || item.state === 'warn')) {
+    const fixBtn = document.createElement('button');
+    fixBtn.type = 'button';
+    fixBtn.className = 'btn btn-sm btn-secondary check-action';
+    fixBtn.dataset.action = 'fix';
+    fixBtn.textContent = FIX_LABELS[item.fixable.kind] || 'Fix';
+    actions.appendChild(fixBtn);
+  }
+
+  li.append(icon, label, actions);
+  return li;
+}
+
+function renderChecklist() {
+  const runMode = state.settings?.run_mode || 'docker';
+  const ul = document.getElementById('checklist');
+  const visible = CHECK_ORDER.filter((id) => visibleInMode(id, runMode));
+
+  const rows = visible.map((id) => {
+    const item = state.checks.get(id) || {
+      id, state: 'idle', label: defaultLabel(id), required: false, fixable: null,
+    };
+    return renderChecklistItem(item);
+  });
+  ul.replaceChildren(...rows);
+
+  updateChecklistSummary(visible);
+}
+
+function defaultLabel(id) {
+  const port = state.settings?.node_config?.port ?? 20049;
+  switch (id) {
+    case 'docker':            return 'Docker installed & running';
+    case 'docker-compose':    return 'Docker Compose v2 available';
+    case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
+    case 'wsl':               return 'WSL installed with distro';
+    case 'stack-images':      return 'Stack images available';
+    case 'binary':            return 'Node binary available';
+    case 'version':           return 'Node version up to date';
+    case 'secret':            return 'Node secret configured';
+    case 'ip':                return 'Public IP reachable';
+    case 'hostname':          return 'Hostname accessible to internet';
+    case 'port':              return `Port ${port} — press Recheck to test`;
+    case 'port-dashboard':    return 'Dashboard port 20080 available';
+    case 'port-tls':          return 'TLS ports 80 + 443 available';
+    case 'rest-port-native':  return 'Native REST port available';
+    case 'firewall':          return 'Local firewall allows port (UDP+TCP)';
+    case 'dwave-key':         return 'D-Wave API token configured';
+    default:                  return id;
+  }
+}
+
+function updateChecklistSummary(visibleIds) {
+  const items = visibleIds.map((id) => state.checks.get(id)).filter(Boolean);
+  const allRun = items.length === visibleIds.length &&
+                 items.every((i) => i.state !== 'idle' && i.state !== 'running');
+
+  const requiredFailing = items.filter(
+    (i) => i.required === true && i.state === 'fail'
   ).length;
-  const warnings = checks.filter(
-    (c) => c.required === false && !checkPassed(c) && !c.label?.includes('\u2026')
+  const warnings = items.filter(
+    (i) => i.state === 'warn' || (i.required !== true && i.state === 'fail')
   ).length;
 
-  state.checksPassed = allPassed;
+  state.checksPassed = allRun && requiredFailing === 0;
 
   const summary = document.getElementById('checklist-summary');
   const checklistEl = document.getElementById('checklist');
   const toggleBtn = document.getElementById('checklist-toggle');
+  if (!summary || !toggleBtn) return;
 
-  if (summary) {
-    if (!complete) {
-      summary.textContent = 'Checking\u2026';
-      summary.style.color = 'var(--text-faint)';
-    } else if (allPassed && warnings === 0) {
-      summary.textContent = '\u2713 All requirements met';
-      summary.style.color = 'var(--success)';
-      toggleBtn.setAttribute('aria-expanded', 'false');
-      checklistEl.style.display = 'none';
-    } else if (allPassed && warnings > 0) {
-      const s = warnings > 1 ? 's' : '';
-      summary.textContent = `\u2713 Ready (${warnings} warning${s})`;
-      summary.style.color = 'var(--warning)';
-      toggleBtn.setAttribute('aria-expanded', 'false');
-      checklistEl.style.display = 'none';
-    } else {
-      summary.textContent = `\u2717 ${requiredFailing} not met`;
-      summary.style.color = 'var(--error)';
-      toggleBtn.setAttribute('aria-expanded', 'true');
-      checklistEl.style.display = '';
-    }
+  if (!allRun) {
+    summary.textContent = 'Checking…';
+    summary.style.color = 'var(--text-faint)';
+  } else if (requiredFailing === 0 && warnings === 0) {
+    summary.textContent = '✓ All requirements met';
+    summary.style.color = 'var(--success)';
+    toggleBtn.setAttribute('aria-expanded', 'false');
+    checklistEl.style.display = 'none';
+  } else if (requiredFailing === 0) {
+    const s = warnings > 1 ? 's' : '';
+    summary.textContent = `✓ Ready (${warnings} warning${s})`;
+    summary.style.color = 'var(--warning)';
+    toggleBtn.setAttribute('aria-expanded', 'false');
+    checklistEl.style.display = 'none';
+  } else {
+    summary.textContent = `✗ ${requiredFailing} not met`;
+    summary.style.color = 'var(--error)';
+    toggleBtn.setAttribute('aria-expanded', 'true');
+    checklistEl.style.display = '';
   }
-
-  checks.forEach((check) => {
-    const item = document.querySelector(
-      `.checklist-item[data-id="${check.id}"]`
-    );
-    if (!item) return;
-    const icon = item.querySelector('.check-icon');
-    const label = item.querySelector('.check-label');
-
-    const passed = checkPassed(check);
-    const isPending = !passed && check.label?.includes('\u2026');
-    const isWarning = !passed && !isPending && check.required === false;
-    icon.textContent = passed
-      ? '\u2713'
-      : isPending ? '\u25CB' : (isWarning ? '\u26A0' : '\u2717');
-    icon.style.color = passed
-      ? 'var(--success)'
-      : isPending ? 'var(--text-faint)' : (isWarning ? 'var(--warning)' : 'var(--error)');
-    if (label && check.label) label.textContent = check.label;
-
-    const actionBtn = item.querySelector('.check-action');
-    if (actionBtn && actionBtn.tagName === 'BUTTON') {
-      actionBtn.style.display = (passed || isPending) ? 'none' : 'inline-flex';
-    }
-  });
 
   updateStartStopState();
 }
+
+function mergeCheckUpdate(item) {
+  state.checks.set(item.id, item);
+  renderChecklist();
+
+  // The version check resolves the "v<app> (node <node>)" label in the
+  // header. When version transitions to a terminal state the node version
+  // may have changed (pull/download fixes), so refresh the display.
+  if (item.id === 'version' && item.state !== 'idle' && item.state !== 'running') {
+    refreshNodeVersion();
+  }
+}
+
+// ─── Fix action dispatcher ──────────────────────────────────────────────────
+async function runFix(id) {
+  const item = state.checks.get(id);
+  if (!item || !item.fixable) return;
+
+  const fix = item.fixable;
+  switch (fix.kind) {
+    case 'InstallDocker':
+      openUrl('https://docs.docker.com/get-docker/');
+      return;
+
+    case 'PullImage': {
+      // Pulls every image in the current profile (node + dashboard +
+      // postgres + caddy as applicable). The old tag-specific call is
+      // obsolete — image selection happens inside compose now.
+      try {
+        await invoke('pull_compose_images');
+      } catch (e) {
+        console.error('Pull failed:', e);
+      }
+      return;
+    }
+
+    case 'DownloadBinary':
+      try {
+        await invoke('download_native_binary');
+      } catch (e) {
+        appendLog({ timestamp: '', level: 'ERROR', message: `Download failed: ${e}` });
+      }
+      return;
+
+    case 'GenerateSecret':
+      try {
+        const secret = await invoke('generate_node_secret');
+        document.getElementById('secret-display').value = secret;
+        if (state.settings) {
+          state.settings.node_config.secret = secret;
+          await invoke('update_settings', { settings: state.settings });
+        }
+        await invoke('recheck', { ids: ['secret'] }).catch(console.error);
+      } catch (e) {
+        console.error('Failed to generate secret:', e);
+      }
+      return;
+
+    case 'Delegate':
+      return runFix(fix.arg);
+  }
+}
+
+// ─── Checklist event delegation ──────────────────────────────────────────────
+document.getElementById('checklist').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const li = btn.closest('.checklist-item');
+  const id = li?.dataset.id;
+  if (!id) return;
+  if (btn.dataset.action === 'recheck') {
+    invoke('recheck', { ids: [id] }).catch(console.error);
+  } else if (btn.dataset.action === 'fix') {
+    runFix(id);
+  }
+});
+
+// ─── Global Recheck All ──────────────────────────────────────────────────────
+document.getElementById('btn-recheck-all').addEventListener('click', () => {
+  invoke('recheck').catch(console.error);
+});
 
 // ─── Log panel ────────────────────────────────────────────────────────────────
 function escHtml(str) {
@@ -604,93 +923,6 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
   document.getElementById('log-output').innerHTML = '';
 });
 
-// ─── Checklist action buttons ──────────────────────────────────────────────────
-document
-  .querySelector('[data-id="docker"] .check-action')
-  ?.addEventListener('click', () => {
-    openUrl('https://docs.docker.com/get-docker/');
-  });
-
-document
-  .querySelector('[data-id="image"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="image"] .check-action');
-    const tag = state.settings?.image_tag || 'cpu';
-    btn.disabled = true;
-    btn.textContent = 'Pulling\u2026';
-    try {
-      await invoke('pull_node_image', { imageTag: tag });
-      btn.style.display = 'none';
-      await invoke('run_checklist');
-    } catch (e) {
-      btn.disabled = false;
-      btn.textContent = 'Retry Pull';
-      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
-    }
-  });
-
-document
-  .querySelector('[data-id="secret"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="secret"] .check-action');
-    btn.disabled = true;
-    btn.textContent = 'Generating\u2026';
-    try {
-      const secret = await invoke('generate_node_secret');
-      document.getElementById('secret-display').value = secret;
-      if (state.settings) {
-        state.settings.node_config.secret = secret;
-        await invoke('update_settings', { settings: state.settings });
-      }
-      btn.style.display = 'none';
-      await invoke('run_checklist');
-    } catch (e) {
-      btn.disabled = false;
-      btn.textContent = 'Generate Secret';
-      console.error(e);
-    }
-  });
-
-// ─── Binary download action ──────────────────────────────────────────────────
-document
-  .querySelector('[data-id="binary"] .check-action')
-  ?.addEventListener('click', async () => {
-    const btn = document.querySelector('[data-id="binary"] .check-action');
-    const label = document.querySelector('[data-id="binary"] .check-label');
-    btn.disabled = true;
-    btn.textContent = 'Downloading\u2026';
-    label.textContent = 'Downloading node binary\u2026';
-    // Switch label to "Installing" once download completes (before invoke returns)
-    const progressCleanup = await listen('binary-download-progress', (event) => {
-      if (event.payload.done) {
-        label.textContent = 'Installing node binary\u2026';
-        btn.textContent = 'Installing\u2026';
-      }
-    });
-    try {
-      const version = await invoke('download_native_binary');
-      label.textContent = `Node binary v${version} installed`;
-      btn.style.display = 'none';
-      progressCleanup();
-      await invoke('run_checklist');
-    } catch (e) {
-      label.textContent = `Download failed: ${e}`;
-      btn.disabled = false;
-      btn.textContent = 'Retry Download & Install';
-      progressCleanup();
-    }
-  });
-
-// ─── Version update action (delegates to image pull or binary download) ──────
-document
-  .querySelector('[data-id="version"] .check-action')
-  ?.addEventListener('click', () => {
-    const target = isDockerMode()
-      ? document.querySelector('[data-id="image"] .check-action')
-      : document.querySelector('[data-id="binary"] .check-action');
-    if (target) target.click();
-  });
-
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
 function isDockerMode() {
   return (state.settings?.run_mode ?? 'docker') === 'docker';
@@ -708,10 +940,16 @@ function expandConfig() {
 
 async function startNode() {
   if (isDockerMode()) {
-    await invoke('start_node_container');
+    await invoke('start_stack');
     await invoke('start_log_stream');
   } else {
+    // Native mode: run the binary on the host + (optionally) the
+    // compose stack's non-node services (dashboard+postgres+caddy) so
+    // the user still gets the dashboard UI.
     await invoke('start_native_node');
+    if (state.settings?.dashboard_enabled) {
+      try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
+    }
   }
   collapseConfig();
 }
@@ -719,9 +957,12 @@ async function startNode() {
 async function stopNode() {
   if (isDockerMode()) {
     await invoke('stop_log_stream');
-    await invoke('stop_node_container');
+    await invoke('stop_stack');
   } else {
     await invoke('stop_native_node');
+    if (state.settings?.dashboard_enabled) {
+      try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
+    }
   }
 }
 
@@ -792,13 +1033,36 @@ document.getElementById('btn-save').addEventListener('click', async () => {
 });
 
 // ─── Polling ──────────────────────────────────────────────────────────────────
+// `containerRunning` now means "the compose stack's node service is up" in
+// Docker mode, or "the compose stack has services up" as a proxy for "the
+// manager is managing something" in Native mode.
+function stackRunningInMode() {
+  const s = state.stack;
+  if (!s) return false;
+  if (isDockerMode()) {
+    // Node container must be one of the running services in Docker mode.
+    const nodeRunning = s.services?.some(
+      (x) => ['cpu', 'cuda', 'qpu'].includes(x.service) && x.running,
+    );
+    return !!nodeRunning;
+  }
+  return s.services?.some((x) => x.running);
+}
+
 async function pollStatus() {
   try {
+    // Stack status is valid in both Docker and Native modes (Native runs a
+    // subset — dashboard+postgres[+caddy]).
+    try {
+      state.stack = await invoke('get_stack_status');
+    } catch {
+      state.stack = null;
+    }
+
     if (isDockerMode()) {
-      const status = await invoke('get_container_status');
-      state.containerRunning = status.running;
+      state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
-      setStatus(status.running ? 'running' : 'stopped');
+      setStatus(state.containerRunning ? 'running' : 'stopped');
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
@@ -811,39 +1075,8 @@ async function pollStatus() {
     setStatus('stopped');
   }
   updateStartStopState();
+  refreshDashboardTab();
 }
-
-// ─── Port recheck ─────────────────────────────────────────────────────────────
-document.getElementById('btn-port-recheck').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-port-recheck');
-  const item = document.querySelector('.checklist-item[data-id="port"]');
-  const icon = item.querySelector('.check-icon');
-  const label = item.querySelector('.check-label');
-  const port = state.settings?.node_config?.port ?? 20049;
-
-  btn.disabled = true;
-  btn.textContent = 'Checking\u2026';
-  icon.textContent = '\u25cb';
-  icon.style.color = '';
-  label.textContent = `Port ${port} \u2014 checking via public IP\u2026`;
-
-  try {
-    const ok = await invoke('recheck_port_forwarding', { port });
-    state.portCheckResult = ok;
-    icon.textContent = ok ? '\u2713' : '\u2717';
-    icon.style.color = ok ? 'var(--success)' : 'var(--error)';
-    label.textContent = ok
-      ? `Port ${port} forwarded (ensure both UDP+TCP on router)`
-      : `Port ${port} \u2014 not reachable \u2014 forward UDP+TCP on router`;
-    // Re-evaluate summary and start-button state using the stored checks.
-    updateChecklist(state.lastChecks);
-  } catch (e) {
-    label.textContent = `Port check error: ${e}`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Recheck';
-  }
-});
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
 async function setupListeners() {
@@ -851,8 +1084,9 @@ async function setupListeners() {
     appendLog(event.payload);
   });
 
+  // Single CheckItem per event — merged into state.checks by id.
   await listen('checklist-update', (event) => {
-    updateChecklist(event.payload);
+    mergeCheckUpdate(event.payload);
   });
 
   await listen('node-status', (event) => {
@@ -863,18 +1097,30 @@ async function setupListeners() {
     updateStartStopState();
   });
 
-  // Background version check result — patches the placeholder in the checklist
-  await listen('version-check-update', (event) => {
-    const result = event.payload;
-    const checks = state.lastChecks;
-    if (!checks) return;
-    const idx = checks.findIndex((c) => c.id === 'version');
-    if (idx >= 0) {
-      checks[idx] = result;
-    } else {
-      checks.push(result);
+  // Docker pull lifecycle — pull-complete always triggers a backend-side
+  // recheck of image+version, so the UI auto-updates without us doing
+  // anything here beyond logging terminal outcomes.
+  await listen('pull-complete', (event) => {
+    const { success, error } = event.payload || {};
+    if (!success) {
+      appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
-    updateChecklist(checks);
+  });
+
+  // Stop lifecycle — update the status pill immediately; backend also
+  // emits container-status so we don't have to wait for the next poll.
+  await listen('stop-complete', (event) => {
+    const { success, error } = event.payload || {};
+    if (!success) {
+      appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${error || 'unknown error'}` });
+    }
+  });
+
+  await listen('stack-status', (event) => {
+    // Backend may emit lifecycle events in future; for now we just re-poll
+    // to refresh state.stack and the dashboard iframe visibility.
+    void event;
+    pollStatus();
   });
 
   // Update notifications
@@ -986,22 +1232,28 @@ async function init() {
   // Register listeners FIRST so no events are missed
   await setupListeners();
 
-  // Load settings (fast, file I/O only) then populate form
-  invoke('get_settings')
-    .then((settings) => {
-      state.settings = settings;
-      populateForm(settings);
-      document.getElementById('run-mode-select').value =
-        settings.run_mode || 'docker';
-      document.getElementById('auto-update-enabled').checked =
-        settings.auto_update_enabled ?? false;
-      if (settings.active_tab && settings.active_tab !== 'status') {
-        document
-          .querySelector(`[data-tab="${settings.active_tab}"]`)
-          ?.click();
-      }
-    })
-    .catch((e) => console.error('Failed to load settings:', e));
+  // Load settings FIRST, before anything that branches on run_mode.
+  // pollStatus() reads isDockerMode() synchronously before its first
+  // await, so if settings haven't resolved by then it falls back to the
+  // 'docker' default — a native-mode user whose node is already running
+  // would be probed via get_stack_status, see no running services, and
+  // the log-tail reconnect below would be skipped for the entire session.
+  try {
+    const settings = await invoke('get_settings');
+    state.settings = settings;
+    populateForm(settings);
+    document.getElementById('run-mode-select').value =
+      settings.run_mode || 'docker';
+    document.getElementById('auto-update-enabled').checked =
+      settings.auto_update_enabled ?? false;
+    if (settings.active_tab && settings.active_tab !== 'status') {
+      document
+        .querySelector(`[data-tab="${settings.active_tab}"]`)
+        ?.click();
+    }
+  } catch (e) {
+    console.error('Failed to load settings:', e);
+  }
 
   // Display app version
   invoke('get_app_version')
@@ -1042,7 +1294,16 @@ async function init() {
     })
     .catch(() => {});
 
-  invoke('run_checklist').catch(console.error);
+  // Seed placeholders from the cache, then kick off a full recheck.
+  invoke('get_checklist')
+    .then((checks) => {
+      for (const c of checks) state.checks.set(c.id, c);
+      renderChecklist();
+    })
+    .catch(console.error)
+    .finally(() => {
+      invoke('recheck').catch(console.error);
+    });
 
   invoke('check_app_update')
     .then((update) => {

@@ -290,6 +290,18 @@ body {
 }
 
 /* ─── Checklist ──────────────────────────────────────────────────────────── */
+.checklist-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.checklist-header .checklist-toggle {
+  flex: 1;
+  margin-bottom: 0;
+}
+
 .checklist {
   list-style: none;
   padding: 0;
@@ -312,11 +324,34 @@ body {
   width: 20px;
   text-align: center;
   font-size: 14px;
+  color: var(--text-faint);
+}
+
+/* Per-state icon colours. Default (Idle) inherits the faint colour above. */
+.check-icon.state-pass { color: var(--success); }
+.check-icon.state-warn { color: var(--warning); }
+.check-icon.state-fail { color: var(--error); }
+.check-icon.state-skip { color: var(--text-faint); }
+.check-icon.state-running {
+  color: var(--accent, var(--text-primary));
+  display: inline-block;
+  animation: checklist-spin 1.2s linear infinite;
+}
+
+@keyframes checklist-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .check-label {
   flex: 1;
   font-size: 14px;
+}
+
+.check-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 button.check-action {
@@ -729,6 +764,23 @@ button.check-action:disabled {
   min-height: 400px;
   color: var(--text-faint);
   font-size: 18px;
+}
+
+/* Dashboard tab: the embedded iframe fills the tab edge-to-edge except for
+   the bottom margin that keeps it above the collapsed log drawer. When the
+   drawer expands it overlays the iframe temporarily — matches the rest of
+   the app's behaviour and avoids a relayout jump. */
+#tab-dashboard.active {
+  padding: 0;
+  padding-bottom: var(--drawer-collapsed);
+  display: flex;
+  flex-direction: column;
+}
+
+#tab-dashboard iframe,
+#tab-dashboard .dashboard-placeholder {
+  flex: 1;
+  min-height: 0;
 }
 
 /* ─── Scrollbar ──────────────────────────────────────────────────────────── */
