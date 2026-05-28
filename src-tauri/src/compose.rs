@@ -315,9 +315,12 @@ async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(),
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu";
-const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda";
-const COMPOSE_IMAGE_TAG: &str = "v0.2-preview";
+pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu";
+pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda";
+pub const VALIDATOR_IMAGE: &str =
+    "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node";
+pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
+pub const COMPOSE_IMAGE_TAG: &str = "v0.2-preview";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -817,6 +820,15 @@ mod tests {
             image_for_tag(ImageTag::Cuda),
             "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda"
         );
+        assert_eq!(
+            VALIDATOR_IMAGE,
+            "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node"
+        );
+        assert_eq!(
+            DASHBOARD_IMAGE,
+            "registry.gitlab.com/quip.network/dashboard.quip.network"
+        );
+        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2-preview");
     }
 
     #[test]

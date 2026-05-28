@@ -106,50 +106,63 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
 /// background monitor to iterate over the whole stack, and by each
 /// Tauri-facing check wrapper to keep serialisation shapes unchanged.
 ///
-/// Postgres and Caddy are deliberately absent: they use pinned version
-/// tags (`postgres:16`, `caddy:2-alpine`), not `:latest`, so point
-/// releases come in via routine `docker compose pull` rather than
-/// silent digest drift.
+/// Postgres and Caddy are deliberately absent: they use Docker Hub version
+/// tags (`postgres:16`, `caddy:2-alpine`), so point releases come in via
+/// routine `docker compose pull` rather than GitLab registry checks.
 #[derive(Clone, Copy, Debug)]
 pub enum ImageRef {
-    Node(crate::settings::ImageTag),
+    Miner(crate::settings::ImageTag),
+    Validator,
     Dashboard,
 }
 
 impl ImageRef {
-    fn gitlab_path(&self) -> &'static str {
+    fn repository(&self) -> &'static str {
         match self {
-            ImageRef::Node(crate::settings::ImageTag::Cuda) => {
-                "quip.network/quip-protocol/quip-network-node-cuda"
+            ImageRef::Miner(image_tag) => crate::compose::image_for_tag(*image_tag),
+            ImageRef::Validator => crate::compose::VALIDATOR_IMAGE,
+            ImageRef::Dashboard => crate::compose::DASHBOARD_IMAGE,
+        }
+    }
+
+    fn gitlab_path(&self) -> &'static str {
+        self.repository()
+            .strip_prefix("registry.gitlab.com/")
+            .unwrap_or_else(|| self.repository())
+    }
+
+    fn tag(&self) -> &'static str {
+        match self {
+            ImageRef::Miner(_) | ImageRef::Validator | ImageRef::Dashboard => {
+                crate::compose::COMPOSE_IMAGE_TAG
             }
-            ImageRef::Node(crate::settings::ImageTag::Cpu) => {
-                "quip.network/quip-protocol/quip-network-node-cpu"
-            }
-            ImageRef::Dashboard => "quip.network/dashboard.quip.network",
         }
     }
 
     fn local_ref(&self) -> String {
-        format!("registry.gitlab.com/{}:latest", self.gitlab_path())
+        format!("{}:{}", self.repository(), self.tag())
     }
 
     /// Human label used by the UI for update toasts.
     pub fn display_name(&self) -> &'static str {
         match self {
-            ImageRef::Node(crate::settings::ImageTag::Cuda) => "Node (CUDA)",
-            ImageRef::Node(crate::settings::ImageTag::Cpu) => "Node (CPU)",
+            ImageRef::Miner(crate::settings::ImageTag::Cuda) => "Miner (CUDA)",
+            ImageRef::Miner(crate::settings::ImageTag::Cpu) => "Miner (CPU)",
+            ImageRef::Validator => "Validator",
             ImageRef::Dashboard => "Dashboard",
         }
     }
 }
 
-/// The images whose latest-tag digests are worth polling for the given
-/// settings + run_mode. Native mode drops the node image (it runs on the
-/// host); `dashboard_enabled == false` drops the dashboard image.
+/// The images whose configured-tag digests are worth polling for the given
+/// settings + run_mode. Native mode drops Docker miner/validator images (the
+/// miner binary runs on the host); `dashboard_enabled == false` drops the
+/// dashboard image.
 fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
     let mut v = Vec::new();
     if settings.run_mode == crate::settings::RunMode::Docker {
-        v.push(ImageRef::Node(settings.image_tag));
+        v.push(ImageRef::Miner(settings.image_tag));
+        v.push(ImageRef::Validator);
     }
     if settings.dashboard_enabled {
         v.push(ImageRef::Dashboard);
@@ -157,9 +170,10 @@ fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
     v
 }
 
-/// Core GitLab registry digest probe — HEAD the manifest, diff against the
-/// local `docker image inspect` digest. Gracefully degrades to `Ok(None)`
-/// when the registry requires auth or the image isn't present locally.
+/// Core GitLab registry digest probe — HEAD the configured tag's manifest,
+/// diff against the local `docker image inspect` digest. Gracefully degrades
+/// to `Ok(None)` when the registry requires auth or the image isn't present
+/// locally.
 async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdateInfo>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -167,8 +181,9 @@ async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdate
         .map_err(|e| e.to_string())?;
 
     let manifest_url = format!(
-        "https://registry.gitlab.com/v2/{}/manifests/latest",
-        image.gitlab_path()
+        "https://registry.gitlab.com/v2/{}/manifests/{}",
+        image.gitlab_path(),
+        image.tag()
     );
 
     let resp = match client
@@ -227,12 +242,25 @@ async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdate
 pub async fn check_image_update(
     image_tag: crate::settings::ImageTag,
 ) -> Result<Option<ImageUpdateInfo>, String> {
-    check_gitlab_image_update(ImageRef::Node(image_tag)).await
+    check_gitlab_image_update(ImageRef::Miner(image_tag)).await
 }
 
 #[tauri::command]
 pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, String> {
     check_gitlab_image_update(ImageRef::Dashboard).await
+}
+
+pub async fn check_docker_core_image_update(
+    image_tag: crate::settings::ImageTag,
+) -> Result<Option<(ImageRef, ImageUpdateInfo)>, String> {
+    for image in [ImageRef::Miner(image_tag), ImageRef::Validator] {
+        if let Some(info) = check_gitlab_image_update(image).await? {
+            if info.update_available {
+                return Ok(Some((image, info)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Background task that checks for updates every 30 minutes.
@@ -308,6 +336,80 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{AppSettings, ImageTag, RunMode};
+
+    #[test]
+    fn image_refs_use_v02_preview_repositories() {
+        let refs = [
+            (
+                ImageRef::Miner(ImageTag::Cpu),
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2-preview",
+                "quip.network/quip-protocol/quip-miner-cpu",
+                "Miner (CPU)",
+            ),
+            (
+                ImageRef::Miner(ImageTag::Cuda),
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
+                "quip.network/quip-protocol/quip-miner-cuda",
+                "Miner (CUDA)",
+            ),
+            (
+                ImageRef::Validator,
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
+                "quip.network/quip-protocol-rs/quip-network-node",
+                "Validator",
+            ),
+            (
+                ImageRef::Dashboard,
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+                "quip.network/dashboard.quip.network",
+                "Dashboard",
+            ),
+        ];
+
+        for (image, local_ref, gitlab_path, display_name) in refs {
+            assert_eq!(image.local_ref(), local_ref);
+            assert_eq!(image.gitlab_path(), gitlab_path);
+            assert_eq!(image.tag(), "v0.2-preview");
+            assert_eq!(image.display_name(), display_name);
+        }
+    }
+
+    #[test]
+    fn relevant_images_include_validator_only_for_docker_mode() {
+        let mut settings = AppSettings::default();
+        settings.run_mode = RunMode::Docker;
+        settings.image_tag = ImageTag::Cuda;
+        settings.dashboard_enabled = true;
+
+        let docker_images: Vec<String> = relevant_images(&settings)
+            .into_iter()
+            .map(|image| image.local_ref())
+            .collect();
+        assert_eq!(
+            docker_images,
+            vec![
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+            ]
+        );
+
+        settings.run_mode = RunMode::Native;
+        let native_images: Vec<String> = relevant_images(&settings)
+            .into_iter()
+            .map(|image| image.local_ref())
+            .collect();
+        assert_eq!(
+            native_images,
+            vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview"]
+        );
     }
 }
 

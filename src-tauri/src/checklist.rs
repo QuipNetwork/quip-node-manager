@@ -295,17 +295,28 @@ fn docker_image_present(image_ref: &str) -> bool {
 }
 
 /// Images the current profile + service list expects to find locally.
-/// In Native mode the node image is excluded (the binary runs on the host).
+/// In Native mode Docker miner/validator images are excluded because the miner
+/// binary runs on the host.
 fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
     let mut images = Vec::new();
     if ctx.run_mode == RunMode::Docker {
         images.push(format!(
-            "{}:latest",
-            crate::compose::image_for_tag(ctx.image_tag)
+            "{}:{}",
+            crate::compose::image_for_tag(ctx.image_tag),
+            crate::compose::COMPOSE_IMAGE_TAG
+        ));
+        images.push(format!(
+            "{}:{}",
+            crate::compose::VALIDATOR_IMAGE,
+            crate::compose::COMPOSE_IMAGE_TAG
         ));
     }
     if ctx.dashboard_enabled {
-        images.push("registry.gitlab.com/quip.network/dashboard.quip.network:latest".into());
+        images.push(format!(
+            "{}:{}",
+            crate::compose::DASHBOARD_IMAGE,
+            crate::compose::COMPOSE_IMAGE_TAG
+        ));
         images.push("postgres:16".into());
         if ctx.tls_enabled {
             images.push("caddy:2-alpine".into());
@@ -1267,13 +1278,16 @@ async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
 async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("version", ctx);
     match ctx.run_mode {
-        RunMode::Docker => match crate::update::check_image_update(ctx.image_tag).await {
-            Ok(Some(info)) if info.update_available => base
-                .with_state(CheckState::Warn)
-                .with_label("Node image outdated \u{2014} pull latest"),
+        RunMode::Docker => match crate::update::check_docker_core_image_update(ctx.image_tag).await
+        {
+            Ok(Some((image, _))) => base.with_state(CheckState::Warn).with_label(format!(
+                "{} image outdated \u{2014} pull {}",
+                image.display_name(),
+                crate::compose::COMPOSE_IMAGE_TAG
+            )),
             Ok(_) => base
                 .with_state(CheckState::Pass)
-                .with_label("Node image up to date"),
+                .with_label("Miner + validator images up to date"),
             Err(e) => base
                 .with_state(CheckState::Warn)
                 .with_label("Node version (unable to check)")
@@ -1584,5 +1598,23 @@ mod tests {
         let item = idle_item("port-validator", &ctx);
         assert!(!item.required);
         assert_eq!(item.fixable, None);
+    }
+
+    #[test]
+    fn required_stack_images_use_v02_preview_refs() {
+        let mut ctx = test_ctx();
+        ctx.image_tag = ImageTag::Cuda;
+        ctx.tls_enabled = true;
+
+        assert_eq!(
+            required_stack_images(&ctx),
+            vec![
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+                "postgres:16",
+                "caddy:2-alpine",
+            ]
+        );
     }
 }
