@@ -137,7 +137,7 @@ function refreshDashboardTab() {
 const CHECK_ORDER = [
   'docker', 'docker-compose', 'stack-assets', 'wsl',
   'stack-images', 'binary', 'version', 'secret',
-  'ip', 'hostname', 'port', 'port-dashboard', 'port-tls',
+  'ip', 'hostname', 'port', 'port-validator', 'port-dashboard', 'port-tls',
   'rest-port-native', 'firewall', 'dwave-key',
 ];
 
@@ -214,7 +214,7 @@ document.getElementById('port').addEventListener('change', async () => {
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port', 'firewall'] }).catch(console.error);
+    await invoke('recheck', { ids: ['port'] }).catch(console.error);
   }
 });
 
@@ -223,6 +223,7 @@ document.getElementById('validator-port').addEventListener('change', async () =>
   if (state.settings) {
     state.settings.node_config.validator_port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
+    await invoke('recheck', { ids: ['port-validator', 'firewall'] }).catch(console.error);
   }
 });
 
@@ -702,7 +703,7 @@ function visibleInMode(id, runMode) {
       return !isDocker && dashboard;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / port / firewall — always shown.
+    // version / secret / ip / hostname / ports / firewall — always shown.
     default:
       return true;
   }
@@ -764,6 +765,7 @@ function renderChecklist() {
 
 function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
+  const validatorPort = state.settings?.node_config?.validator_port ?? 30033;
   switch (id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
@@ -776,10 +778,12 @@ function defaultLabel(id) {
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
     case 'port':              return `Public API port ${port} — press Recheck to test`;
+    case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'port-dashboard':    return 'Dashboard port 20080 available';
     case 'port-tls':          return 'TLS ports 80 + 443 available';
     case 'rest-port-native':  return 'Native REST port available';
-    case 'firewall':          return 'Local firewall allows port (UDP+TCP)';
+    case 'firewall':
+      return `Local firewall allows validator P2P port ${validatorPort} (UDP+TCP)`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
   }

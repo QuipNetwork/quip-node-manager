@@ -127,7 +127,10 @@ impl Default for ChecklistState {
 pub struct CheckCtx {
     pub run_mode: RunMode,
     pub image_tag: crate::settings::ImageTag,
+    /// Public Caddy/API host port. In v0.2 this is HTTP/WebSocket over TCP.
     pub port: u16,
+    /// Host-exposed validator libp2p port. The container still binds 30333.
+    pub validator_port: u16,
     pub public_host: String,
     /// "Is the compose stack expected to be running?" — drives visibility of
     /// dashboard/TLS/postgres-related checks.
@@ -167,6 +170,7 @@ impl CheckCtx {
             run_mode: settings.run_mode,
             image_tag: settings.image_tag,
             port: settings.node_config.port,
+            validator_port: settings.node_config.validator_port,
             public_host: settings.node_config.public_host,
             dashboard_enabled: settings.dashboard_enabled,
             tls_enabled: settings.tls_enabled,
@@ -368,26 +372,19 @@ async fn fetch_ip_ipify() -> Option<String> {
     }
 }
 
-/// Outcome of `probe_port_forwarding`. The probe picks between a TCP
-/// forward check and a full QUIC handshake check based on whether the
-/// node is already bound to the port — that determines what we can
-/// actually verify.
+/// Outcome of `probe_port_forwarding`. v0.2 uses `checkport` TCP probes for
+/// both public API and validator reachability checks. If the port is free
+/// locally we temporarily bind it so the external probe has something to hit;
+/// if it is already bound we probe the service currently holding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortProbeResult {
-    /// Node is running and a full QUIC/QUIP handshake completed over UDP.
-    /// End-to-end reachability is verified.
+    /// The port was already bound locally and the external TCP probe reached
+    /// this host.
     Verified,
-    /// Node is running but the QUIC handshake failed. UDP is likely not
-    /// forwarded, a firewall is blocking it, or the node isn't speaking
-    /// QUIP correctly.
-    QuicHandshakeFailed,
-    /// Node isn't running; the router is forwarding TCP to this host
-    /// (verified via a temp listener). Once the node starts, a recheck
-    /// should escalate this to `Verified`.
+    /// The port was free locally, and the external TCP probe reached our
+    /// temporary listener.
     ForwardReady,
-    /// Node isn't running and TCP forwarding doesn't work either. The
-    /// router isn't reflecting traffic to this host or a firewall is
-    /// dropping it.
+    /// TCP forwarding did not reach this host.
     Unreachable,
     /// check.quip.network rate-limited the request. We can't verify right
     /// now but the port may well be fine — treat as passing until the
@@ -396,7 +393,7 @@ pub enum PortProbeResult {
         /// Seconds until the ban is expected to lift, per the service's
         /// `retry_after_seconds` field.
         retry_after_secs: u64,
-        /// Which endpoint got limited: "checkport" or "checkconn".
+        /// Which endpoint got limited.
         endpoint: &'static str,
     },
 }
@@ -410,9 +407,8 @@ impl PortProbeResult {
     }
 }
 
-/// Result of a single call to `/checkport` or `/checkconn`. Distinguishes
-/// "no response from the host at all" (definitive fail) from "host
-/// responded, just not as expected" (router forwards — pass) and from
+/// Result of a single call to `/checkport`. Distinguishes "no response from
+/// the host at all" from "host responded, just not as expected" and from
 /// service-side errors we shouldn't blame the user for.
 enum ProbeOutcome {
     /// Service returned success-key=true OR success-key=false with an
@@ -445,18 +441,11 @@ fn is_connect_timeout(error: &str) -> bool {
         || lower.contains("no route")
 }
 
-/// Port forwarding check. One probe runs, not two:
+/// TCP forwarding check. One `/checkport` probe runs:
 ///
-///   - If something is already bound to `port` locally (i.e. we can't
-///     `TcpListener::bind` it), the node is presumably running — so we
-///     ask `check.quip.network/checkconn` to do a real QUIP handshake.
-///     A pass there proves UDP forwarding + node health end-to-end.
+///   - If something is already bound to `port` locally, probe that service.
+///   - If the port is free, hold a temporary listener for the probe.
 ///
-///   - If the port is free, the node isn't running and a QUIC handshake
-///     can't possibly succeed. We instead verify the TCP forward by
-///     holding a temp listener for the duration of `/checkport`. Users
-///     can click Recheck after starting the node to escalate to the
-///     QUIC verification path.
 /// GUI-facing entry point. `ctx.app` is used to emit the full check.quip.network
 /// request URL, HTTP status, and response body into `node-log` so users can
 /// copy/paste the raw output when asking for support.
@@ -468,16 +457,16 @@ async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeR
             ctx.log_probe(
                 "INFO",
                 format!(
-                    "port {} in use locally ({}) \u{2014} assuming node is up; using QUIC probe",
+                    "port {} in use locally ({}) \u{2014} using TCP /checkport probe",
                     port, e
                 ),
             );
-            match probe_external_quic(ctx, port).await {
+            match probe_external_tcp(ctx, port).await {
                 ProbeOutcome::HostResponded => PortProbeResult::Verified,
-                ProbeOutcome::Timeout => PortProbeResult::QuicHandshakeFailed,
+                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
                     retry_after_secs: retry,
-                    endpoint: "checkconn",
+                    endpoint: "checkport",
                 },
                 // Lenient-pass on service error: we can't blame the user
                 // when check.quip.network is down, misbehaving, or
@@ -524,19 +513,14 @@ pub async fn probe_port_forwarding(port: u16) -> PortProbeResult {
     probe_port_forwarding_with_ctx(&ctx, port).await
 }
 
-async fn probe_external_quic(ctx: &CheckCtx, port: u16) -> ProbeOutcome {
-    fetch_probe_json(ctx, "checkconn", port, "quip", 15).await
-}
-
 async fn probe_external_tcp(ctx: &CheckCtx, port: u16) -> ProbeOutcome {
     fetch_probe_json(ctx, "checkport", port, "reachable", 10).await
 }
 
-/// Shared HTTP fetcher for `/checkport` and `/checkconn`. Every step
-/// (URL, network error, HTTP status, response body) is emitted to
-/// `node-log` via `ctx.log_probe` so users can see service-side errors
-/// like `"handshake timeout"`, `"alpn mismatch"`, or `"connection refused"`
-/// without having to reproduce the request by hand.
+/// Shared HTTP fetcher for check.quip.network. Every step (URL, network
+/// error, HTTP status, response body) is emitted to `node-log` via
+/// `ctx.log_probe` so users can see service-side errors without having to
+/// reproduce the request by hand.
 ///
 /// Classifies the result into `ProbeOutcome` — callers use that to
 /// decide which `PortProbeResult` variant to surface.
@@ -839,6 +823,7 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "ip",
     "hostname",
     "port",
+    "port-validator",
     "port-dashboard",
     "port-tls",
     "rest-port-native",
@@ -867,7 +852,7 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         // non-empty, fails otherwise.
         "dwave-key" => ctx.has_dwave_config,
         // Everything else is always visible.
-        "version" | "secret" | "ip" | "hostname" | "port" | "firewall" => true,
+        "version" | "secret" | "ip" | "hostname" | "port" | "port-validator" | "firewall" => true,
         _ => false,
     }
 }
@@ -932,7 +917,13 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(
             id,
-            &format!("Port {} — press Recheck to test", ctx.port),
+            &format!("Public API port {} — press Recheck to test", ctx.port),
+            false,
+            None,
+        ),
+        "port-validator" => CheckItem::new(
+            id,
+            &format!("Validator P2P port {} reachable", ctx.validator_port),
             false,
             None,
         ),
@@ -944,7 +935,15 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             false,
             None,
         ),
-        "firewall" => CheckItem::new(id, "Local firewall allows port (UDP+TCP)", false, None),
+        "firewall" => CheckItem::new(
+            id,
+            &format!(
+                "Local firewall allows validator P2P port {} (UDP+TCP)",
+                ctx.validator_port
+            ),
+            false,
+            None,
+        ),
         "dwave-key" => CheckItem::new(id, "D-Wave API token configured", true, None),
         _ => CheckItem::new(id, id, false, None),
     }
@@ -1121,33 +1120,59 @@ async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
     let (state, label) = match probe_port_forwarding_with_ctx(ctx, port).await {
         PortProbeResult::Verified => (
             CheckState::Pass,
-            format!("Port {} verified (host responded)", port),
-        ),
-        PortProbeResult::QuicHandshakeFailed => (
-            CheckState::Warn,
-            format!(
-                "Port {} node is running but UDP/QUIC timed out \u{2014} check UDP forward + firewall",
-                port
-            ),
+            format!("Public API port {} reachable (host responded)", port),
         ),
         PortProbeResult::ForwardReady => (
             CheckState::Pass,
-            format!(
-                "Port {} TCP forward ready \u{2014} start the node and recheck to verify QUIC",
-                port
-            ),
+            format!("Public API port {} TCP forward ready", port),
         ),
         PortProbeResult::Unreachable => (
             CheckState::Warn,
             format!(
-                "Port {} not reachable \u{2014} check router forward + firewall",
+                "Public API port {} not reachable \u{2014} check router forward + firewall",
                 port
             ),
         ),
-        PortProbeResult::RateLimited { retry_after_secs, endpoint } => (
+        PortProbeResult::RateLimited {
+            retry_after_secs,
+            endpoint,
+        } => (
             CheckState::Pass,
             format!(
-                "Port {} (couldn't verify: rate-limited by check.quip.network via /{} \u{2014} retry in {}s)",
+                "Public API port {} rate-limited by /{} \u{2014} retry in {}s",
+                port, endpoint, retry_after_secs
+            ),
+        ),
+    };
+    base.with_state(state).with_label(label)
+}
+
+async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("port-validator", ctx);
+    let port = ctx.validator_port;
+    let (state, label) = match probe_port_forwarding_with_ctx(ctx, port).await {
+        PortProbeResult::Verified => (
+            CheckState::Pass,
+            format!("Validator P2P port {} reachable (host responded)", port),
+        ),
+        PortProbeResult::ForwardReady => (
+            CheckState::Pass,
+            format!("Validator P2P port {} TCP forward ready", port),
+        ),
+        PortProbeResult::Unreachable => (
+            CheckState::Warn,
+            format!(
+                "Validator P2P port {} not reachable \u{2014} check router forward + firewall",
+                port
+            ),
+        ),
+        PortProbeResult::RateLimited {
+            retry_after_secs,
+            endpoint,
+        } => (
+            CheckState::Pass,
+            format!(
+                "Validator P2P port {} rate-limited by /{} \u{2014} retry in {}s",
                 port, endpoint, retry_after_secs
             ),
         ),
@@ -1157,7 +1182,7 @@ async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("firewall", ctx);
-    let port = ctx.port;
+    let port = ctx.validator_port;
     let (ok, label) = tokio::task::spawn_blocking(move || check_local_firewall(port))
         .await
         .unwrap_or((false, "Firewall check failed".into()));
@@ -1166,7 +1191,8 @@ async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
     } else {
         CheckState::Warn
     };
-    base.with_state(state).with_label(label)
+    base.with_state(state)
+        .with_label(format!("Validator P2P {}", label))
 }
 
 async fn run_check_port_dashboard(ctx: &CheckCtx) -> CheckItem {
@@ -1282,6 +1308,7 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
+        "port-validator" => run_check_port_validator(ctx).await,
         "port-dashboard" => run_check_port_dashboard(ctx).await,
         "port-tls" => run_check_port_tls(ctx).await,
         "rest-port-native" => run_check_rest_port_native(ctx).await,
@@ -1480,6 +1507,7 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         run_mode: run_mode.clone(),
         image_tag: settings.image_tag,
         port: settings.node_config.port,
+        validator_port: settings.node_config.validator_port,
         public_host: settings.node_config.public_host,
         dashboard_enabled: settings.dashboard_enabled,
         tls_enabled: settings.tls_enabled,
@@ -1497,8 +1525,64 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     results
 }
 
-/// Convenience for TUI port-only recheck. Returns a plain bool since the
-/// TUI doesn't render the richer four-state diagnostic the GUI uses.
-pub async fn probe_port_forwarding_with_default_ip(port: u16) -> bool {
+/// Convenience for the TUI public API port recheck. Returns a plain bool since
+/// the TUI doesn't render the richer diagnostic the GUI uses.
+pub async fn probe_public_api_port_with_default_ip(port: u16) -> bool {
     probe_port_forwarding(port).await.is_externally_reachable()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::ImageTag;
+
+    fn test_ctx() -> CheckCtx {
+        CheckCtx {
+            run_mode: RunMode::Docker,
+            image_tag: ImageTag::Cpu,
+            port: 20049,
+            validator_port: 30033,
+            public_host: String::new(),
+            dashboard_enabled: true,
+            tls_enabled: false,
+            native_rest_port: 20100,
+            has_dwave_config: false,
+            dwave_token_set: false,
+            app: None,
+            public_ip: OnceCell::new(),
+            stack_running: OnceCell::new(),
+        }
+    }
+
+    #[test]
+    fn v02_port_labels_use_api_and_validator_defaults() {
+        let ctx = test_ctx();
+
+        assert_eq!(
+            idle_item("port", &ctx).label,
+            "Public API port 20049 \u{2014} press Recheck to test"
+        );
+        assert_eq!(
+            idle_item("port-validator", &ctx).label,
+            "Validator P2P port 30033 reachable"
+        );
+        assert_eq!(
+            idle_item("firewall", &ctx).label,
+            "Local firewall allows validator P2P port 30033 (UDP+TCP)"
+        );
+    }
+
+    #[test]
+    fn validator_port_check_is_visible_and_warning_only() {
+        let ctx = test_ctx();
+        let ids = visible_ids(&ctx);
+
+        let api = ids.iter().position(|id| id == "port").unwrap();
+        let validator = ids.iter().position(|id| id == "port-validator").unwrap();
+        assert_eq!(validator, api + 1);
+
+        let item = idle_item("port-validator", &ctx);
+        assert!(!item.required);
+        assert_eq!(item.fixable, None);
+    }
 }

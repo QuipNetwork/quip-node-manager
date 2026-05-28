@@ -415,17 +415,17 @@ impl TuiApp {
                         CheckState::Warn
                     };
                     item.label = if passed {
-                        format!("Port {} forwarded", port)
+                        format!("Public API port {} reachable", port)
                     } else {
-                        format!("Port {} — no connection received", port)
+                        format!("Public API port {} \u{2014} no TCP response", port)
                     };
                 }
                 self.port_checking = false;
                 self.port_check_rx = None;
                 let msg = if passed {
-                    "Port is reachable!"
+                    "Public API port is reachable"
                 } else {
-                    "No connection received within 15s"
+                    "No TCP response received"
                 };
                 self.set_status(msg);
             }
@@ -441,25 +441,25 @@ impl TuiApp {
         // Show checking status immediately.
         if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
             item.state = CheckState::Running;
-            item.label = format!("Port {} — checking via public IP…", port);
+            item.label = format!("Public API port {} \u{2014} checking via public IP…", port);
         } else {
             self.checks.push(CheckItem {
                 id: "port".to_string(),
                 state: CheckState::Running,
-                label: format!("Port {} — checking via public IP…", port),
+                label: format!("Public API port {} \u{2014} checking via public IP…", port),
                 detail: None,
                 required: false,
                 fixable: None,
                 updated_at_ms: 0,
             });
         }
-        self.set_status(format!("Checking port {} via public IP…", port));
+        self.set_status(format!("Checking public API port {} via public IP…", port));
 
         let (tx, rx) = mpsc::sync_channel::<bool>(1);
         self.port_check_rx = Some(rx);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let passed = rt.block_on(crate::checklist::probe_port_forwarding_with_default_ip(
+            let passed = rt.block_on(crate::checklist::probe_public_api_port_with_default_ip(
                 port,
             ));
             let _ = tx.send(passed);
