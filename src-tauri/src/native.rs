@@ -392,6 +392,11 @@ pub async fn start_native_node(
     let settings = crate::settings::load_settings();
     let mut config = settings.node_config;
 
+    let migration = crate::migration_v2::migrate_for_run_mode(&RunMode::Native)?;
+    migration.promoted.apply_to_node_config(&mut config);
+    crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
+    crate::migration_v2::emit_report(&app, &migration);
+
     // Auto-detect public IP when no public_host is configured
     if config.public_host.is_empty() {
         if let Ok(ip) = crate::network::detect_public_ip().await {

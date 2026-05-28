@@ -405,13 +405,14 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 ///
 /// Sequence:
 ///   1. sync_stack_assets (staging + Caddyfile patch for Native)
-///   2. write .env
+///   2. migrate existing v0.1 config/env, if present
 ///   3. auto-detect public_host in Docker mode
 ///   4. force native miner REST settings when the deferred native path is used
-///   5. write_config_toml
-///   6. docker compose down  (clean slate; no-op on first start)
-///   7. docker compose --profile <p> pull
-///   8. docker compose --profile <p> up -d [services...]
+///   5. write .env
+///   6. write_config_toml
+///   7. docker compose down  (clean slate; no-op on first start)
+///   8. docker compose --profile <p> pull
+///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
@@ -435,7 +436,17 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         rest_port,
     )?;
 
-    // (2) Docker-mode auto-detect of public_host; Native leaves it to the
+    // (2) Migrate any v0.1 config/env artifacts before writing fresh v0.2
+    // manager-owned files. Promoted fields keep hand-edited public host/port
+    // values from being lost by the generated config.
+    let migration = crate::migration_v2::migrate_for_run_mode(&settings.run_mode)?;
+    migration
+        .promoted
+        .apply_to_node_config(&mut settings.node_config);
+    crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
+    crate::migration_v2::emit_report(&app, &migration);
+
+    // (3) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         if let Ok(ip) = crate::network::detect_public_ip().await {
@@ -444,7 +455,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // (3) Native miner installation/update is deferred. Keep the old native
+    // (4) Native miner installation/update is deferred. Keep the old native
     // REST override isolated to Native mode so the Docker v0.2 config always
     // uses internal miner REST port 80.
     if settings.run_mode == RunMode::Native {
@@ -452,15 +463,15 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
 
-    // (4) .env
+    // (5) .env
     write_env_file(&settings)?;
 
-    // (5) config.toml (host side, bind-mounted into the node container in
+    // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     log_cmd(&app, "Writing config.toml");
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
-    // (6) Clean slate. `down` is cheap and idempotent; removes stale
+    // (7) Clean slate. `down` is cheap and idempotent; removes stale
     // containers left behind when the user switches image_tag/profile.
     log_cmd(&app, "docker compose down");
     let _ = run_compose_streaming(&app, vec!["down".into()]).await;
@@ -471,10 +482,10 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.tls_enabled,
     );
 
-    // (7) Pull the configured v0.2 preview tags.
+    // (8) Pull the configured v0.2 preview tags.
     pull_compose_images(app.clone()).await?;
 
-    // (8) Up.
+    // (9) Up.
     let mut up_args: Vec<String> =
         vec!["--profile".into(), profile.into(), "up".into(), "-d".into()];
     for s in compose_services(&settings.run_mode, settings.tls_enabled) {

@@ -573,6 +573,23 @@ impl TuiApp {
         let run_mode = self.form.run_mode();
         let mut config = self.form.to_node_config(&self.settings.node_config);
 
+        match crate::migration_v2::migrate_for_run_mode(&run_mode) {
+            Ok(report) => {
+                report.promoted.apply_to_node_config(&mut config);
+                if let Err(e) = crate::migration_v2::persist_promoted_settings(&report.promoted) {
+                    self.set_status(format!("Migration settings error: {}", e));
+                    return;
+                }
+                if report.changed {
+                    self.set_status("Migrated v0.1 node data to v0.2 layout");
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("Migration error: {}", e));
+                return;
+            }
+        }
+
         // Auto-detect public IP when no public_host is configured
         if config.public_host.is_empty() {
             if let Ok(rt) = tokio::runtime::Runtime::new() {

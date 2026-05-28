@@ -252,7 +252,7 @@ Verification gate:
 Files:
 
 - `src-tauri/Cargo.toml`
-- `src-tauri/src/migration.rs` or `src-tauri/src/config_migration.rs`
+- `src-tauri/src/migration_v2.rs`
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/compose.rs`
 - `src-tauri/src/config.rs`
