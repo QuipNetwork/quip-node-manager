@@ -5,8 +5,8 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
@@ -142,7 +142,10 @@ impl FormState {
             Some(q) => (true, q.clone()),
             None => (false, DwaveConfig::default()),
         };
-        let first_gpu = nc.gpu_device_configs.iter().find(|d| d.enabled)
+        let first_gpu = nc
+            .gpu_device_configs
+            .iter()
+            .find(|d| d.enabled)
             .or_else(|| nc.gpu_device_configs.first());
         let run_mode_idx = match s.run_mode {
             RunMode::Docker => 0,
@@ -153,12 +156,9 @@ impl FormState {
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
-            public_host_enabled: !nc.public_host.is_empty()
-                || nc.public_port.is_some(),
+            public_host_enabled: !nc.public_host.is_empty() || nc.public_port.is_some(),
             public_host: nc.public_host.clone(),
-            public_port: nc.public_port
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            public_port: nc.public_port.map(|p| p.to_string()).unwrap_or_default(),
             peers: nc.peers.join("\n"),
             cpu_cores: nc.num_cpus.to_string(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
@@ -188,10 +188,17 @@ impl FormState {
     }
 
     pub fn run_mode(&self) -> RunMode {
-        if self.run_mode_idx == 1 { RunMode::Native } else { RunMode::Docker }
+        if self.run_mode_idx == 1 {
+            RunMode::Native
+        } else {
+            RunMode::Docker
+        }
     }
 
-    pub fn to_node_config(&self, base: &crate::settings::NodeConfig) -> crate::settings::NodeConfig {
+    pub fn to_node_config(
+        &self,
+        base: &crate::settings::NodeConfig,
+    ) -> crate::settings::NodeConfig {
         let mut nc = base.clone();
         nc.port = self.port.parse().unwrap_or(20049);
         nc.node_name = self.node_name.clone();
@@ -400,7 +407,11 @@ impl TuiApp {
                 // Update the port check item in the checks list.
                 let port = self.settings.node_config.port;
                 if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
-                    item.state = if passed { CheckState::Pass } else { CheckState::Warn };
+                    item.state = if passed {
+                        CheckState::Pass
+                    } else {
+                        CheckState::Warn
+                    };
                     item.label = if passed {
                         format!("Port {} forwarded", port)
                     } else {
@@ -409,7 +420,11 @@ impl TuiApp {
                 }
                 self.port_checking = false;
                 self.port_check_rx = None;
-                let msg = if passed { "Port is reachable!" } else { "No connection received within 15s" };
+                let msg = if passed {
+                    "Port is reachable!"
+                } else {
+                    "No connection received within 15s"
+                };
                 self.set_status(msg);
             }
         }
@@ -442,9 +457,9 @@ impl TuiApp {
         self.port_check_rx = Some(rx);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let passed = rt.block_on(
-                crate::checklist::probe_port_forwarding_with_default_ip(port),
-            );
+            let passed = rt.block_on(crate::checklist::probe_port_forwarding_with_default_ip(
+                port,
+            ));
             let _ = tx.send(passed);
         });
     }
@@ -470,9 +485,13 @@ impl TuiApp {
                 let running = if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         #[cfg(unix)]
-                        { unsafe { libc::kill(pid, 0) == 0 } }
+                        {
+                            unsafe { libc::kill(pid, 0) == 0 }
+                        }
                         #[cfg(windows)]
-                        { true } // Assume running if PID file exists on Windows
+                        {
+                            true
+                        } // Assume running if PID file exists on Windows
                     } else {
                         false
                     }
@@ -483,7 +502,11 @@ impl TuiApp {
                     running,
                     container_id: None,
                     image: String::new(),
-                    status_text: if running { "running (native)".to_string() } else { "not running".to_string() },
+                    status_text: if running {
+                        "running (native)".to_string()
+                    } else {
+                        "not running".to_string()
+                    },
                 };
             }
             RunMode::Docker => {
@@ -502,9 +525,7 @@ impl TuiApp {
                         if parts.len() >= 4 {
                             ContainerStatus {
                                 running: parts[1] == "true",
-                                container_id: Some(
-                                    parts[0][..12.min(parts[0].len())].to_string(),
-                                ),
+                                container_id: Some(parts[0][..12.min(parts[0].len())].to_string()),
                                 image: parts[2].to_string(),
                                 status_text: parts[3].to_string(),
                             }
@@ -558,7 +579,9 @@ impl TuiApp {
 
     fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
         // Remove any stale container first
-        let _ = crate::cmd::new("docker").args(["rm", "-f", "quip-node"]).output();
+        let _ = crate::cmd::new("docker")
+            .args(["rm", "-f", "quip-node"])
+            .output();
 
         let data_dir = crate::settings::data_dir();
         let data_mount = format!("{}:/data", data_dir.display());
@@ -638,7 +661,8 @@ impl TuiApp {
             let log_path = data_dir.join("node-output.log");
             let log_file = std::fs::File::create(&log_path)
                 .map_err(|e| format!("Cannot create log file: {}", e))?;
-            let log_err = log_file.try_clone()
+            let log_err = log_file
+                .try_clone()
                 .map_err(|e| format!("Cannot clone log file: {}", e))?;
             let child = crate::cmd::new(&bin)
                 .arg("--config")
@@ -662,7 +686,9 @@ impl TuiApp {
     fn stop_node(&mut self) {
         match self.form.run_mode() {
             RunMode::Docker => {
-                let _ = crate::cmd::new("docker").args(["stop", "quip-node"]).output();
+                let _ = crate::cmd::new("docker")
+                    .args(["stop", "quip-node"])
+                    .output();
                 let _ = crate::cmd::new("docker")
                     .args(["rm", "-f", "quip-node"])
                     .output();
@@ -672,7 +698,9 @@ impl TuiApp {
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         #[cfg(unix)]
-                        unsafe { libc::kill(-pid, libc::SIGTERM); }
+                        unsafe {
+                            libc::kill(-pid, libc::SIGTERM);
+                        }
                         #[cfg(windows)]
                         {
                             let _ = crate::cmd::new("taskkill")
@@ -710,8 +738,7 @@ impl TuiApp {
 
     fn regenerate_secret(&mut self) {
         use rand::Rng;
-        let bytes: Vec<u8> =
-            (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
+        let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
         let secret = hex::encode(bytes);
         let path = crate::settings::data_dir().join("node-secret.json");
         let content = format!("{{\"secret\":\"{}\"}}", secret);

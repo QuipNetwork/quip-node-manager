@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
 use crate::tui_app::{Action, EditMode, FocusId, TuiApp};
@@ -165,8 +164,11 @@ fn activate(app: &mut TuiApp) -> Action {
 
         // GPU Utilization — increase by 10 (wraps at 100)
         FocusId::GpuUtilization => {
-            app.form.gpu_utilization =
-                if app.form.gpu_utilization >= 100 { 10 } else { app.form.gpu_utilization + 10 };
+            app.form.gpu_utilization = if app.form.gpu_utilization >= 100 {
+                10
+            } else {
+                app.form.gpu_utilization + 10
+            };
             app.dirty = true;
             Action::None
         }

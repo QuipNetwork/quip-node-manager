@@ -46,9 +46,7 @@ impl Default for GpuBackend {
 /// QPU is *not* a separate image — D-Wave mining activates via the
 /// `[dwave]` section in config.toml on top of the CPU image, so the
 /// operator's choice reduces to "do I have an NVIDIA GPU or not".
-#[derive(
-    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq,
-)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageTag {
     #[default]
@@ -123,22 +121,48 @@ impl Default for DwaveConfig {
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 
-fn default_port() -> u16 { 20049 }
-fn default_listen() -> String { "::".to_string() }
-fn default_num_cpus() -> u32 { 1 }
-fn default_timeout() -> u32 { 3 }
-fn default_heartbeat_interval() -> u32 { 15 }
-fn default_heartbeat_timeout() -> u32 { 300 }
-fn default_log_level() -> String { "info".to_string() }
+fn default_port() -> u16 {
+    20049
+}
+fn default_listen() -> String {
+    "::".to_string()
+}
+fn default_num_cpus() -> u32 {
+    1
+}
+fn default_timeout() -> u32 {
+    3
+}
+fn default_heartbeat_interval() -> u32 {
+    15
+}
+fn default_heartbeat_timeout() -> u32 {
+    300
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 fn default_genesis_config() -> String {
     "genesis_block.json".to_string()
 }
-fn default_tofu() -> bool { true }
-fn default_trust_db() -> String { "~/.quip/trust.db".to_string() }
-fn default_rest_host() -> String { "127.0.0.1".to_string() }
-fn default_rest_port() -> i16 { -1 }
-fn default_telemetry_enabled() -> bool { true }
-fn default_telemetry_dir() -> String { "telemetry".to_string() }
+fn default_tofu() -> bool {
+    true
+}
+fn default_trust_db() -> String {
+    "~/.quip/trust.db".to_string()
+}
+fn default_rest_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_rest_port() -> i16 {
+    -1
+}
+fn default_telemetry_enabled() -> bool {
+    true
+}
+fn default_telemetry_dir() -> String {
+    "telemetry".to_string()
+}
 
 // ─── Node config ────────────────────────────────────────────────────────────
 
@@ -266,7 +290,9 @@ impl Default for NodeConfig {
 
 // ─── App settings ───────────────────────────────────────────────────────────
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 fn default_dashboard_hostname() -> String {
     "localhost:20080".to_string()
 }
@@ -380,8 +406,7 @@ struct BootstrapConfig {
 }
 
 fn bootstrap_path() -> PathBuf {
-    let config = dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".config"));
+    let config = dirs::config_dir().unwrap_or_else(|| dirs::home_dir().unwrap().join(".config"));
     config.join("quip-node-manager").join("bootstrap.json")
 }
 
@@ -397,8 +422,7 @@ fn save_bootstrap(cfg: &BootstrapConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let content = serde_json::to_string_pretty(cfg)
-        .map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -459,9 +483,7 @@ pub fn load_settings() -> AppSettings {
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
     ensure_data_dir()?;
-    let content =
-        serde_json::to_string_pretty(settings)
-            .map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), content).map_err(|e| e.to_string())
 }
 
@@ -471,9 +493,7 @@ pub async fn get_settings() -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub async fn update_settings(
-    mut settings: AppSettings,
-) -> Result<(), String> {
+pub async fn update_settings(mut settings: AppSettings) -> Result<(), String> {
     // Native mode is only supported on macOS
     if !cfg!(target_os = "macos") {
         settings.run_mode = RunMode::Docker;
@@ -508,9 +528,7 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
     } else {
         // Validate path is writable
         let p = PathBuf::from(&path);
-        fs::create_dir_all(&p).map_err(|e| {
-            format!("Cannot create directory {}: {}", path, e)
-        })?;
+        fs::create_dir_all(&p).map_err(|e| format!("Cannot create directory {}: {}", path, e))?;
         Some(path)
     };
     // Load-modify-save so we don't wipe postgres_password when changing the

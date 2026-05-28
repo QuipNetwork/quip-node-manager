@@ -155,8 +155,7 @@ pub struct CheckCtx {
 impl CheckCtx {
     fn from_settings(app: Option<AppHandle>) -> Self {
         let settings = crate::settings::load_settings();
-        let native_rest_port =
-            crate::compose::native_rest_port(&settings.node_config);
+        let native_rest_port = crate::compose::native_rest_port(&settings.node_config);
         let has_dwave_config = settings.node_config.dwave_config.is_some();
         let dwave_token_set = settings
             .node_config
@@ -196,10 +195,7 @@ impl CheckCtx {
     /// Memoised public-IP fetch. First caller pays the network cost;
     /// subsequent callers in the same recheck batch reuse the result.
     async fn public_ip(&self) -> Option<String> {
-        self.public_ip
-            .get_or_init(fetch_public_ip)
-            .await
-            .clone()
+        self.public_ip.get_or_init(fetch_public_ip).await.clone()
     }
 
     /// Memoised "is our compose stack currently up?" probe. Any service
@@ -252,7 +248,10 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
 
 #[cfg(target_os = "windows")]
 fn check_wsl() -> (bool, String) {
-    if let Ok(out) = crate::cmd::new("wsl").args(["--list", "--verbose"]).output() {
+    if let Ok(out) = crate::cmd::new("wsl")
+        .args(["--list", "--verbose"])
+        .output()
+    {
         if out.status.success() {
             let text = decode_wsl_output(&out.stdout);
             let has_distro = text.lines().skip(1).any(|l| !l.trim().is_empty());
@@ -302,10 +301,7 @@ fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
         ));
     }
     if ctx.dashboard_enabled {
-        images.push(
-            "registry.gitlab.com/quip.network/dashboard.quip.network:latest"
-                .into(),
-        );
+        images.push("registry.gitlab.com/quip.network/dashboard.quip.network:latest".into());
         images.push("postgres:16".into());
         if ctx.tls_enabled {
             images.push("caddy:2-alpine".into());
@@ -317,8 +313,7 @@ fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
 /// Bindability test for a TCP port. Used by port-dashboard / port-tls /
 /// rest-port-native to flag conflicts before the user presses Start.
 fn tcp_port_bindable(port: u16) -> bool {
-    let addr: std::net::SocketAddr =
-        format!("0.0.0.0:{}", port).parse().unwrap();
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     std::net::TcpListener::bind(addr).is_ok()
 }
 
@@ -344,13 +339,21 @@ async fn fetch_public_ip() -> Option<String> {
 
 async fn fetch_ip_check_service() -> Option<String> {
     let client = make_client(5)?;
-    let resp = client.get(format!("{}/ip", CHECK_SERVICE)).send().await.ok()?;
+    let resp = client
+        .get(format!("{}/ip", CHECK_SERVICE))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let json: Value = resp.json().await.ok()?;
     let ip = json["ip"].as_str()?.trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 async fn fetch_ip_ipify() -> Option<String> {
@@ -358,7 +361,11 @@ async fn fetch_ip_ipify() -> Option<String> {
     let resp = client.get("https://api.ipify.org").send().await.ok()?;
     let text = resp.text().await.ok()?;
     let ip = text.trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// Outcome of `probe_port_forwarding`. The probe picks between a TCP
@@ -453,10 +460,7 @@ fn is_connect_timeout(error: &str) -> bool {
 /// GUI-facing entry point. `ctx.app` is used to emit the full check.quip.network
 /// request URL, HTTP status, and response body into `node-log` so users can
 /// copy/paste the raw output when asking for support.
-async fn probe_port_forwarding_with_ctx(
-    ctx: &CheckCtx,
-    port: u16,
-) -> PortProbeResult {
+async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeResult {
     use tokio::net::TcpListener;
 
     match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
@@ -547,7 +551,10 @@ async fn fetch_probe_json(
     ctx.log_probe("INFO", format!("GET {}", url));
 
     let Some(client) = make_client(timeout_secs) else {
-        ctx.log_probe("ERROR", format!("{}: failed to build HTTP client", endpoint));
+        ctx.log_probe(
+            "ERROR",
+            format!("{}: failed to build HTTP client", endpoint),
+        );
         return ProbeOutcome::ServiceError;
     };
 
@@ -556,7 +563,10 @@ async fn fetch_probe_json(
         Err(e) => {
             ctx.log_probe(
                 "ERROR",
-                format!("{}: network error talking to check.quip.network: {}", endpoint, e),
+                format!(
+                    "{}: network error talking to check.quip.network: {}",
+                    endpoint, e
+                ),
             );
             return ProbeOutcome::ServiceError;
         }
@@ -567,13 +577,22 @@ async fn fetch_probe_json(
         .await
         .unwrap_or_else(|e| format!("<body read error: {}>", e));
     let body_for_log = if body.len() > 1024 {
-        format!("{}\u{2026}(truncated, {} bytes total)", &body[..1024], body.len())
+        format!(
+            "{}\u{2026}(truncated, {} bytes total)",
+            &body[..1024],
+            body.len()
+        )
     } else {
         body.clone()
     };
     ctx.log_probe(
         if status.is_success() { "INFO" } else { "ERROR" },
-        format!("{} \u{2192} HTTP {} {}", endpoint, status.as_u16(), body_for_log),
+        format!(
+            "{} \u{2192} HTTP {} {}",
+            endpoint,
+            status.as_u16(),
+            body_for_log
+        ),
     );
 
     if status.as_u16() == 429 {
@@ -590,7 +609,10 @@ async fn fetch_probe_json(
     let Ok(json) = serde_json::from_str::<Value>(&body) else {
         return ProbeOutcome::ServiceError;
     };
-    let success = json.get(success_key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = json
+        .get(success_key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if success {
         return ProbeOutcome::HostResponded;
     }
@@ -598,10 +620,7 @@ async fn fetch_probe_json(
     // timeout means the host didn't respond at all. Anything else (ALPN
     // mismatch, RST, TLS error, banner timeout, etc.) means the host IS
     // reachable at the transport layer, so the router forward is working.
-    let error_str = json
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let error_str = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
     if is_connect_timeout(error_str) {
         ProbeOutcome::Timeout
     } else {
@@ -612,7 +631,10 @@ async fn fetch_probe_json(
 async fn check_hostname_dns(hostname: &str) -> Option<bool> {
     let client = make_client(10)?;
     let resp = client
-        .get(format!("{}/checkhostname?hostname={}", CHECK_SERVICE, hostname))
+        .get(format!(
+            "{}/checkhostname?hostname={}",
+            CHECK_SERVICE, hostname
+        ))
         .send()
         .await
         .ok()?;
@@ -633,7 +655,10 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
     if text.contains("disabled") || text.contains("state = 0") {
-        Some((true, format!("macOS Firewall: Port {} open (UDP+TCP)", port)))
+        Some((
+            true,
+            format!("macOS Firewall: Port {} open (UDP+TCP)", port),
+        ))
     } else if text.contains("enabled") || text.contains("state = 1") {
         Some((
             true,
@@ -693,7 +718,14 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         return Some((true, "Windows Firewall disabled".to_string()));
     }
     let rule = crate::cmd::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", "name=all", "dir=in"])
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            "name=all",
+            "dir=in",
+        ])
         .output()
         .ok()?;
     let rule_text = String::from_utf8_lossy(&rule.stdout);
@@ -707,8 +739,12 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if port_match && is_allow {
-                if cur_proto == "udp" { found_udp = true; }
-                if cur_proto == "tcp" { found_tcp = true; }
+                if cur_proto == "udp" {
+                    found_udp = true;
+                }
+                if cur_proto == "tcp" {
+                    found_tcp = true;
+                }
             }
             cur_proto.clear();
             port_match = false;
@@ -718,21 +754,38 @@ fn os_firewall_check(port: u16) -> Option<(bool, String)> {
         if let Some((key, val)) = trimmed.split_once(':') {
             let key = key.trim().to_lowercase();
             let val = val.trim().to_lowercase();
-            if key == "protocol" { cur_proto = val.clone(); }
-            if key == "localport" && val.contains(&port_str) { port_match = true; }
-            if key == "action" && val == "allow" { is_allow = true; }
+            if key == "protocol" {
+                cur_proto = val.clone();
+            }
+            if key == "localport" && val.contains(&port_str) {
+                port_match = true;
+            }
+            if key == "action" && val == "allow" {
+                is_allow = true;
+            }
         }
     }
     if port_match && is_allow {
-        if cur_proto == "udp" { found_udp = true; }
-        if cur_proto == "tcp" { found_tcp = true; }
+        if cur_proto == "udp" {
+            found_udp = true;
+        }
+        if cur_proto == "tcp" {
+            found_tcp = true;
+        }
     }
     if found_udp && found_tcp {
-        Some((true, format!("Windows Firewall allows {}/udp and {}/tcp", port, port)))
+        Some((
+            true,
+            format!("Windows Firewall allows {}/udp and {}/tcp", port, port),
+        ))
     } else {
         let mut missing = Vec::new();
-        if !found_udp { missing.push("UDP"); }
-        if !found_tcp { missing.push("TCP"); }
+        if !found_udp {
+            missing.push("UDP");
+        }
+        if !found_tcp {
+            missing.push("TCP");
+        }
         Some((
             false,
             format!(
@@ -759,8 +812,14 @@ fn check_local_firewall(port: u16) -> (bool, String) {
     let tcp_ok = std::net::TcpListener::bind(addr).is_ok();
     match (udp_ok, tcp_ok) {
         (true, true) => (true, format!("Port {} bindable locally (UDP+TCP)", port)),
-        (true, false) => (false, format!("Port {}: UDP bindable but TCP blocked", port)),
-        (false, true) => (false, format!("Port {}: TCP bindable but UDP blocked", port)),
+        (true, false) => (
+            false,
+            format!("Port {}: UDP bindable but TCP blocked", port),
+        ),
+        (false, true) => (
+            false,
+            format!("Port {}: TCP bindable but UDP blocked", port),
+        ),
         (false, false) => (false, format!("Cannot bind port {} (UDP+TCP)", port)),
     }
 }
@@ -791,28 +850,18 @@ pub const ALL_CHECK_IDS: &[&str] = &[
 pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
     match id {
         // Docker daemon + compose itself — required whenever compose will run.
-        "docker" | "docker-compose" | "stack-assets" | "stack-images" => {
-            ctx.compose_will_run()
-        }
+        "docker" | "docker-compose" | "stack-assets" | "stack-images" => ctx.compose_will_run(),
         // Windows-only WSL probe. Docker mode only (Native is macOS-only).
         "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
         // Binary is native-mode only.
         "binary" => ctx.run_mode == RunMode::Native,
         // New per-port bind checks. Only applicable when compose will run AND
         // that profile actually binds the port.
-        "port-dashboard" => {
-            ctx.compose_will_run()
-                && ctx.dashboard_enabled
-                && !ctx.tls_enabled
-        }
-        "port-tls" => {
-            ctx.compose_will_run() && ctx.dashboard_enabled && ctx.tls_enabled
-        }
+        "port-dashboard" => ctx.compose_will_run() && ctx.dashboard_enabled && !ctx.tls_enabled,
+        "port-tls" => ctx.compose_will_run() && ctx.dashboard_enabled && ctx.tls_enabled,
         // Native + dashboard makes the native binary bind a REST port that
         // Docker containers reach via host.docker.internal.
-        "rest-port-native" => {
-            ctx.run_mode == RunMode::Native && ctx.dashboard_enabled
-        }
+        "rest-port-native" => ctx.run_mode == RunMode::Native && ctx.dashboard_enabled,
         // Visible whenever the user has a [dwave] block in NodeConfig
         // (i.e. they've opted into QPU mining). Passes if the token is
         // non-empty, fails otherwise.
@@ -836,23 +885,65 @@ pub fn visible_ids(ctx: &CheckCtx) -> Vec<String> {
 /// any check has run.
 fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
     match id {
-        "docker" => CheckItem::new(id, "Docker installed & running", true, Some(FixKind::InstallDocker)),
-        "docker-compose" => CheckItem::new(id, "Docker Compose v2 available", true, Some(FixKind::InstallDocker)),
-        "stack-assets" => CheckItem::new(id, "Stack files staged (compose.yml + Caddyfile)", true, None),
+        "docker" => CheckItem::new(
+            id,
+            "Docker installed & running",
+            true,
+            Some(FixKind::InstallDocker),
+        ),
+        "docker-compose" => CheckItem::new(
+            id,
+            "Docker Compose v2 available",
+            true,
+            Some(FixKind::InstallDocker),
+        ),
+        "stack-assets" => CheckItem::new(
+            id,
+            "Stack files staged (compose.yml + Caddyfile)",
+            true,
+            None,
+        ),
         "wsl" => CheckItem::new(id, "WSL installed with distro", false, None),
-        "stack-images" => CheckItem::new(id, "Stack images available", true, Some(FixKind::PullImage)),
-        "binary" => CheckItem::new(id, "Node binary available", true, Some(FixKind::DownloadBinary)),
-        "version" => CheckItem::new(id, "Node version up to date", false, Some(FixKind::Delegate(match ctx.run_mode {
-            RunMode::Docker => "stack-images".into(),
-            RunMode::Native => "binary".into(),
-        }))),
-        "secret" => CheckItem::new(id, "Node secret configured", true, Some(FixKind::GenerateSecret)),
+        "stack-images" => {
+            CheckItem::new(id, "Stack images available", true, Some(FixKind::PullImage))
+        }
+        "binary" => CheckItem::new(
+            id,
+            "Node binary available",
+            true,
+            Some(FixKind::DownloadBinary),
+        ),
+        "version" => CheckItem::new(
+            id,
+            "Node version up to date",
+            false,
+            Some(FixKind::Delegate(match ctx.run_mode {
+                RunMode::Docker => "stack-images".into(),
+                RunMode::Native => "binary".into(),
+            })),
+        ),
+        "secret" => CheckItem::new(
+            id,
+            "Node secret configured",
+            true,
+            Some(FixKind::GenerateSecret),
+        ),
         "ip" => CheckItem::new(id, "Public IP reachable", false, None),
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
-        "port" => CheckItem::new(id, &format!("Port {} — press Recheck to test", ctx.port), false, None),
+        "port" => CheckItem::new(
+            id,
+            &format!("Port {} — press Recheck to test", ctx.port),
+            false,
+            None,
+        ),
         "port-dashboard" => CheckItem::new(id, "Dashboard port 20080 available", false, None),
         "port-tls" => CheckItem::new(id, "TLS ports 80 + 443 available", false, None),
-        "rest-port-native" => CheckItem::new(id, &format!("Native REST port {} available", ctx.native_rest_port), false, None),
+        "rest-port-native" => CheckItem::new(
+            id,
+            &format!("Native REST port {} available", ctx.native_rest_port),
+            false,
+            None,
+        ),
         "firewall" => CheckItem::new(id, "Local firewall allows port (UDP+TCP)", false, None),
         "dwave-key" => CheckItem::new(id, "D-Wave API token configured", true, None),
         _ => CheckItem::new(id, id, false, None),
@@ -866,7 +957,9 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_docker(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("docker", ctx);
-    let ok = tokio::task::spawn_blocking(check_docker).await.unwrap_or(false);
+    let ok = tokio::task::spawn_blocking(check_docker)
+        .await
+        .unwrap_or(false);
     if ok {
         base.with_state(CheckState::Pass)
     } else {
@@ -881,13 +974,19 @@ async fn run_check_wsl(ctx: &CheckCtx) -> CheckItem {
     let (ok, label) = tokio::task::spawn_blocking(check_wsl)
         .await
         .unwrap_or((false, "WSL check failed".into()));
-    let state = if ok { CheckState::Pass } else { CheckState::Warn };
+    let state = if ok {
+        CheckState::Pass
+    } else {
+        CheckState::Warn
+    };
     base.with_state(state).with_label(label)
 }
 
 #[cfg(not(target_os = "windows"))]
 async fn run_check_wsl(ctx: &CheckCtx) -> CheckItem {
-    idle_item("wsl", ctx).with_state(CheckState::Skip).with_detail("non-Windows platform")
+    idle_item("wsl", ctx)
+        .with_state(CheckState::Skip)
+        .with_detail("non-Windows platform")
 }
 
 async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
@@ -909,9 +1008,8 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
     if ok {
         base.with_state(CheckState::Pass)
     } else {
-        base.with_state(CheckState::Fail).with_detail(
-            "install Docker Desktop, which ships with the `docker compose` CLI plugin",
-        )
+        base.with_state(CheckState::Fail)
+            .with_detail("install Docker Desktop, which ships with the `docker compose` CLI plugin")
     }
 }
 
@@ -922,9 +1020,8 @@ async fn run_check_stack_assets(ctx: &CheckCtx) -> CheckItem {
     if ok {
         base.with_state(CheckState::Pass)
     } else {
-        base.with_state(CheckState::Warn).with_detail(
-            "stack files not staged yet — they'll be written on next Start",
-        )
+        base.with_state(CheckState::Warn)
+            .with_detail("stack files not staged yet — they'll be written on next Start")
     }
 }
 
@@ -932,7 +1029,8 @@ async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("stack-images", ctx);
     let images = required_stack_images(ctx);
     if images.is_empty() {
-        return base.with_state(CheckState::Skip)
+        return base
+            .with_state(CheckState::Skip)
             .with_detail("no compose images needed for this profile");
     }
     let missing: Vec<String> = tokio::task::spawn_blocking(move || {
@@ -959,7 +1057,8 @@ async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
     if ok {
         base.with_state(CheckState::Pass)
     } else {
-        base.with_state(CheckState::Fail).with_detail("run Download & Install")
+        base.with_state(CheckState::Fail)
+            .with_detail("run Download & Install")
     }
 }
 
@@ -968,15 +1067,20 @@ async fn run_check_secret(ctx: &CheckCtx) -> CheckItem {
     if check_secret_exists() {
         base.with_state(CheckState::Pass)
     } else {
-        base.with_state(CheckState::Fail).with_detail("run Generate Secret")
+        base.with_state(CheckState::Fail)
+            .with_detail("run Generate Secret")
     }
 }
 
 async fn run_check_ip(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("ip", ctx);
     match ctx.public_ip().await {
-        Some(ip) => base.with_state(CheckState::Pass).with_label(format!("Public IP: {}", ip)),
-        None => base.with_state(CheckState::Warn).with_label("Public IP unreachable"),
+        Some(ip) => base
+            .with_state(CheckState::Pass)
+            .with_label(format!("Public IP: {}", ip)),
+        None => base
+            .with_state(CheckState::Warn)
+            .with_label("Public IP unreachable"),
     }
 }
 
@@ -1002,8 +1106,13 @@ async fn run_check_hostname(ctx: &CheckCtx) -> CheckItem {
         (ip, passed)
     };
 
-    let state = if passed { CheckState::Pass } else { CheckState::Warn };
-    base.with_state(state).with_label(format!("{} accessible to internet", hostname))
+    let state = if passed {
+        CheckState::Pass
+    } else {
+        CheckState::Warn
+    };
+    base.with_state(state)
+        .with_label(format!("{} accessible to internet", hostname))
 }
 
 async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
@@ -1052,7 +1161,11 @@ async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
     let (ok, label) = tokio::task::spawn_blocking(move || check_local_firewall(port))
         .await
         .unwrap_or((false, "Firewall check failed".into()));
-    let state = if ok { CheckState::Pass } else { CheckState::Warn };
+    let state = if ok {
+        CheckState::Pass
+    } else {
+        CheckState::Warn
+    };
     base.with_state(state).with_label(label)
 }
 
@@ -1081,22 +1194,21 @@ async fn run_check_port_tls(ctx: &CheckCtx) -> CheckItem {
     if ctx.stack_running().await {
         return base.with_state(CheckState::Pass);
     }
-    let (ok_80, ok_443) = tokio::task::spawn_blocking(|| {
-        (tcp_port_bindable(80), tcp_port_bindable(443))
-    })
-    .await
-    .unwrap_or((false, false));
+    let (ok_80, ok_443) =
+        tokio::task::spawn_blocking(|| (tcp_port_bindable(80), tcp_port_bindable(443)))
+            .await
+            .unwrap_or((false, false));
     match (ok_80, ok_443) {
         (true, true) => base.with_state(CheckState::Pass),
-        (false, true) => base.with_state(CheckState::Warn).with_detail(
-            "TCP :80 in use — Caddy's ACME HTTP-01 challenge will fail",
-        ),
-        (true, false) => base.with_state(CheckState::Warn).with_detail(
-            "TCP :443 in use — Caddy cannot serve HTTPS",
-        ),
-        (false, false) => base.with_state(CheckState::Warn).with_detail(
-            "TCP :80 and :443 both in use — free them before enabling TLS",
-        ),
+        (false, true) => base
+            .with_state(CheckState::Warn)
+            .with_detail("TCP :80 in use — Caddy's ACME HTTP-01 challenge will fail"),
+        (true, false) => base
+            .with_state(CheckState::Warn)
+            .with_detail("TCP :443 in use — Caddy cannot serve HTTPS"),
+        (false, false) => base
+            .with_state(CheckState::Warn)
+            .with_detail("TCP :80 and :443 both in use — free them before enabling TLS"),
     }
 }
 
@@ -1129,23 +1241,26 @@ async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
 async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("version", ctx);
     match ctx.run_mode {
-        RunMode::Docker => {
-            match crate::update::check_image_update(ctx.image_tag).await {
-                Ok(Some(info)) if info.update_available => base
-                    .with_state(CheckState::Warn)
-                    .with_label("Node image outdated \u{2014} pull latest"),
-                Ok(_) => base.with_state(CheckState::Pass).with_label("Node image up to date"),
-                Err(e) => base
-                    .with_state(CheckState::Warn)
-                    .with_label("Node version (unable to check)")
-                    .with_detail(e),
-            }
-        }
-        RunMode::Native => match crate::native::check_binary_update().await {
-            Ok(Some(info)) => base
+        RunMode::Docker => match crate::update::check_image_update(ctx.image_tag).await {
+            Ok(Some(info)) if info.update_available => base
                 .with_state(CheckState::Warn)
-                .with_label(format!("Node outdated \u{2014} v{} available", info.version)),
-            Ok(None) => base.with_state(CheckState::Pass).with_label("Node binary up to date"),
+                .with_label("Node image outdated \u{2014} pull latest"),
+            Ok(_) => base
+                .with_state(CheckState::Pass)
+                .with_label("Node image up to date"),
+            Err(e) => base
+                .with_state(CheckState::Warn)
+                .with_label("Node version (unable to check)")
+                .with_detail(e),
+        },
+        RunMode::Native => match crate::native::check_binary_update().await {
+            Ok(Some(info)) => base.with_state(CheckState::Warn).with_label(format!(
+                "Node outdated \u{2014} v{} available",
+                info.version
+            )),
+            Ok(None) => base
+                .with_state(CheckState::Pass)
+                .with_label("Node binary up to date"),
             Err(e) => base
                 .with_state(CheckState::Warn)
                 .with_label("Node version (unable to check)")
@@ -1173,7 +1288,9 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "firewall" => run_check_firewall(ctx).await,
         "version" => run_check_version(ctx).await,
         "dwave-key" => run_check_dwave_key(ctx).await,
-        _ => idle_item(id, ctx).with_state(CheckState::Skip).with_detail("unknown check id"),
+        _ => idle_item(id, ctx)
+            .with_state(CheckState::Skip)
+            .with_detail("unknown check id"),
     }
 }
 
@@ -1186,7 +1303,11 @@ fn emit_item(app: &AppHandle, item: &CheckItem) {
 /// Append a `[checklist]` entry to the node-log so the console shows every
 /// state transition alongside the node's own output.
 fn emit_log(app: &AppHandle, auto: bool, verb: &str, item: &CheckItem, level: &str) {
-    let prefix = if auto { "[checklist] [auto] " } else { "[checklist] " };
+    let prefix = if auto {
+        "[checklist] [auto] "
+    } else {
+        "[checklist] "
+    };
     let detail = item
         .detail
         .as_ref()
@@ -1237,16 +1358,19 @@ async fn recheck_one(
     // Transition to Running.
     let running = {
         let mut cache = state.cache.lock().await;
-        let base = cache
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| idle_item(id, ctx));
+        let base = cache.get(id).cloned().unwrap_or_else(|| idle_item(id, ctx));
         let running = base.with_state(CheckState::Running);
         cache.insert(id.to_string(), running.clone());
         running
     };
     emit_item(app, &running);
-    emit_log(app, auto, verb_for_state(&running.state).0, &running, verb_for_state(&running.state).1);
+    emit_log(
+        app,
+        auto,
+        verb_for_state(&running.state).0,
+        &running,
+        verb_for_state(&running.state).1,
+    );
 
     // Run the check.
     let final_item = run_check_by_id(id, ctx).await;
@@ -1344,8 +1468,7 @@ pub async fn trigger_recheck_auto(app: AppHandle, ids: Vec<String>) {
 /// final CheckItems. For non-Tauri callers (TUI).
 pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     let settings = crate::settings::load_settings();
-    let native_rest_port =
-        crate::compose::native_rest_port(&settings.node_config);
+    let native_rest_port = crate::compose::native_rest_port(&settings.node_config);
     let dwave_token_set = settings
         .node_config
         .dwave_config

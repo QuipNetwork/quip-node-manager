@@ -185,14 +185,16 @@ pub fn installed_binary_version() -> Option<String> {
         .unwrap_or(text.trim())
         .trim_start_matches('v')
         .to_string();
-    if version.is_empty() { None } else { Some(version) }
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
 }
 
 /// Download the latest binary from GitLab releases.
 #[tauri::command]
-pub async fn download_native_binary(
-    app: tauri::AppHandle,
-) -> Result<String, String> {
+pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
@@ -235,29 +237,23 @@ pub async fn download_native_binary(
 
     let total = resp.content_length();
     if let Some(t) = total {
-        log(format!(
-            "Binary size: {:.1} MB",
-            t as f64 / 1_048_576.0
-        ));
+        log(format!("Binary size: {:.1} MB", t as f64 / 1_048_576.0));
     }
 
     // Stream to file
     let bin_dir = data_dir().join("bin");
-    std::fs::create_dir_all(&bin_dir)
-        .map_err(|e| format!("Cannot create bin dir: {}", e))?;
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("Cannot create bin dir: {}", e))?;
 
     let dest = binary_path();
     let tmp = dest.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|e| format!("Cannot create file: {}", e))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("Cannot create file: {}", e))?;
 
     let mut downloaded: u64 = 0;
     let mut last_pct: u64 = 0;
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| format!("Download error: {}", e))?;
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
         file.write_all(&chunk)
             .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
@@ -288,8 +284,7 @@ pub async fn download_native_binary(
     drop(file);
 
     // Move tmp → final
-    std::fs::rename(&tmp, &dest)
-        .map_err(|e| format!("Cannot install binary: {}", e))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("Cannot install binary: {}", e))?;
 
     // chmod +x on Unix
     #[cfg(unix)]
@@ -299,8 +294,7 @@ pub async fn download_native_binary(
             .map_err(|e| e.to_string())?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)
-            .map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
 
     let _ = app.emit(
@@ -312,8 +306,7 @@ pub async fn download_native_binary(
         },
     );
 
-    let version =
-        installed_binary_version().unwrap_or("unknown".into());
+    let version = installed_binary_version().unwrap_or("unknown".into());
     log(format!("Installed {} v{}", name, version));
 
     Ok(version)
@@ -321,14 +314,11 @@ pub async fn download_native_binary(
 
 /// Check if a newer binary is available from GitLab releases.
 #[tauri::command]
-pub async fn check_binary_update(
-) -> Result<Option<crate::update::UpdateInfo>, String> {
-    let current = match tokio::task::spawn_blocking(
-        installed_binary_version,
-    )
-    .await
-    .ok()
-    .flatten()
+pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
+    let current = match tokio::task::spawn_blocking(installed_binary_version)
+        .await
+        .ok()
+        .flatten()
     {
         Some(v) => v,
         None => return Ok(None),
@@ -365,9 +355,7 @@ pub async fn check_binary_update(
         return Ok(None);
     }
 
-    if crate::update::parse_semver(tag)
-        > crate::update::parse_semver(&current)
-    {
+    if crate::update::parse_semver(tag) > crate::update::parse_semver(&current) {
         Ok(Some(crate::update::UpdateInfo {
             version: tag.to_string(),
             url: format!(
@@ -392,10 +380,7 @@ pub async fn start_native_node(
     // Check for already-running process (in-memory or orphan from PID file)
     if let Some(child) = state.child.lock().unwrap().as_ref() {
         let pid = child.id();
-        return Err(format!(
-            "Node already running (PID {})",
-            pid
-        ));
+        return Err(format!("Node already running (PID {})", pid));
     }
     if let Some(pid) = detect_orphan_node() {
         return Err(format!(
@@ -419,10 +404,7 @@ pub async fn start_native_node(
 
     let bin = binary_path();
     if !bin.exists() {
-        return Err(format!(
-            "Node binary not found at {}",
-            bin.display()
-        ));
+        return Err(format!("Node binary not found at {}", bin.display()));
     }
 
     let config_path = data_dir().join("config.toml");
@@ -437,8 +419,7 @@ pub async fn start_native_node(
         .map_err(|e| format!("Cannot clone log file: {}", e))?;
 
     let work_dir = data_dir();
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("Cannot create data dir: {}", e))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
 
     let mut cmd = crate::cmd::new(&bin);
     cmd.args(["--config", &config_path.to_string_lossy()])
@@ -461,11 +442,7 @@ pub async fn start_native_node(
     let pid = child.id();
 
     // Log the command
-    let cmd_msg = format!(
-        "$ {} --config {}",
-        bin.display(),
-        config_path.display()
-    );
+    let cmd_msg = format!("$ {} --config {}", bin.display(), config_path.display());
     let _ = app.emit(
         "node-log",
         &LogEntry {
@@ -496,10 +473,7 @@ pub async fn start_native_node(
 
 /// Tail node logs: starts with node-output.log (process stdout),
 /// then switches to node.log once the node creates it.
-fn start_log_tail(
-    app: tauri::AppHandle,
-    stop_flag: Arc<Mutex<bool>>,
-) {
+fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
     use crate::log_stream::{start_log_stream_for_app, FallbackSource};
     let path = node_output_log_path();
     let _ = app.emit(
@@ -539,8 +513,7 @@ pub async fn start_native_log_tail(
 /// Outer deadline for the native stop path. `kill_pid` itself takes ~2s
 /// (SIGTERM → sleep → SIGKILL on Unix) so 5s gives real escalation room
 /// without letting a stuck process block the UI forever.
-const NATIVE_STOP_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const NATIVE_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stop the native node process with verify + auto-recheck.
 ///
@@ -562,9 +535,8 @@ pub async fn stop_native_node(
         let pid = guard.as_ref().map(|c| c.id());
         (pid, guard.take())
     };
-    let orphan_pid = read_pid().filter(|pid| {
-        child_pid.map(|cp| cp != *pid).unwrap_or(true) && is_process_alive(*pid)
-    });
+    let orphan_pid = read_pid()
+        .filter(|pid| child_pid.map(|cp| cp != *pid).unwrap_or(true) && is_process_alive(*pid));
 
     // Do the blocking kill work in a bounded thread so the async runtime
     // stays responsive and we can time out cleanly.
@@ -589,9 +561,7 @@ pub async fn stop_native_node(
     remove_pid();
 
     let timed_out = kill_result.is_err();
-    let still_alive = child_pid
-        .map(is_process_alive)
-        .unwrap_or(false)
+    let still_alive = child_pid.map(is_process_alive).unwrap_or(false)
         || orphan_pid.map(is_process_alive).unwrap_or(false);
 
     if timed_out || still_alive {
@@ -607,18 +577,12 @@ pub async fn stop_native_node(
         return Err(msg.to_string());
     }
 
-    let _ = app.emit(
-        "stop-complete",
-        serde_json::json!({ "success": true }),
-    );
+    let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
 
     let rc_app = app.clone();
     tokio::spawn(async move {
-        crate::checklist::trigger_recheck_auto(
-            rc_app,
-            vec!["binary".into(), "version".into()],
-        )
-        .await;
+        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into(), "version".into()])
+            .await;
     });
 
     Ok(())

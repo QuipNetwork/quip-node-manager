@@ -58,9 +58,7 @@ pub async fn get_node_version() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let settings = crate::settings::load_settings();
         match settings.run_mode {
-            crate::settings::RunMode::Native => {
-                crate::native::installed_binary_version()
-            }
+            crate::settings::RunMode::Native => crate::native::installed_binary_version(),
             crate::settings::RunMode::Docker => None,
         }
     })
@@ -162,9 +160,7 @@ fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
 /// Core GitLab registry digest probe — HEAD the manifest, diff against the
 /// local `docker image inspect` digest. Gracefully degrades to `Ok(None)`
 /// when the registry requires auth or the image isn't present locally.
-async fn check_gitlab_image_update(
-    image: ImageRef,
-) -> Result<Option<ImageUpdateInfo>, String> {
+async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdateInfo>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -212,16 +208,13 @@ async fn check_gitlab_image_update(
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default()
     })
     .await
     .unwrap_or_default();
 
-    let update_available =
-        !current_digest.is_empty() && !current_digest.contains(&digest);
+    let update_available = !current_digest.is_empty() && !current_digest.contains(&digest);
 
     Ok(Some(ImageUpdateInfo {
         current_digest,
@@ -238,8 +231,7 @@ pub async fn check_image_update(
 }
 
 #[tauri::command]
-pub async fn check_dashboard_image_update(
-) -> Result<Option<ImageUpdateInfo>, String> {
+pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, String> {
     check_gitlab_image_update(ImageRef::Dashboard).await
 }
 
@@ -248,8 +240,7 @@ pub async fn check_dashboard_image_update(
 /// - Native mode: checks for new binary release
 /// - Always: checks for new node-manager app release
 pub async fn background_update_monitor(app: tauri::AppHandle) {
-    let mut interval =
-        tokio::time::interval(Duration::from_secs(30 * 60));
+    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
     // Skip the first immediate tick
     interval.tick().await;
 
@@ -301,9 +292,7 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         // Native binary: separate channel because the binary is not a
         // container image and lives on GitLab Releases, not the registry.
         if settings.run_mode == crate::settings::RunMode::Native {
-            if let Ok(Some(info)) =
-                crate::native::check_binary_update().await
-            {
+            if let Ok(Some(info)) = crate::native::check_binary_update().await {
                 let _ = app.emit("binary-update-available", &info);
 
                 if settings.auto_update_enabled {
@@ -314,10 +303,7 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             info.version
                         ),
                     );
-                    let _ = crate::native::download_native_binary(
-                        app.clone(),
-                    )
-                    .await;
+                    let _ = crate::native::download_native_binary(app.clone()).await;
                     emit_log(&app, "[Auto-Update] Binary updated.");
                 }
             }

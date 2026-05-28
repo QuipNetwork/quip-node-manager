@@ -46,15 +46,11 @@ const KNOWN_TOOL_PATHS: &[&str] = &[
 /// safety net is rarely needed. Kept for parity and for unusual Docker
 /// Desktop install locations.
 #[cfg(target_os = "windows")]
-const KNOWN_TOOL_PATHS: &[&str] = &[
-    r"C:\Program Files\Docker\Docker\resources\bin",
-];
+const KNOWN_TOOL_PATHS: &[&str] = &[r"C:\Program Files\Docker\Docker\resources\bin"];
 
 fn expand_home(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-        {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             return PathBuf::from(home).join(rest);
         }
     }
@@ -132,7 +128,9 @@ static MANUAL_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 /// PATH so the next `cmd::new` call rebuilds with the new entry.
 #[allow(dead_code)] // wired in a follow-up when the modal UI lands
 pub fn set_manual_tool_dir(dir: Option<PathBuf>) {
-    *MANUAL_OVERRIDE.write().expect("manual-override lock poisoned") = dir;
+    *MANUAL_OVERRIDE
+        .write()
+        .expect("manual-override lock poisoned") = dir;
     // OnceLock can't be reset, so we use a generation counter instead —
     // `augmented_path` re-reads the override on every miss.
     CACHED_PATH.get_or_init(build_augmented_path); // touch to ensure init
@@ -145,13 +143,12 @@ static CACHED_PATH: OnceLock<OsString> = OnceLock::new();
 fn build_augmented_path() -> OsString {
     let mut parts: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let push = |parts: &mut Vec<PathBuf>,
-                seen: &mut std::collections::HashSet<PathBuf>,
-                p: PathBuf| {
-        if seen.insert(p.clone()) {
-            parts.push(p);
-        }
-    };
+    let push =
+        |parts: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>, p: PathBuf| {
+            if seen.insert(p.clone()) {
+                parts.push(p);
+            }
+        };
 
     if let Ok(guard) = MANUAL_OVERRIDE.read() {
         if let Some(dir) = guard.as_ref() {

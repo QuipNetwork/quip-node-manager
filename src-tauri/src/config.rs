@@ -10,20 +10,14 @@ const DEFAULT_PEERS: &[&str] = &[
     "nodes.quip.network:20049",
 ];
 
-fn render_config_toml(
-    config: &NodeConfig,
-    run_mode: &RunMode,
-) -> String {
+fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
     let mut out = String::new();
     let is_docker = *run_mode == RunMode::Docker;
 
     // ── [global] ────────────────────────────────────────────────────────
     out.push_str("[global]\n");
     if !config.node_name.is_empty() {
-        out.push_str(&format!(
-            "node_name = \"{}\"\n",
-            config.node_name
-        ));
+        out.push_str(&format!("node_name = \"{}\"\n", config.node_name));
     }
     out.push_str(&format!("listen = \"{}\"\n", config.listen));
     // Docker mode: the node always binds the container-internal port (20049)
@@ -32,10 +26,7 @@ fn render_config_toml(
     let bind_port = if is_docker { 20049 } else { config.port };
     out.push_str(&format!("port = {}\n", bind_port));
     if !config.public_host.is_empty() {
-        out.push_str(&format!(
-            "public_host = \"{}\"\n",
-            config.public_host
-        ));
+        out.push_str(&format!("public_host = \"{}\"\n", config.public_host));
     }
     // public_port tells peers which port to dial back on. Explicit user
     // value wins; otherwise, in Docker mode, announce the user-facing port
@@ -55,17 +46,12 @@ fn render_config_toml(
         out.push_str(&format!("secret = \"{}\"\n", config.secret));
     }
     out.push_str(&format!("auto_mine = {}\n", config.auto_mine));
-    out.push_str(&format!(
-        "genesis_config = \"{}\"\n",
-        config.genesis_config
-    ));
+    out.push_str(&format!("genesis_config = \"{}\"\n", config.genesis_config));
     if config.peers.is_empty() {
-        let peer_strs: Vec<String> =
-            DEFAULT_PEERS.iter().map(|p| format!("\"{}\"", p)).collect();
+        let peer_strs: Vec<String> = DEFAULT_PEERS.iter().map(|p| format!("\"{}\"", p)).collect();
         out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
     } else {
-        let peer_strs: Vec<String> =
-            config.peers.iter().map(|p| format!("\"{}\"", p)).collect();
+        let peer_strs: Vec<String> = config.peers.iter().map(|p| format!("\"{}\"", p)).collect();
         out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
     }
     out.push_str(&format!("timeout = {}\n", config.timeout));
@@ -84,14 +70,8 @@ fn render_config_toml(
     // TLS
     out.push_str(&format!("verify_tls = {}\n", config.verify_tls));
     if !config.tls_cert_file.is_empty() {
-        out.push_str(&format!(
-            "tls_cert_file = \"{}\"\n",
-            config.tls_cert_file
-        ));
-        out.push_str(&format!(
-            "tls_key_file = \"{}\"\n",
-            config.tls_key_file
-        ));
+        out.push_str(&format!("tls_cert_file = \"{}\"\n", config.tls_cert_file));
+        out.push_str(&format!("tls_key_file = \"{}\"\n", config.tls_key_file));
     }
 
     // TOFU
@@ -105,10 +85,7 @@ fn render_config_toml(
 
     // REST API (only emit when explicitly enabled)
     if config.rest_port > 0 || config.rest_insecure_port > 0 {
-        out.push_str(&format!(
-            "rest_host = \"{}\"\n",
-            config.rest_host
-        ));
+        out.push_str(&format!("rest_host = \"{}\"\n", config.rest_host));
         out.push_str(&format!("rest_port = {}\n", config.rest_port));
         out.push_str(&format!(
             "rest_insecure_port = {}\n",
@@ -117,21 +94,12 @@ fn render_config_toml(
     }
 
     // Logging
-    out.push_str(&format!(
-        "log_level = \"{}\"\n",
-        config.log_level
-    ));
+    out.push_str(&format!("log_level = \"{}\"\n", config.log_level));
     if !config.node_log.is_empty() {
-        out.push_str(&format!(
-            "node_log = \"{}\"\n",
-            config.node_log
-        ));
+        out.push_str(&format!("node_log = \"{}\"\n", config.node_log));
     }
     if !config.http_log.is_empty() {
-        out.push_str(&format!(
-            "http_log = \"{}\"\n",
-            config.http_log
-        ));
+        out.push_str(&format!("http_log = \"{}\"\n", config.http_log));
     }
 
     // Telemetry
@@ -148,10 +116,7 @@ fn render_config_toml(
         } else {
             config.telemetry_dir.clone()
         };
-        out.push_str(&format!(
-            "telemetry_dir = \"{}\"\n",
-            telemetry_dir
-        ));
+        out.push_str(&format!("telemetry_dir = \"{}\"\n", telemetry_dir));
     }
     out.push('\n');
 
@@ -179,20 +144,18 @@ fn render_config_toml(
 
     // Effective backend: Mps is clamped to "no backend" in Docker mode
     // because the container is Linux and has no Metal access.
-    let effective_backend =
-        if is_docker && config.gpu_backend == GpuBackend::Mps {
-            None
-        } else {
-            Some(config.gpu_backend.clone())
-        };
+    let effective_backend = if is_docker && config.gpu_backend == GpuBackend::Mps {
+        None
+    } else {
+        Some(config.gpu_backend.clone())
+    };
 
     let (gpu_util, gpu_yield) = enabled_devices
         .first()
         .map(|d| (d.utilization, d.yielding))
         .unwrap_or((100, false));
 
-    let emit_backend =
-        effective_backend.is_some() && !enabled_devices.is_empty();
+    let emit_backend = effective_backend.is_some() && !enabled_devices.is_empty();
 
     if emit_backend {
         out.push_str("[gpu]\n");
@@ -207,16 +170,10 @@ fn render_config_toml(
                 for dev in &enabled_devices {
                     out.push_str(&format!("[cuda.{}]\n", dev.index));
                     if dev.utilization != gpu_util {
-                        out.push_str(&format!(
-                            "utilization = {}\n",
-                            dev.utilization
-                        ));
+                        out.push_str(&format!("utilization = {}\n", dev.utilization));
                     }
                     if dev.yielding != gpu_yield {
-                        out.push_str(&format!(
-                            "yielding = {}\n",
-                            dev.yielding
-                        ));
+                        out.push_str(&format!("yielding = {}\n", dev.yielding));
                     }
                     out.push('\n');
                 }
@@ -239,22 +196,13 @@ fn render_config_toml(
             out.push_str("[dwave]\n");
             out.push_str(&format!("token = \"{}\"\n", dw.token));
             if !dw.daily_budget.is_empty() {
-                out.push_str(&format!(
-                    "daily_budget = \"{}\"\n",
-                    dw.daily_budget
-                ));
+                out.push_str(&format!("daily_budget = \"{}\"\n", dw.daily_budget));
             }
             if !dw.solver.is_empty() {
-                out.push_str(&format!(
-                    "solver = \"{}\"\n",
-                    dw.solver
-                ));
+                out.push_str(&format!("solver = \"{}\"\n", dw.solver));
             }
             if !dw.dwave_region_url.is_empty() {
-                out.push_str(&format!(
-                    "dwave_region_url = \"{}\"\n",
-                    dw.dwave_region_url
-                ));
+                out.push_str(&format!("dwave_region_url = \"{}\"\n", dw.dwave_region_url));
             }
             out.push('\n');
         }
@@ -263,10 +211,7 @@ fn render_config_toml(
     out
 }
 
-pub fn write_config_toml(
-    config: &NodeConfig,
-    run_mode: &RunMode,
-) -> Result<(), String> {
+pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
     crate::settings::ensure_data_dir()?;
     let content = render_config_toml(config, run_mode);
     // Docker mode: compose bind-mounts `./data:/data` (relative to the
@@ -286,10 +231,7 @@ pub fn write_config_toml(
 }
 
 #[tauri::command]
-pub async fn generate_config_toml(
-    config: NodeConfig,
-    run_mode: RunMode,
-) -> Result<String, String> {
+pub async fn generate_config_toml(config: NodeConfig, run_mode: RunMode) -> Result<String, String> {
     Ok(render_config_toml(&config, &run_mode))
 }
 
@@ -298,10 +240,7 @@ mod tests {
     use super::*;
     use crate::settings::GpuDeviceConfig;
 
-    fn cfg_with_gpu(
-        backend: GpuBackend,
-        devices: Vec<GpuDeviceConfig>,
-    ) -> NodeConfig {
+    fn cfg_with_gpu(backend: GpuBackend, devices: Vec<GpuDeviceConfig>) -> NodeConfig {
         NodeConfig {
             gpu_backend: backend,
             gpu_device_configs: devices,

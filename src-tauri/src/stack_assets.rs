@@ -25,13 +25,11 @@ use std::path::PathBuf;
 /// Upstream compose.yml, embedded at compile time from the vendored
 /// `nodes.quip.network` submodule. rustc's dep-info tracks the included
 /// path so `cargo build` rebuilds whenever the file changes.
-const COMPOSE_YML: &str =
-    include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
+const COMPOSE_YML: &str = include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
 
 /// Upstream Caddyfile, embedded alongside the compose.yml. Patched at
 /// runtime for Native mode (see `sync_stack_assets`).
-const CADDYFILE: &str =
-    include_str!("../../vendor/nodes.quip.network/caddy/Caddyfile");
+const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Caddyfile");
 
 /// Internal node port inside every compose container. Never changes.
 /// User-visible port changes only remap the host side of the publish.
@@ -70,8 +68,7 @@ pub fn sync_stack_assets(
 ) -> Result<(), String> {
     let base = data_dir();
     for sub in ["data", "dashboard-data", "caddy"] {
-        fs::create_dir_all(base.join(sub))
-            .map_err(|e| format!("mkdir {sub}: {e}"))?;
+        fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
     let compose_out = patch_compose_ports(COMPOSE_YML, public_port);
@@ -85,8 +82,7 @@ pub fn sync_stack_assets(
         ),
         RunMode::Docker => CADDYFILE.to_string(),
     };
-    fs::write(stack_caddyfile(), caddy_out)
-        .map_err(|e| format!("write Caddyfile: {e}"))?;
+    fs::write(stack_caddyfile(), caddy_out).map_err(|e| format!("write Caddyfile: {e}"))?;
 
     Ok(())
 }

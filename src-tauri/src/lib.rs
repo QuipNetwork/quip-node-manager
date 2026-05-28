@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-pub mod cmd;
 pub mod checklist;
+pub mod cmd;
 pub mod compose;
 pub mod config;
 pub mod hardware;
@@ -38,7 +38,9 @@ pub fn set_tray_update(app: &tauri::AppHandle, has_update: bool, tooltip: &str) 
     let state = app.state::<TrayState>();
     let id_guard = state.id.lock().unwrap();
     let Some(id) = id_guard.as_ref() else { return };
-    let Some(tray) = app.tray_by_id(id) else { return };
+    let Some(tray) = app.tray_by_id(id) else {
+        return;
+    };
 
     let icon_bytes = if has_update {
         TRAY_ICON_UPDATE
@@ -109,15 +111,11 @@ pub fn run() {
         ])
         .setup(|app| {
             // ── System tray ──────────────────────────────────────
-            let show_i = MenuItemBuilder::with_id("show", "Show Window")
-                .build(app)?;
-            let start_i = MenuItemBuilder::with_id("start", "Start Node")
-                .build(app)?;
-            let stop_i = MenuItemBuilder::with_id("stop", "Stop Node")
-                .build(app)?;
+            let show_i = MenuItemBuilder::with_id("show", "Show Window").build(app)?;
+            let start_i = MenuItemBuilder::with_id("start", "Start Node").build(app)?;
+            let stop_i = MenuItemBuilder::with_id("stop", "Stop Node").build(app)?;
             let sep = PredefinedMenuItem::separator(app)?;
-            let quit_i =
-                MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let quit_i = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app)
                 .items(&[&show_i, &start_i, &stop_i, &sep, &quit_i])
                 .build()?;
@@ -130,9 +128,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     match event.id().as_ref() {
                         "show" => {
-                            if let Some(w) =
-                                app.get_webview_window("main")
-                            {
+                            if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.show();
                                 let _ = w.unminimize();
                                 let _ = w.set_focus();
@@ -141,8 +137,7 @@ pub fn run() {
                         "start" => {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                let settings =
-                                    crate::settings::load_settings();
+                                let settings = crate::settings::load_settings();
                                 // Native: run the binary + (if dashboard) the
                                 // compose stack's non-node services.
                                 // Docker: run the full compose stack.
@@ -151,20 +146,13 @@ pub fn run() {
                                         compose::start_stack(handle).await
                                     }
                                     crate::settings::RunMode::Native => {
-                                        let state = handle
-                                            .state::<NativeProcessState>();
+                                        let state = handle.state::<NativeProcessState>();
                                         let native_res =
-                                            native::start_native_node(
-                                                handle.clone(),
-                                                state,
-                                            )
-                                            .await
-                                            .map(|_| ());
+                                            native::start_native_node(handle.clone(), state)
+                                                .await
+                                                .map(|_| ());
                                         if settings.dashboard_enabled {
-                                            let _ = compose::start_stack(
-                                                handle.clone(),
-                                            )
-                                            .await;
+                                            let _ = compose::start_stack(handle.clone()).await;
                                         }
                                         native_res
                                     }
@@ -174,26 +162,17 @@ pub fn run() {
                         "stop" => {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                let settings =
-                                    crate::settings::load_settings();
+                                let settings = crate::settings::load_settings();
                                 let _ = match settings.run_mode {
                                     crate::settings::RunMode::Docker => {
                                         compose::stop_stack(handle).await
                                     }
                                     crate::settings::RunMode::Native => {
-                                        let state = handle
-                                            .state::<NativeProcessState>();
+                                        let state = handle.state::<NativeProcessState>();
                                         let native_res =
-                                            native::stop_native_node(
-                                                handle.clone(),
-                                                state,
-                                            )
-                                            .await;
+                                            native::stop_native_node(handle.clone(), state).await;
                                         if settings.dashboard_enabled {
-                                            let _ = compose::stop_stack(
-                                                handle.clone(),
-                                            )
-                                            .await;
+                                            let _ = compose::stop_stack(handle.clone()).await;
                                         }
                                         native_res
                                     }
@@ -214,9 +193,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        if let Some(w) =
-                            app.get_webview_window("main")
-                        {
+                        if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.unminimize();
                             let _ = w.set_focus();
@@ -233,10 +210,7 @@ pub fn run() {
             let main_window = app.get_webview_window("main").unwrap();
             let w = main_window.clone();
             main_window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested {
-                    api, ..
-                } = event
-                {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = w.hide();
                 }
@@ -244,9 +218,7 @@ pub fn run() {
 
             // ── Background update monitor ────────────────────────
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(
-                update::background_update_monitor(handle),
-            );
+            tauri::async_runtime::spawn(update::background_update_monitor(handle));
             Ok(())
         })
         .run(tauri::generate_context!())

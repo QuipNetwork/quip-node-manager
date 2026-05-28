@@ -9,8 +9,7 @@
 
 use crate::log_stream::LogStreamState;
 use crate::settings::{
-    AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth,
-    StackStatus,
+    AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
 use crate::stack_assets::{
     stack_caddyfile, stack_compose_file, stack_project_dir, sync_stack_assets,
@@ -83,11 +82,7 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 /// Compose profile name for `(image_tag, dashboard, tls)`. TLS without
 /// dashboard is meaningless in this stack (Caddy only fronts the dashboard),
 /// so we collapse the TLS branch when dashboard is off.
-pub fn compose_profile(
-    image_tag: ImageTag,
-    dashboard: bool,
-    tls: bool,
-) -> &'static str {
+pub fn compose_profile(image_tag: ImageTag, dashboard: bool, tls: bool) -> &'static str {
     match (image_tag, dashboard, tls) {
         (ImageTag::Cpu, true, true) => "cpu",
         (ImageTag::Cpu, true, false) => "cpu-notls",
@@ -101,10 +96,7 @@ pub fn compose_profile(
 /// Whether the compose stack is skipped entirely. True iff Native mode with
 /// dashboard disabled — the user wants the bare native binary and nothing
 /// else. Every other combo runs some compose services.
-pub fn compose_skipped(
-    run_mode: &RunMode,
-    dashboard_enabled: bool,
-) -> bool {
+pub fn compose_skipped(run_mode: &RunMode, dashboard_enabled: bool) -> bool {
     *run_mode == RunMode::Native && !dashboard_enabled
 }
 
@@ -117,10 +109,7 @@ pub fn compose_skipped(
 ///   list of the non-node services. The profile is still set (dashboard/
 ///   postgres/caddy are profile-gated), but the positional args restrict
 ///   startup to just those.
-pub fn compose_services(
-    run_mode: &RunMode,
-    tls_enabled: bool,
-) -> &'static [&'static str] {
+pub fn compose_services(run_mode: &RunMode, tls_enabled: bool) -> &'static [&'static str] {
     match (run_mode, tls_enabled) {
         (RunMode::Docker, _) => &[],
         (RunMode::Native, true) => &["dashboard", "postgres", "caddy"],
@@ -213,8 +202,7 @@ fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     }
 
     let path = stack_project_dir().join(".env");
-    fs::write(&path, lines.join("\n") + "\n")
-        .map_err(|e| format!("write .env: {e}"))?;
+    fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
 
     // Best-effort 0600: DWAVE_API_KEY and POSTGRES_PASSWORD shouldn't be
     // world-readable on shared systems.
@@ -233,10 +221,7 @@ fn write_env_file(settings: &AppSettings) -> Result<(), String> {
 /// respects context timeouts; this is a backstop against a wedged daemon.
 const COMPOSE_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
-async fn run_compose_streaming(
-    app: &AppHandle,
-    args: Vec<String>,
-) -> Result<(), String> {
+async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let mut child = compose_cmd()
@@ -252,10 +237,7 @@ async fn run_compose_streaming(
         let app_out = app.clone();
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = app_out.emit(
-                    "pull-progress",
-                    serde_json::json!({ "line": &line }),
-                );
+                let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
                 let _ = app_out.emit(
                     "node-log",
                     serde_json::json!({
@@ -321,10 +303,8 @@ async fn run_compose_streaming(
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-const CPU_IMAGE: &str =
-    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu";
-const CUDA_IMAGE: &str =
-    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda";
+const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu";
+const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -394,13 +374,15 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
         settings.tls_enabled,
     );
 
-    let mut args: Vec<String> =
-        vec!["--profile".into(), profile.into(), "pull".into()];
+    let mut args: Vec<String> = vec!["--profile".into(), profile.into(), "pull".into()];
     for s in compose_services(&settings.run_mode, settings.tls_enabled) {
         args.push((*s).into());
     }
 
-    log_cmd(&app, &format!("docker compose --profile {profile} pull ..."));
+    log_cmd(
+        &app,
+        &format!("docker compose --profile {profile} pull ..."),
+    );
     run_compose_streaming(&app, args).await
 }
 
@@ -435,9 +417,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
-    if settings.run_mode == RunMode::Docker
-        && settings.node_config.public_host.is_empty()
-    {
+    if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         if let Ok(ip) = crate::network::detect_public_ip().await {
             log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
             settings.node_config.public_host = ip;
@@ -474,10 +454,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (5) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     log_cmd(&app, "Writing config.toml");
-    crate::config::write_config_toml(
-        &settings.node_config,
-        &settings.run_mode,
-    )?;
+    crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     // (6) Clean slate. `down` is cheap and idempotent; removes stale
     // containers left behind when the user switches image_tag/profile.
@@ -494,12 +471,8 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     pull_compose_images(app.clone()).await?;
 
     // (8) Up.
-    let mut up_args: Vec<String> = vec![
-        "--profile".into(),
-        profile.into(),
-        "up".into(),
-        "-d".into(),
-    ];
+    let mut up_args: Vec<String> =
+        vec!["--profile".into(), profile.into(), "up".into(), "-d".into()];
     for s in compose_services(&settings.run_mode, settings.tls_enabled) {
         up_args.push((*s).into());
     }
@@ -550,10 +523,7 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     match &result {
         Ok(_) => {
             log_output(&app, "Compose stack stopped.");
-            let _ = app.emit(
-                "stop-complete",
-                serde_json::json!({ "success": true }),
-            );
+            let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
         }
         Err(e) => {
             log_err(&app, e);
@@ -587,17 +557,13 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
 async fn force_remove_known_containers(app: &AppHandle) {
     for &name in KNOWN_CONTAINER_NAMES {
         let out = tokio::task::spawn_blocking(move || {
-            crate::cmd::new("docker")
-                .args(["rm", "-f", name])
-                .output()
+            crate::cmd::new("docker").args(["rm", "-f", name]).output()
         })
         .await;
         let Ok(Ok(output)) = out else { continue };
         if output.status.success() {
             // Docker prints the removed container's name to stdout.
-            let removed = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string();
+            let removed = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !removed.is_empty() {
                 log_cmd(app, &format!("docker rm -f {name}"));
                 log_output(app, &format!("Removed {removed}"));
@@ -647,9 +613,7 @@ async fn sweep_orphan_node_containers(app: &AppHandle) {
             );
             let id = id.to_string();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::cmd::new("docker")
-                    .args(["rm", "-f", &id])
-                    .output()
+                crate::cmd::new("docker").args(["rm", "-f", &id]).output()
             })
             .await;
         }
@@ -759,12 +723,10 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
 /// Useful for debugging the merged configuration the daemon would receive.
 #[tauri::command]
 pub async fn get_stack_config() -> Result<String, String> {
-    let output = tokio::task::spawn_blocking(|| {
-        compose_cmd().args(["config"]).output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    let output = tokio::task::spawn_blocking(|| compose_cmd().args(["config"]).output())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
