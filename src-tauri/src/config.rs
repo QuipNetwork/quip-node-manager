@@ -2,121 +2,96 @@
 use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
 use std::fs;
 
-const DEFAULT_PEERS: &[&str] = &[
-    "qpu-1.nodes.quip.network:20049",
-    "cpu-1.quip.carback.us:20049",
-    "gpu-1.quip.carback.us:20049",
-    "gpu-2.quip.carback.us:20050",
-    "nodes.quip.network:20049",
-];
+const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
+const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
+const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
+const DOCKER_MINER_REST_PORT: u16 = 80;
+const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
+
+fn toml_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{}\"", escaped)
+}
+
+fn push_toml_str(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(" = ");
+    out.push_str(&toml_string(value));
+    out.push('\n');
+}
+
+fn push_toml_string_array(out: &mut String, key: &str, values: &[String]) {
+    out.push_str(key);
+    out.push_str(" = [");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&toml_string(value));
+    }
+    out.push_str("]\n");
+}
+
+fn native_rest_port(config: &NodeConfig) -> u16 {
+    if config.rest_insecure_port > 0 {
+        config.rest_insecure_port as u16
+    } else if config.rest_port > 0 {
+        config.rest_port as u16
+    } else {
+        DEFAULT_NATIVE_REST_PORT
+    }
+}
+
+fn native_signer_key() -> String {
+    data_dir()
+        .join("keystore.json")
+        .to_string_lossy()
+        .to_string()
+}
 
 fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
     let mut out = String::new();
     let is_docker = *run_mode == RunMode::Docker;
 
-    // ── [global] ────────────────────────────────────────────────────────
-    out.push_str("[global]\n");
+    // ── [miner] ─────────────────────────────────────────────────────────
+    out.push_str("[miner]\n");
+    let validators = if is_docker {
+        vec![DOCKER_VALIDATOR_RPC.to_string()]
+    } else {
+        vec![format!("ws://127.0.0.1:{}/rpc", config.port)]
+    };
+    push_toml_string_array(&mut out, "validators", &validators);
+    let signer_key = if is_docker {
+        DOCKER_SIGNER_KEY.to_string()
+    } else {
+        native_signer_key()
+    };
+    push_toml_str(&mut out, "signer_key", &signer_key);
+    if is_docker {
+        push_toml_str(&mut out, "rest_host", DOCKER_MINER_REST_HOST);
+        out.push_str(&format!("rest_port = {}\n", DOCKER_MINER_REST_PORT));
+    } else {
+        push_toml_str(&mut out, "rest_host", &config.rest_host);
+        out.push_str(&format!("rest_port = {}\n", native_rest_port(config)));
+    }
+
     if !config.node_name.is_empty() {
-        out.push_str(&format!("node_name = \"{}\"\n", config.node_name));
+        push_toml_str(&mut out, "node_name", &config.node_name);
     }
-    out.push_str(&format!("listen = \"{}\"\n", config.listen));
-    // Docker mode: the node always binds the container-internal port (20049)
-    // and compose remaps the host side. Native mode: the node binds whatever
-    // the user configured, since there's no container in between.
-    let bind_port = if is_docker { 20049 } else { config.port };
-    out.push_str(&format!("port = {}\n", bind_port));
     if !config.public_host.is_empty() {
-        out.push_str(&format!("public_host = \"{}\"\n", config.public_host));
+        push_toml_str(&mut out, "public_host", &config.public_host);
     }
-    // public_port tells peers which port to dial back on. Explicit user
-    // value wins; otherwise, in Docker mode, announce the user-facing port
-    // whenever it differs from the internal bind (i.e. the host side of the
-    // publish has been remapped).
-    let effective_public_port = config.public_port.or_else(|| {
-        if bind_port != config.port {
-            Some(config.port)
-        } else {
-            None
-        }
-    });
-    if let Some(pp) = effective_public_port {
+    if let Some(pp) = config.public_port {
         out.push_str(&format!("public_port = {}\n", pp));
     }
-    if !config.secret.is_empty() {
-        out.push_str(&format!("secret = \"{}\"\n", config.secret));
-    }
-    out.push_str(&format!("auto_mine = {}\n", config.auto_mine));
-    out.push_str(&format!("genesis_config = \"{}\"\n", config.genesis_config));
-    if config.peers.is_empty() {
-        let peer_strs: Vec<String> = DEFAULT_PEERS.iter().map(|p| format!("\"{}\"", p)).collect();
-        out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
-    } else {
-        let peer_strs: Vec<String> = config.peers.iter().map(|p| format!("\"{}\"", p)).collect();
-        out.push_str(&format!("peer = [{}]\n", peer_strs.join(", ")));
-    }
-    out.push_str(&format!("timeout = {}\n", config.timeout));
-    out.push_str(&format!(
-        "heartbeat_interval = {}\n",
-        config.heartbeat_interval
-    ));
-    out.push_str(&format!(
-        "heartbeat_timeout = {}\n",
-        config.heartbeat_timeout
-    ));
-    if let Some(fanout) = config.fanout {
-        out.push_str(&format!("fanout = {}\n", fanout));
-    }
-
-    // TLS
-    out.push_str(&format!("verify_tls = {}\n", config.verify_tls));
-    if !config.tls_cert_file.is_empty() {
-        out.push_str(&format!("tls_cert_file = \"{}\"\n", config.tls_cert_file));
-        out.push_str(&format!("tls_key_file = \"{}\"\n", config.tls_key_file));
-    }
-
-    // TOFU
-    out.push_str(&format!("tofu = {}\n", config.tofu));
-    let trust_db = if is_docker {
-        "/data/trust.db".to_string()
-    } else {
-        config.trust_db.clone()
-    };
-    out.push_str(&format!("trust_db = \"{}\"\n", trust_db));
-
-    // REST API (only emit when explicitly enabled)
-    if config.rest_port > 0 || config.rest_insecure_port > 0 {
-        out.push_str(&format!("rest_host = \"{}\"\n", config.rest_host));
-        out.push_str(&format!("rest_port = {}\n", config.rest_port));
-        out.push_str(&format!(
-            "rest_insecure_port = {}\n",
-            config.rest_insecure_port
-        ));
-    }
-
-    // Logging
-    out.push_str(&format!("log_level = \"{}\"\n", config.log_level));
+    push_toml_str(&mut out, "log_level", &config.log_level);
     if !config.node_log.is_empty() {
-        out.push_str(&format!("node_log = \"{}\"\n", config.node_log));
-    }
-    if !config.http_log.is_empty() {
-        out.push_str(&format!("http_log = \"{}\"\n", config.http_log));
-    }
-
-    // Telemetry
-    out.push_str(&format!(
-        "telemetry_enabled = {}\n",
-        config.telemetry_enabled
-    ));
-    if config.telemetry_enabled {
-        // In Docker the node process runs with cwd=/app as a non-root user,
-        // so a relative path like "telemetry" resolves to /app/telemetry
-        // which isn't writable. Force an absolute path under /data.
-        let telemetry_dir = if is_docker {
-            "/data/telemetry".to_string()
-        } else {
-            config.telemetry_dir.clone()
-        };
-        out.push_str(&format!("telemetry_dir = \"{}\"\n", telemetry_dir));
+        push_toml_str(&mut out, "node_log", &config.node_log);
     }
     out.push('\n');
 
@@ -127,15 +102,10 @@ fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
 
     // ── GPU sections ────────────────────────────────────────────────────
     // [gpu] holds global defaults inherited by every backend section
-    // ([cuda.N], [metal], [modal]). See quip-protocol/quip-node.example.toml.
+    // ([cuda.N], [metal], [modal]). See quip-protocol/quip-miner.example.toml.
     //
-    // Emission rules:
-    //   - A backend section is only written if the user has at least one
-    //     GPU device enabled. With zero devices enabled, emitting an
-    //     empty [metal] / [modal] still activates that backend in the
-    //     node — which then fails to build its (zero) miners.
-    //   - Metal is unavailable in Linux containers regardless of what
-    //     the Mac host reports. In Docker mode we suppress Mps.
+    // Metal is unavailable in Linux containers regardless of what the Mac
+    // host reports. In Docker mode we suppress Mps.
     let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
         .gpu_device_configs
         .iter()
@@ -155,18 +125,18 @@ fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
         .map(|d| (d.utilization, d.yielding))
         .unwrap_or((100, false));
 
-    let emit_backend = effective_backend.is_some() && !enabled_devices.is_empty();
+    let emit_gpu_globals = effective_backend.is_some() && !enabled_devices.is_empty();
 
-    if emit_backend {
+    if emit_gpu_globals {
         out.push_str("[gpu]\n");
         out.push_str(&format!("utilization = {}\n", gpu_util));
         out.push_str(&format!("yielding = {}\n", gpu_yield));
         out.push('\n');
     }
 
-    if emit_backend {
-        match effective_backend {
-            Some(GpuBackend::Local) => {
+    match effective_backend {
+        Some(GpuBackend::Local) => {
+            if emit_gpu_globals {
                 for dev in &enabled_devices {
                     out.push_str(&format!("[cuda.{}]\n", dev.index));
                     if dev.utilization != gpu_util {
@@ -178,34 +148,35 @@ fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
                     out.push('\n');
                 }
             }
-            Some(GpuBackend::Mps) => {
-                out.push_str("[metal]\n");
-                out.push('\n');
-            }
-            Some(GpuBackend::Modal) => {
-                out.push_str("[modal]\n");
-                out.push('\n');
-            }
-            None => {}
         }
-    }
-
-    // ── [dwave] ─────────────────────────────────────────────────────────
-    if let Some(dw) = &config.dwave_config {
-        if !dw.token.is_empty() {
-            out.push_str("[dwave]\n");
-            out.push_str(&format!("token = \"{}\"\n", dw.token));
-            if !dw.daily_budget.is_empty() {
-                out.push_str(&format!("daily_budget = \"{}\"\n", dw.daily_budget));
-            }
-            if !dw.solver.is_empty() {
-                out.push_str(&format!("solver = \"{}\"\n", dw.solver));
-            }
-            if !dw.dwave_region_url.is_empty() {
-                out.push_str(&format!("dwave_region_url = \"{}\"\n", dw.dwave_region_url));
-            }
+        Some(GpuBackend::Mps) => {
+            out.push_str("[metal]\n");
             out.push('\n');
         }
+        Some(GpuBackend::Modal) => {
+            out.push_str("[modal]\n");
+            out.push('\n');
+        }
+        None => {}
+    }
+
+    // ── [qpu] / [dwave] ─────────────────────────────────────────────────
+    if let Some(dw) = &config.dwave_config {
+        out.push_str("[qpu]\n\n");
+        out.push_str("[dwave]\n");
+        if !dw.token.is_empty() {
+            push_toml_str(&mut out, "token", &dw.token);
+        }
+        if !dw.daily_budget.is_empty() {
+            push_toml_str(&mut out, "daily_budget", &dw.daily_budget);
+        }
+        if !dw.solver.is_empty() {
+            push_toml_str(&mut out, "solver", &dw.solver);
+        }
+        if !dw.dwave_region_url.is_empty() {
+            push_toml_str(&mut out, "dwave_region_url", &dw.dwave_region_url);
+        }
+        out.push('\n');
     }
 
     out
@@ -218,7 +189,7 @@ pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), 
     // project-directory), so the container sees `/data/config.toml` as
     // `<data_dir>/data/config.toml` on the host. Writing to the bare
     // `<data_dir>/config.toml` (native's location) would land it outside
-    // the mount and the node would never read it — falling back to
+    // the mount and the miner would never read it — falling back to
     // auto-detected defaults like `num_cpus = os.cpu_count()`.
     let path = match run_mode {
         RunMode::Docker => data_dir().join("data").join("config.toml"),
@@ -238,7 +209,7 @@ pub async fn generate_config_toml(config: NodeConfig, run_mode: RunMode) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::GpuDeviceConfig;
+    use crate::settings::{DwaveConfig, GpuDeviceConfig};
 
     fn cfg_with_gpu(backend: GpuBackend, devices: Vec<GpuDeviceConfig>) -> NodeConfig {
         NodeConfig {
@@ -246,6 +217,101 @@ mod tests {
             gpu_device_configs: devices,
             ..NodeConfig::default()
         }
+    }
+
+    #[test]
+    fn docker_config_uses_v02_miner_schema() {
+        let cfg = NodeConfig {
+            listen: "0.0.0.0".to_string(),
+            peers: vec!["legacy-peer:20049".to_string()],
+            auto_mine: true,
+            secret: "legacy-secret".to_string(),
+            genesis_config: "legacy-genesis.json".to_string(),
+            timeout: 9,
+            heartbeat_interval: 10,
+            heartbeat_timeout: 11,
+            fanout: Some(3),
+            verify_tls: true,
+            tls_cert_file: "cert.pem".to_string(),
+            tls_key_file: "key.pem".to_string(),
+            tofu: false,
+            trust_db: "/tmp/trust.db".to_string(),
+            http_log: "http.log".to_string(),
+            telemetry_enabled: false,
+            telemetry_dir: "telemetry-old".to_string(),
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+
+        assert!(toml.contains("[miner]\n"));
+        assert!(!toml.contains("[global]"));
+        assert!(toml.contains("validators = [\"ws://quip-validator:9944\"]"));
+        assert!(toml.contains("signer_key = \"/data/keystore.json\""));
+        assert!(toml.contains("rest_host = \"0.0.0.0\""));
+        assert!(toml.contains("rest_port = 80"));
+        assert!(toml.contains("[cpu]\n"));
+
+        for legacy_key in [
+            "listen =",
+            "port = 20049",
+            "peer =",
+            "auto_mine",
+            "secret =",
+            "genesis_config",
+            "timeout =",
+            "heartbeat_interval",
+            "heartbeat_timeout",
+            "fanout",
+            "verify_tls",
+            "tls_cert_file",
+            "tls_key_file",
+            "tofu",
+            "trust_db",
+            "http_log",
+            "telemetry_enabled",
+            "telemetry_dir",
+        ] {
+            assert!(
+                !toml.contains(legacy_key),
+                "rendered legacy key: {legacy_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_config_preserves_promoted_miner_fields() {
+        let cfg = NodeConfig {
+            node_name: "validator-home".to_string(),
+            public_host: "node.example.com".to_string(),
+            public_port: Some(24444),
+            log_level: "debug".to_string(),
+            node_log: "/data/logs/miner.log".to_string(),
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+
+        assert!(toml.contains("node_name = \"validator-home\""));
+        assert!(toml.contains("public_host = \"node.example.com\""));
+        assert!(toml.contains("public_port = 24444"));
+        assert!(toml.contains("log_level = \"debug\""));
+        assert!(toml.contains("node_log = \"/data/logs/miner.log\""));
+    }
+
+    #[test]
+    fn native_config_renders_host_local_miner_paths() {
+        let cfg = NodeConfig {
+            port: 21049,
+            rest_host: "127.0.0.1".to_string(),
+            rest_insecure_port: 20123,
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+
+        assert!(toml.contains("validators = [\"ws://127.0.0.1:21049/rpc\"]"));
+        assert!(toml.contains("signer_key = "));
+        assert!(toml.contains("keystore.json"));
+        assert!(toml.contains("rest_host = \"127.0.0.1\""));
+        assert!(toml.contains("rest_port = 20123"));
     }
 
     #[test]
@@ -319,5 +385,24 @@ mod tests {
         let toml = render_config_toml(&cfg, &RunMode::Native);
         assert!(!toml.contains("[gpu]"));
         assert!(toml.contains("[metal]"));
+    }
+
+    #[test]
+    fn dwave_config_activates_qpu_backend() {
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "DWAVE-TOKEN".to_string(),
+                daily_budget: "60s".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+
+        assert!(toml.contains("[qpu]\n"));
+        assert!(toml.contains("[dwave]\n"));
+        assert!(toml.contains("token = \"DWAVE-TOKEN\""));
+        assert!(toml.contains("daily_budget = \"60s\""));
+        assert!(toml.contains("solver = \"Advantage2_System1.13\""));
     }
 }
