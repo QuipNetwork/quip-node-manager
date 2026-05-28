@@ -236,12 +236,20 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
     ]));
 
-    // Port
+    // Public API port
     lines.push(field_line(
         app,
         &FocusId::Port,
-        "Port",
+        "Public API",
         &field_value(app, &FocusId::Port, &app.form.port),
+    ));
+
+    // Validator P2P port
+    lines.push(field_line(
+        app,
+        &FocusId::ValidatorPort,
+        "Validator P2P",
+        &field_value(app, &FocusId::ValidatorPort, &app.form.validator_port),
     ));
 
     // Listen (read-only)

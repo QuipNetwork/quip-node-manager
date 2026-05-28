@@ -95,8 +95,12 @@
             </div>
             <div class="mining-config-grid">
               <div class="form-group">
-                <label for="port">Port (UDP+TCP)</label>
+                <label for="port">Public API Port</label>
                 <input type="number" id="port" min="1024" max="65535" value="20049" />
+              </div>
+              <div class="form-group">
+                <label for="validator-port">Validator P2P Port</label>
+                <input type="number" id="validator-port" min="1024" max="65535" value="30033" />
               </div>
               <div class="form-group">
                 <label for="listen">Listen Address</label>
@@ -296,8 +300,8 @@
             <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
               <div class="form-group">
                 <label for="dashboard-hostname">Dashboard Hostname</label>
-                <input type="text" id="dashboard-hostname" placeholder="localhost:20080" />
-                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Use <code>localhost:20080</code> for local HTTP, or a real DNS name to trigger automatic Let's Encrypt certs.</div>
+                <input type="text" id="dashboard-hostname" placeholder=":20049" />
+                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Use <code>:20049</code> for local HTTP, or <code>example.com, example.com:20049</code> for public TLS.</div>
               </div>
               <div class="form-group">
                 <label for="cert-email">ACME Email <span style="color:var(--text-faint);font-weight:400;">(required for Let's Encrypt)</span></label>

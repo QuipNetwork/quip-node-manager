@@ -124,6 +124,9 @@ impl Default for DwaveConfig {
 fn default_port() -> u16 {
     20049
 }
+fn default_validator_port() -> u16 {
+    30033
+}
 fn default_listen() -> String {
     "::".to_string()
 }
@@ -169,8 +172,13 @@ fn default_telemetry_dir() -> String {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
     // Network
+    // v0.2: public Caddy/API/dashboard/RPC host port.
     #[serde(default = "default_port")]
     pub port: u16,
+    // v0.2: validator libp2p host port, mapped to container-internal 30333.
+    #[serde(default = "default_validator_port")]
+    pub validator_port: u16,
+    // v0.1 legacy fields kept for app-settings.json compatibility.
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default)]
@@ -255,6 +263,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             port: 20049,
+            validator_port: 30033,
             listen: "::".to_string(),
             public_host: String::new(),
             public_port: None,
@@ -294,7 +303,7 @@ fn default_true() -> bool {
     true
 }
 fn default_dashboard_hostname() -> String {
-    "localhost:20080".to_string()
+    ":20049".to_string()
 }
 
 /// Accept the old `"qpu"` string (briefly shipped to users) as an alias for
@@ -536,4 +545,47 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
     let mut cfg = load_bootstrap();
     cfg.data_dir = new_dir;
     save_bootstrap(&cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn node_config_defaults_validator_port_for_legacy_json() {
+        let config: NodeConfig = serde_json::from_value(json!({
+            "port": 20049,
+            "listen": "::"
+        }))
+        .unwrap();
+
+        assert_eq!(config.port, 20049);
+        assert_eq!(config.validator_port, 30033);
+    }
+
+    #[test]
+    fn app_settings_default_dashboard_hostname_is_public_api_port() {
+        assert_eq!(AppSettings::default().dashboard_hostname, ":20049");
+    }
+
+    #[test]
+    fn app_settings_deserializes_legacy_qpu_image_without_losing_fields() {
+        let settings: AppSettings = serde_json::from_value(json!({
+            "node_config": {
+                "port": 20444,
+                "node_name": "legacy-node"
+            },
+            "active_tab": "status",
+            "window_maximized": false,
+            "image_tag": "qpu"
+        }))
+        .unwrap();
+
+        assert_eq!(settings.node_config.port, 20444);
+        assert_eq!(settings.node_config.validator_port, 30033);
+        assert_eq!(settings.node_config.node_name, "legacy-node");
+        assert_eq!(settings.image_tag, ImageTag::Cpu);
+        assert_eq!(settings.dashboard_hostname, ":20049");
+    }
 }

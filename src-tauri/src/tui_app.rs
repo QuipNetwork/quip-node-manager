@@ -35,6 +35,7 @@ pub enum FocusId {
     ConfigToggle,
     RunMode,
     Port,
+    ValidatorPort,
     SecretShow,
     SecretRegenerate,
     AutoMine,
@@ -99,6 +100,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct FormState {
     pub port: String,
+    pub validator_port: String,
     pub node_name: String,
     pub auto_mine: bool,
     pub run_mode_idx: usize, // 0=Docker, 1=Native
@@ -153,6 +155,7 @@ impl FormState {
         };
         FormState {
             port: nc.port.to_string(),
+            validator_port: nc.validator_port.to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
@@ -201,6 +204,7 @@ impl FormState {
     ) -> crate::settings::NodeConfig {
         let mut nc = base.clone();
         nc.port = self.port.parse().unwrap_or(20049);
+        nc.validator_port = self.validator_port.parse().unwrap_or(30033);
         nc.node_name = self.node_name.clone();
         nc.auto_mine = self.auto_mine;
         nc.public_host = if self.public_host_enabled {
@@ -783,6 +787,7 @@ impl TuiApp {
         if self.config_expanded {
             list.push(FocusId::RunMode);
             list.push(FocusId::Port);
+            list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
             list.push(FocusId::AutoMine);

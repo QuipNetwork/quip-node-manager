@@ -188,6 +188,7 @@ fn activate(app: &mut TuiApp) -> Action {
 
         // Text fields — enter edit mode
         FocusId::Port
+        | FocusId::ValidatorPort
         | FocusId::NodeName
         | FocusId::PublicHostInput
         | FocusId::PublicPortInput
@@ -232,6 +233,7 @@ fn toggle_or_activate(app: &mut TuiApp) -> Action {
 fn start_edit(app: &mut TuiApp) {
     let current = match &app.focus {
         FocusId::Port => app.form.port.clone(),
+        FocusId::ValidatorPort => app.form.validator_port.clone(),
         FocusId::NodeName => app.form.node_name.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
         FocusId::PublicPortInput => app.form.public_port.clone(),
@@ -262,6 +264,7 @@ fn commit_edit(app: &mut TuiApp) {
     match &app.edit_mode {
         EditMode::EditingField(id) => match id {
             FocusId::Port => app.form.port = buf,
+            FocusId::ValidatorPort => app.form.validator_port = buf,
             FocusId::NodeName => app.form.node_name = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
             FocusId::PublicPortInput => app.form.public_port = buf,

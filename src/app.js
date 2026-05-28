@@ -33,6 +33,21 @@ const state = {
   hardwareSurvey: null,
 };
 
+const DEFAULT_DASHBOARD_HOSTNAME = ':20049';
+
+function dashboardHostForBrowser(value) {
+  const firstHost = (value || DEFAULT_DASHBOARD_HOSTNAME)
+    .split(',')[0]
+    .trim() || DEFAULT_DASHBOARD_HOSTNAME;
+  return firstHost.startsWith(':') ? `localhost${firstHost}` : firstHost;
+}
+
+function isLocalDashboardHost(hostname) {
+  return hostname.startsWith('localhost') ||
+    hostname.startsWith('127.0.0.1') ||
+    hostname.startsWith('[::1]');
+}
+
 // ─── Stack Configuration UI ─────────────────────────────────────────────────
 
 // Show the TLS subsettings block only when both dashboard and TLS are on.
@@ -67,11 +82,11 @@ document.addEventListener('change', (e) => {
 
 function dashboardUrl(settings) {
   if (!settings?.dashboard_enabled) return null;
-  const hostname = settings.dashboard_hostname || 'localhost:20080';
+  const hostname = dashboardHostForBrowser(settings.dashboard_hostname);
   // ACME via Caddy only when TLS is on AND the hostname is a real DNS name
   // (localhost can't get a public cert). In every other case plain HTTP on
   // whatever port was configured.
-  if (settings.tls_enabled && !hostname.startsWith('localhost')) {
+  if (settings.tls_enabled && !isLocalDashboardHost(hostname)) {
     return `https://${hostname.replace(/:.*/, '')}`;
   }
   return `http://${hostname}`;
@@ -200,6 +215,14 @@ document.getElementById('port').addEventListener('change', async () => {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
     await invoke('recheck', { ids: ['port', 'firewall'] }).catch(console.error);
+  }
+});
+
+document.getElementById('validator-port').addEventListener('change', async () => {
+  const port = parseInt(document.getElementById('validator-port').value) || 30033;
+  if (state.settings) {
+    state.settings.node_config.validator_port = port;
+    await invoke('update_settings', { settings: state.settings }).catch(console.error);
   }
 });
 
@@ -435,6 +458,7 @@ function collectConfig() {
 
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
+    validator_port: parseInt(document.getElementById('validator-port').value) || 30033,
     listen: document.getElementById('listen')?.value?.trim() || '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
@@ -497,7 +521,7 @@ function applyFormToSettings() {
     document.getElementById('tls-enabled')?.checked ?? false;
   state.settings.dashboard_hostname =
     document.getElementById('dashboard-hostname')?.value?.trim() ||
-    'localhost:20080';
+    DEFAULT_DASHBOARD_HOSTNAME;
   state.settings.cert_email =
     document.getElementById('cert-email')?.value?.trim() || '';
   state.settings.zerossl_api_key =
@@ -510,6 +534,7 @@ function populateForm(settings) {
 
   // Node Configuration
   document.getElementById('port').value = c.port ?? 20049;
+  document.getElementById('validator-port').value = c.validator_port ?? 30033;
   document.getElementById('listen').value = c.listen || '::';
   document.getElementById('secret-display').value = c.secret ?? '';
   document.getElementById('auto-mine').checked = c.auto_mine ?? false;
@@ -554,7 +579,7 @@ function populateForm(settings) {
   document.getElementById('tls-enabled').checked =
     settings.tls_enabled ?? false;
   document.getElementById('dashboard-hostname').value =
-    settings.dashboard_hostname ?? 'localhost:20080';
+    settings.dashboard_hostname ?? DEFAULT_DASHBOARD_HOSTNAME;
   document.getElementById('cert-email').value = settings.cert_email ?? '';
   document.getElementById('zerossl-api-key').value =
     settings.zerossl_api_key ?? '';
@@ -750,7 +775,7 @@ function defaultLabel(id) {
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Port ${port} — press Recheck to test`;
+    case 'port':              return `Public API port ${port} — press Recheck to test`;
     case 'port-dashboard':    return 'Dashboard port 20080 available';
     case 'port-tls':          return 'TLS ports 80 + 443 available';
     case 'rest-port-native':  return 'Native REST port available';
