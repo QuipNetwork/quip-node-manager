@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `docker compose`-based stack orchestration — replaces the single
-//! `docker run quip-node` path from docker.rs.
+//! `docker compose`-based stack orchestration.
 //!
-//! Docker mode drives the full stack (node + dashboard + postgres + caddy).
-//! Native mode starts only the non-node services (`dashboard`+`postgres`,
-//! plus `caddy` if TLS is on) and expects the native binary to run the node
-//! on the host; the dashboard reaches it via `host.docker.internal`.
+//! Docker mode drives the full v0.2 stack (miner + validator + dashboard +
+//! postgres + caddy). Native miner installation is deferred; the remaining
+//! native path starts only Docker-side support services.
 
 use crate::log_stream::LogStreamState;
 use crate::settings::{
@@ -79,25 +77,21 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 
 // ── profile + services selection ───────────────────────────────────────────
 
-/// Compose profile name for `(image_tag, dashboard, tls)`. TLS without
-/// dashboard is meaningless in this stack (Caddy only fronts the dashboard),
-/// so we collapse the TLS branch when dashboard is off.
-pub fn compose_profile(image_tag: ImageTag, dashboard: bool, tls: bool) -> &'static str {
-    match (image_tag, dashboard, tls) {
-        (ImageTag::Cpu, true, true) => "cpu",
-        (ImageTag::Cpu, true, false) => "cpu-notls",
-        (ImageTag::Cpu, false, _) => "cpu-nodash",
-        (ImageTag::Cuda, true, true) => "cuda",
-        (ImageTag::Cuda, true, false) => "cuda-notls",
-        (ImageTag::Cuda, false, _) => "cuda-nodash",
+/// Compose profile name for v0.2. Dashboard-disabled support is deferred;
+/// the standard upstream profiles always include dashboard, postgres, Caddy,
+/// the selected miner, bootstrap, and validator.
+pub fn compose_profile(image_tag: ImageTag, _dashboard: bool, _tls: bool) -> &'static str {
+    match image_tag {
+        ImageTag::Cpu => "cpu",
+        ImageTag::Cuda => "cuda",
     }
 }
 
-/// Whether the compose stack is skipped entirely. True iff Native mode with
-/// dashboard disabled — the user wants the bare native binary and nothing
-/// else. Every other combo runs some compose services.
-pub fn compose_skipped(run_mode: &RunMode, dashboard_enabled: bool) -> bool {
-    *run_mode == RunMode::Native && !dashboard_enabled
+/// Whether the compose stack is skipped entirely. Dashboard-disabled support is
+/// deferred for v0.2 alignment, so every current mode has compose services to
+/// stage/check/pull/start.
+pub fn compose_skipped(_run_mode: &RunMode, _dashboard_enabled: bool) -> bool {
+    false
 }
 
 /// Explicit service list for `docker compose up -d [services...]`.
@@ -105,28 +99,20 @@ pub fn compose_skipped(run_mode: &RunMode, dashboard_enabled: bool) -> bool {
 /// - Docker mode: empty slice means "start every service the profile allows"
 ///   (compose default). We don't enumerate because the profile already gates
 ///   things down to the correct set.
-/// - Native mode: we skip the node container and hand compose an explicit
-///   list of the non-node services. The profile is still set (dashboard/
-///   postgres/caddy are profile-gated), but the positional args restrict
-///   startup to just those.
-pub fn compose_services(run_mode: &RunMode, tls_enabled: bool) -> &'static [&'static str] {
-    match (run_mode, tls_enabled) {
-        (RunMode::Docker, _) => &[],
-        (RunMode::Native, true) => &["dashboard", "postgres", "caddy"],
-        (RunMode::Native, false) => &["dashboard-direct", "postgres"],
+/// - Native mode: we skip the miner and bootstrap containers and hand compose
+///   an explicit list of support services. The profile is still set so these
+///   services are eligible, while positional args restrict startup to them.
+pub fn compose_services(run_mode: &RunMode, _tls_enabled: bool) -> &'static [&'static str] {
+    match run_mode {
+        RunMode::Docker => &[],
+        RunMode::Native => &["quip-validator", "dashboard", "postgres", "caddy"],
     }
 }
 
 // ── Native REST port ───────────────────────────────────────────────────────
 
-/// Port the node exposes for the dashboard to poll. Used for both modes:
-///   - Native + dashboard: host binds `127.0.0.1:<port>`; dashboard reaches
-///     it via `host.docker.internal:<port>` from inside the container.
-///   - Docker + dashboard: node container binds `0.0.0.0:<port>`; dashboard
-///     reaches it via the `quip-node` compose network alias.
-/// Honors the user-configured `rest_insecure_port` when set; otherwise falls
-/// back to 20100 (non-privileged — the containerized node runs as the host
-/// PUID, so ports <1024 are out of reach without capabilities).
+/// Host REST port for the deferred native miner path. Docker miners bind
+/// internal port 80 and are reached through Caddy's `/api/v1/*` route.
 pub fn native_rest_port(cfg: &NodeConfig) -> u16 {
     if cfg.rest_insecure_port > 0 {
         cfg.rest_insecure_port as u16
@@ -146,7 +132,7 @@ fn to_forward_slash(p: PathBuf) -> String {
 /// `docker compose -f <data_dir>/docker-compose.yml --project-directory
 /// <data_dir> --project-name quip` — the common prefix for every compose
 /// invocation.
-fn compose_cmd() -> Command {
+pub(crate) fn compose_cmd() -> Command {
     let compose_file = to_forward_slash(stack_compose_file());
     let project_dir = to_forward_slash(stack_project_dir());
     let mut c = crate::cmd::new("docker");
@@ -166,7 +152,7 @@ fn compose_cmd() -> Command {
 
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
 /// there is no merge with an existing file.
-fn write_env_file(settings: &AppSettings) -> Result<(), String> {
+pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
     let dwave_key = settings
         .node_config
@@ -303,8 +289,9 @@ async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(),
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu";
-const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda";
+const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu";
+const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda";
+const COMPOSE_IMAGE_TAG: &str = "v0.2-preview";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -351,12 +338,12 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 }
 
 /// Pull every image needed by the current profile + service list. Runs
-/// `docker compose --profile <p> pull [services...]` so the daemon talks to
-/// the registry for each entry even if local copies exist (cache-bust for
-/// `:latest` tags).
+/// `docker compose --profile <p> pull [services...]` so the daemon checks the
+/// registry for the configured v0.2 preview tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
-    let settings = crate::settings::load_settings();
+    let mut settings = crate::settings::load_settings();
+    settings.dashboard_enabled = true;
     if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
         return Ok(());
     }
@@ -392,9 +379,9 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 ///
 /// Sequence:
 ///   1. sync_stack_assets (staging + Caddyfile patch for Native)
-///   2. write .env (credentials, QUIP_NODE_URL for Native)
+///   2. write .env
 ///   3. auto-detect public_host in Docker mode
-///   4. force rest_host=0.0.0.0 + rest_insecure_port in Native+dashboard
+///   4. force native miner REST settings when the deferred native path is used
 ///   5. write_config_toml
 ///   6. docker compose down  (clean slate; no-op on first start)
 ///   7. docker compose --profile <p> pull
@@ -402,6 +389,7 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
+    settings.dashboard_enabled = true;
 
     if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
         log_cmd(
@@ -430,27 +418,11 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // (3) Force REST on whenever the dashboard is enabled — it's how the
-    // dashboard polls telemetry. The default NodeConfig has REST disabled
-    // (rest_insecure_port = -1), so without this override the dashboard
-    // silently can't reach the node.
-    //   - Native : bind 127.0.0.1. Docker Desktop's vpnkit proxies
-    //              host.docker.internal to the host's loopback, so 0.0.0.0
-    //              isn't needed — and 127.0.0.1 avoids leaking this
-    //              unauthenticated admin port onto the LAN. (Native mode is
-    //              macOS-only; Linux Docker CE would need a different bind.)
-    //   - Docker : bind 0.0.0.0 inside the container so the dashboard can
-    //              reach it across the compose network via the `quip-node`
-    //              alias. The port isn't published to the host, so LAN
-    //              exposure isn't a concern.
-    // We mutate the in-memory copy only — app-settings.json on disk is
-    // untouched.
-    if settings.dashboard_enabled {
-        let bind = match settings.run_mode {
-            RunMode::Native => "127.0.0.1",
-            RunMode::Docker => "0.0.0.0",
-        };
-        settings.node_config.rest_host = bind.to_string();
+    // (3) Native miner installation/update is deferred. Keep the old native
+    // REST override isolated to Native mode so the Docker v0.2 config always
+    // uses internal miner REST port 80.
+    if settings.run_mode == RunMode::Native {
+        settings.node_config.rest_host = "127.0.0.1".to_string();
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
 
@@ -473,7 +445,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.tls_enabled,
     );
 
-    // (7) Pull (always — cache-bust :latest).
+    // (7) Pull the configured v0.2 preview tags.
     pull_compose_images(app.clone()).await?;
 
     // (8) Up.
@@ -549,10 +521,14 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
 const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-cpu",
     "quip-cuda",
-    "quip-qpu",
+    "quip-validator",
+    "quip-bootstrap",
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
+    "quip-faucet",
+    // Legacy one-container TUI path; kept as a cleanup-only backstop.
+    "quip-node",
 ];
 
 /// Force-remove every container the compose file declares by name. Runs
@@ -585,7 +561,7 @@ async fn force_remove_known_containers(app: &AppHandle) {
 /// since `docker ps --filter label!=…` isn't portable.
 async fn sweep_orphan_node_containers(app: &AppHandle) {
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
-        let image_ref = format!("{image}:latest");
+        let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
         let ps = tokio::task::spawn_blocking({
             let image_ref = image_ref.clone();
             move || {
@@ -747,4 +723,62 @@ pub async fn get_stack_config() -> Result<String, String> {
 #[allow(dead_code)]
 pub(crate) fn _caddyfile_path() -> PathBuf {
     stack_caddyfile()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_profile_uses_only_v02_cpu_and_cuda_profiles() {
+        assert_eq!(compose_profile(ImageTag::Cpu, true, true), "cpu");
+        assert_eq!(compose_profile(ImageTag::Cpu, true, false), "cpu");
+        assert_eq!(compose_profile(ImageTag::Cpu, false, false), "cpu");
+        assert_eq!(compose_profile(ImageTag::Cuda, true, true), "cuda");
+        assert_eq!(compose_profile(ImageTag::Cuda, true, false), "cuda");
+        assert_eq!(compose_profile(ImageTag::Cuda, false, false), "cuda");
+    }
+
+    #[test]
+    fn compose_services_docker_uses_profile_defaults() {
+        assert!(compose_services(&RunMode::Docker, true).is_empty());
+        assert!(compose_services(&RunMode::Docker, false).is_empty());
+    }
+
+    #[test]
+    fn compose_services_native_runs_only_support_services() {
+        assert_eq!(
+            compose_services(&RunMode::Native, false),
+            ["quip-validator", "dashboard", "postgres", "caddy"]
+        );
+        assert!(!compose_services(&RunMode::Native, true).contains(&"cpu"));
+        assert!(!compose_services(&RunMode::Native, true).contains(&"cuda"));
+        assert!(!compose_services(&RunMode::Native, true).contains(&"quip-bootstrap"));
+    }
+
+    #[test]
+    fn compose_is_not_skipped_while_dashboard_disabled_is_deferred() {
+        assert!(!compose_skipped(&RunMode::Docker, false));
+        assert!(!compose_skipped(&RunMode::Native, false));
+    }
+
+    #[test]
+    fn v02_cleanup_containers_do_not_include_qpu_service() {
+        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-validator"));
+        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-bootstrap"));
+        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-faucet"));
+        assert!(!KNOWN_CONTAINER_NAMES.contains(&"quip-qpu"));
+    }
+
+    #[test]
+    fn miner_image_paths_use_v02_names() {
+        assert_eq!(
+            image_for_tag(ImageTag::Cpu),
+            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu"
+        );
+        assert_eq!(
+            image_for_tag(ImageTag::Cuda),
+            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda"
+        );
+    }
 }

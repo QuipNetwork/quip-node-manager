@@ -10,11 +10,9 @@ use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, DwaveConfig, RunMode};
+use crate::settings::{AppSettings, DwaveConfig, RunMode, StackHealth};
 
-// Legacy single-container status used by the TUI's inline `docker run` flow.
-// The TUI is a fallback for the GUI and doesn't yet drive the compose stack;
-// the GUI's StackStatus replaced this shape for Tauri-facing callers.
+// Compact status used by the TUI. The GUI exposes the full StackStatus shape.
 #[derive(Clone, Debug)]
 pub struct ContainerStatus {
     pub running: bool,
@@ -514,42 +512,58 @@ impl TuiApp {
                 };
             }
             RunMode::Docker => {
-                let output = crate::cmd::new("docker")
-                    .args([
-                        "inspect",
-                        "--format",
-                        "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
-                        "quip-node",
-                    ])
-                    .output();
-                self.status = match output {
-                    Ok(o) if o.status.success() => {
-                        let line = String::from_utf8_lossy(&o.stdout);
-                        let parts: Vec<&str> = line.trim().split('\t').collect();
-                        if parts.len() >= 4 {
-                            ContainerStatus {
-                                running: parts[1] == "true",
-                                container_id: Some(parts[0][..12.min(parts[0].len())].to_string()),
-                                image: parts[2].to_string(),
-                                status_text: parts[3].to_string(),
-                            }
-                        } else {
-                            ContainerStatus {
-                                running: false,
-                                container_id: None,
-                                image: String::new(),
-                                status_text: "unknown".to_string(),
-                            }
-                        }
-                    }
-                    _ => ContainerStatus {
-                        running: false,
-                        container_id: None,
-                        image: String::new(),
-                        status_text: "not found".to_string(),
-                    },
-                };
+                self.status = self.stack_status_for_tui();
             }
+        }
+    }
+
+    fn stack_status_for_tui(&self) -> ContainerStatus {
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "cannot create runtime".to_string(),
+            };
+        };
+        let Ok(stack) = rt.block_on(crate::compose::get_stack_status()) else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "compose status unavailable".to_string(),
+            };
+        };
+
+        let selected_service = self.form.image_tag.service();
+        let selected = stack
+            .services
+            .iter()
+            .find(|s| s.service == selected_service)
+            .or_else(|| {
+                stack
+                    .services
+                    .iter()
+                    .find(|s| s.service == "quip-validator")
+            })
+            .or_else(|| stack.services.iter().find(|s| s.running))
+            .or_else(|| stack.services.first());
+
+        let running = matches!(stack.overall, StackHealth::Running | StackHealth::Degraded);
+        let Some(service) = selected else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "not found".to_string(),
+            };
+        };
+
+        ContainerStatus {
+            running,
+            container_id: Some(service.name.clone()),
+            image: service.image.clone(),
+            status_text: format!("{} ({:?})", service.status_text, stack.overall),
         }
     }
 
@@ -582,72 +596,71 @@ impl TuiApp {
     }
 
     fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        // Remove any stale container first
+        // Remove the legacy single-container TUI path if it was used before
+        // the manager moved to the v0.2 compose stack.
         let _ = crate::cmd::new("docker")
             .args(["rm", "-f", "quip-node"])
             .output();
 
-        let data_dir = crate::settings::data_dir();
-        let data_mount = format!("{}:/data", data_dir.display());
-        let image = format!(
-            "{}:latest",
-            crate::compose::image_for_tag(self.settings.image_tag)
+        let mut settings = self.settings.clone();
+        settings.node_config = config.clone();
+        settings.image_tag = self.form.image_tag;
+        settings.run_mode = RunMode::Docker;
+        settings.dashboard_enabled = true;
+
+        if let Err(e) = crate::stack_assets::sync_stack_assets(
+            &RunMode::Docker,
+            config.port,
+            config.validator_port,
+            crate::compose::native_rest_port(config),
+        ) {
+            self.set_status(format!("Stack asset error: {}", e));
+            return;
+        }
+        if let Err(e) = crate::compose::write_env_file(&settings) {
+            self.set_status(format!("Env error: {}", e));
+            return;
+        }
+
+        let profile = crate::compose::compose_profile(
+            settings.image_tag,
+            settings.dashboard_enabled,
+            settings.tls_enabled,
         );
 
-        let quip_mode = if config.gpu_device_configs.iter().any(|d| d.enabled)
-            && self.settings.image_tag == crate::settings::ImageTag::Cuda
-        {
-            "gpu"
-        } else {
-            "cpu"
-        };
+        self.set_status("Stopping existing compose stack...");
+        let _ = crate::compose::compose_cmd().args(["down"]).output();
 
-        let mut args = vec![
-            "run".to_string(),
-            "-d".to_string(),
-            "--name".to_string(),
-            "quip-node".to_string(),
-            "-p".to_string(),
-            format!("{}:{}/udp", config.port, config.port),
-            "-v".to_string(),
-            data_mount,
-            "-e".to_string(),
-            format!("QUIP_MODE={}", quip_mode),
-            "-e".to_string(),
-            format!("QUIP_PORT={}", config.port),
-            "-e".to_string(),
-            format!("QUIP_LISTEN={}", config.listen),
-            "-e".to_string(),
-            format!("QUIP_AUTO_MINE={}", config.auto_mine),
-        ];
-        if !config.peers.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_PEERS={}", config.peers.join(",")));
+        self.set_status("Pulling compose images...");
+        if !self.run_compose_step(&["--profile", profile, "pull"], "Pull failed") {
+            return;
         }
-        if !config.public_host.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_PUBLIC_HOST={}", config.public_host));
-        }
-        if !config.node_name.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_NODE_NAME={}", config.node_name));
-        }
-        if quip_mode == "gpu" {
-            args.push("--gpus".to_string());
-            args.push("all".to_string());
-        }
-        args.push(image);
 
-        match crate::cmd::new("docker").args(&args).output() {
-            Ok(o) if o.status.success() => {
-                self.set_status("Node started (Docker)");
-                self.refresh_status();
-            }
+        self.set_status("Starting compose stack...");
+        if self.run_compose_step(&["--profile", profile, "up", "-d"], "Start failed") {
+            self.set_status("Stack started (Docker)");
+            self.refresh_status();
+        }
+    }
+
+    fn run_compose_step(&mut self, args: &[&str], label: &str) -> bool {
+        match crate::compose::compose_cmd().args(args).output() {
+            Ok(o) if o.status.success() => true,
             Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr).to_string();
-                self.set_status(format!("Start failed: {}", err.trim()));
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let detail = stderr.trim();
+                if detail.is_empty() {
+                    self.set_status(format!("{}: {}", label, stdout.trim()));
+                } else {
+                    self.set_status(format!("{}: {}", label, detail));
+                }
+                false
             }
-            Err(e) => self.set_status(format!("Start failed: {}", e)),
+            Err(e) => {
+                self.set_status(format!("{}: {}", label, e));
+                false
+            }
         }
     }
 
@@ -690,12 +703,7 @@ impl TuiApp {
     fn stop_node(&mut self) {
         match self.form.run_mode() {
             RunMode::Docker => {
-                let _ = crate::cmd::new("docker")
-                    .args(["stop", "quip-node"])
-                    .output();
-                let _ = crate::cmd::new("docker")
-                    .args(["rm", "-f", "quip-node"])
-                    .output();
+                let _ = crate::compose::compose_cmd().args(["down"]).output();
             }
             RunMode::Native => {
                 let pid_path = crate::settings::data_dir().join("node.pid");

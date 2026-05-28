@@ -215,8 +215,8 @@ where
 /// The source to stream while waiting for node.log to appear.
 pub enum FallbackSource {
     /// Stream `docker compose logs -f --no-log-prefix <service>`. The
-    /// service name is one of `cpu`, `cuda`, `qpu` — resolved from the
-    /// caller's current `image_tag`.
+    /// miner service name is `cpu` or `cuda`, resolved from the caller's
+    /// current `image_tag`.
     ComposeLogs { service: String },
     /// Tail a file (e.g. node-output.log for native stdout capture)
     File(PathBuf),
