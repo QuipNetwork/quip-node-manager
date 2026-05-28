@@ -124,11 +124,6 @@ fn activate(app: &mut TuiApp) -> Action {
         }
 
         // Checkboxes — toggle on Enter too
-        FocusId::AutoMine => {
-            app.form.auto_mine = !app.form.auto_mine;
-            app.dirty = true;
-            Action::None
-        }
         FocusId::PublicHostEnable => {
             app.form.public_host_enabled = !app.form.public_host_enabled;
             app.dirty = true;
@@ -143,16 +138,6 @@ fn activate(app: &mut TuiApp) -> Action {
         }
         FocusId::GpuYielding => {
             app.form.gpu_yielding = !app.form.gpu_yielding;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::VerifyTls => {
-            app.form.verify_tls = !app.form.verify_tls;
-            app.dirty = true;
-            Action::None
-        }
-        FocusId::TelemetryEnabled => {
-            app.form.telemetry_enabled = !app.form.telemetry_enabled;
             app.dirty = true;
             Action::None
         }
@@ -192,20 +177,9 @@ fn activate(app: &mut TuiApp) -> Action {
         | FocusId::NodeName
         | FocusId::PublicHostInput
         | FocusId::PublicPortInput
-        | FocusId::Peers
         | FocusId::CpuCores
         | FocusId::QpuApiKey
         | FocusId::QpuDailyBudget
-        | FocusId::Timeout
-        | FocusId::HeartbeatInterval
-        | FocusId::HeartbeatTimeout
-        | FocusId::Fanout
-        | FocusId::TlsCertFile
-        | FocusId::TlsKeyFile
-        | FocusId::RestHost
-        | FocusId::RestPort
-        | FocusId::RestInsecurePort
-        | FocusId::TelemetryDir
         | FocusId::NodeLog
         | FocusId::HttpLog => {
             start_edit(app);
@@ -216,11 +190,8 @@ fn activate(app: &mut TuiApp) -> Action {
 
 fn toggle_or_activate(app: &mut TuiApp) -> Action {
     match app.focus {
-        FocusId::AutoMine
-        | FocusId::PublicHostEnable
+        FocusId::PublicHostEnable
         | FocusId::GpuYielding
-        | FocusId::VerifyTls
-        | FocusId::TelemetryEnabled
         | FocusId::AutoUpdate
         | FocusId::RunMode
         | FocusId::GpuEnable => activate(app),
@@ -237,20 +208,9 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::NodeName => app.form.node_name.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
         FocusId::PublicPortInput => app.form.public_port.clone(),
-        FocusId::Peers => app.form.peers.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
         FocusId::QpuDailyBudget => app.form.qpu_daily_budget.clone(),
-        FocusId::Timeout => app.form.timeout.clone(),
-        FocusId::HeartbeatInterval => app.form.heartbeat_interval.clone(),
-        FocusId::HeartbeatTimeout => app.form.heartbeat_timeout.clone(),
-        FocusId::Fanout => app.form.fanout.clone(),
-        FocusId::TlsCertFile => app.form.tls_cert_file.clone(),
-        FocusId::TlsKeyFile => app.form.tls_key_file.clone(),
-        FocusId::RestHost => app.form.rest_host.clone(),
-        FocusId::RestPort => app.form.rest_port.clone(),
-        FocusId::RestInsecurePort => app.form.rest_insecure_port.clone(),
-        FocusId::TelemetryDir => app.form.telemetry_dir.clone(),
         FocusId::NodeLog => app.form.node_log.clone(),
         FocusId::HttpLog => app.form.http_log.clone(),
         _ => return,
@@ -268,20 +228,9 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::NodeName => app.form.node_name = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
             FocusId::PublicPortInput => app.form.public_port = buf,
-            FocusId::Peers => app.form.peers = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
             FocusId::QpuDailyBudget => app.form.qpu_daily_budget = buf,
-            FocusId::Timeout => app.form.timeout = buf,
-            FocusId::HeartbeatInterval => app.form.heartbeat_interval = buf,
-            FocusId::HeartbeatTimeout => app.form.heartbeat_timeout = buf,
-            FocusId::Fanout => app.form.fanout = buf,
-            FocusId::TlsCertFile => app.form.tls_cert_file = buf,
-            FocusId::TlsKeyFile => app.form.tls_key_file = buf,
-            FocusId::RestHost => app.form.rest_host = buf,
-            FocusId::RestPort => app.form.rest_port = buf,
-            FocusId::RestInsecurePort => app.form.rest_insecure_port = buf,
-            FocusId::TelemetryDir => app.form.telemetry_dir = buf,
             FocusId::NodeLog => app.form.node_log = buf,
             FocusId::HttpLog => app.form.http_log = buf,
             _ => {}

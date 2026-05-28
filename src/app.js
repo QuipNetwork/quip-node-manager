@@ -405,15 +405,15 @@ document.getElementById('public-host-enable').addEventListener('change', () => {
   }
 });
 
-// ─── QPU section toggle ───────────────────────────────────────────────────────
+// ─── D-Wave section toggle ───────────────────────────────────────────────────
 document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
   const section = document.getElementById('qpu-section');
   const btn = document.getElementById('btn-qpu-toggle');
   const isVisible = section.style.display !== 'none';
   section.style.display = isVisible ? 'none' : 'block';
   btn.textContent = isVisible
-    ? 'Have D-Wave / QPU Access? Click here'
-    : 'Hide QPU Configuration';
+    ? 'Configure D-Wave Access'
+    : 'Hide D-Wave Configuration';
 });
 
 // ─── GPU utilization slider ──────────────────────────────────────────────────
@@ -452,15 +452,12 @@ function collectConfig() {
       }
     : null;
 
-  const fanoutRaw = document.getElementById('fanout')?.value?.trim();
-  const fanout = fanoutRaw ? (parseInt(fanoutRaw) || null) : null;
-
   const base = state.settings?.node_config ?? {};
 
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
     validator_port: parseInt(document.getElementById('validator-port').value) || 30033,
-    listen: document.getElementById('listen')?.value?.trim() || '::',
+    listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
       : '',
@@ -468,24 +465,20 @@ function collectConfig() {
       ? (parseInt(document.getElementById('public-port')?.value) || null)
       : null,
     node_name: document.getElementById('node-name')?.value?.trim() ?? '',
-    peers: document
-      .getElementById('peers')
-      .value.split('\n')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-    auto_mine: document.getElementById('auto-mine')?.checked ?? false,
+    peers: base.peers ?? [],
+    auto_mine: base.auto_mine ?? false,
     secret: state.settings?.node_config?.secret ?? '',
     genesis_config: base.genesis_config ?? 'genesis_block.json',
     tofu: base.tofu ?? true,
     trust_db: base.trust_db ?? '~/.quip/trust.db',
-    tls_cert_file: document.getElementById('tls-cert-file')?.value?.trim() ?? '',
-    tls_key_file: document.getElementById('tls-key-file')?.value?.trim() ?? '',
-    verify_tls: document.getElementById('verify-tls')?.checked ?? false,
-    rest_host: document.getElementById('rest-host')?.value?.trim() ?? '127.0.0.1',
-    rest_port: parseInt(document.getElementById('rest-port')?.value) ?? -1,
-    rest_insecure_port: parseInt(document.getElementById('rest-insecure-port')?.value) ?? -1,
-    telemetry_enabled: document.getElementById('telemetry-enabled')?.checked ?? true,
-    telemetry_dir: document.getElementById('telemetry-dir')?.value?.trim() ?? 'telemetry',
+    tls_cert_file: base.tls_cert_file ?? '',
+    tls_key_file: base.tls_key_file ?? '',
+    verify_tls: base.verify_tls ?? false,
+    rest_host: base.rest_host ?? '127.0.0.1',
+    rest_port: base.rest_port ?? -1,
+    rest_insecure_port: base.rest_insecure_port ?? -1,
+    telemetry_enabled: base.telemetry_enabled ?? true,
+    telemetry_dir: base.telemetry_dir ?? 'telemetry',
     log_level: document.getElementById('log-level')?.value || 'info',
     node_log: document.getElementById('node-log')?.value?.trim() ?? '',
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
@@ -493,12 +486,10 @@ function collectConfig() {
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
     dwave_config: dwaveConfig,
-    timeout: parseInt(document.getElementById('timeout')?.value) || 3,
-    heartbeat_interval:
-      parseInt(document.getElementById('heartbeat-interval')?.value) || 15,
-    heartbeat_timeout:
-      parseInt(document.getElementById('heartbeat-timeout')?.value) || 300,
-    fanout,
+    timeout: base.timeout ?? 3,
+    heartbeat_interval: base.heartbeat_interval ?? 15,
+    heartbeat_timeout: base.heartbeat_timeout ?? 300,
+    fanout: base.fanout ?? null,
   };
 }
 
@@ -510,8 +501,8 @@ function applyFormToSettings() {
     document.getElementById('auto-update-enabled')?.checked ?? false;
 
   // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
-  // enabled, CPU otherwise. QPU mining is a config.toml [dwave] concern, not
-  // a separate image — so there's no QPU option to pick here.
+  // enabled, CPU otherwise. D-Wave mining is a config.toml [dwave] concern,
+  // not a separate image.
   const hasEnabledCuda = (state.settings.node_config.gpu_device_configs || [])
     .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
   state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
@@ -533,44 +524,22 @@ function applyFormToSettings() {
 function populateForm(settings) {
   const c = settings.node_config;
 
-  // Node Configuration
+  // Validator / miner configuration
   document.getElementById('port').value = c.port ?? 20049;
   document.getElementById('validator-port').value = c.validator_port ?? 30033;
-  document.getElementById('listen').value = c.listen || '::';
   document.getElementById('secret-display').value = c.secret ?? '';
-  document.getElementById('auto-mine').checked = c.auto_mine ?? false;
 
   // Custom settings
   document.getElementById('node-name').value = c.node_name ?? '';
   const publicHost = c.public_host ?? '';
   const publicPort = c.public_port ?? null;
-  if (publicHost || publicPort) {
-    document.getElementById('public-host-enable').checked = true;
-    document.getElementById('public-host').disabled = false;
-    document.getElementById('public-port').disabled = false;
-    document.getElementById('public-host').value = publicHost;
-    document.getElementById('public-port').value = publicPort ?? '';
-  }
-  document.getElementById('peers').value = (c.peers || []).join('\n');
-  document.getElementById('timeout').value = c.timeout ?? 3;
-  document.getElementById('heartbeat-interval').value =
-    c.heartbeat_interval ?? 15;
-  document.getElementById('heartbeat-timeout').value =
-    c.heartbeat_timeout ?? 300;
-  if (c.fanout != null) {
-    document.getElementById('fanout').value = c.fanout;
-  }
+  const publicOverrideEnabled = !!(publicHost || publicPort);
+  document.getElementById('public-host-enable').checked = publicOverrideEnabled;
+  document.getElementById('public-host').disabled = !publicOverrideEnabled;
+  document.getElementById('public-port').disabled = !publicOverrideEnabled;
+  document.getElementById('public-host').value = publicHost;
+  document.getElementById('public-port').value = publicPort ?? '';
   document.getElementById('log-level').value = c.log_level ?? 'info';
-  document.getElementById('verify-tls').checked = c.verify_tls ?? false;
-
-  // New fields
-  document.getElementById('telemetry-enabled').checked = c.telemetry_enabled ?? true;
-  document.getElementById('telemetry-dir').value = c.telemetry_dir ?? 'telemetry';
-  document.getElementById('tls-cert-file').value = c.tls_cert_file ?? '';
-  document.getElementById('tls-key-file').value = c.tls_key_file ?? '';
-  document.getElementById('rest-host').value = c.rest_host ?? '127.0.0.1';
-  document.getElementById('rest-port').value = c.rest_port ?? -1;
-  document.getElementById('rest-insecure-port').value = c.rest_insecure_port ?? -1;
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
 
@@ -589,15 +558,9 @@ function populateForm(settings) {
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
     publicHost || publicPort ||
-    (c.peers || []).length > 0 ||
-    c.timeout !== 3 ||
-    c.heartbeat_interval !== 15 ||
-    c.heartbeat_timeout !== 300 ||
-    c.fanout != null ||
     c.log_level !== 'info' ||
-    (c.verify_tls ?? false) ||
-    (c.tls_cert_file ?? '') ||
-    (c.rest_port ?? -1) > 0;
+    (c.node_log ?? '') ||
+    (c.http_log ?? '');
   if (hasCustom) {
     document.getElementById('btn-custom-toggle').setAttribute('aria-expanded', 'true');
     document.getElementById('custom-settings-section').style.display = '';
@@ -613,7 +576,7 @@ function populateForm(settings) {
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
   document.getElementById('gpu-yielding').checked = gpuCfg?.yielding ?? false;
 
-  // QPU / D-Wave
+  // D-Wave
   const dw = c.dwave_config;
   if (dw) {
     document.getElementById('qpu-api-key').value = dw.token ?? '';
@@ -621,7 +584,7 @@ function populateForm(settings) {
     if (dw.token) {
       document.getElementById('qpu-section').style.display = 'block';
       document.getElementById('btn-qpu-toggle').textContent =
-        'Hide QPU Configuration';
+        'Hide D-Wave Configuration';
     }
   }
   // GPU device list rendered after list_gpu_devices call in init

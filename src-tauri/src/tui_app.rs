@@ -36,13 +36,11 @@ pub enum FocusId {
     ValidatorPort,
     SecretShow,
     SecretRegenerate,
-    AutoMine,
     NodeName,
     CustomToggle,
     PublicHostEnable,
     PublicHostInput,
     PublicPortInput,
-    Peers,
     CpuCores,
     GpuEnable,
     GpuUtilization,
@@ -53,19 +51,7 @@ pub enum FocusId {
     ApplyRestart,
     AutoUpdate,
     // Advanced (inside Custom Settings)
-    Timeout,
-    HeartbeatInterval,
-    HeartbeatTimeout,
-    Fanout,
-    VerifyTls,
     LogLevel,
-    TlsCertFile,
-    TlsKeyFile,
-    RestHost,
-    RestPort,
-    RestInsecurePort,
-    TelemetryEnabled,
-    TelemetryDir,
     NodeLog,
     HttpLog,
 }
@@ -109,7 +95,6 @@ pub struct FormState {
     pub cpu_cores: String,
     pub gpu_utilization: u8,
     pub gpu_yielding: bool,
-    pub qpu_enabled: bool,
     pub qpu_api_key: String,
     pub qpu_daily_budget: String,
     // Advanced settings
@@ -138,9 +123,9 @@ pub struct FormState {
 impl FormState {
     pub fn from_settings(s: &AppSettings) -> Self {
         let nc = &s.node_config;
-        let (qpu_enabled, dw) = match &nc.dwave_config {
-            Some(q) => (true, q.clone()),
-            None => (false, DwaveConfig::default()),
+        let dw = match &nc.dwave_config {
+            Some(q) => q.clone(),
+            None => DwaveConfig::default(),
         };
         let first_gpu = nc
             .gpu_device_configs
@@ -164,7 +149,6 @@ impl FormState {
             cpu_cores: nc.num_cpus.to_string(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
             gpu_yielding: first_gpu.map(|d| d.yielding).unwrap_or(false),
-            qpu_enabled,
             qpu_api_key: dw.token,
             qpu_daily_budget: dw.daily_budget,
             timeout: nc.timeout.to_string(),
@@ -228,17 +212,18 @@ impl FormState {
             d.utilization = self.gpu_utilization;
             d.yielding = self.gpu_yielding;
         }
-        nc.dwave_config = if self.qpu_enabled {
+        let dwave_token = self.qpu_api_key.trim();
+        nc.dwave_config = if dwave_token.is_empty() {
+            None
+        } else {
             Some(DwaveConfig {
-                token: self.qpu_api_key.clone(),
+                token: dwave_token.to_string(),
                 solver: "Advantage2_System1.13".to_string(),
                 dwave_region_url: "https://na-west-1.cloud.dwavesys.com/sapi/v2/".to_string(),
                 daily_budget: self.qpu_daily_budget.clone(),
                 qpu_min_blocks_for_estimation: None,
                 qpu_ema_alpha: None,
             })
-        } else {
-            None
         };
         nc.timeout = self.timeout.parse().unwrap_or(3);
         nc.heartbeat_interval = self.heartbeat_interval.parse().unwrap_or(15);
@@ -296,6 +281,7 @@ impl TuiApp {
     pub fn new() -> Self {
         let settings = crate::settings::load_settings();
         let form = FormState::from_settings(&settings);
+        let qpu_expanded = !form.qpu_api_key.is_empty();
         let (tx, rx) = mpsc::sync_channel(512);
         let secret = load_secret_sync();
         let log_stop = Arc::new(Mutex::new(false));
@@ -330,7 +316,7 @@ impl TuiApp {
             checklist_expanded: true,
             config_expanded: false,
             custom_expanded: false,
-            qpu_expanded: false,
+            qpu_expanded,
             node_secret: secret,
             secret_visible: false,
             status_message: None,
@@ -815,7 +801,6 @@ impl TuiApp {
             list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
-            list.push(FocusId::AutoMine);
             list.push(FocusId::NodeName);
             list.push(FocusId::CustomToggle);
             if self.custom_expanded {
@@ -824,22 +809,7 @@ impl TuiApp {
                     list.push(FocusId::PublicHostInput);
                     list.push(FocusId::PublicPortInput);
                 }
-                list.push(FocusId::Peers);
-                list.push(FocusId::Timeout);
-                list.push(FocusId::HeartbeatInterval);
-                list.push(FocusId::HeartbeatTimeout);
-                list.push(FocusId::Fanout);
-                list.push(FocusId::VerifyTls);
                 list.push(FocusId::LogLevel);
-                list.push(FocusId::TlsCertFile);
-                list.push(FocusId::TlsKeyFile);
-                list.push(FocusId::RestHost);
-                list.push(FocusId::RestPort);
-                list.push(FocusId::RestInsecurePort);
-                list.push(FocusId::TelemetryEnabled);
-                if self.form.telemetry_enabled {
-                    list.push(FocusId::TelemetryDir);
-                }
                 list.push(FocusId::NodeLog);
                 list.push(FocusId::HttpLog);
                 list.push(FocusId::AutoUpdate);

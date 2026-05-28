@@ -252,17 +252,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         &field_value(app, &FocusId::ValidatorPort, &app.form.validator_port),
     ));
 
-    // Listen (read-only)
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{:<16} ", "Listen"), Style::default().fg(DIM)),
-        Span::styled(
-            app.settings.node_config.listen.clone(),
-            Style::default().fg(DIM),
-        ),
-        Span::styled("  (read-only)", Style::default().fg(DIM)),
-    ]));
-
     // Node Secret
     let secret_display = if app.secret_visible {
         app.node_secret.clone()
@@ -278,16 +267,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         btn_span(
             "[ Regenerate ]",
             focus_style(app, &FocusId::SecretRegenerate),
-        ),
-    ]));
-
-    // Auto-mine checkbox
-    let checked = if app.form.auto_mine { "[x]" } else { "[ ]" };
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("{} Auto-mine", checked),
-            focus_style(app, &FocusId::AutoMine),
         ),
     ]));
 
@@ -338,55 +317,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 &field_value(app, &FocusId::PublicPortInput, &port_display),
             ));
         }
-        lines.push(field_line(
-            app,
-            &FocusId::Peers,
-            "Peers",
-            &field_value(app, &FocusId::Peers, &app.form.peers.replace('\n', ", ")),
-        ));
-
-        // Advanced fields
-        lines.push(field_line(
-            app,
-            &FocusId::Timeout,
-            "  Timeout (s)",
-            &field_value(app, &FocusId::Timeout, &app.form.timeout),
-        ));
-        lines.push(field_line(
-            app,
-            &FocusId::HeartbeatInterval,
-            "  HB Interval",
-            &field_value(
-                app,
-                &FocusId::HeartbeatInterval,
-                &app.form.heartbeat_interval,
-            ),
-        ));
-        lines.push(field_line(
-            app,
-            &FocusId::HeartbeatTimeout,
-            "  HB Timeout",
-            &field_value(app, &FocusId::HeartbeatTimeout, &app.form.heartbeat_timeout),
-        ));
-        let fanout_display = if app.form.fanout.is_empty() {
-            "(default)".to_string()
-        } else {
-            app.form.fanout.clone()
-        };
-        lines.push(field_line(
-            app,
-            &FocusId::Fanout,
-            "  Fanout",
-            &field_value(app, &FocusId::Fanout, &fanout_display),
-        ));
-        let tls_check = if app.form.verify_tls { "[x]" } else { "[ ]" };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Verify TLS", tls_check),
-                focus_style(app, &FocusId::VerifyTls),
-            ),
-        ]));
         let log_levels = ["info", "debug", "warn", "error"];
         let ll_display = if log_levels.contains(&app.form.log_level.as_str()) {
             app.form.log_level.clone()
@@ -399,82 +329,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             "  Log Level",
             &ll_display,
         ));
-
-        // TLS Certificates
-        lines.push(field_line(
-            app,
-            &FocusId::TlsCertFile,
-            "  TLS Cert",
-            &field_value(
-                app,
-                &FocusId::TlsCertFile,
-                &if app.form.tls_cert_file.is_empty() {
-                    "(self-signed)".to_string()
-                } else {
-                    app.form.tls_cert_file.clone()
-                },
-            ),
-        ));
-        lines.push(field_line(
-            app,
-            &FocusId::TlsKeyFile,
-            "  TLS Key",
-            &field_value(
-                app,
-                &FocusId::TlsKeyFile,
-                &if app.form.tls_key_file.is_empty() {
-                    "(self-signed)".to_string()
-                } else {
-                    app.form.tls_key_file.clone()
-                },
-            ),
-        ));
-
-        // REST API
-        lines.push(field_line(
-            app,
-            &FocusId::RestHost,
-            "  REST Host",
-            &field_value(app, &FocusId::RestHost, &app.form.rest_host),
-        ));
-        lines.push(field_line(
-            app,
-            &FocusId::RestPort,
-            "  REST HTTPS",
-            &field_value(app, &FocusId::RestPort, &app.form.rest_port),
-        ));
-        lines.push(field_line(
-            app,
-            &FocusId::RestInsecurePort,
-            "  REST HTTP",
-            &field_value(
-                app,
-                &FocusId::RestInsecurePort,
-                &app.form.rest_insecure_port,
-            ),
-        ));
-
-        // Telemetry
-        let telem_check = if app.form.telemetry_enabled {
-            "[x]"
-        } else {
-            "[ ]"
-        };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Telemetry", telem_check),
-                focus_style(app, &FocusId::TelemetryEnabled),
-            ),
-        ]));
-        if app.form.telemetry_enabled {
-            lines.push(field_line(
-                app,
-                &FocusId::TelemetryDir,
-                "  Telemetry Dir",
-                &field_value(app, &FocusId::TelemetryDir, &app.form.telemetry_dir),
-            ));
-        }
 
         // Log files
         lines.push(field_line(
@@ -559,18 +413,18 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ]));
     }
 
-    // QPU toggle
+    // D-Wave mining toggle
     let qpu_check = if app.qpu_expanded { "[x]" } else { "[ ]" };
     lines.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
-            format!("{} D-Wave / QPU Access", qpu_check),
+            format!("{} D-Wave Mining", qpu_check),
             focus_style(app, &FocusId::QpuToggle),
         ),
     ]));
     if app.qpu_expanded {
         lines.push(Line::from(Span::styled(
-            "      Solver: Advantage2_System1.13 · Region: NA West 1",
+            "      Runs on CPU miner mode · Advantage2_System1.13 · NA West 1",
             Style::default().fg(DIM),
         )));
         let masked_key = if app.form.qpu_api_key.is_empty() {
