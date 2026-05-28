@@ -365,6 +365,7 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     sync_stack_assets(
         &settings.run_mode,
         settings.node_config.port,
+        settings.node_config.validator_port,
         native_rest_port(&settings.node_config),
     )?;
 
@@ -413,7 +414,12 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let rest_port = native_rest_port(&settings.node_config);
 
     // (1) Stage assets.
-    sync_stack_assets(&settings.run_mode, settings.node_config.port, rest_port)?;
+    sync_stack_assets(
+        &settings.run_mode,
+        settings.node_config.port,
+        settings.node_config.validator_port,
+        rest_port,
+    )?;
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
