@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 
 const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
@@ -7,35 +9,6 @@ const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
 const DOCKER_MINER_REST_PORT: u16 = 80;
 const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
-
-fn toml_string(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    format!("\"{}\"", escaped)
-}
-
-fn push_toml_str(out: &mut String, key: &str, value: &str) {
-    out.push_str(key);
-    out.push_str(" = ");
-    out.push_str(&toml_string(value));
-    out.push('\n');
-}
-
-fn push_toml_string_array(out: &mut String, key: &str, values: &[String]) {
-    out.push_str(key);
-    out.push_str(" = [");
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&toml_string(value));
-    }
-    out.push_str("]\n");
-}
 
 fn native_rest_port(config: &NodeConfig) -> u16 {
     if config.rest_insecure_port > 0 {
@@ -54,132 +27,191 @@ fn native_signer_key() -> String {
         .to_string()
 }
 
-fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
-    let mut out = String::new();
-    let is_docker = *run_mode == RunMode::Docker;
+#[derive(Serialize)]
+struct MinerToml {
+    validators: Vec<String>,
+    signer_key: String,
+    rest_host: String,
+    rest_port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    node_name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    public_host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_port: Option<u16>,
+    log_level: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    node_log: String,
+}
 
-    // ── [miner] ─────────────────────────────────────────────────────────
-    out.push_str("[miner]\n");
-    let validators = if is_docker {
-        vec![DOCKER_VALIDATOR_RPC.to_string()]
-    } else {
-        vec![format!("ws://127.0.0.1:{}/rpc", config.port)]
-    };
-    push_toml_string_array(&mut out, "validators", &validators);
-    let signer_key = if is_docker {
-        DOCKER_SIGNER_KEY.to_string()
-    } else {
-        native_signer_key()
-    };
-    push_toml_str(&mut out, "signer_key", &signer_key);
-    if is_docker {
-        push_toml_str(&mut out, "rest_host", DOCKER_MINER_REST_HOST);
-        out.push_str(&format!("rest_port = {}\n", DOCKER_MINER_REST_PORT));
-    } else {
-        push_toml_str(&mut out, "rest_host", &config.rest_host);
-        out.push_str(&format!("rest_port = {}\n", native_rest_port(config)));
-    }
+#[derive(Serialize)]
+struct CpuToml {
+    num_cpus: u32,
+}
 
-    if !config.node_name.is_empty() {
-        push_toml_str(&mut out, "node_name", &config.node_name);
-    }
-    if !config.public_host.is_empty() {
-        push_toml_str(&mut out, "public_host", &config.public_host);
-    }
-    if let Some(pp) = config.public_port {
-        out.push_str(&format!("public_port = {}\n", pp));
-    }
-    push_toml_str(&mut out, "log_level", &config.log_level);
-    if !config.node_log.is_empty() {
-        push_toml_str(&mut out, "node_log", &config.node_log);
-    }
-    out.push('\n');
+#[derive(Serialize)]
+struct GpuToml {
+    utilization: u8,
+    yielding: bool,
+}
 
-    // ── [cpu] ───────────────────────────────────────────────────────────
-    out.push_str("[cpu]\n");
-    out.push_str(&format!("num_cpus = {}\n", config.num_cpus));
-    out.push('\n');
+#[derive(Default, Serialize)]
+struct CudaDeviceToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utilization: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yielding: Option<bool>,
+}
 
-    // ── GPU sections ────────────────────────────────────────────────────
-    // [gpu] holds global defaults inherited by every backend section
-    // ([cuda.N], [metal], [modal]). See quip-protocol/quip-miner.example.toml.
-    //
-    // Metal is unavailable in Linux containers regardless of what the Mac
-    // host reports. In Docker mode we suppress Mps.
-    let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
-        .gpu_device_configs
-        .iter()
-        .filter(|d| d.enabled)
-        .collect();
+#[derive(Serialize)]
+struct DwaveToml {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    token: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    daily_budget: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    solver: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    dwave_region_url: String,
+}
 
-    // Effective backend: Mps is clamped to "no backend" in Docker mode
-    // because the container is Linux and has no Metal access.
-    let effective_backend = if is_docker && config.gpu_backend == GpuBackend::Mps {
-        None
-    } else {
-        Some(config.gpu_backend.clone())
-    };
+#[derive(Default, Serialize)]
+struct MarkerToml {}
 
-    let (gpu_util, gpu_yield) = enabled_devices
-        .first()
-        .map(|d| (d.utilization, d.yielding))
-        .unwrap_or((100, false));
+#[derive(Serialize)]
+struct ConfigToml {
+    miner: MinerToml,
+    cpu: CpuToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu: Option<GpuToml>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    cuda: BTreeMap<String, CudaDeviceToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metal: Option<MarkerToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modal: Option<MarkerToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qpu: Option<MarkerToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwave: Option<DwaveToml>,
+}
 
-    let emit_gpu_globals = effective_backend.is_some() && !enabled_devices.is_empty();
+impl ConfigToml {
+    fn from_node_config(config: &NodeConfig, run_mode: &RunMode) -> Self {
+        let is_docker = *run_mode == RunMode::Docker;
+        let miner = MinerToml {
+            validators: if is_docker {
+                vec![DOCKER_VALIDATOR_RPC.to_string()]
+            } else {
+                vec![format!("ws://127.0.0.1:{}/rpc", config.port)]
+            },
+            signer_key: if is_docker {
+                DOCKER_SIGNER_KEY.to_string()
+            } else {
+                native_signer_key()
+            },
+            rest_host: if is_docker {
+                DOCKER_MINER_REST_HOST.to_string()
+            } else {
+                config.rest_host.clone()
+            },
+            rest_port: if is_docker {
+                DOCKER_MINER_REST_PORT
+            } else {
+                native_rest_port(config)
+            },
+            node_name: config.node_name.clone(),
+            public_host: config.public_host.clone(),
+            public_port: config.public_port,
+            log_level: config.log_level.clone(),
+            node_log: config.node_log.clone(),
+        };
 
-    if emit_gpu_globals {
-        out.push_str("[gpu]\n");
-        out.push_str(&format!("utilization = {}\n", gpu_util));
-        out.push_str(&format!("yielding = {}\n", gpu_yield));
-        out.push('\n');
-    }
+        // [gpu] holds global defaults inherited by every backend section
+        // ([cuda.N], [metal], [modal]). See quip-protocol/quip-miner.example.toml.
+        //
+        // Metal is unavailable in Linux containers regardless of what the Mac
+        // host reports. In Docker mode we suppress Mps.
+        let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
+            .gpu_device_configs
+            .iter()
+            .filter(|d| d.enabled)
+            .collect();
 
-    match effective_backend {
-        Some(GpuBackend::Local) => {
-            if emit_gpu_globals {
-                for dev in &enabled_devices {
-                    out.push_str(&format!("[cuda.{}]\n", dev.index));
-                    if dev.utilization != gpu_util {
-                        out.push_str(&format!("utilization = {}\n", dev.utilization));
+        let effective_backend = if is_docker && config.gpu_backend == GpuBackend::Mps {
+            None
+        } else {
+            Some(config.gpu_backend.clone())
+        };
+
+        let (gpu_util, gpu_yield) = enabled_devices
+            .first()
+            .map(|d| (d.utilization, d.yielding))
+            .unwrap_or((100, false));
+
+        let gpu = if effective_backend.is_some() && !enabled_devices.is_empty() {
+            Some(GpuToml {
+                utilization: gpu_util,
+                yielding: gpu_yield,
+            })
+        } else {
+            None
+        };
+
+        let mut cuda = BTreeMap::new();
+        let mut metal = None;
+        let mut modal = None;
+        match effective_backend {
+            Some(GpuBackend::Local) => {
+                if gpu.is_some() {
+                    for dev in &enabled_devices {
+                        cuda.insert(
+                            dev.index.to_string(),
+                            CudaDeviceToml {
+                                utilization: (dev.utilization != gpu_util)
+                                    .then_some(dev.utilization),
+                                yielding: (dev.yielding != gpu_yield).then_some(dev.yielding),
+                            },
+                        );
                     }
-                    if dev.yielding != gpu_yield {
-                        out.push_str(&format!("yielding = {}\n", dev.yielding));
-                    }
-                    out.push('\n');
                 }
             }
+            Some(GpuBackend::Mps) => metal = Some(MarkerToml::default()),
+            Some(GpuBackend::Modal) => modal = Some(MarkerToml::default()),
+            None => {}
         }
-        Some(GpuBackend::Mps) => {
-            out.push_str("[metal]\n");
-            out.push('\n');
-        }
-        Some(GpuBackend::Modal) => {
-            out.push_str("[modal]\n");
-            out.push('\n');
-        }
-        None => {}
-    }
 
-    // ── [qpu] / [dwave] ─────────────────────────────────────────────────
-    if let Some(dw) = &config.dwave_config {
-        out.push_str("[qpu]\n\n");
-        out.push_str("[dwave]\n");
-        if !dw.token.is_empty() {
-            push_toml_str(&mut out, "token", &dw.token);
-        }
-        if !dw.daily_budget.is_empty() {
-            push_toml_str(&mut out, "daily_budget", &dw.daily_budget);
-        }
-        if !dw.solver.is_empty() {
-            push_toml_str(&mut out, "solver", &dw.solver);
-        }
-        if !dw.dwave_region_url.is_empty() {
-            push_toml_str(&mut out, "dwave_region_url", &dw.dwave_region_url);
-        }
-        out.push('\n');
-    }
+        let (qpu, dwave) = match &config.dwave_config {
+            Some(dw) => (
+                Some(MarkerToml::default()),
+                Some(DwaveToml {
+                    token: dw.token.clone(),
+                    daily_budget: dw.daily_budget.clone(),
+                    solver: dw.solver.clone(),
+                    dwave_region_url: dw.dwave_region_url.clone(),
+                }),
+            ),
+            None => (None, None),
+        };
 
-    out
+        ConfigToml {
+            miner,
+            cpu: CpuToml {
+                num_cpus: config.num_cpus,
+            },
+            gpu,
+            cuda,
+            metal,
+            modal,
+            qpu,
+            dwave,
+        }
+    }
+}
+
+fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
+    let config_toml = ConfigToml::from_node_config(config, run_mode);
+    toml::to_string_pretty(&config_toml).expect("config TOML serialization should not fail")
 }
 
 pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {

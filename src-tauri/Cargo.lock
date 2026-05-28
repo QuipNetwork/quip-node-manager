@@ -3123,6 +3123,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]
