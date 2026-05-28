@@ -1026,7 +1026,8 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
 async fn run_check_stack_assets(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("stack-assets", ctx);
     let ok = crate::stack_assets::stack_compose_file().exists()
-        && crate::stack_assets::stack_caddyfile().exists();
+        && crate::stack_assets::stack_caddyfile().exists()
+        && crate::stack_assets::stack_chain_spec_file().exists();
     if ok {
         base.with_state(CheckState::Pass)
     } else {

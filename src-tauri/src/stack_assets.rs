@@ -2,8 +2,8 @@
 //! Stage the docker-compose stack files into the user's data dir so
 //! `docker compose` can run with `--project-directory`.
 //!
-//! The compose.yml and Caddyfile are embedded into the binary at compile
-//! time via `include_str!`. That avoids Tauri's resource-bundler path
+//! The compose.yml, Caddyfile, and chain spec are embedded into the binary at
+//! compile time via `include_str!`. That avoids Tauri's resource-bundler path
 //! entirely, so a raw exe (e.g. Windows `--no-bundle` builds that ship
 //! just `quip-node-manager.exe` with no sibling resource folder) still
 //! has the files available at runtime.
@@ -30,6 +30,10 @@ const COMPOSE_YML: &str = include_str!("../../vendor/nodes.quip.network/docker-c
 /// runtime for Native mode (see `sync_stack_assets`).
 const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Caddyfile");
 
+/// Canonical Quip testnet chain spec referenced by the v0.2 compose file.
+const CHAIN_SPEC: &str =
+    include_str!("../../vendor/nodes.quip.network/chain-specs/quip-testnet.json");
+
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
@@ -48,13 +52,19 @@ pub fn stack_caddyfile() -> PathBuf {
     data_dir().join("caddy").join("Caddyfile")
 }
 
+/// `<data_dir>/chain-specs/quip-testnet.json` — staged from embedded bytes.
+pub fn stack_chain_spec_file() -> PathBuf {
+    data_dir().join("chain-specs").join("quip-testnet.json")
+}
+
 /// `--project-directory` for every `docker compose` invocation.
 pub fn stack_project_dir() -> PathBuf {
     data_dir()
 }
 
-/// Write the embedded compose.yml + Caddyfile into `<data_dir>/` and create
-/// the subdirectories compose bind-mounts. Idempotent — always overwrites.
+/// Write the embedded compose.yml, Caddyfile, and chain spec into
+/// `<data_dir>/`, and create the subdirectories compose bind-mounts.
+/// Idempotent — always overwrites.
 ///
 /// `public_api_port` replaces Caddy's upstream host-side `20049`.
 /// `validator_port` replaces the validator's upstream host-side `30333`
@@ -69,7 +79,7 @@ pub fn sync_stack_assets(
     native_rest_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
-    for sub in ["data", "dashboard-data", "caddy"] {
+    for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
@@ -79,6 +89,8 @@ pub fn sync_stack_assets(
 
     let caddy_out = patch_caddyfile(run_mode, CADDYFILE, native_rest_port);
     fs::write(stack_caddyfile(), caddy_out).map_err(|e| format!("write Caddyfile: {e}"))?;
+
+    fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
     Ok(())
 }
@@ -145,6 +157,12 @@ mod tests {
         assert!(patched.contains("\"20049:20049\""));
         assert!(patched.contains("\"30033:30333/tcp\""));
         assert!(patched.contains("\"30033:30333/udp\""));
+    }
+
+    #[test]
+    fn embedded_chain_spec_is_quip_testnet_json() {
+        assert!(CHAIN_SPEC.contains("\"name\": \"Quip Testnet\""));
+        assert!(CHAIN_SPEC.contains("\"bootNodes\""));
     }
 
     #[test]
