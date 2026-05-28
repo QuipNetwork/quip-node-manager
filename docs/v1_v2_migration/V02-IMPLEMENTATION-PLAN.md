@@ -443,4 +443,7 @@ and UX polish on top.
 - Dashboard-disabled support: decide after the standard v0.2 Docker flow works.
   If disabling dashboard requires Caddyfile or compose surgery, defer or remove
   support explicitly.
+- `dashboard_hostname` naming: revisit after the v0.2 flow stabilizes. The
+  setting now drives the Caddy/API hostname, so it may need to be renamed to
+  `hostname` or another neutral name.
 - Faucet/localdev UI: out of scope for the first v0.2 manager alignment.

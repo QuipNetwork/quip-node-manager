@@ -154,38 +154,8 @@ pub(crate) fn compose_cmd() -> Command {
 /// there is no merge with an existing file.
 pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
-    let dwave_key = settings
-        .node_config
-        .dwave_config
-        .as_ref()
-        .map(|d| d.token.clone())
-        .unwrap_or_default();
     let pg_password = crate::settings::postgres_password();
-
-    let mut lines = vec![
-        format!("PUID={puid}"),
-        format!("PGID={pgid}"),
-        format!("QUIP_HOSTNAME={}", settings.dashboard_hostname),
-        format!("CERT_EMAIL={}", settings.cert_email),
-        format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
-        format!("DWAVE_API_KEY={dwave_key}"),
-        format!("POSTGRES_PASSWORD={pg_password}"),
-    ];
-
-    // Point the dashboard at the node's REST endpoint. The compose default
-    // is `http://quip-node:80`, but port 80 would require the containerized
-    // node to run as root. Override to a non-privileged port that we also
-    // force on the node side below.
-    //   - Native : host-bound binary reached via host.docker.internal
-    //   - Docker : node container reached via the `quip-node` compose alias
-    if settings.dashboard_enabled {
-        let port = native_rest_port(&settings.node_config);
-        let host = match settings.run_mode {
-            RunMode::Native => "host.docker.internal",
-            RunMode::Docker => "quip-node",
-        };
-        lines.push(format!("QUIP_NODE_URL=http://{host}:{port}"));
-    }
+    let lines = render_env_lines(settings, puid, pgid, &pg_password);
 
     let path = stack_project_dir().join(".env");
     fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
@@ -199,6 +169,62 @@ pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn cpu_set_for_config(cfg: &NodeConfig) -> String {
+    match cfg.num_cpus {
+        0 | 1 => "0".to_string(),
+        n => format!("0-{}", n - 1),
+    }
+}
+
+fn render_env_lines(
+    settings: &AppSettings,
+    puid: u32,
+    pgid: u32,
+    pg_password: &str,
+) -> Vec<String> {
+    let dwave_key = settings
+        .node_config
+        .dwave_config
+        .as_ref()
+        .map(|d| d.token.clone())
+        .unwrap_or_default();
+    let hostname = if settings.dashboard_hostname.trim().is_empty() {
+        ":20049"
+    } else {
+        settings.dashboard_hostname.trim()
+    };
+    let validator_name = if settings.node_config.node_name.trim().is_empty() {
+        "quip-validator"
+    } else {
+        settings.node_config.node_name.trim()
+    };
+
+    let mut lines = vec![
+        format!("PUID={puid}"),
+        format!("PGID={pgid}"),
+        format!("QUIP_HOSTNAME={hostname}"),
+        format!("CERT_EMAIL={}", settings.cert_email),
+        format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
+        format!("DWAVE_API_KEY={dwave_key}"),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        format!("QUIP_MINER_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_DASHBOARD_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_VALIDATOR_TAG={COMPOSE_IMAGE_TAG}"),
+        format!(
+            "QUIP_MINER_CPUSET={}",
+            cpu_set_for_config(&settings.node_config)
+        ),
+        format!("VALIDATOR_NAME={validator_name}"),
+    ];
+
+    if settings.run_mode == RunMode::Docker {
+        lines.push("QUIP_VALIDATORS=ws://quip-validator:9944".to_string());
+    }
+    lines.push("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944".to_string());
+
+    lines
 }
 
 // ── streaming compose output ───────────────────────────────────────────────
@@ -780,5 +806,70 @@ mod tests {
             image_for_tag(ImageTag::Cuda),
             "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda"
         );
+    }
+
+    #[test]
+    fn env_lines_use_v02_dashboard_and_validator_keys() {
+        let mut settings = AppSettings::default();
+        settings.dashboard_hostname = String::new();
+        settings.cert_email = "ops@example.com".to_string();
+        settings.zerossl_api_key = "zero".to_string();
+        settings.run_mode = RunMode::Docker;
+        settings.node_config.node_name = "validator-home".to_string();
+        settings.node_config.num_cpus = 4;
+
+        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret");
+        let env = lines.join("\n");
+
+        assert!(env.contains("PUID=501"));
+        assert!(env.contains("PGID=1000"));
+        assert!(env.contains("QUIP_HOSTNAME=:20049"));
+        assert!(env.contains("CERT_EMAIL=ops@example.com"));
+        assert!(env.contains("ZEROSSL_API_KEY=zero"));
+        assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
+        assert!(env.contains("QUIP_MINER_TAG=v0.2-preview"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2-preview"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2-preview"));
+        assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
+        assert!(env.contains("VALIDATOR_NAME=validator-home"));
+        assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));
+        assert!(env.contains("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944"));
+        assert!(!env.contains("QUIP_NODE_URL"));
+        assert!(!env.contains("QUIP_NODE_TOKEN"));
+    }
+
+    #[test]
+    fn env_lines_preserve_dwave_key() {
+        let mut settings = AppSettings::default();
+        settings.node_config.dwave_config = Some(crate::settings::DwaveConfig {
+            token: "dwave-token".to_string(),
+            ..crate::settings::DwaveConfig::default()
+        });
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        assert!(env.contains("DWAVE_API_KEY=dwave-token"));
+    }
+
+    #[test]
+    fn env_lines_native_omits_docker_miner_validator_env() {
+        let mut settings = AppSettings {
+            run_mode: RunMode::Native,
+            ..AppSettings::default()
+        };
+        settings.node_config.node_name = "physical-miner-validator".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(!env.contains("QUIP_VALIDATORS="));
+        assert!(env.contains("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944"));
+    }
+
+    #[test]
+    fn env_lines_default_validator_name_and_single_cpu_cpuset() {
+        let settings = AppSettings::default();
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("VALIDATOR_NAME=quip-validator"));
+        assert!(env.contains("QUIP_MINER_CPUSET=0"));
     }
 }
