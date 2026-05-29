@@ -663,7 +663,7 @@ impl TuiApp {
         }
     }
 
-    fn start_node_native(&mut self, _config: &crate::settings::NodeConfig) {
+    fn start_node_native(&mut self, config: &crate::settings::NodeConfig) {
         if !crate::native::is_binary_available() {
             self.set_status("No native binary found. Download it first.");
             return;
@@ -675,14 +675,15 @@ impl TuiApp {
             let bin = data_dir.join("bin").join(crate::native::binary_name());
             let config_path = data_dir.join("config.toml");
             let log_path = data_dir.join("node-output.log");
+            let _ = crate::native::ensure_native_signer_key(&bin)?;
+            let miner_args = crate::native::native_miner_args(config, &config_path);
             let log_file = std::fs::File::create(&log_path)
                 .map_err(|e| format!("Cannot create log file: {}", e))?;
             let log_err = log_file
                 .try_clone()
                 .map_err(|e| format!("Cannot clone log file: {}", e))?;
             let child = crate::cmd::new(&bin)
-                .arg("--config")
-                .arg(&config_path)
+                .args(&miner_args)
                 .stdout(log_file)
                 .stderr(log_err)
                 .spawn()

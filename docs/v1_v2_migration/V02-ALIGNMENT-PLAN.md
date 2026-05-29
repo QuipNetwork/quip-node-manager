@@ -82,7 +82,7 @@ Native / Physical Metal miner output:
 
 ```toml
 [miner]
-validators = ["ws://127.0.0.1:<caddy-or-validator-rpc-port>/rpc"]
+validators = ["ws://127.0.0.1:<public-api-port>/rpc"]
 signer_key = "<data_dir>/keystore.json"
 rest_host = "127.0.0.1"
 rest_port = <native_rest_port>
@@ -229,22 +229,32 @@ Use this for macOS Metal/MPS mining where the miner must run on the host.
 - Native binary should be the v0.2 `quip-miner`, not old `quip-network-node`.
 - Docker compose still runs validator, dashboard, postgres, and caddy.
 - Compose must omit miner containers and bootstrap.
+- Startup brings the Docker support stack up before launching the native miner,
+  so the local validator RPC route is available.
+- Native miner startup waits for the host-visible validator RPC route to answer a
+  JSON-RPC probe before launching the miner, avoiding a compose/Caddy readiness
+  race where the miner can fail before manual checks succeed.
 - Native miner config uses `[metal]`.
-- Native miner points at the local validator through a host-reachable endpoint.
+- Native miner points at the local validator through Caddy's host-reachable
+  `/rpc` route on the configured public API port.
 - Caddy `/api/v1/*` should proxy to `host.docker.internal:<native_rest_port>`.
 - Dashboard still talks to substrate RPC through the Docker validator.
+- Native miner launches as
+  `quip-miner <cpu|gpu|qpu> --config <toml> --signer-key <keystore>
+  --faucet-url https://faucet.testnet.quip.network`.
+  Other miner values come from the rendered config or binary defaults.
+  `--config` is a subcommand option, not a top-level `quip-miner` option.
+- Native miner first-run startup runs
+  `quip-miner keygen --out <data_dir>/keystore.json` when the configured
+  signer key is missing. Existing keystores are never overwritten.
 - Native miner release assets for `v0.2-preview`:
   - `quip-miner-macos-arm64`
   - `quip-miner-macos-x86_64`
 
-Open implementation detail: choose the cleanest host-visible validator RPC path.
-Options:
-
-- expose validator RPC to `127.0.0.1` on the host, or
-- point the native miner at Caddy `/rpc` on the public API port.
-
-Prefer a loopback-only validator RPC publish if supported cleanly, because it
-keeps miner-to-validator traffic local and avoids depending on Caddy TLS mode.
+The host-visible validator RPC path is the Caddy `/rpc` route on
+`127.0.0.1:<public-api-port>`. A direct loopback validator RPC publish was
+tested and reverted because it did not change the miner's
+`validators-unreachable ... AttributeError` failure.
 
 ## Port Handling
 

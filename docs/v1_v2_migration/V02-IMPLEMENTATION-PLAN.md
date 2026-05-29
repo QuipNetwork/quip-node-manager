@@ -97,6 +97,13 @@ Tasks:
   - `rest_port = 80`
 - Native/Metal config remains behind existing native mode paths:
   - use host-local paths.
+  - point validators at `ws://127.0.0.1:<public-api-port>/rpc`.
+  - launch as
+    `quip-miner <cpu|gpu|qpu> --config <toml> --signer-key <keystore>
+    --faucet-url https://faucet.testnet.quip.network`.
+    `--config` belongs to the miner subcommand.
+  - run `quip-miner keygen --out <data_dir>/keystore.json` before native
+    miner start when the configured signer key does not exist.
   - native binary install/update uses the `v0.2-preview` `quip-miner` assets.
 - Preserve useful miner fields:
   - `node_name`
@@ -422,6 +429,34 @@ Manual smoke tests:
   - v0.1 config migrates to `[miner]`.
   - backup is present.
   - public host and public port survive.
+- Native / Physical Metal start:
+  - starts the validator/dashboard compose support stack before launching the
+    host miner.
+  - waits for the host-visible validator RPC route to answer JSON-RPC before
+    launching the host miner.
+  - launches with config path, signer key, and public faucet URL; other miner
+    values come from config or binary defaults.
+  - does not pass `--config` before the subcommand.
+  - generates `<data_dir>/keystore.json` on first run and preserves existing
+    keystores.
+
+## Pending Follow-Ups
+
+- Start failure cleanup:
+  - If Docker mode fails to start after bringing up part of the stack, clean up
+    dangling compose services so the next start begins from a known state.
+  - If Native mode fails after starting the Docker support stack or while
+    launching the host miner, stop the support services and clear any partial
+    native process state.
+  - Cleanup should avoid deleting data directories or named volumes unless the
+    user explicitly asks for a reset.
+- Node version check performance:
+  - Make native miner version checks faster by using the cached downloaded
+    release marker where possible.
+  - Short-circuit remote release/version checks when the installed binary name
+    and cached tag already match the target tag.
+  - Revalidate when the target tag, platform asset name, or marker format
+    changes.
 
 ## Suggested Implementation Order
 

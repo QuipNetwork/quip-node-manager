@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::log_stream::LogEntry;
-use crate::settings::{data_dir, RunMode};
+use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
 use serde::Serialize;
+use std::path::Path;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
 const PROTOCOL_RELEASE_TAG: &str = crate::compose::COMPOSE_IMAGE_TAG;
+const PUBLIC_TESTNET_FAUCET_URL: &str = "https://faucet.testnet.quip.network";
+const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(90);
 
 #[derive(Serialize, Clone, Debug)]
 pub struct NativeNodeStatus {
@@ -94,6 +98,177 @@ fn pid_file_path() -> std::path::PathBuf {
 
 fn node_output_log_path() -> std::path::PathBuf {
     data_dir().join("node-output.log")
+}
+
+pub(crate) fn native_miner_validator_url(config: &NodeConfig) -> String {
+    format!("ws://127.0.0.1:{}/rpc", config.port)
+}
+
+fn validator_rpc_http_probe_url(validator_url: &str) -> String {
+    validator_url
+        .strip_prefix("ws://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            validator_url
+                .strip_prefix("wss://")
+                .map(|rest| format!("https://{rest}"))
+        })
+        .unwrap_or_else(|| validator_url.to_string())
+}
+
+pub(crate) fn native_miner_subcommand(config: &NodeConfig) -> &'static str {
+    if config.dwave_config.is_some() {
+        return "qpu";
+    }
+
+    if matches!(config.gpu_backend, GpuBackend::Mps | GpuBackend::Modal)
+        || config
+            .gpu_device_configs
+            .iter()
+            .any(|device| device.enabled)
+    {
+        return "gpu";
+    }
+
+    "cpu"
+}
+
+pub(crate) fn native_miner_args(config: &NodeConfig, config_path: &Path) -> Vec<String> {
+    let subcommand = native_miner_subcommand(config);
+    let signer_key = native_signer_key_path().to_string_lossy().to_string();
+    vec![
+        subcommand.to_string(),
+        "--config".to_string(),
+        config_path.to_string_lossy().to_string(),
+        "--signer-key".to_string(),
+        signer_key,
+        "--faucet-url".to_string(),
+        PUBLIC_TESTNET_FAUCET_URL.to_string(),
+    ]
+}
+
+pub(crate) fn native_signer_key_path() -> std::path::PathBuf {
+    data_dir().join("keystore.json")
+}
+
+pub(crate) fn native_keygen_args(signer_key: &Path) -> Vec<String> {
+    vec![
+        "keygen".to_string(),
+        "--out".to_string(),
+        signer_key.to_string_lossy().to_string(),
+    ]
+}
+
+pub(crate) fn ensure_native_signer_key(bin: &Path) -> Result<bool, String> {
+    let signer_key = native_signer_key_path();
+    if signer_key.exists() {
+        return Ok(false);
+    }
+
+    let work_dir = data_dir();
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
+
+    let output = crate::cmd::new(bin)
+        .args(native_keygen_args(&signer_key))
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|e| format!("Failed to generate native miner keystore: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            return Err(format!("Native miner keygen failed: {}", output.status));
+        }
+        return Err(format!(
+            "Native miner keygen failed: {}: {}",
+            output.status, detail
+        ));
+    }
+
+    if !signer_key.exists() {
+        return Err(format!(
+            "Native miner keygen finished but did not create {}",
+            signer_key.display()
+        ));
+    }
+
+    Ok(true)
+}
+
+async fn wait_for_native_miner_validator_rpc(
+    app: &tauri::AppHandle,
+    validator_url: &str,
+) -> Result<(), String> {
+    // TODO: Revisit this readiness gate; it likely needs another pass to make
+    // the flow and diagnostics more eloquent.
+    let probe_url = validator_rpc_http_probe_url(validator_url);
+    let _ = app.emit(
+        "node-log",
+        &LogEntry {
+            timestamp: String::new(),
+            level: "INFO".to_string(),
+            message: format!("Waiting for validator RPC at {validator_url}"),
+        },
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "system_health",
+        "params": [],
+    });
+    let start = std::time::Instant::now();
+    let mut last_error = String::from("not checked yet");
+
+    while start.elapsed() < NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT {
+        match client.post(&probe_url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) if status.is_success() => {
+                        if serde_json::from_str::<serde_json::Value>(&text)
+                            .map(|value| {
+                                value.get("result").is_some() || value.get("error").is_some()
+                            })
+                            .unwrap_or(false)
+                        {
+                            let _ = app.emit(
+                                "node-log",
+                                &LogEntry {
+                                    timestamp: String::new(),
+                                    level: "INFO".to_string(),
+                                    message: format!("Validator RPC is ready at {validator_url}"),
+                                },
+                            );
+                            return Ok(());
+                        }
+                        last_error = format!("unexpected RPC response: {text}");
+                    }
+                    Ok(text) => {
+                        last_error = format!("HTTP {status}: {text}");
+                    }
+                    Err(e) => {
+                        last_error = format!("HTTP {status}, read error: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = e.to_string();
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    Err(format!(
+        "Validator RPC not ready at {validator_url} after {}s: {last_error}",
+        NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT.as_secs()
+    ))
 }
 
 fn write_pid(pid: u32) {
@@ -465,8 +640,26 @@ pub async fn start_native_node(
     let work_dir = data_dir();
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
 
+    if ensure_native_signer_key(&bin)? {
+        let _ = app.emit(
+            "node-log",
+            &LogEntry {
+                timestamp: String::new(),
+                level: "INFO".to_string(),
+                message: format!(
+                    "Generated native miner keystore at {}",
+                    native_signer_key_path().display()
+                ),
+            },
+        );
+    }
+
+    let validator_url = native_miner_validator_url(&config);
+    wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
+
+    let miner_args = native_miner_args(&config, &config_path);
     let mut cmd = crate::cmd::new(&bin);
-    cmd.args(["--config", &config_path.to_string_lossy()])
+    cmd.args(&miner_args)
         .current_dir(&work_dir)
         .stdout(log_file)
         .stderr(log_file_err);
@@ -486,7 +679,7 @@ pub async fn start_native_node(
     let pid = child.id();
 
     // Log the command
-    let cmd_msg = format!("$ {} --config {}", bin.display(), config_path.display());
+    let cmd_msg = format!("$ {} {}", bin.display(), miner_args.join(" "));
     let _ = app.emit(
         "node-log",
         &LogEntry {
@@ -713,5 +906,82 @@ mod tests {
     fn release_version_normalization_accepts_preview_tags() {
         assert_eq!(normalize_release_version("v0.2-preview"), "0.2-preview");
         assert_eq!(normalize_release_version("0.2-preview"), "0.2-preview");
+    }
+
+    #[test]
+    fn native_miner_args_pass_config_signer_and_public_faucet() {
+        let cfg = NodeConfig::default();
+        let args = native_miner_args(&cfg, Path::new("/tmp/config.toml"));
+        let signer_key = native_signer_key_path().to_string_lossy().to_string();
+
+        assert_eq!(
+            args,
+            vec![
+                "cpu".to_string(),
+                "--config".to_string(),
+                "/tmp/config.toml".to_string(),
+                "--signer-key".to_string(),
+                signer_key,
+                "--faucet-url".to_string(),
+                PUBLIC_TESTNET_FAUCET_URL.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_keygen_args_write_to_configured_signer_path() {
+        let args = native_keygen_args(Path::new("/tmp/quip-data/keystore.json"));
+
+        assert_eq!(
+            args,
+            vec!["keygen", "--out", "/tmp/quip-data/keystore.json"]
+        );
+    }
+
+    #[test]
+    fn native_miner_subcommand_prefers_qpu_over_gpu() {
+        let cfg = NodeConfig {
+            dwave_config: Some(crate::settings::DwaveConfig::default()),
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(native_miner_subcommand(&cfg), "qpu");
+    }
+
+    #[test]
+    fn native_miner_subcommand_uses_gpu_for_mps() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(native_miner_subcommand(&cfg), "gpu");
+    }
+
+    #[test]
+    fn native_miner_validator_url_uses_caddy_rpc_path() {
+        let cfg = NodeConfig {
+            port: 21049,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(native_miner_validator_url(&cfg), "ws://127.0.0.1:21049/rpc");
+    }
+
+    #[test]
+    fn validator_rpc_http_probe_url_converts_websocket_urls() {
+        assert_eq!(
+            validator_rpc_http_probe_url("ws://127.0.0.1:20049/rpc"),
+            "http://127.0.0.1:20049/rpc"
+        );
+        assert_eq!(
+            validator_rpc_http_probe_url("wss://node.example.com/rpc"),
+            "https://node.example.com/rpc"
+        );
+        assert_eq!(
+            validator_rpc_http_probe_url("http://127.0.0.1:20049/rpc"),
+            "http://127.0.0.1:20049/rpc"
+        );
     }
 }

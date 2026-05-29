@@ -23,6 +23,8 @@ const state = {
   // { services: [{name, service, running, health, status_text, image}], overall }
   stack: null,
   checksPassed: false,
+  starting: false,
+  stopping: false,
   detectedGpus: [], // { index, name }
   logLines: [],
   MAX_LOG_LINES: 500,
@@ -616,10 +618,14 @@ function populateForm(settings) {
 // ─── Start/Stop/Apply enable state ───────────────────────────────────────────
 function updateStartStopState() {
   const running = state.containerRunning || state.nativeRunning;
-  document.getElementById('btn-start').disabled =
-    !state.checksPassed || running;
-  document.getElementById('btn-stop').disabled = !running;
-  document.getElementById('btn-apply').disabled = !state.checksPassed;
+  const startBtn = document.getElementById('btn-start');
+  const stopBtn = document.getElementById('btn-stop');
+  startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
+  startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+  stopBtn.disabled = !running || state.starting || state.stopping;
+  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  document.getElementById('btn-apply').disabled =
+    !state.checksPassed || state.starting || state.stopping;
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -958,8 +964,8 @@ async function startNode() {
   } else {
     // Native mode: run the binary on the host + the compose stack's
     // non-node services so the user still gets the dashboard UI.
+    await invoke('start_stack');
     await invoke('start_native_node');
-    try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
   }
   collapseConfig();
 }
@@ -976,20 +982,32 @@ async function stopNode() {
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 document.getElementById('btn-start').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
+  state.starting = true;
+  updateStartStopState();
   applyStatus.textContent = 'Starting\u2026';
+  appendLog({ timestamp: '', level: 'INFO', message: 'Starting node manager stack…' });
   try {
+    if (!state.settings) throw new Error('settings are not loaded yet');
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     await startNode();
     applyStatus.textContent = 'Node started.';
     await pollStatus();
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Start failed: ${e}` });
+  } finally {
+    state.starting = false;
+    updateStartStopState();
   }
 });
 
 document.getElementById('btn-stop').addEventListener('click', async () => {
+  const applyStatus = document.getElementById('apply-status');
+  state.stopping = true;
+  updateStartStopState();
+  applyStatus.textContent = 'Stopping\u2026';
   try {
     await stopNode();
     state.containerRunning = false;
@@ -997,17 +1015,25 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     setStatus('stopped');
     updateStartStopState();
     expandConfig();
+    applyStatus.textContent = 'Node stopped.';
   } catch (e) {
-    console.error(e);
+    applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${e}` });
+  } finally {
+    state.stopping = false;
+    updateStartStopState();
   }
 });
 
 // ─── Apply & Restart ──────────────────────────────────────────────────────────
 document.getElementById('btn-apply').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
+  state.starting = true;
+  updateStartStopState();
   applyStatus.textContent = 'Applying\u2026';
   try {
+    if (!state.settings) throw new Error('settings are not loaded yet');
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     const running = isDockerMode() ? state.containerRunning : state.nativeRunning;
     if (running) {
@@ -1023,6 +1049,10 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Apply failed: ${e}` });
+  } finally {
+    state.starting = false;
+    updateStartStopState();
   }
 });
 

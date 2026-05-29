@@ -149,12 +149,14 @@ pub fn run() {
                                     }
                                     crate::settings::RunMode::Native => {
                                         let state = handle.state::<NativeProcessState>();
-                                        let native_res =
-                                            native::start_native_node(handle.clone(), state)
-                                                .await
-                                                .map(|_| ());
-                                        let _ = compose::start_stack(handle.clone()).await;
-                                        native_res
+                                        match compose::start_stack(handle.clone()).await {
+                                            Ok(()) => {
+                                                native::start_native_node(handle.clone(), state)
+                                                    .await
+                                                    .map(|_| ())
+                                            }
+                                            Err(e) => Err(e),
+                                        }
                                     }
                                 };
                             });
