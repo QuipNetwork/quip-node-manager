@@ -185,18 +185,17 @@
               Image is auto-selected: CUDA when any NVIDIA GPU is enabled, CPU otherwise. D-Wave mining activates on top of CPU miner mode.
             </div>
             <div class="form-group" style="display:flex;align-items:center;gap:10px;">
-              <input type="checkbox" id="dashboard-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-              <label for="dashboard-enabled" style="margin:0;cursor:pointer;">Enable dashboard <span style="color:var(--text-faint);font-weight:400;">(dashboard + Postgres)</span></label>
-            </div>
-            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
               <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
               <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>
             </div>
             <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
               <div class="form-group">
-                <label for="dashboard-hostname">Caddy/API Hostname</label>
-                <input type="text" id="dashboard-hostname" placeholder=":20049" />
-                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Use <code>:20049</code> for local HTTP, or <code>example.com, example.com:20049</code> for public TLS.</div>
+                <label for="hostname">Caddy/API Hostname</label>
+                <input type="text" id="hostname" placeholder=":20049" />
+                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">
+                  <code>:20049</code> for local HTTP, or
+                  <code>example.com, example.com:20049</code> for public TLS.
+                </div>
               </div>
               <div class="form-group">
                 <label for="cert-email">ACME Email <span style="color:var(--text-faint);font-weight:400;">(required for Let's Encrypt)</span></label>
@@ -277,7 +276,7 @@
     <!-- Dashboard Tab -->
     <div id="tab-dashboard" class="tab-content">
       <div id="dashboard-empty" class="dashboard-placeholder" style="display:none;">
-        <span id="dashboard-empty-msg">Dashboard disabled — enable it in the Status tab to see metrics here.</span>
+        <span id="dashboard-empty-msg">Starting dashboard…</span>
       </div>
       <iframe
         id="dashboard-frame"

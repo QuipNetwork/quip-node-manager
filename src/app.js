@@ -34,11 +34,52 @@ const state = {
 };
 
 const DEFAULT_DASHBOARD_HOSTNAME = ':20049';
+const CADDY_PUBLIC_API_PORT = 20049;
 
-function dashboardHostForBrowser(value) {
-  const firstHost = (value || DEFAULT_DASHBOARD_HOSTNAME)
+function publicHostName(value) {
+  let host = (value || '').trim();
+  if (!host) return '';
+  const schemeIndex = host.indexOf('://');
+  if (schemeIndex >= 0) host = host.slice(schemeIndex + 3);
+  if (host.includes('@')) host = host.split('@').pop();
+  host = host.split(/[/?#]/)[0].trim();
+  if (host.startsWith('[')) {
+    host = host.slice(1).split(']')[0].trim();
+  } else if ((host.match(/:/g) || []).length === 1) {
+    host = host.split(':')[0].trim();
+  }
+  return /\s/.test(host) ? '' : host.replace(/\.$/, '');
+}
+
+function isIpAddress(hostname) {
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) ||
+    (hostname.includes(':') && /^[0-9a-f:]+$/i.test(hostname));
+}
+
+function isPublicDnsHost(hostname) {
+  if (!hostname || isIpAddress(hostname)) return false;
+  const lower = hostname.toLowerCase();
+  return lower !== 'localhost' &&
+    !lower.endsWith('.localhost') &&
+    !lower.endsWith('.local');
+}
+
+function dashboardHostnameForSettings(settings) {
+  const publicHost = publicHostName(settings?.node_config?.public_host);
+  if (isPublicDnsHost(publicHost)) {
+    return `${publicHost}, ${publicHost}:${CADDY_PUBLIC_API_PORT}`;
+  }
+  return settings?.hostname || DEFAULT_DASHBOARD_HOSTNAME;
+}
+
+function dashboardHostForBrowser(settings) {
+  const configured = dashboardHostnameForSettings(settings);
+  const firstHost = (configured || DEFAULT_DASHBOARD_HOSTNAME)
     .split(',')[0]
     .trim() || DEFAULT_DASHBOARD_HOSTNAME;
+  if (firstHost === DEFAULT_DASHBOARD_HOSTNAME) {
+    return `localhost:${settings?.node_config?.port || CADDY_PUBLIC_API_PORT}`;
+  }
   return firstHost.startsWith(':') ? `localhost${firstHost}` : firstHost;
 }
 
@@ -50,29 +91,21 @@ function isLocalDashboardHost(hostname) {
 
 // ─── Stack Configuration UI ─────────────────────────────────────────────────
 
-// Show the TLS subsettings block only when both dashboard and TLS are on.
-// TLS without the dashboard is meaningless (Caddy only fronts the dashboard
-// in this stack) so we disable the TLS checkbox when dashboard is off.
+// Show certificate subsettings only when TLS is enabled. The dashboard is
+// always part of the v0.2 stack.
 function updateStackUiVisibility() {
-  const dashEl = document.getElementById('dashboard-enabled');
   const tlsEl = document.getElementById('tls-enabled');
   const subs = document.getElementById('tls-subsettings');
-  if (!dashEl || !tlsEl || !subs) return;
+  if (!tlsEl || !subs) return;
 
-  const dash = dashEl.checked;
-  tlsEl.disabled = !dash;
-  if (!dash) tlsEl.checked = false;
-  subs.style.display = dash && tlsEl.checked ? '' : 'none';
+  subs.style.display = tlsEl.checked ? '' : 'none';
 }
 
 document.addEventListener('change', (e) => {
   if (!e.target) return;
-  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+  if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
-  }
-  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
-    // These settings change the compose profile; refresh the checklist so
-    // the user sees profile-specific items (rest-port-native, port-tls, …)
+    // TLS changes profile-specific port checks (port-dashboard / port-tls)
     // without waiting for the next recheck cycle.
     invoke('recheck').catch(() => {});
   }
@@ -81,8 +114,7 @@ document.addEventListener('change', (e) => {
 // ─── Dashboard tab iframe wiring ────────────────────────────────────────────
 
 function dashboardUrl(settings) {
-  if (!settings?.dashboard_enabled) return null;
-  const hostname = dashboardHostForBrowser(settings.dashboard_hostname);
+  const hostname = dashboardHostForBrowser(settings);
   // ACME via Caddy only when TLS is on AND the hostname is a real DNS name
   // (localhost can't get a public cert). In every other case plain HTTP on
   // whatever port was configured.
@@ -114,12 +146,7 @@ function refreshDashboardTab() {
   // string on every tick, reloading the iframe and resetting the user's
   // place on the page.
   const currentSrc = frame.getAttribute('src');
-  if (!url) {
-    if (msg) msg.textContent = 'Dashboard disabled — enable it in the Status tab.';
-    show(empty, 'flex');
-    show(frame, 'none');
-    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
-  } else if (!dashRunning) {
+  if (!dashRunning) {
     if (msg) msg.textContent = 'Starting dashboard…';
     show(empty, 'flex');
     show(frame, 'none');
@@ -507,12 +534,10 @@ function applyFormToSettings() {
     .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
   state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
 
-  state.settings.dashboard_enabled =
-    document.getElementById('dashboard-enabled')?.checked ?? true;
   state.settings.tls_enabled =
     document.getElementById('tls-enabled')?.checked ?? false;
-  state.settings.dashboard_hostname =
-    document.getElementById('dashboard-hostname')?.value?.trim() ||
+  state.settings.hostname =
+    document.getElementById('hostname')?.value?.trim() ||
     DEFAULT_DASHBOARD_HOSTNAME;
   state.settings.cert_email =
     document.getElementById('cert-email')?.value?.trim() || '';
@@ -544,12 +569,10 @@ function populateForm(settings) {
   document.getElementById('http-log').value = c.http_log ?? '';
 
   // Stack Configuration (image_tag is auto-derived, no UI control)
-  document.getElementById('dashboard-enabled').checked =
-    settings.dashboard_enabled ?? true;
   document.getElementById('tls-enabled').checked =
     settings.tls_enabled ?? false;
-  document.getElementById('dashboard-hostname').value =
-    settings.dashboard_hostname ?? DEFAULT_DASHBOARD_HOSTNAME;
+  document.getElementById('hostname').value =
+    settings.hostname ?? DEFAULT_DASHBOARD_HOSTNAME;
   document.getElementById('cert-email').value = settings.cert_email ?? '';
   document.getElementById('zerossl-api-key').value =
     settings.zerossl_api_key ?? '';
@@ -640,13 +663,11 @@ function setStatus(stateStr) {
 function visibleInMode(id, runMode) {
   const s = state.settings;
   const isDocker = (runMode || 'docker') === 'docker';
-  const dashboard = s?.dashboard_enabled ?? true;
   const tls = s?.tls_enabled ?? false;
   const hasDwave = !!s?.node_config?.dwave_config;
-  // Compose runs whenever we're in Docker mode, OR Native mode with the
-  // dashboard on (dashboard+postgres[+caddy] run via compose even when
-  // the node runs as a host binary).
-  const composeWillRun = isDocker || dashboard;
+  // Compose runs in both Docker mode and Native mode. Native uses it for the
+  // validator/dashboard support services even when the miner runs on the host.
+  const composeWillRun = true;
 
   switch (id) {
     case 'docker':
@@ -659,11 +680,11 @@ function visibleInMode(id, runMode) {
     case 'binary':
       return !isDocker;
     case 'port-dashboard':
-      return composeWillRun && dashboard && !tls;
+      return composeWillRun && !tls;
     case 'port-tls':
-      return composeWillRun && dashboard && tls;
+      return composeWillRun && tls;
     case 'rest-port-native':
-      return !isDocker && dashboard;
+      return !isDocker;
     case 'dwave-key':
       return hasDwave;
     // version / secret / ip / hostname / ports / firewall — always shown.
@@ -935,13 +956,10 @@ async function startNode() {
     await invoke('start_stack');
     await invoke('start_log_stream');
   } else {
-    // Native mode: run the binary on the host + (optionally) the
-    // compose stack's non-node services (dashboard+postgres+caddy) so
-    // the user still gets the dashboard UI.
+    // Native mode: run the binary on the host + the compose stack's
+    // non-node services so the user still gets the dashboard UI.
     await invoke('start_native_node');
-    if (state.settings?.dashboard_enabled) {
-      try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
-    }
+    try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
   }
   collapseConfig();
 }
@@ -952,9 +970,7 @@ async function stopNode() {
     await invoke('stop_stack');
   } else {
     await invoke('stop_native_node');
-    if (state.settings?.dashboard_enabled) {
-      try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
-    }
+    try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
   }
 }
 

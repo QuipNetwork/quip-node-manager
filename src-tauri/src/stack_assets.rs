@@ -13,6 +13,10 @@
 //!     from upstream 20049 to the user configured API port.
 //!   - compose.yml: the validator libp2p host port is rewritten from
 //!     upstream 30333 to the manager default/configured 30033.
+//!   - compose.yml: when `public_host` is set, the validator command gets
+//!     a matching `--public-addr=<multiaddr>` using the public validator port.
+//!   - Caddyfile: the optional local faucet route is stripped; the manager
+//!     uses the public testnet faucet exposed by the upstream miner bootstrap.
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:80` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
@@ -37,8 +41,7 @@ const CHAIN_SPEC: &str =
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
-/// defaults to 30033; `--public-addr` is intentionally deferred until the
-/// running v0.2 stack proves whether it is needed.
+/// defaults to 30033 and is also used for generated `--public-addr` values.
 const CONTAINER_VALIDATOR_PORT: u16 = 30333;
 
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
@@ -69,6 +72,8 @@ pub fn stack_project_dir() -> PathBuf {
 /// `public_api_port` replaces Caddy's upstream host-side `20049`.
 /// `validator_port` replaces the validator's upstream host-side `30333`
 /// while preserving the container-internal `30333`.
+/// `public_host`, when set, is converted into a Substrate public multiaddr
+/// using `validator_port`.
 ///
 /// In Native mode the Caddyfile's upstream for `/api/v1/*` is also
 /// rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>`.
@@ -76,6 +81,7 @@ pub fn sync_stack_assets(
     run_mode: &RunMode,
     public_api_port: u16,
     validator_port: u16,
+    public_host: &str,
     native_rest_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
@@ -83,7 +89,7 @@ pub fn sync_stack_assets(
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
-    let compose_out = patch_compose_ports(COMPOSE_YML, public_api_port, validator_port);
+    let compose_out = patch_compose_file(COMPOSE_YML, public_api_port, validator_port, public_host);
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
 
@@ -93,6 +99,16 @@ pub fn sync_stack_assets(
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
     Ok(())
+}
+
+fn patch_compose_file(
+    src: &str,
+    public_api_port: u16,
+    validator_port: u16,
+    public_host: &str,
+) -> String {
+    let patched = patch_compose_ports(src, public_api_port, validator_port);
+    patch_validator_public_addr(&patched, public_host, validator_port)
 }
 
 /// Remap host sides of canonical upstream `HOST:CONTAINER` port directives.
@@ -111,14 +127,43 @@ fn patch_compose_ports(src: &str, public_api_port: u16, validator_port: u16) -> 
     )
 }
 
+fn patch_validator_public_addr(src: &str, public_host: &str, validator_port: u16) -> String {
+    let Some(public_addr) = crate::hostnames::validator_public_addr(public_host, validator_port)
+    else {
+        return src.to_string();
+    };
+    let validator_arg = "      - --validator\n";
+    src.replacen(
+        validator_arg,
+        &format!("{validator_arg}      - --public-addr={public_addr}\n"),
+        1,
+    )
+}
+
 fn patch_caddyfile(run_mode: &RunMode, src: &str, native_rest_port: u16) -> String {
+    let src = strip_local_faucet_route(src);
     match run_mode {
         RunMode::Native => src.replace(
             "quip-miner:80",
             &format!("host.docker.internal:{native_rest_port}"),
         ),
-        RunMode::Docker => src.to_string(),
+        RunMode::Docker => src,
     }
+}
+
+fn strip_local_faucet_route(src: &str) -> String {
+    let Some(start) = src.find("\t# Optional faucet sidecar") else {
+        return src.to_string();
+    };
+    let Some(relative_end) = src[start..].find("\n\n\t# Miner telemetry") else {
+        return src.to_string();
+    };
+
+    let end = start + relative_end + 2;
+    let mut out = String::with_capacity(src.len());
+    out.push_str(&src[..start]);
+    out.push_str(&src[end..]);
+    out
 }
 
 #[cfg(test)]
@@ -160,6 +205,37 @@ mod tests {
     }
 
     #[test]
+    fn patch_compose_file_adds_public_addr_from_dns_public_host() {
+        let patched = patch_compose_file(
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "node.example.com",
+        );
+        assert!(patched.contains("      - --public-addr=/dns4/node.example.com/tcp/30033\n"));
+    }
+
+    #[test]
+    fn patch_compose_file_adds_public_addr_from_ip_public_host() {
+        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "1.2.3.4");
+        assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
+
+        let patched = patch_compose_file(
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "[2001:db8::1]",
+        );
+        assert!(patched.contains("      - --public-addr=/ip6/2001:db8::1/tcp/30033\n"));
+    }
+
+    #[test]
+    fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
+        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "");
+        assert!(!patched.contains("--public-addr"));
+    }
+
+    #[test]
     fn embedded_chain_spec_is_quip_testnet_json() {
         assert!(CHAIN_SPEC.contains("\"name\": \"Quip Testnet\""));
         assert!(CHAIN_SPEC.contains("\"bootNodes\""));
@@ -171,6 +247,8 @@ mod tests {
         assert!(patched.contains("handle /rpc"));
         assert!(patched.contains("handle /api/v1/*"));
         assert!(patched.contains("reverse_proxy quip-miner:80"));
+        assert!(!patched.contains("/api/faucet"));
+        assert!(!patched.contains("quip-faucet"));
         assert!(!patched.contains("host.docker.internal:20100"));
     }
 
@@ -181,5 +259,7 @@ mod tests {
         assert!(patched.contains("handle /api/v1/*"));
         assert!(patched.contains("reverse_proxy host.docker.internal:20100"));
         assert!(!patched.contains("reverse_proxy quip-miner:80"));
+        assert!(!patched.contains("/api/faucet"));
+        assert!(!patched.contains("quip-faucet"));
     }
 }

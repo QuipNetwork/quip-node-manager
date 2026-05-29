@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod compose;
 pub mod config;
 pub mod hardware;
+pub mod hostnames;
 pub mod log_stream;
 pub mod migration_v2;
 pub mod native;
@@ -139,8 +140,8 @@ pub fn run() {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
                                 let settings = crate::settings::load_settings();
-                                // Native: run the binary + (if dashboard) the
-                                // compose stack's non-node services.
+                                // Native: run the binary + the compose
+                                // stack's non-node services.
                                 // Docker: run the full compose stack.
                                 let _ = match settings.run_mode {
                                     crate::settings::RunMode::Docker => {
@@ -152,9 +153,7 @@ pub fn run() {
                                             native::start_native_node(handle.clone(), state)
                                                 .await
                                                 .map(|_| ());
-                                        if settings.dashboard_enabled {
-                                            let _ = compose::start_stack(handle.clone()).await;
-                                        }
+                                        let _ = compose::start_stack(handle.clone()).await;
                                         native_res
                                     }
                                 };
@@ -172,9 +171,7 @@ pub fn run() {
                                         let state = handle.state::<NativeProcessState>();
                                         let native_res =
                                             native::stop_native_node(handle.clone(), state).await;
-                                        if settings.dashboard_enabled {
-                                            let _ = compose::stop_stack(handle.clone()).await;
-                                        }
+                                        let _ = compose::stop_stack(handle.clone()).await;
                                         native_res
                                     }
                                 };

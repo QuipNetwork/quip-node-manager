@@ -299,10 +299,7 @@ impl Default for NodeConfig {
 
 // ─── App settings ───────────────────────────────────────────────────────────
 
-fn default_true() -> bool {
-    true
-}
-fn default_dashboard_hostname() -> String {
+fn default_hostname() -> String {
     ":20049".to_string()
 }
 
@@ -330,12 +327,10 @@ pub struct AppSettings {
     pub window_maximized: bool,
     #[serde(default, deserialize_with = "deserialize_image_tag_compat")]
     pub image_tag: ImageTag,
-    #[serde(default = "default_true")]
-    pub dashboard_enabled: bool,
     #[serde(default)]
     pub tls_enabled: bool,
-    #[serde(default = "default_dashboard_hostname")]
-    pub dashboard_hostname: String,
+    #[serde(default = "default_hostname", alias = "dashboard_hostname")]
+    pub hostname: String,
     #[serde(default)]
     pub cert_email: String,
     #[serde(default)]
@@ -353,9 +348,8 @@ impl Default for AppSettings {
             active_tab: "status".to_string(),
             window_maximized: false,
             image_tag: ImageTag::default(),
-            dashboard_enabled: true,
             tls_enabled: false,
-            dashboard_hostname: default_dashboard_hostname(),
+            hostname: default_hostname(),
             cert_email: String::new(),
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
@@ -565,8 +559,25 @@ mod tests {
     }
 
     #[test]
-    fn app_settings_default_dashboard_hostname_is_public_api_port() {
-        assert_eq!(AppSettings::default().dashboard_hostname, ":20049");
+    fn app_settings_default_hostname_is_public_api_port() {
+        assert_eq!(AppSettings::default().hostname, ":20049");
+    }
+
+    #[test]
+    fn app_settings_deserializes_legacy_dashboard_hostname_alias() {
+        let settings: AppSettings = serde_json::from_value(json!({
+            "node_config": {},
+            "active_tab": "status",
+            "window_maximized": false,
+            "image_tag": "cpu",
+            "dashboard_hostname": "node.example.com, node.example.com:20049"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            settings.hostname,
+            "node.example.com, node.example.com:20049"
+        );
     }
 
     #[test]
@@ -586,6 +597,6 @@ mod tests {
         assert_eq!(settings.node_config.validator_port, 30033);
         assert_eq!(settings.node_config.node_name, "legacy-node");
         assert_eq!(settings.image_tag, ImageTag::Cpu);
-        assert_eq!(settings.dashboard_hostname, ":20049");
+        assert_eq!(settings.hostname, ":20049");
     }
 }

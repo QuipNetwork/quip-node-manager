@@ -2,8 +2,8 @@
 
 This is the execution plan derived from `V02-ALIGNMENT-PLAN.md`. The goal is
 to move the manager to the `nodes.quip.network` v0.2 Docker stack while keeping
-native miner installation/update work and dashboard-disabled policy decisions
-deferred until the core Docker flow is working.
+native miner installation/update work deferred until the core Docker flow is
+working.
 
 ## Scope
 
@@ -20,10 +20,15 @@ Implement now:
 
 Defer:
 
-- `--public-addr` validator advertising decision.
 - v0.2 native miner binary installation and update workflow.
-- final dashboard-disabled support decision.
-- faucet/localdev UI support.
+
+Resolved after Phase 10:
+
+- Set validator `--public-addr` from `public_host` when it is configured.
+- Do not support dashboard-disabled mode in the v0.2 manager flow.
+- Use `public_host` as the Caddy/API hostname when it is a DNS hostname;
+  otherwise use the existing hostname setting.
+- Do not use a local faucet; rely on the public testnet faucet.
 
 ## Phase 0: Baseline And Safety
 
@@ -156,14 +161,17 @@ Tasks:
   - Docker miner keeps `quip-miner:80`.
   - Native miner path rewrites `quip-miner:80` to
     `host.docker.internal:<native_rest_port>`.
-- Do not implement `--public-addr` command patching yet. Leave a code comment
-  or issue note near validator port patching.
+- Patch validator `--public-addr` when `public_host` is configured:
+  - DNS host -> `/dns4/<host>/tcp/<validator_port>`.
+  - IPv4 host -> `/ip4/<host>/tcp/<validator_port>`.
+  - IPv6 host -> `/ip6/<host>/tcp/<validator_port>`.
 
 Verification gate:
 
 - Unit tests cover default and custom public API port.
 - Unit tests cover default and custom validator port for TCP and UDP.
-- Staged Caddyfile still contains `/rpc` and `/api/v1/*` routes.
+- Staged Caddyfile still contains `/rpc` and `/api/v1/*` routes, and does not
+  expose the optional local faucet route.
 
 ## Phase 4: Compose Orchestration
 
@@ -179,11 +187,11 @@ Tasks:
 - Replace profile logic with v0.2 profiles:
   - Docker mode: `cpu` or `cuda`.
   - Remove `cpu-notls`, `cuda-notls`, `cpu-nodash`, `cuda-nodash`.
-- Keep dashboard-disabled support deferred:
-  - first implementation can assume the v0.2 standard stack includes Caddy,
-    dashboard, Postgres, validator, bootstrap, and miner.
-  - if the existing UI toggle remains, either disable it with clear copy or
-    ignore it in v0.2 until the final decision.
+- Do not support dashboard-disabled mode:
+  - the v0.2 standard stack includes Caddy, dashboard, Postgres, validator,
+    bootstrap, and miner.
+  - remove the `dashboard_enabled` app setting; legacy settings files can keep
+    the extra key, but the manager no longer reads or writes it.
 - Native/Metal compose support services:
   - do not start `cpu`, `cuda`, or `quip-bootstrap`.
   - start `quip-validator`, `dashboard`, `postgres`, and `caddy` only if native
@@ -196,7 +204,6 @@ Tasks:
   - `quip-dashboard`
   - `quip-postgres`
   - `quip-caddy`
-  - optional `quip-faucet`
 - Remove `quip-qpu` from v0.2 known containers, but consider keeping a
   one-time legacy cleanup path for old v0.1 containers.
 - Update orphan image sweep image names.
@@ -436,14 +443,15 @@ and UX polish on top.
 
 ## Deferred Decision Log
 
-- `--public-addr`: do not implement until a running v0.2 stack confirms whether
-  custom host port `30033` needs explicit advertised address configuration.
+- `--public-addr`: resolved. Set it from `public_host` when configured, using
+  the configured host-exposed validator port.
 - Native miner install/update: leave existing native install path alone until
   v0.2 release asset names are finalized.
-- Dashboard-disabled support: decide after the standard v0.2 Docker flow works.
-  If disabling dashboard requires Caddyfile or compose surgery, defer or remove
-  support explicitly.
-- `dashboard_hostname` naming: revisit after the v0.2 flow stabilizes. The
-  setting now drives the Caddy/API hostname, so it may need to be renamed to
-  `hostname` or another neutral name.
-- Faucet/localdev UI: out of scope for the first v0.2 manager alignment.
+- Dashboard-disabled support: resolved. It is not supported in the v0.2 manager
+  flow.
+- `dashboard_hostname` naming: resolved. Rename the stored setting to
+  `hostname`; accept legacy `dashboard_hostname` while reading old settings.
+  This hostname is shared by all services because Caddy proxies the stack. A
+  DNS `public_host` takes precedence when suitable for Caddy.
+- Faucet/localdev UI: resolved. The manager does not start or proxy a local
+  faucet; bootstrap uses the public testnet faucet.

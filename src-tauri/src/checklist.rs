@@ -132,9 +132,6 @@ pub struct CheckCtx {
     /// Host-exposed validator libp2p port. The container still binds 30333.
     pub validator_port: u16,
     pub public_host: String,
-    /// "Is the compose stack expected to be running?" — drives visibility of
-    /// dashboard/TLS/postgres-related checks.
-    pub dashboard_enabled: bool,
     pub tls_enabled: bool,
     /// The port the native binary exposes for dashboard telemetry in Native
     /// mode. Passed into `rest-port-native` without recomputing defaults.
@@ -172,7 +169,6 @@ impl CheckCtx {
             port: settings.node_config.port,
             validator_port: settings.node_config.validator_port,
             public_host: settings.node_config.public_host,
-            dashboard_enabled: settings.dashboard_enabled,
             tls_enabled: settings.tls_enabled,
             native_rest_port,
             has_dwave_config,
@@ -219,10 +215,10 @@ impl CheckCtx {
             .await
     }
 
-    /// Whether `docker compose` is expected to have anything to run. False
-    /// only when Native mode + dashboard disabled.
+    /// Whether `docker compose` is expected to have anything to run. v0.2
+    /// always runs compose services in both Docker and Native manager modes.
     fn compose_will_run(&self) -> bool {
-        self.run_mode != RunMode::Native || self.dashboard_enabled
+        true
     }
 }
 
@@ -311,16 +307,14 @@ fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
             crate::compose::COMPOSE_IMAGE_TAG
         ));
     }
-    if ctx.dashboard_enabled {
-        images.push(format!(
-            "{}:{}",
-            crate::compose::DASHBOARD_IMAGE,
-            crate::compose::COMPOSE_IMAGE_TAG
-        ));
-        images.push("postgres:16".into());
-        if ctx.tls_enabled {
-            images.push("caddy:2-alpine".into());
-        }
+    images.push(format!(
+        "{}:{}",
+        crate::compose::DASHBOARD_IMAGE,
+        crate::compose::COMPOSE_IMAGE_TAG
+    ));
+    images.push("postgres:16".into());
+    if ctx.tls_enabled {
+        images.push("caddy:2-alpine".into());
     }
     images
 }
@@ -853,11 +847,11 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         "binary" => ctx.run_mode == RunMode::Native,
         // New per-port bind checks. Only applicable when compose will run AND
         // that profile actually binds the port.
-        "port-dashboard" => ctx.compose_will_run() && ctx.dashboard_enabled && !ctx.tls_enabled,
-        "port-tls" => ctx.compose_will_run() && ctx.dashboard_enabled && ctx.tls_enabled,
-        // Native + dashboard makes the native binary bind a REST port that
+        "port-dashboard" => ctx.compose_will_run() && !ctx.tls_enabled,
+        "port-tls" => ctx.compose_will_run() && ctx.tls_enabled,
+        // Native mode makes the native binary bind a REST port that
         // Docker containers reach via host.docker.internal.
-        "rest-port-native" => ctx.run_mode == RunMode::Native && ctx.dashboard_enabled,
+        "rest-port-native" => ctx.run_mode == RunMode::Native,
         // Visible whenever the user has a [dwave] block in NodeConfig
         // (i.e. they've opted into QPU mining). Passes if the token is
         // non-empty, fails otherwise.
@@ -1524,7 +1518,6 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         port: settings.node_config.port,
         validator_port: settings.node_config.validator_port,
         public_host: settings.node_config.public_host,
-        dashboard_enabled: settings.dashboard_enabled,
         tls_enabled: settings.tls_enabled,
         native_rest_port,
         has_dwave_config,
@@ -1558,7 +1551,6 @@ mod tests {
             port: 20049,
             validator_port: 30033,
             public_host: String::new(),
-            dashboard_enabled: true,
             tls_enabled: false,
             native_rest_port: 20100,
             has_dwave_config: false,

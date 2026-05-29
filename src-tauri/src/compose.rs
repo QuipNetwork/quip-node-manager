@@ -3,7 +3,7 @@
 //!
 //! Docker mode drives the full v0.2 stack (miner + validator + dashboard +
 //! postgres + caddy). Native miner installation is deferred; the remaining
-//! native path starts only Docker-side support services.
+//! native path starts the Docker-side validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
 use crate::settings::{
@@ -77,21 +77,14 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 
 // ── profile + services selection ───────────────────────────────────────────
 
-/// Compose profile name for v0.2. Dashboard-disabled support is deferred;
-/// the standard upstream profiles always include dashboard, postgres, Caddy,
-/// the selected miner, bootstrap, and validator.
-pub fn compose_profile(image_tag: ImageTag, _dashboard: bool, _tls: bool) -> &'static str {
+/// Compose profile name for v0.2. The standard upstream profiles always
+/// include dashboard, postgres, Caddy, the selected miner, bootstrap, and
+/// validator.
+pub fn compose_profile(image_tag: ImageTag) -> &'static str {
     match image_tag {
         ImageTag::Cpu => "cpu",
         ImageTag::Cuda => "cuda",
     }
-}
-
-/// Whether the compose stack is skipped entirely. Dashboard-disabled support is
-/// deferred for v0.2 alignment, so every current mode has compose services to
-/// stage/check/pull/start.
-pub fn compose_skipped(_run_mode: &RunMode, _dashboard_enabled: bool) -> bool {
-    false
 }
 
 /// Explicit service list for `docker compose up -d [services...]`.
@@ -190,11 +183,10 @@ fn render_env_lines(
         .as_ref()
         .map(|d| d.token.clone())
         .unwrap_or_default();
-    let hostname = if settings.dashboard_hostname.trim().is_empty() {
-        ":20049"
-    } else {
-        settings.dashboard_hostname.trim()
-    };
+    let hostname = crate::hostnames::resolved_caddy_hostname(
+        &settings.node_config.public_host,
+        &settings.hostname,
+    );
     let validator_name = if settings.node_config.node_name.trim().is_empty() {
         "quip-validator"
     } else {
@@ -371,46 +363,43 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 /// registry for the configured v0.2 preview tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
-    let mut settings = crate::settings::load_settings();
-    settings.dashboard_enabled = true;
-    if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
-        return Ok(());
-    }
+    let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
     sync_stack_assets(
         &settings.run_mode,
         settings.node_config.port,
         settings.node_config.validator_port,
+        &settings.node_config.public_host,
         native_rest_port(&settings.node_config),
     )?;
 
-    let profile = compose_profile(
-        settings.image_tag,
-        settings.dashboard_enabled,
-        settings.tls_enabled,
-    );
+    pull_compose_images_for_settings(&app, &settings).await
+}
+
+async fn pull_compose_images_for_settings(
+    app: &AppHandle,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    let profile = compose_profile(settings.image_tag);
 
     let mut args: Vec<String> = vec!["--profile".into(), profile.into(), "pull".into()];
     for s in compose_services(&settings.run_mode, settings.tls_enabled) {
         args.push((*s).into());
     }
 
-    log_cmd(
-        &app,
-        &format!("docker compose --profile {profile} pull ..."),
-    );
-    run_compose_streaming(&app, args).await
+    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
+    run_compose_streaming(app, args).await
 }
 
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
 ///
 /// Sequence:
-///   1. sync_stack_assets (staging + Caddyfile patch for Native)
-///   2. migrate existing v0.1 config/env, if present
-///   3. auto-detect public_host in Docker mode
-///   4. force native miner REST settings when the deferred native path is used
+///   1. migrate existing v0.1 config/env, if present
+///   2. auto-detect public_host in Docker mode
+///   3. force native miner REST settings when the deferred native path is used
+///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
 ///   5. write .env
 ///   6. write_config_toml
 ///   7. docker compose down  (clean slate; no-op on first start)
@@ -419,27 +408,8 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
-    settings.dashboard_enabled = true;
 
-    if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
-        log_cmd(
-            &app,
-            "Native mode with dashboard disabled — no compose stack to start.",
-        );
-        return Ok(());
-    }
-
-    let rest_port = native_rest_port(&settings.node_config);
-
-    // (1) Stage assets.
-    sync_stack_assets(
-        &settings.run_mode,
-        settings.node_config.port,
-        settings.node_config.validator_port,
-        rest_port,
-    )?;
-
-    // (2) Migrate any v0.1 config/env artifacts before writing fresh v0.2
+    // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
     // manager-owned files. Promoted fields keep hand-edited public host/port
     // values from being lost by the generated config.
     let migration = crate::migration_v2::migrate_for_run_mode(&settings.run_mode)?;
@@ -449,7 +419,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
     crate::migration_v2::emit_report(&app, &migration);
 
-    // (3) Docker-mode auto-detect of public_host; Native leaves it to the
+    // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         if let Ok(ip) = crate::network::detect_public_ip().await {
@@ -458,13 +428,25 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // (4) Native miner installation/update is deferred. Keep the old native
+    let rest_port = native_rest_port(&settings.node_config);
+
+    // (3) Native miner installation/update is deferred. Keep the old native
     // REST override isolated to Native mode so the Docker v0.2 config always
     // uses internal miner REST port 80.
     if settings.run_mode == RunMode::Native {
         settings.node_config.rest_host = "127.0.0.1".to_string();
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
+
+    // (4) Stage assets after migration/auto-detection so public_host can drive
+    // the validator's public address.
+    sync_stack_assets(
+        &settings.run_mode,
+        settings.node_config.port,
+        settings.node_config.validator_port,
+        &settings.node_config.public_host,
+        rest_port,
+    )?;
 
     // (5) .env
     write_env_file(&settings)?;
@@ -479,14 +461,10 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     log_cmd(&app, "docker compose down");
     let _ = run_compose_streaming(&app, vec!["down".into()]).await;
 
-    let profile = compose_profile(
-        settings.image_tag,
-        settings.dashboard_enabled,
-        settings.tls_enabled,
-    );
+    let profile = compose_profile(settings.image_tag);
 
     // (8) Pull the configured v0.2 preview tags.
-    pull_compose_images(app.clone()).await?;
+    pull_compose_images_for_settings(&app, &settings).await?;
 
     // (9) Up.
     let mut up_args: Vec<String> =
@@ -566,7 +544,6 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
-    "quip-faucet",
     // Legacy one-container TUI path; kept as a cleanup-only backstop.
     "quip-node",
 ];
@@ -771,12 +748,8 @@ mod tests {
 
     #[test]
     fn compose_profile_uses_only_v02_cpu_and_cuda_profiles() {
-        assert_eq!(compose_profile(ImageTag::Cpu, true, true), "cpu");
-        assert_eq!(compose_profile(ImageTag::Cpu, true, false), "cpu");
-        assert_eq!(compose_profile(ImageTag::Cpu, false, false), "cpu");
-        assert_eq!(compose_profile(ImageTag::Cuda, true, true), "cuda");
-        assert_eq!(compose_profile(ImageTag::Cuda, true, false), "cuda");
-        assert_eq!(compose_profile(ImageTag::Cuda, false, false), "cuda");
+        assert_eq!(compose_profile(ImageTag::Cpu), "cpu");
+        assert_eq!(compose_profile(ImageTag::Cuda), "cuda");
     }
 
     #[test]
@@ -797,16 +770,10 @@ mod tests {
     }
 
     #[test]
-    fn compose_is_not_skipped_while_dashboard_disabled_is_deferred() {
-        assert!(!compose_skipped(&RunMode::Docker, false));
-        assert!(!compose_skipped(&RunMode::Native, false));
-    }
-
-    #[test]
     fn v02_cleanup_containers_do_not_include_qpu_service() {
         assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-validator"));
         assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-bootstrap"));
-        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-faucet"));
+        assert!(!KNOWN_CONTAINER_NAMES.contains(&"quip-faucet"));
         assert!(!KNOWN_CONTAINER_NAMES.contains(&"quip-qpu"));
     }
 
@@ -834,7 +801,7 @@ mod tests {
     #[test]
     fn env_lines_use_v02_dashboard_and_validator_keys() {
         let mut settings = AppSettings::default();
-        settings.dashboard_hostname = String::new();
+        settings.hostname = String::new();
         settings.cert_email = "ops@example.com".to_string();
         settings.zerossl_api_key = "zero".to_string();
         settings.run_mode = RunMode::Docker;
@@ -859,6 +826,29 @@ mod tests {
         assert!(env.contains("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944"));
         assert!(!env.contains("QUIP_NODE_URL"));
         assert!(!env.contains("QUIP_NODE_TOKEN"));
+        assert!(!env.contains("QUIP_FAUCET_URL"));
+    }
+
+    #[test]
+    fn env_lines_use_public_host_for_caddy_when_it_is_dns() {
+        let mut settings = AppSettings::default();
+        settings.node_config.public_host = "node.example.com".to_string();
+        settings.hostname = "dashboard.example.com".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
+    }
+
+    #[test]
+    fn env_lines_fall_back_to_hostname_when_public_host_is_not_dns() {
+        let mut settings = AppSettings::default();
+        settings.node_config.public_host = "203.0.113.9".to_string();
+        settings.hostname = "dashboard.example.com".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
     }
 
     #[test]

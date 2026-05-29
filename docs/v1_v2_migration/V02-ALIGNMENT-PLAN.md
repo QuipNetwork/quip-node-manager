@@ -29,7 +29,6 @@ The v0.2 stack is a topology change, not just an image update.
 - Caddy becomes the single HTTP/WS front door:
   - `/rpc` -> `quip-validator:9944`
   - `/api/v1/*` -> `quip-miner:80`
-  - `/api/faucet/*` -> `quip-faucet:8087`
   - `/` -> dashboard
 - Public `20049/tcp` is now the Caddy API/dashboard/RPC port, not the miner's
   QUIC peer port.
@@ -123,9 +122,10 @@ Current patching rewrites `"20049:20049/tcp"` and UDP mappings. In v0.2:
   - upstream default `"30333:30333/udp"` -> `"<validator_port>:30333/udp"`
   - manager default: `"30033:30333/tcp"` and `"30033:30333/udp"`
 
-Defer the `--public-addr` decision until after the rest of the v0.2 alignment
-is implemented. Initial implementation should patch the host mapping only and
-log the remaining question so it can be validated against a running stack.
+Set validator `--public-addr` from `public_host` when it is configured. The
+manager converts DNS hosts to `/dns4/<host>/tcp/<validator_port>`, IPv4 hosts to
+`/ip4/<host>/tcp/<validator_port>`, and IPv6 hosts to
+`/ip6/<host>/tcp/<validator_port>`.
 
 Native mode Caddy patching changes from `quip-node:80` to the v0.2 miner alias:
 
@@ -139,7 +139,7 @@ Replace old profile logic:
 
 - remove `cpu-notls`, `cuda-notls`, `cpu-nodash`, `cuda-nodash`
 - use upstream `cpu` / `cuda` profiles
-- optionally add `faucet` only for local dev or explicit future UI support
+- do not add the local `faucet` profile; the stack uses the public faucet
 
 Docker mode should start the full selected profile:
 
@@ -163,7 +163,6 @@ Update known container cleanup:
 - remove `quip-qpu`
 - add `quip-validator`
 - add `quip-bootstrap`
-- optionally add `quip-faucet`
 - keep `quip-dashboard`
 - keep `quip-postgres`
 - keep `quip-caddy`
@@ -465,12 +464,18 @@ Run `docker compose config` against staged files for:
 
 - Use `30033` as the manager default for the host-exposed validator P2P port.
   It maps to upstream's internal validator port `30333`.
-- Postpone the `--public-addr` decision until after the rest of the v0.2
-  implementation is in place.
+- Set validator `--public-addr` from `public_host` when it is configured,
+  using the host-exposed validator port.
 - Defer v0.2 native miner installation/update work until after the Docker and
   config migration changes. The native release asset name is still TBD.
 - The dashboard has fully migrated from `QUIP_NODE_URL` to
   `QUIP_VALIDATOR_RPC_URLS`; no temporary compatibility env vars are needed.
-- Dashboard-disabled support should be the last decision after the core Docker
-  flow is implemented. If it requires Caddyfile changes or complicates compose
-  service selection, defer or drop it explicitly.
+- Dashboard-disabled support is not part of the v0.2 manager flow. The
+  dashboard, Postgres, and Caddy remain part of the managed stack.
+- Rename `dashboard_hostname` to `hostname`, while accepting legacy settings
+  files that still contain `dashboard_hostname`. The hostname is shared by all
+  services because Caddy proxies the stack. A DNS `public_host` takes
+  precedence when it is suitable for Caddy; IP addresses fall back to the
+  explicit hostname.
+- Do not use a local faucet. The miner bootstrap uses the public testnet
+  faucet, and the manager should not proxy `/api/faucet/*`.

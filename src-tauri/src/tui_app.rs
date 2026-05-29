@@ -609,12 +609,12 @@ impl TuiApp {
         settings.node_config = config.clone();
         settings.image_tag = self.form.image_tag;
         settings.run_mode = RunMode::Docker;
-        settings.dashboard_enabled = true;
 
         if let Err(e) = crate::stack_assets::sync_stack_assets(
             &RunMode::Docker,
             config.port,
             config.validator_port,
+            &config.public_host,
             crate::compose::native_rest_port(config),
         ) {
             self.set_status(format!("Stack asset error: {}", e));
@@ -625,11 +625,7 @@ impl TuiApp {
             return;
         }
 
-        let profile = crate::compose::compose_profile(
-            settings.image_tag,
-            settings.dashboard_enabled,
-            settings.tls_enabled,
-        );
+        let profile = crate::compose::compose_profile(settings.image_tag);
 
         self.set_status("Stopping existing compose stack...");
         let _ = crate::compose::compose_cmd().args(["down"]).output();

@@ -156,17 +156,15 @@ impl ImageRef {
 
 /// The images whose configured-tag digests are worth polling for the given
 /// settings + run_mode. Native mode drops Docker miner/validator images (the
-/// miner binary runs on the host); `dashboard_enabled == false` drops the
-/// dashboard image.
+/// miner binary runs on the host). Dashboard-disabled mode is unsupported in
+/// v0.2, so the dashboard image is always relevant.
 fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
     let mut v = Vec::new();
     if settings.run_mode == crate::settings::RunMode::Docker {
         v.push(ImageRef::Miner(settings.image_tag));
         v.push(ImageRef::Validator);
     }
-    if settings.dashboard_enabled {
-        v.push(ImageRef::Dashboard);
-    }
+    v.push(ImageRef::Dashboard);
     v
 }
 
@@ -386,7 +384,6 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.run_mode = RunMode::Docker;
         settings.image_tag = ImageTag::Cuda;
-        settings.dashboard_enabled = true;
 
         let docker_images: Vec<String> = relevant_images(&settings)
             .into_iter()
