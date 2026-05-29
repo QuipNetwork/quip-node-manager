@@ -756,7 +756,7 @@ function defaultLabel(id) {
     case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
     case 'wsl':               return 'WSL installed with distro';
     case 'stack-images':      return 'Stack images available';
-    case 'binary':            return 'Node binary available';
+    case 'binary':            return 'Native miner binary available';
     case 'version':           return 'Node version up to date';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
@@ -1139,7 +1139,7 @@ async function setupListeners() {
 
   await listen('binary-update-available', (event) => {
     const info = event.payload;
-    appendLog({ timestamp: '', level: 'INFO', message: `New binary v${info.version} available. Download to update.` });
+    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Download to update.` });
     refreshNodeVersion();
   });
 
@@ -1153,10 +1153,10 @@ async function setupListeners() {
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {
-      if (statusEl) statusEl.textContent = 'Installing binary\u2026';
+      if (statusEl) statusEl.textContent = 'Installing native miner\u2026';
     } else if (total) {
       const pct = Math.round((downloaded / total) * 100);
-      if (statusEl) statusEl.textContent = `Downloading binary: ${pct}%`;
+      if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
     }
   });
 }

@@ -1,9 +1,8 @@
 # Quip Node Manager v0.2 Implementation Plan
 
 This is the execution plan derived from `V02-ALIGNMENT-PLAN.md`. The goal is
-to move the manager to the `nodes.quip.network` v0.2 Docker stack while keeping
-native miner installation/update work deferred until the core Docker flow is
-working.
+to move the manager to the `nodes.quip.network` v0.2 stack, including the
+Docker stack and native macOS miner assets.
 
 ## Scope
 
@@ -20,7 +19,7 @@ Implement now:
 
 Defer:
 
-- v0.2 native miner binary installation and update workflow.
+- No remaining v0.2 alignment decisions.
 
 Resolved after Phase 10:
 
@@ -96,11 +95,9 @@ Tasks:
   - `signer_key = "/data/keystore.json"`
   - `rest_host = "0.0.0.0"`
   - `rest_port = 80`
-- Native/Metal config remains isolated for now:
-  - do not implement native binary install/update.
-  - keep native config rendering behind existing native mode paths.
-  - if native config must render for tests, use host-local paths and clearly
-    mark the runtime as deferred.
+- Native/Metal config remains behind existing native mode paths:
+  - use host-local paths.
+  - native binary install/update uses the `v0.2-preview` `quip-miner` assets.
 - Preserve useful miner fields:
   - `node_name`
   - `public_host`
@@ -391,7 +388,8 @@ Tasks:
   - dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network`
 - Use configured preview tags where possible instead of hardcoded `latest`.
 - Include validator in relevant image checks for Docker mode.
-- Keep native binary update checks deferred and isolated.
+- Native binary update checks use the `v0.2-preview` `quip-miner` release
+  assets.
 
 Verification gate:
 
@@ -445,8 +443,8 @@ and UX polish on top.
 
 - `--public-addr`: resolved. Set it from `public_host` when configured, using
   the configured host-exposed validator port.
-- Native miner install/update: leave existing native install path alone until
-  v0.2 release asset names are finalized.
+- Native miner install/update: resolved. Use `quip-miner-macos-arm64` and
+  `quip-miner-macos-x86_64` from the `v0.2-preview` `quip-protocol` release.
 - Dashboard-disabled support: resolved. It is not supported in the v0.2 manager
   flow.
 - `dashboard_hostname` naming: resolved. Rename the stored setting to

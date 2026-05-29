@@ -2,8 +2,8 @@
 //! `docker compose`-based stack orchestration.
 //!
 //! Docker mode drives the full v0.2 stack (miner + validator + dashboard +
-//! postgres + caddy). Native miner installation is deferred; the remaining
-//! native path starts the Docker-side validator/dashboard support services.
+//! postgres + caddy). Native mode starts the host miner plus Docker-side
+//! validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
 use crate::settings::{
@@ -104,8 +104,8 @@ pub fn compose_services(run_mode: &RunMode, _tls_enabled: bool) -> &'static [&'s
 
 // ── Native REST port ───────────────────────────────────────────────────────
 
-/// Host REST port for the deferred native miner path. Docker miners bind
-/// internal port 80 and are reached through Caddy's `/api/v1/*` route.
+/// Host REST port for the native miner path. Docker miners bind internal port
+/// 80 and are reached through Caddy's `/api/v1/*` route.
 pub fn native_rest_port(cfg: &NodeConfig) -> u16 {
     if cfg.rest_insecure_port > 0 {
         cfg.rest_insecure_port as u16
@@ -398,7 +398,7 @@ async fn pull_compose_images_for_settings(
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
 ///   2. auto-detect public_host in Docker mode
-///   3. force native miner REST settings when the deferred native path is used
+///   3. force native miner REST settings when Native mode is used
 ///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
 ///   5. write .env
 ///   6. write_config_toml
@@ -430,9 +430,8 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 
     let rest_port = native_rest_port(&settings.node_config);
 
-    // (3) Native miner installation/update is deferred. Keep the old native
-    // REST override isolated to Native mode so the Docker v0.2 config always
-    // uses internal miner REST port 80.
+    // (3) Keep the native REST override isolated to Native mode so the Docker
+    // v0.2 config always uses internal miner REST port 80.
     if settings.run_mode == RunMode::Native {
         settings.node_config.rest_host = "127.0.0.1".to_string();
         settings.node_config.rest_insecure_port = rest_port as i16;

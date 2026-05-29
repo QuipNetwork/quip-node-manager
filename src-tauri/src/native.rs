@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
+const PROTOCOL_RELEASE_TAG: &str = crate::compose::COMPOSE_IMAGE_TAG;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct NativeNodeStatus {
@@ -37,20 +38,49 @@ impl NativeProcessState {
 
 pub fn binary_name() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "quip-network-node-macos-arm64"
+        "quip-miner-macos-arm64"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "quip-network-node-macos-x86_64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "quip-network-node-linux-x86_64"
-    } else if cfg!(target_os = "windows") {
-        "quip-network-node-windows-x86_64.exe"
+        "quip-miner-macos-x86_64"
     } else {
-        "quip-network-node"
+        "quip-miner"
     }
 }
 
 fn binary_path() -> std::path::PathBuf {
     data_dir().join("bin").join(binary_name())
+}
+
+fn binary_release_marker_path() -> std::path::PathBuf {
+    data_dir()
+        .join("bin")
+        .join(format!("{}.release", binary_name()))
+}
+
+fn release_download_url() -> String {
+    format!(
+        "https://gitlab.com/quip.network/quip-protocol/-/releases/{}/downloads/{}",
+        PROTOCOL_RELEASE_TAG,
+        binary_name()
+    )
+}
+
+fn installed_binary_release_tag() -> Option<String> {
+    std::fs::read_to_string(binary_release_marker_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_binary_release_marker() {
+    let path = binary_release_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, PROTOCOL_RELEASE_TAG);
+}
+
+fn normalize_release_version(value: &str) -> String {
+    value.trim().trim_start_matches('v').to_ascii_lowercase()
 }
 
 pub fn is_binary_available() -> bool {
@@ -192,16 +222,13 @@ pub fn installed_binary_version() -> Option<String> {
     }
 }
 
-/// Download the latest binary from GitLab releases.
+/// Download the configured v0.2 native miner binary from GitLab releases.
 #[tauri::command]
 pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
-    let url = format!(
-        "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
-        name
-    );
+    let url = release_download_url();
 
     let log = |msg: String| {
         let entry = serde_json::json!({
@@ -296,6 +323,7 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
+    write_binary_release_marker();
 
     let _ = app.emit(
         "binary-download-progress",
@@ -306,13 +334,17 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         },
     );
 
-    let version = installed_binary_version().unwrap_or("unknown".into());
-    log(format!("Installed {} v{}", name, version));
+    let version = installed_binary_version()
+        .unwrap_or_else(|| normalize_release_version(PROTOCOL_RELEASE_TAG));
+    log(format!(
+        "Installed {} from {} (binary version: {})",
+        name, PROTOCOL_RELEASE_TAG, version
+    ));
 
     Ok(version)
 }
 
-/// Check if a newer binary is available from GitLab releases.
+/// Check if the configured v0.2 native miner release is installed.
 #[tauri::command]
 pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
     let current = match tokio::task::spawn_blocking(installed_binary_version)
@@ -330,10 +362,10 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         .map_err(|e| e.to_string())?;
 
     let url = format!(
-        "https://gitlab.com/api/v4/projects/{}/releases",
-        PROTOCOL_PROJECT
+        "https://gitlab.com/api/v4/projects/{}/releases/{}",
+        PROTOCOL_PROJECT, PROTOCOL_RELEASE_TAG
     );
-    let releases: Vec<serde_json::Value> = match client
+    let release: serde_json::Value = match client
         .get(&url)
         .header("User-Agent", "quip-node-manager")
         .send()
@@ -343,33 +375,37 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         Err(_) => return Ok(None),
     };
 
-    let Some(latest) = releases.first() else {
-        return Ok(None);
-    };
-
-    let tag = latest["tag_name"]
-        .as_str()
-        .unwrap_or("")
-        .trim_start_matches('v');
-    if tag.is_empty() {
+    let tag = release["tag_name"].as_str().unwrap_or(PROTOCOL_RELEASE_TAG);
+    if tag.is_empty() || !release_has_binary_asset(&release, binary_name()) {
         return Ok(None);
     }
 
-    if crate::update::parse_semver(tag) > crate::update::parse_semver(&current) {
+    let current_tag_matches = installed_binary_release_tag()
+        .map(|installed| installed == tag)
+        .unwrap_or(false);
+    let current_version_matches =
+        normalize_release_version(&current) == normalize_release_version(tag);
+
+    if !current_tag_matches && !current_version_matches {
         Ok(Some(crate::update::UpdateInfo {
-            version: tag.to_string(),
-            url: format!(
-                "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
-                binary_name()
-            ),
-            notes: latest["description"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
+            version: normalize_release_version(tag),
+            url: release_download_url(),
+            notes: release["description"].as_str().unwrap_or("").to_string(),
         }))
     } else {
         Ok(None)
     }
+}
+
+fn release_has_binary_asset(release: &serde_json::Value, asset_name: &str) -> bool {
+    release["assets"]["links"]
+        .as_array()
+        .map(|links| {
+            links
+                .iter()
+                .any(|link| link["name"].as_str() == Some(asset_name))
+        })
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -409,7 +445,10 @@ pub async fn start_native_node(
 
     let bin = binary_path();
     if !bin.exists() {
-        return Err(format!("Node binary not found at {}", bin.display()));
+        return Err(format!(
+            "Native miner binary not found at {}",
+            bin.display()
+        ));
     }
 
     let config_path = data_dir().join("config.toml");
@@ -461,7 +500,7 @@ pub async fn start_native_node(
         &LogEntry {
             timestamp: String::new(),
             level: "INFO".to_string(),
-            message: format!("Native node started (PID {})", pid),
+            message: format!("Native miner started (PID {})", pid),
         },
     );
 
@@ -473,7 +512,7 @@ pub async fn start_native_node(
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
-    Ok(format!("Native node started (PID {})", pid))
+    Ok(format!("Native miner started (PID {})", pid))
 }
 
 /// Tail node logs: starts with node-output.log (process stdout),
@@ -633,4 +672,46 @@ pub async fn get_native_node_status(
 #[tauri::command]
 pub async fn check_native_binary() -> Result<bool, String> {
     Ok(is_binary_available())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_binary_name_uses_v02_miner_asset() {
+        assert!(binary_name().starts_with("quip-miner"));
+        assert!(!binary_name().starts_with("quip-network-node"));
+    }
+
+    #[test]
+    fn release_download_url_uses_v02_preview_asset_path() {
+        let url = release_download_url();
+        assert!(url.contains("/releases/v0.2-preview/downloads/"));
+        assert!(url.ends_with(binary_name()));
+    }
+
+    #[test]
+    fn release_asset_detection_finds_current_platform_binary() {
+        let release = serde_json::json!({
+            "assets": {
+                "links": [
+                    { "name": binary_name() },
+                    { "name": "other-file" }
+                ]
+            }
+        });
+
+        assert!(release_has_binary_asset(&release, binary_name()));
+        assert!(!release_has_binary_asset(
+            &release,
+            "quip-network-node-macos-arm64"
+        ));
+    }
+
+    #[test]
+    fn release_version_normalization_accepts_preview_tags() {
+        assert_eq!(normalize_release_version("v0.2-preview"), "0.2-preview");
+        assert_eq!(normalize_release_version("0.2-preview"), "0.2-preview");
+    }
 }

@@ -899,7 +899,7 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
         }
         "binary" => CheckItem::new(
             id,
-            "Node binary available",
+            "Native miner binary available",
             true,
             Some(FixKind::DownloadBinary),
         ),
@@ -1290,12 +1290,12 @@ async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
         },
         RunMode::Native => match crate::native::check_binary_update().await {
             Ok(Some(info)) => base.with_state(CheckState::Warn).with_label(format!(
-                "Node outdated \u{2014} v{} available",
+                "Native miner outdated \u{2014} v{} available",
                 info.version
             )),
             Ok(None) => base
                 .with_state(CheckState::Pass)
-                .with_label("Node binary up to date"),
+                .with_label("Native miner binary up to date"),
             Err(e) => base
                 .with_state(CheckState::Warn)
                 .with_label("Node version (unable to check)")

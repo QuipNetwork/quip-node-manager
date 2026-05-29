@@ -233,6 +233,9 @@ Use this for macOS Metal/MPS mining where the miner must run on the host.
 - Native miner points at the local validator through a host-reachable endpoint.
 - Caddy `/api/v1/*` should proxy to `host.docker.internal:<native_rest_port>`.
 - Dashboard still talks to substrate RPC through the Docker validator.
+- Native miner release assets for `v0.2-preview`:
+  - `quip-miner-macos-arm64`
+  - `quip-miner-macos-x86_64`
 
 Open implementation detail: choose the cleanest host-visible validator RPC path.
 Options:
@@ -419,9 +422,8 @@ Update image references:
 Digest checks should use the configured tags, not hardcoded `latest`, once the
 app supports v0.2 preview/version tags.
 
-Native update and installation should be deferred until after the other v0.2
-changes are implemented. The v0.2 native miner release asset name is still TBD,
-so keep the old native path isolated until this is decided.
+Native update and installation uses the `v0.2-preview` release assets from
+`quip-protocol`, not the old `quip-network-node-*` native assets.
 
 ## Verification Plan
 
@@ -466,8 +468,8 @@ Run `docker compose config` against staged files for:
   It maps to upstream's internal validator port `30333`.
 - Set validator `--public-addr` from `public_host` when it is configured,
   using the host-exposed validator port.
-- Defer v0.2 native miner installation/update work until after the Docker and
-  config migration changes. The native release asset name is still TBD.
+- Native miner installation/update uses the `v0.2-preview` release assets:
+  `quip-miner-macos-arm64` and `quip-miner-macos-x86_64`.
 - The dashboard has fully migrated from `QUIP_NODE_URL` to
   `QUIP_VALIDATOR_RPC_URLS`; no temporary compatibility env vars are needed.
 - Dashboard-disabled support is not part of the v0.2 manager flow. The
