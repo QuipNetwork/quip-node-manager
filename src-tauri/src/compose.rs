@@ -360,7 +360,7 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 
 /// Pull every image needed by the current profile + service list. Runs
 /// `docker compose --profile <p> pull [services...]` so the daemon checks the
-/// registry for the configured v0.2 preview tags even if local copies exist.
+/// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     let settings = crate::settings::load_settings();
@@ -373,6 +373,10 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
         &settings.node_config.public_host,
         native_rest_port(&settings.node_config),
     )?;
+    // Write .env too: without it compose substitutes the compose.yml
+    // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
+    // start sequence) would silently fetch the wrong tag.
+    write_env_file(&settings)?;
 
     pull_compose_images_for_settings(&app, &settings).await
 }
