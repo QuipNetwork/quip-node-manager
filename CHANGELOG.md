@@ -53,6 +53,33 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2
+
+### New Features
+
+- **Bundled local validator**: every Docker stack now runs a Substrate block-producing validator (`quip-validator`) plus a one-shot bootstrap container that registers your keystore in `QuantumPow.Miners` and funds it from the testnet faucet, alongside the miner, dashboard, postgres, and Caddy. The miner talks to the validator over RPC — `ws://quip-validator:9944` in Docker mode, or `ws://127.0.0.1:9944` (published on the host loopback) when the miner runs natively on macOS. The manager waits for the validator's RPC to come up before starting a native miner.
+- **Automatic v0.1 → v0.2 config migration**: on first start after upgrading, the app rewrites your old `config.toml` from the `[global]` schema to the new `[miner]` schema and migrates your `.env`, backing up the originals to `.v0.1_backup/` (and `.env.v0.1_backup`) first. Your hand-edited public host, public port, node name, log level, and log path are carried forward; obsolete v0.1 keys and the old dashboard `QUIP_NODE_URL`/`QUIP_NODE_TOKEN` env vars are dropped. Migration is logged to the console and refuses to run (rather than clobber) if a backup already exists.
+- **Adaptive Metal GPU cap (macOS)**: the GPU Configuration panel now exposes an adaptive cap for Apple Metal mining that throttles to a lower occupancy while you're actively using the Mac and runs flat-out when idle, with a configurable active-utilization percentage and idle delay. These knobs are written to a dedicated `[metal]` config section instead of being inherited from the shared `[gpu]` block.
+- **Live image pull progress**: the Logs tab now shows per-image progress bars while `docker compose pull` downloads the stack, instead of streaming raw layer output into the console.
+- **Configurable validator P2P and RPC ports**: the Validator/Miner settings now let you set the validator's libp2p peering port (default 30033) and, in native mode, the host port the local miner uses to reach the validator's JSON-RPC (default 9944).
+
+### Changes
+
+- **Caddy is now the single always-on front door**: Caddy, the dashboard, and Postgres start with every node — the separate "Enable dashboard" toggle is gone. One public API port (default 20049) fronts the dashboard UI, the validator RPC (`/rpc`), and miner telemetry (`/api/v1`). The manager's compose profiles are reduced to just `cpu` and `cuda`.
+- **Stack images bumped to v0.2**: the stack now pulls pinned `:v0.2` images instead of `:latest`. The node images were renamed from `quip-network-node-cpu`/`-cuda` to `quip-miner-cpu`/`quip-miner-cuda`, and a new validator image (`quip-protocol-rs/quip-network-node`) is added.
+- **Native miner binary renamed to `quip-miner-*`**: macOS native mode now downloads and runs `quip-miner-macos-arm64` / `-x86_64`. Any leftover `quip-network-node-*` binary from v0.1 is removed automatically on launch to reclaim disk space.
+- **Run Mode is driven by the Metal toggle on macOS**: the explicit Docker/Native selector is removed. On macOS, turning Metal GPU mining on runs the native miner; turning it off runs CPU mining via the Docker stack. Windows and Linux always use Docker.
+- **Host-published vs container-internal ports decoupled**: the validator's host port (default 30033) maps to the container's fixed 30333, and when you set a public host the validator advertises a matching libp2p address automatically. The native miner's REST always binds to the host loopback; only the public-facing API port is user-configurable.
+- **Pre-flight checklist rewritten around the two internet-facing ports**: the checklist now runs exactly two external reachability probes — the Public API port and the Validator P2P port — plus a single "Stack images available" check that covers the miner, validator, dashboard, Postgres, and Caddy images for your profile. The "Recheck All" button is now "Retry All".
+- **Settings panel simplified**: the old per-node networking knobs (listen address, bootstrap peers, timeout/heartbeat/fanout, REST host/port, telemetry directory, TLS cert file paths, auto-mine, and verify-TLS) are no longer surfaced in the UI now that the validator and Caddy own those concerns. The TLS panel's hostname field is now the Caddy/API hostname (`:20049` for local HTTP, or `example.com, example.com:20049` for public Let's Encrypt TLS).
+
+### Removals
+
+- **`qpu` compose service/profile and the `notls`/`nodash` profile variants**: D-Wave mining still rides on the CPU image via the `[dwave]` config section, and the dashboard/TLS are now governed by always-on services rather than separate profiles.
+- **`port-dashboard`, `port-tls`, `rest-port-native`, and the local firewall checks**: these internal-plumbing and duplicative-firewall pre-flight items are gone, replaced by the two external port probes and the stack-images check.
+
+---
+
 ## v0.1.1
 
 ### New Features
