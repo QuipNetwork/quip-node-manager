@@ -356,6 +356,10 @@ pub enum PortProbeResult {
     ForwardReady,
     /// TCP forwarding did not reach this host.
     Unreachable,
+    /// check.quip.network itself was unreachable or errored (network error,
+    /// HTTP 5xx, non-JSON body). We can't confirm external reachability, so
+    /// we surface a warning rather than a misleading green check.
+    Unverified,
     /// check.quip.network rate-limited the request. We can't verify right
     /// now but the port may well be fine — treat as passing until the
     /// cool-down expires and a real recheck can run.
@@ -438,11 +442,10 @@ async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeR
                     retry_after_secs: retry,
                     endpoint: "checkport",
                 },
-                // Lenient-pass on service error: we can't blame the user
-                // when check.quip.network is down, misbehaving, or
-                // unreachable from our end. The port is locally bound,
-                // which is the best signal we have.
-                ProbeOutcome::ServiceError => PortProbeResult::Verified,
+                // check.quip.network is down/misbehaving — we can't confirm
+                // reachability, so report it as unverified (a warning) rather
+                // than a green check we haven't earned.
+                ProbeOutcome::ServiceError => PortProbeResult::Unverified,
             }
         }
         Ok(listener) => {
@@ -469,9 +472,9 @@ async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeR
                     retry_after_secs: retry,
                     endpoint: "checkport",
                 },
-                // Lenient-pass on service error — no connectivity signal
-                // either way when check.quip.network isn't cooperating.
-                ProbeOutcome::ServiceError => PortProbeResult::ForwardReady,
+                // check.quip.network isn't cooperating — no connectivity
+                // signal either way, so report unverified (a warning).
+                ProbeOutcome::ServiceError => PortProbeResult::Unverified,
             }
         }
     }
@@ -859,23 +862,26 @@ async fn run_check_hostname(ctx: &CheckCtx) -> CheckItem {
         .with_label(format!("{} accessible to internet", hostname))
 }
 
-async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("port", ctx);
-    let port = ctx.port;
-    let (state, label) = match probe_port_forwarding_with_ctx(ctx, port).await {
+/// Map a `PortProbeResult` to a checklist state + label. `noun` distinguishes
+/// the public API port from the validator P2P port in the message. Shared by
+/// both port checks so they stay consistent.
+fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (CheckState, String) {
+    match result {
         PortProbeResult::Verified => (
             CheckState::Pass,
-            format!("Public API port {} reachable (host responded)", port),
+            format!("{noun} port {port} reachable (host responded)"),
         ),
-        PortProbeResult::ForwardReady => (
-            CheckState::Pass,
-            format!("Public API port {} TCP forward ready", port),
-        ),
+        PortProbeResult::ForwardReady => {
+            (CheckState::Pass, format!("{noun} port {port} TCP forward ready"))
+        }
         PortProbeResult::Unreachable => (
             CheckState::Warn,
+            format!("{noun} port {port} not reachable \u{2014} check router forward + firewall"),
+        ),
+        PortProbeResult::Unverified => (
+            CheckState::Warn,
             format!(
-                "Public API port {} not reachable \u{2014} check router forward + firewall",
-                port
+                "{noun} port {port} \u{2014} couldn't externally verify (check.quip.network unreachable)"
             ),
         ),
         PortProbeResult::RateLimited {
@@ -883,45 +889,22 @@ async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
             endpoint,
         } => (
             CheckState::Pass,
-            format!(
-                "Public API port {} rate-limited by /{} \u{2014} retry in {}s",
-                port, endpoint, retry_after_secs
-            ),
+            format!("{noun} port {port} rate-limited by /{endpoint} \u{2014} retry in {retry_after_secs}s"),
         ),
-    };
+    }
+}
+
+async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("port", ctx);
+    let result = probe_port_forwarding_with_ctx(ctx, ctx.port).await;
+    let (state, label) = port_probe_state_label(result, "Public API", ctx.port);
     base.with_state(state).with_label(label)
 }
 
 async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port-validator", ctx);
-    let port = ctx.validator_port;
-    let (state, label) = match probe_port_forwarding_with_ctx(ctx, port).await {
-        PortProbeResult::Verified => (
-            CheckState::Pass,
-            format!("Validator P2P port {} reachable (host responded)", port),
-        ),
-        PortProbeResult::ForwardReady => (
-            CheckState::Pass,
-            format!("Validator P2P port {} TCP forward ready", port),
-        ),
-        PortProbeResult::Unreachable => (
-            CheckState::Warn,
-            format!(
-                "Validator P2P port {} not reachable \u{2014} check router forward + firewall",
-                port
-            ),
-        ),
-        PortProbeResult::RateLimited {
-            retry_after_secs,
-            endpoint,
-        } => (
-            CheckState::Pass,
-            format!(
-                "Validator P2P port {} rate-limited by /{} \u{2014} retry in {}s",
-                port, endpoint, retry_after_secs
-            ),
-        ),
-    };
+    let result = probe_port_forwarding_with_ctx(ctx, ctx.validator_port).await;
+    let (state, label) = port_probe_state_label(result, "Validator P2P", ctx.validator_port);
     base.with_state(state).with_label(label)
 }
 
@@ -1246,6 +1229,25 @@ mod tests {
                 !ALL_CHECK_IDS.contains(&removed),
                 "{removed} should be removed from the checklist"
             );
+        }
+    }
+
+    #[test]
+    fn unverified_probe_warns_that_it_could_not_externally_verify() {
+        let (state, label) =
+            port_probe_state_label(PortProbeResult::Unverified, "Public API", 20049);
+        assert_eq!(state, CheckState::Warn);
+        assert!(
+            label.contains("couldn't externally verify"),
+            "label was: {label}"
+        );
+    }
+
+    #[test]
+    fn reachable_probe_results_still_pass() {
+        for result in [PortProbeResult::Verified, PortProbeResult::ForwardReady] {
+            let (state, _) = port_probe_state_label(result, "Validator P2P", 30033);
+            assert_eq!(state, CheckState::Pass);
         }
     }
 
