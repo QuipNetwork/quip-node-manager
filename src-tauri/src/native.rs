@@ -641,10 +641,27 @@ pub async fn start_native_node(
     // Write config.toml for native mode
     crate::config::write_config_toml(&config, &RunMode::Native)?;
 
+    // Auto-provision the miner binary when it's missing — mirrors Docker
+    // mode pulling images on start, so a fresh or relocated data dir doesn't
+    // dead-end here.
     let bin = binary_path();
     if !bin.exists() {
+        let _ = app.emit(
+            "node-log",
+            &LogEntry {
+                timestamp: String::new(),
+                level: "INFO".to_string(),
+                message: format!(
+                    "Native miner binary not found at {} — downloading…",
+                    bin.display()
+                ),
+            },
+        );
+        download_native_binary(app.clone()).await?;
+    }
+    if !bin.exists() {
         return Err(format!(
-            "Native miner binary not found at {}",
+            "Native miner binary still missing at {} after download",
             bin.display()
         ));
     }
