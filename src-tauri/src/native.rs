@@ -164,8 +164,8 @@ fn node_output_log_path() -> std::path::PathBuf {
     data_dir().join("node-output.log")
 }
 
-pub(crate) fn native_miner_validator_url(config: &NodeConfig) -> String {
-    format!("ws://127.0.0.1:{}/rpc", config.port)
+pub(crate) fn native_miner_validator_url() -> &'static str {
+    crate::config::NATIVE_VALIDATOR_RPC
 }
 
 fn validator_rpc_http_probe_url(validator_url: &str) -> String {
@@ -730,8 +730,8 @@ pub async fn start_native_node(
         );
     }
 
-    let validator_url = native_miner_validator_url(&config);
-    wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
+    let validator_url = native_miner_validator_url();
+    wait_for_native_miner_validator_rpc(&app, validator_url).await?;
 
     let miner_args = native_miner_args(&config, &config_path);
     let mut cmd = crate::cmd::new(&bin);
@@ -1099,13 +1099,10 @@ mod tests {
     }
 
     #[test]
-    fn native_miner_validator_url_uses_caddy_rpc_path() {
-        let cfg = NodeConfig {
-            port: 21049,
-            ..NodeConfig::default()
-        };
-
-        assert_eq!(native_miner_validator_url(&cfg), "ws://127.0.0.1:21049/rpc");
+    fn native_miner_validator_url_uses_raw_validator_rpc() {
+        // Native miner connects to the validator's raw RPC published on the
+        // host loopback, not Caddy's /rpc route.
+        assert_eq!(native_miner_validator_url(), "ws://127.0.0.1:9944");
     }
 
     #[test]
