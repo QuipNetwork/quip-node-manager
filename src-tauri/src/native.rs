@@ -100,18 +100,57 @@ async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json:
     resp.json().await.ok()
 }
 
-/// The most recent release that ships `asset_name`. Releases come back
-/// newest-first, so the first match wins — this tracks whatever the latest
-/// release is tagged (`v0.2`, `v0.2.0rc1`, …) and skips older releases that
-/// only carry the legacy asset name.
-fn find_latest_binary_release<'a>(
-    releases: &'a serde_json::Value,
+/// (tag, asset_url, description) for every release that ships `asset_name`,
+/// newest-first (GitLab returns releases newest-first). This tracks whatever
+/// the latest releases are tagged (`v0.2`, `v0.2.0rc1`, …) and skips older
+/// releases that only carry the legacy asset name.
+fn binary_release_candidates(
+    releases: &serde_json::Value,
     asset_name: &str,
-) -> Option<&'a serde_json::Value> {
+) -> Vec<(String, String, String)> {
     releases
-        .as_array()?
-        .iter()
-        .find(|rel| release_has_binary_asset(rel, asset_name))
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rel| {
+            let tag = rel["tag_name"].as_str()?.to_string();
+            let url = release_asset_url(rel, asset_name)?;
+            let desc = rel["description"].as_str().unwrap_or("").to_string();
+            Some((tag, url, desc))
+        })
+        .collect()
+}
+
+/// A release asset link is registered in the API as soon as the release is
+/// tagged, but the artifact behind it 404s until its build job finishes. A
+/// HEAD is unreliable (GitLab answers 200 at the redirect layer), so probe
+/// with a 1-byte ranged GET — a 404 means "not built yet".
+async fn asset_is_downloadable(client: &reqwest::Client, url: &str) -> bool {
+    match client
+        .get(url)
+        .header("User-Agent", "quip-node-manager")
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status() != reqwest::StatusCode::NOT_FOUND,
+        Err(_) => false,
+    }
+}
+
+/// Newest release whose `asset_name` artifact is actually downloadable. Skips
+/// just-tagged releases whose build hasn't produced the artifact yet.
+async fn resolve_latest_downloadable_release(
+    client: &reqwest::Client,
+    releases: &serde_json::Value,
+    asset_name: &str,
+) -> Option<(String, String, String)> {
+    for candidate in binary_release_candidates(releases, asset_name) {
+        if asset_is_downloadable(client, &candidate.1).await {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Direct download URL for `asset_name` within `release`. Prefers the stable
@@ -488,11 +527,14 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     let releases = fetch_protocol_releases(&meta_client)
         .await
         .ok_or_else(|| "Could not list quip-protocol releases".to_string())?;
-    let release = find_latest_binary_release(&releases, name)
-        .ok_or_else(|| format!("No published quip-protocol release ships {name} yet"))?;
-    let tag = release["tag_name"].as_str().unwrap_or_default().to_string();
-    let url = release_asset_url(release, name)
-        .ok_or_else(|| format!("Release {tag} has no download link for {name}"))?;
+    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "The latest quip-protocol release ships {name}, but its artifact \
+                 isn't available yet — the build may still be running. Try again shortly."
+            )
+        })?;
 
     log(format!("Downloading {name} ({tag})"));
     log(format!("From {url}"));
@@ -603,11 +645,11 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
     let Some(releases) = fetch_protocol_releases(&client).await else {
         return Ok(None);
     };
-    let Some(release) = find_latest_binary_release(&releases, binary_name()) else {
-        return Ok(None);
-    };
-    let tag = release["tag_name"].as_str().unwrap_or_default();
-    let Some(url) = release_asset_url(release, binary_name()) else {
+    // Only offer an update we can actually install — a just-tagged release
+    // whose artifact build hasn't finished is skipped until it's downloadable.
+    let Some((tag, url, description)) =
+        resolve_latest_downloadable_release(&client, &releases, binary_name()).await
+    else {
         return Ok(None);
     };
     if tag.is_empty() {
@@ -618,28 +660,17 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         .map(|installed| installed == tag)
         .unwrap_or(false);
     let current_version_matches =
-        normalize_release_version(&current) == normalize_release_version(tag);
+        normalize_release_version(&current) == normalize_release_version(&tag);
 
     if !current_tag_matches && !current_version_matches {
         Ok(Some(crate::update::UpdateInfo {
-            version: normalize_release_version(tag),
+            version: normalize_release_version(&tag),
             url,
-            notes: release["description"].as_str().unwrap_or("").to_string(),
+            notes: description,
         }))
     } else {
         Ok(None)
     }
-}
-
-fn release_has_binary_asset(release: &serde_json::Value, asset_name: &str) -> bool {
-    release["assets"]["links"]
-        .as_array()
-        .map(|links| {
-            links
-                .iter()
-                .any(|link| link["name"].as_str() == Some(asset_name))
-        })
-        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -975,11 +1006,19 @@ mod tests {
     }
 
     #[test]
-    fn picks_latest_release_that_ships_the_current_binary() {
-        // GitLab returns releases newest-first. The v0.2 rc ships the
+    fn candidates_are_newest_first_and_skip_legacy_asset_releases() {
+        // GitLab returns releases newest-first. The v0.2 rcs ship the
         // quip-miner-* asset; the older v0.1.x release only has the legacy
-        // quip-network-node-* asset, so it must be skipped.
+        // quip-network-node-* asset, so it must be excluded.
         let releases = serde_json::json!([
+            {
+                "tag_name": "v0.2.0rc2",
+                "description": "rc2 notes",
+                "assets": { "links": [
+                    { "name": binary_name(),
+                      "direct_asset_url": "https://example/releases/v0.2.0rc2/downloads/bin" }
+                ]}
+            },
             {
                 "tag_name": "v0.2.0rc1",
                 "assets": { "links": [
@@ -993,21 +1032,23 @@ mod tests {
             }
         ]);
 
-        let rel = find_latest_binary_release(&releases, binary_name()).expect("a match");
-        assert_eq!(rel["tag_name"], "v0.2.0rc1");
+        let candidates = binary_release_candidates(&releases, binary_name());
+        let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(tags, vec!["v0.2.0rc2", "v0.2.0rc1"]);
         assert_eq!(
-            release_asset_url(rel, binary_name()).as_deref(),
-            Some("https://example/releases/v0.2.0rc1/downloads/bin")
+            candidates[0].1,
+            "https://example/releases/v0.2.0rc2/downloads/bin"
         );
+        assert_eq!(candidates[0].2, "rc2 notes");
     }
 
     #[test]
-    fn no_release_shipping_the_binary_resolves_to_none() {
+    fn no_release_shipping_the_binary_yields_no_candidates() {
         let releases = serde_json::json!([
             { "tag_name": "v0.1.20",
               "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] } }
         ]);
-        assert!(find_latest_binary_release(&releases, binary_name()).is_none());
+        assert!(binary_release_candidates(&releases, binary_name()).is_empty());
     }
 
     #[test]
@@ -1019,24 +1060,6 @@ mod tests {
             release_asset_url(&rel, binary_name()).as_deref(),
             Some("https://example/u")
         );
-    }
-
-    #[test]
-    fn release_asset_detection_finds_current_platform_binary() {
-        let release = serde_json::json!({
-            "assets": {
-                "links": [
-                    { "name": binary_name() },
-                    { "name": "other-file" }
-                ]
-            }
-        });
-
-        assert!(release_has_binary_asset(&release, binary_name()));
-        assert!(!release_has_binary_asset(
-            &release,
-            "quip-network-node-macos-arm64"
-        ));
     }
 
     #[test]
