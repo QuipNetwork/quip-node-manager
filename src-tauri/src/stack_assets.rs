@@ -20,6 +20,9 @@
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:80` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
+//!   - compose.yml (Native mode only): the validator's JSON-RPC port is
+//!     published on the host loopback (127.0.0.1:9944) so the host-side
+//!     miner can connect to `ws://127.0.0.1:9944` directly.
 
 use crate::settings::{data_dir, RunMode};
 use std::fs;
@@ -43,6 +46,10 @@ const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
 /// defaults to 30033 and is also used for generated `--public-addr` values.
 const CONTAINER_VALIDATOR_PORT: u16 = 30333;
+/// Validator JSON-RPC port inside the container. In Native mode it's published
+/// on the host loopback (on a configurable host port, default 9944) so the
+/// host-side miner can connect directly rather than via Caddy's `/rpc` route.
+const CONTAINER_VALIDATOR_RPC_PORT: u16 = 9944;
 
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
 pub fn stack_compose_file() -> PathBuf {
@@ -83,13 +90,21 @@ pub fn sync_stack_assets(
     validator_port: u16,
     public_host: &str,
     native_rest_port: u16,
+    validator_rpc_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
     for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
-    let compose_out = patch_compose_file(COMPOSE_YML, public_api_port, validator_port, public_host);
+    let compose_out = patch_compose_file(
+        run_mode,
+        COMPOSE_YML,
+        public_api_port,
+        validator_port,
+        public_host,
+        validator_rpc_port,
+    );
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
 
@@ -102,13 +117,38 @@ pub fn sync_stack_assets(
 }
 
 fn patch_compose_file(
+    run_mode: &RunMode,
     src: &str,
     public_api_port: u16,
     validator_port: u16,
     public_host: &str,
+    validator_rpc_port: u16,
 ) -> String {
     let patched = patch_compose_ports(src, public_api_port, validator_port);
+    let patched =
+        expose_native_validator_rpc(run_mode, &patched, validator_port, validator_rpc_port);
     patch_validator_public_addr(&patched, public_host, validator_port)
+}
+
+/// In Native mode, publish the validator's JSON-RPC port on the host loopback
+/// (`127.0.0.1:<validator_rpc_port>`) so the host-side miner can reach it. In
+/// Docker mode the miner is a container and reaches `quip-validator:9944` over
+/// the compose network, so no host publish is needed.
+fn expose_native_validator_rpc(
+    run_mode: &RunMode,
+    src: &str,
+    validator_port: u16,
+    validator_rpc_port: u16,
+) -> String {
+    if !matches!(run_mode, RunMode::Native) {
+        return src.to_string();
+    }
+    // Anchor on the (already port-patched) validator UDP mapping so the RPC
+    // mapping lands inside the quip-validator service's `ports:` list.
+    let udp_line = format!("      - \"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\"\n");
+    let rpc_line =
+        format!("      - \"127.0.0.1:{validator_rpc_port}:{CONTAINER_VALIDATOR_RPC_PORT}\"\n");
+    src.replacen(&udp_line, &format!("{udp_line}{rpc_line}"), 1)
 }
 
 /// Remap host sides of canonical upstream `HOST:CONTAINER` port directives.
@@ -207,32 +247,90 @@ mod tests {
     #[test]
     fn patch_compose_file_adds_public_addr_from_dns_public_host() {
         let patched = patch_compose_file(
+            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "node.example.com",
+            9944,
         );
         assert!(patched.contains("      - --public-addr=/dns4/node.example.com/tcp/30033\n"));
     }
 
     #[test]
     fn patch_compose_file_adds_public_addr_from_ip_public_host() {
-        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "1.2.3.4");
+        let patched = patch_compose_file(
+            &RunMode::Docker,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "1.2.3.4",
+            9944,
+        );
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
         let patched = patch_compose_file(
+            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "[2001:db8::1]",
+            9944,
         );
         assert!(patched.contains("      - --public-addr=/ip6/2001:db8::1/tcp/30033\n"));
     }
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
-        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "");
+        let patched = patch_compose_file(
+            &RunMode::Docker,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "",
+            9944,
+        );
         assert!(!patched.contains("--public-addr"));
+    }
+
+    #[test]
+    fn native_mode_publishes_validator_rpc_on_configured_host_port() {
+        let patched = patch_compose_file(
+            &RunMode::Native,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "",
+            9944,
+        );
+        assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
+        // Inserted right after the validator's UDP mapping, inside its ports.
+        assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
+
+        // The host side honours the configured port; the container side is
+        // always the validator's fixed 9944.
+        let custom = patch_compose_file(
+            &RunMode::Native,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "",
+            9955,
+        );
+        assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
+    }
+
+    #[test]
+    fn docker_mode_does_not_publish_validator_rpc() {
+        let patched = patch_compose_file(
+            &RunMode::Docker,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "",
+            9944,
+        );
+        assert!(!patched.contains("9944:9944"));
     }
 
     #[test]

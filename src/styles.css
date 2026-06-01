@@ -801,11 +801,59 @@ button.check-action:disabled {
   background: var(--border-input);
 }
 
-.run-mode-warning {
+/* ─── Image Pull Progress ───────────────────────────────────────────────── */
+.pull-progress-panel {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
   font-size: 12px;
-  color: var(--warning);
-  max-width: 400px;
-  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pull-progress-title {
+  color: var(--text-faint);
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+
+.pp-row {
+  display: grid;
+  grid-template-columns: 160px 1fr 86px;
+  align-items: center;
+  gap: 10px;
+}
+
+.pp-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+}
+
+.pp-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border-input, #333);
+  overflow: hidden;
+}
+
+.pp-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.2s ease;
+}
+
+.pp-bar-fill.done {
+  background: var(--success, #3fb950);
+}
+
+.pp-detail {
+  text-align: right;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ─── GPU Device Toggle Switch ──────────────────────────────────────────── */

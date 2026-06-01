@@ -616,6 +616,7 @@ impl TuiApp {
             config.validator_port,
             &config.public_host,
             crate::compose::native_rest_port(config),
+            config.validator_rpc_port,
         ) {
             self.set_status(format!("Stack asset error: {}", e));
             return;

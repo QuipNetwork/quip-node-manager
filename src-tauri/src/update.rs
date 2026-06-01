@@ -343,29 +343,29 @@ mod tests {
     use crate::settings::{AppSettings, ImageTag, RunMode};
 
     #[test]
-    fn image_refs_use_v02_preview_repositories() {
+    fn image_refs_use_v02_repositories() {
         let refs = [
             (
                 ImageRef::Miner(ImageTag::Cpu),
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2",
                 "quip.network/quip-protocol/quip-miner-cpu",
                 "Miner (CPU)",
             ),
             (
                 ImageRef::Miner(ImageTag::Cuda),
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
                 "quip.network/quip-protocol/quip-miner-cuda",
                 "Miner (CUDA)",
             ),
             (
                 ImageRef::Validator,
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
                 "quip.network/quip-protocol-rs/quip-network-node",
                 "Validator",
             ),
             (
                 ImageRef::Dashboard,
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
                 "quip.network/dashboard.quip.network",
                 "Dashboard",
             ),
@@ -374,7 +374,7 @@ mod tests {
         for (image, local_ref, gitlab_path, display_name) in refs {
             assert_eq!(image.local_ref(), local_ref);
             assert_eq!(image.gitlab_path(), gitlab_path);
-            assert_eq!(image.tag(), "v0.2-preview");
+            assert_eq!(image.tag(), "v0.2");
             assert_eq!(image.display_name(), display_name);
         }
     }
@@ -392,9 +392,9 @@ mod tests {
         assert_eq!(
             docker_images,
             vec![
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
             ]
         );
 
@@ -405,7 +405,7 @@ mod tests {
             .collect();
         assert_eq!(
             native_images,
-            vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview"]
+            vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
         );
     }
 }

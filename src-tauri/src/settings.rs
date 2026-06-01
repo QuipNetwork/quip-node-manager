@@ -83,6 +83,34 @@ impl Default for GpuDeviceConfig {
     }
 }
 
+/// Apple Metal (MPS) tuning. A Mac exposes a single implicit GPU, so this
+/// is a standalone config rather than a per-device list. Maps 1:1 to the
+/// v0.2 `[metal]` section: `utilization`/`yielding` are shared GPU keys,
+/// `active_util`/`idle_after_s` are Metal-only adaptive-cap knobs the
+/// protocol keeps out of `[gpu]` inheritance.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MetalConfig {
+    /// Idle/headless occupancy cap (1-100). Flat-out when nobody's present.
+    pub utilization: u8,
+    /// Enable the adaptive cap monitor (HID-idle / thermal / battery sensing).
+    pub yielding: bool,
+    /// Occupancy cap (%) while the user is present.
+    pub active_util: u8,
+    /// Seconds of no input before going idle/flat-out.
+    pub idle_after_s: u32,
+}
+
+impl Default for MetalConfig {
+    fn default() -> Self {
+        MetalConfig {
+            utilization: 100,
+            yielding: true,
+            active_util: 85,
+            idle_after_s: 60,
+        }
+    }
+}
+
 // ─── QPU / D-Wave ───────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -126,6 +154,9 @@ fn default_port() -> u16 {
 }
 fn default_validator_port() -> u16 {
     30033
+}
+fn default_validator_rpc_port() -> u16 {
+    9944
 }
 fn default_listen() -> String {
     "::".to_string()
@@ -178,6 +209,10 @@ pub struct NodeConfig {
     // v0.2: validator libp2p host port, mapped to container-internal 30333.
     #[serde(default = "default_validator_port")]
     pub validator_port: u16,
+    // v0.2 (Native mode): host port the validator's JSON-RPC (container 9944)
+    // is published on, and that the host-side miner connects to.
+    #[serde(default = "default_validator_rpc_port")]
+    pub validator_rpc_port: u16,
     // v0.1 legacy fields kept for app-settings.json compatibility.
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -243,6 +278,8 @@ pub struct NodeConfig {
     pub gpu_backend: GpuBackend,
     #[serde(default)]
     pub gpu_device_configs: Vec<GpuDeviceConfig>,
+    #[serde(default)]
+    pub metal_config: MetalConfig,
 
     // D-Wave QPU
     #[serde(default)]
@@ -264,6 +301,7 @@ impl Default for NodeConfig {
         NodeConfig {
             port: 20049,
             validator_port: 30033,
+            validator_rpc_port: 9944,
             listen: "::".to_string(),
             public_host: String::new(),
             public_port: None,
@@ -288,6 +326,7 @@ impl Default for NodeConfig {
             num_cpus: 1,
             gpu_backend: GpuBackend::Local,
             gpu_device_configs: vec![],
+            metal_config: MetalConfig::default(),
             dwave_config: None,
             timeout: 3,
             heartbeat_interval: 15,

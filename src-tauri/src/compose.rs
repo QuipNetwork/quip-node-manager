@@ -225,7 +225,59 @@ fn render_env_lines(
 /// respects context timeouts; this is a backstop against a wedged daemon.
 const COMPOSE_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How to surface a compose command's output.
+#[derive(Clone, Copy)]
+enum StdoutMode {
+    /// Emit each raw line to node-log (used by up/down).
+    Log,
+    /// Parse `docker compose --progress json` events (emitted on stderr) into
+    /// structured `pull-progress` events. Only image-level milestones and
+    /// unparseable lines reach node-log, so the console isn't flooded with
+    /// per-layer churn.
+    PullJson,
+}
+
+/// Parse one `--progress json` line and emit a structured `pull-progress`
+/// event. Returns `true` if the line was a recognised progress event (so the
+/// caller can skip treating it as error output). Image-level milestones are
+/// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
+/// record without the per-layer noise.
+fn emit_pull_progress_json(app: &AppHandle, line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    // Image-level events have no parent layer; mirror them to the log.
+    if value.get("parent_id").is_none() && id.starts_with("Image ") {
+        let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = app.emit(
+            "node-log",
+            serde_json::json!({
+                "timestamp": "",
+                "level": "INFO",
+                "message": format!("{} {}", text, id.trim_start_matches("Image ")),
+            }),
+        );
+    }
+    let _ = app.emit("pull-progress", value);
+    true
+}
+
 async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
+    run_compose_streaming_mode(app, args, StdoutMode::Log).await
+}
+
+async fn run_compose_streaming_mode(
+    app: &AppHandle,
+    args: Vec<String>,
+    mode: StdoutMode,
+) -> Result<(), String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let mut child = compose_cmd()
@@ -241,7 +293,9 @@ async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(),
         let app_out = app.clone();
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                if matches!(mode, StdoutMode::Log) {
+                    let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                }
                 let _ = app_out.emit(
                     "node-log",
                     serde_json::json!({
@@ -253,10 +307,16 @@ async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(),
             }
         });
 
+        // docker compose writes `--progress json` events to stderr, so the
+        // PullJson parsing lives here. Non-progress lines stay error output.
         let app_err = app.clone();
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if matches!(mode, StdoutMode::PullJson) && emit_pull_progress_json(&app_err, &line)
+                {
+                    continue;
+                }
                 let _ = app_err.emit(
                     "node-log",
                     serde_json::json!({
@@ -312,7 +372,7 @@ pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/qui
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
-pub const COMPOSE_IMAGE_TAG: &str = "v0.2-preview";
+pub const COMPOSE_IMAGE_TAG: &str = "v0.2";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -360,7 +420,7 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 
 /// Pull every image needed by the current profile + service list. Runs
 /// `docker compose --profile <p> pull [services...]` so the daemon checks the
-/// registry for the configured v0.2 preview tags even if local copies exist.
+/// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     let settings = crate::settings::load_settings();
@@ -372,7 +432,12 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
         settings.node_config.validator_port,
         &settings.node_config.public_host,
         native_rest_port(&settings.node_config),
+        settings.node_config.validator_rpc_port,
     )?;
+    // Write .env too: without it compose substitutes the compose.yml
+    // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
+    // start sequence) would silently fetch the wrong tag.
+    write_env_file(&settings)?;
 
     pull_compose_images_for_settings(&app, &settings).await
 }
@@ -383,13 +448,19 @@ async fn pull_compose_images_for_settings(
 ) -> Result<(), String> {
     let profile = compose_profile(settings.image_tag);
 
-    let mut args: Vec<String> = vec!["--profile".into(), profile.into(), "pull".into()];
+    let mut args: Vec<String> = vec![
+        "--progress".into(),
+        "json".into(),
+        "--profile".into(),
+        profile.into(),
+        "pull".into(),
+    ];
     for s in compose_services(&settings.run_mode, settings.tls_enabled) {
         args.push((*s).into());
     }
 
     log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    run_compose_streaming(app, args).await
+    run_compose_streaming_mode(app, args, StdoutMode::PullJson).await
 }
 
 /// Start the compose stack (and, in Native mode, arrange for the native
@@ -445,6 +516,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.node_config.validator_port,
         &settings.node_config.public_host,
         rest_port,
+        settings.node_config.validator_rpc_port,
     )?;
 
     // (5) .env
@@ -794,7 +866,7 @@ mod tests {
             DASHBOARD_IMAGE,
             "registry.gitlab.com/quip.network/dashboard.quip.network"
         );
-        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2-preview");
+        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
     }
 
     #[test]
@@ -816,9 +888,9 @@ mod tests {
         assert!(env.contains("CERT_EMAIL=ops@example.com"));
         assert!(env.contains("ZEROSSL_API_KEY=zero"));
         assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
-        assert!(env.contains("QUIP_MINER_TAG=v0.2-preview"));
-        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2-preview"));
-        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2-preview"));
+        assert!(env.contains("QUIP_MINER_TAG=v0.2"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
         assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));

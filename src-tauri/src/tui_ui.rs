@@ -568,8 +568,8 @@ fn field_value<'a>(app: &TuiApp, id: &FocusId, current: &str) -> String {
 }
 
 fn shorten_image(image: &str) -> String {
-    // registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2-preview
-    // → .../quip-miner-cpu:v0.2-preview
+    // registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2
+    // → .../quip-miner-cpu:v0.2
     if let Some(slash) = image.rfind('/') {
         format!(".../{}", &image[slash + 1..])
     } else {

@@ -107,8 +107,8 @@ document.addEventListener('change', (e) => {
   if (!e.target) return;
   if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
-    // TLS changes profile-specific port checks (port-dashboard / port-tls)
-    // without waiting for the next recheck cycle.
+    // TLS adds caddy:2-alpine to the required stack images — recheck so
+    // stack-images reflects it without waiting for the next cycle.
     invoke('recheck').catch(() => {});
   }
 });
@@ -164,10 +164,9 @@ function refreshDashboardTab() {
 // include ids that don't appear in state.checks for the current settings
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
-  'docker', 'docker-compose', 'stack-assets', 'wsl',
+  'docker', 'docker-compose', 'wsl',
   'stack-images', 'binary', 'version', 'secret',
-  'ip', 'hostname', 'port', 'port-validator', 'port-dashboard', 'port-tls',
-  'rest-port-native', 'firewall', 'dwave-key',
+  'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
 // State-to-icon mapping for the checklist. CSS class `state-<state>`
@@ -189,6 +188,12 @@ const FIX_LABELS = {
   GenerateSecret:  'Generate Secret',
   Delegate:        'Update',
 };
+
+// Checks whose fix is folded into the Retry button: Retry runs the fix
+// (only when the check is failing — re-downloading or, worse, regenerating
+// the node secret on a passing check would be wasteful/destructive) and
+// then rechecks. These show a single Retry button, no separate fix.
+const FIX_FOLDED_INTO_RETRY = new Set(['stack-images', 'binary', 'secret']);
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach((btn) => {
@@ -252,7 +257,7 @@ document.getElementById('validator-port').addEventListener('change', async () =>
   if (state.settings) {
     state.settings.node_config.validator_port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port-validator', 'firewall'] }).catch(console.error);
+    await invoke('recheck', { ids: ['port-validator'] }).catch(console.error);
   }
 });
 
@@ -288,49 +293,38 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
   }
 });
 
-// ─── Run mode select ─────────────────────────────────────────────────────────
-document.getElementById('run-mode-select').addEventListener('change', async () => {
+// ─── Run mode ─────────────────────────────────────────────────────────
+//
+// run_mode has no dedicated UI control. On macOS it is driven by the Metal
+// GPU toggle in renderGpuDevices (on -> native/Metal, off -> docker/CPU);
+// everywhere else the manager always runs the Dockerized stack.
+
+/// Flip run_mode from the Metal toggle, persist, and re-run the checklist
+/// (the visible checks differ between native and docker — e.g. the native
+/// binary check).
+async function setMetalEnabled(enabled) {
   if (!state.settings) return;
-  state.settings.run_mode = document.getElementById('run-mode-select').value;
-  updateRunModeUI();
+  state.settings.run_mode = enabled ? 'native' : 'docker';
   await invoke('update_settings', { settings: state.settings }).catch(console.error);
   // Mode change invalidates the whole cache — backend reseeds and reruns.
   state.checks.clear();
   await invoke('recheck').catch(console.error);
-});
+  updateRunModeUI();
+}
 
 function updateRunModeUI() {
-  const survey = state.hardwareSurvey;
-  const isMac = survey?.os === 'macos';
+  const isMac = state.hardwareSurvey?.os === 'macos';
 
-  // Run Mode toggle is only available on macOS
-  const runModeGroup = document.getElementById('run-mode-group');
-  if (runModeGroup) {
-    runModeGroup.style.display = isMac ? '' : 'none';
-  }
-
-  // Force Docker on non-macOS
+  // Off macOS there is no Metal backend, so the manager always runs the
+  // Dockerized stack. On macOS run_mode reflects the Metal toggle.
   if (!isMac && state.settings) {
     state.settings.run_mode = 'docker';
   }
-
-  const mode = state.settings?.run_mode || 'docker';
-  const isDocker = mode === 'docker';
 
   // Checklist items are filtered by mode inside renderChecklist(); re-render
   // here because mode and the hardware survey (WSL visibility) can land
   // in either order during init.
   renderChecklist();
-
-  // Warnings (only relevant on macOS where the toggle exists)
-  const warning = document.getElementById('run-mode-warning');
-  if (isDocker && isMac) {
-    warning.textContent = '\u26A0 Mac Metal GPUs are not accessible in Docker.';
-    warning.style.display = '';
-  } else {
-    warning.style.display = 'none';
-  }
-
   renderGpuDevices();
 }
 
@@ -340,6 +334,15 @@ function renderGpuDevices() {
   const globalSettings = document.getElementById('gpu-global-settings');
   const survey = state.hardwareSurvey;
   const devices = survey?.gpu_devices || [];
+  const isMetal = survey?.gpu_backend === 'metal';
+  // On macOS the Metal toggle IS the run-mode selector: native = Metal on.
+  const metalEnabled = (state.settings?.run_mode || 'docker') === 'native';
+
+  // Metal exposes adaptive-cap knobs, but only while it's enabled; CUDA never.
+  const metalExtra = document.getElementById('metal-extra-settings');
+  if (metalExtra) {
+    metalExtra.style.display = isMetal && metalEnabled ? '' : 'none';
+  }
 
   list.replaceChildren();
 
@@ -360,7 +363,7 @@ function renderGpuDevices() {
     const saved = savedConfigs.find((c) => c.index === dev.index);
     const enabled = saved ? saved.enabled : false;
     const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
-    const backendLabel = survey.gpu_backend === 'metal' ? 'Metal' : 'CUDA';
+    const backendLabel = isMetal ? 'Metal' : 'CUDA';
 
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
@@ -369,22 +372,43 @@ function renderGpuDevices() {
     label.className = 'gpu-toggle-switch';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
-    checkbox.className = 'gpu-device-toggle';
-    checkbox.dataset.index = String(dev.index);
-    checkbox.checked = enabled;
     const slider = document.createElement('span');
     slider.className = 'gpu-toggle-slider';
+
+    if (isMetal) {
+      // Metal is a single implicit GPU only reachable from the native miner,
+      // so its enable toggle doubles as the run-mode selector: on → native
+      // (Metal mining), off → docker (CPU mining).
+      checkbox.className = 'metal-enable-toggle';
+      checkbox.checked = metalEnabled;
+      checkbox.addEventListener('change', () => setMetalEnabled(checkbox.checked));
+    } else {
+      // CUDA gets a per-device toggle so individual cards can be enabled.
+      checkbox.className = 'gpu-device-toggle';
+      checkbox.dataset.index = String(dev.index);
+      checkbox.checked = enabled;
+    }
     label.appendChild(checkbox);
     label.appendChild(slider);
+    row.appendChild(label);
 
     const text = document.createElement('span');
     text.style.fontSize = '13px';
     text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
 
-    row.appendChild(label);
     row.appendChild(text);
     list.appendChild(row);
   });
+
+  // Make the Metal on/off → mining-mode consequence explicit.
+  if (isMetal) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:12px;color:var(--text-faint);padding:2px 0 0 0;';
+    hint.textContent = metalEnabled
+      ? 'Metal GPU mining enabled — runs the native miner.'
+      : 'Metal off — the node runs CPU mining via Docker.';
+    list.appendChild(hint);
+  }
 }
 
 // ─── TLS guide toggle ────────────────────────────────────────────────────────
@@ -451,6 +475,12 @@ document.getElementById('gpu-utilization').addEventListener('input', () => {
   document.getElementById('gpu-util-display').textContent = `${val}%`;
 });
 
+// ─── Metal active-utilization slider ─────────────────────────────────────────
+document.getElementById('metal-active-util').addEventListener('input', () => {
+  const val = document.getElementById('metal-active-util').value;
+  document.getElementById('metal-active-util-display').textContent = `${val}%`;
+});
+
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
 function collectConfig() {
   const gpuUtilization = parseInt(document.getElementById('gpu-utilization')?.value) || 80;
@@ -469,6 +499,16 @@ function collectConfig() {
     });
   });
 
+  // Metal tuning is a standalone single-GPU config (the [metal] section);
+  // utilization/yielding are shared with the slider above, active_util and
+  // idle_after_s are Metal-only adaptive-cap knobs.
+  const metalConfig = {
+    utilization: gpuUtilization,
+    yielding: gpuYielding,
+    active_util: parseInt(document.getElementById('metal-active-util')?.value) || 85,
+    idle_after_s: parseInt(document.getElementById('metal-idle-after')?.value) || 60,
+  };
+
   const qpuToken = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
   const dwaveConfig = qpuToken
     ? {
@@ -486,6 +526,7 @@ function collectConfig() {
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
     validator_port: parseInt(document.getElementById('validator-port').value) || 30033,
+    validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
     listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
@@ -514,6 +555,7 @@ function collectConfig() {
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
+    metal_config: metalConfig,
     dwave_config: dwaveConfig,
     timeout: base.timeout ?? 3,
     heartbeat_interval: base.heartbeat_interval ?? 15,
@@ -554,6 +596,7 @@ function populateForm(settings) {
   // Validator / miner configuration
   document.getElementById('port').value = c.port ?? 20049;
   document.getElementById('validator-port').value = c.validator_port ?? 30033;
+  document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
 
   // Custom settings
@@ -594,12 +637,23 @@ function populateForm(settings) {
   // CPU Miner
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
 
-  // GPU Miner — utilization/yielding from first enabled device or defaults
+  // GPU Miner — for Metal, utilization/yielding come from metal_config;
+  // for CUDA, from the first enabled device (or defaults).
+  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
+  const metalCfg = c.metal_config ?? {};
   const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
-  const savedUtil = gpuCfg?.utilization ?? 80;
+  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
-  document.getElementById('gpu-yielding').checked = gpuCfg?.yielding ?? false;
+  document.getElementById('gpu-yielding').checked = isMetal
+    ? (metalCfg.yielding ?? true)
+    : (gpuCfg?.yielding ?? false);
+
+  // Metal-only adaptive-cap knobs
+  const activeUtil = metalCfg.active_util ?? 85;
+  document.getElementById('metal-active-util').value = activeUtil;
+  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
+  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
 
   // D-Wave
   const dw = c.dwave_config;
@@ -669,7 +723,6 @@ function setStatus(stateStr) {
 function visibleInMode(id, runMode) {
   const s = state.settings;
   const isDocker = (runMode || 'docker') === 'docker';
-  const tls = s?.tls_enabled ?? false;
   const hasDwave = !!s?.node_config?.dwave_config;
   // Compose runs in both Docker mode and Native mode. Native uses it for the
   // validator/dashboard support services even when the miner runs on the host.
@@ -678,22 +731,15 @@ function visibleInMode(id, runMode) {
   switch (id) {
     case 'docker':
     case 'docker-compose':
-    case 'stack-assets':
     case 'stack-images':
       return composeWillRun;
     case 'wsl':
       return isDocker && state.hardwareSurvey?.os === 'windows';
     case 'binary':
       return !isDocker;
-    case 'port-dashboard':
-      return composeWillRun && !tls;
-    case 'port-tls':
-      return composeWillRun && tls;
-    case 'rest-port-native':
-      return !isDocker;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / ports / firewall — always shown.
+    // version / secret / ip / hostname / ports — always shown.
     default:
       return true;
   }
@@ -720,11 +766,17 @@ function renderChecklistItem(item) {
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
   recheckBtn.dataset.action = 'recheck';
-  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Recheck';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Retry';
   recheckBtn.disabled = item.state === 'running';
   actions.appendChild(recheckBtn);
 
-  if (item.fixable && (item.state === 'fail' || item.state === 'warn')) {
+  // For checks whose fix is folded into Retry (Retry runs the fix, then
+  // rechecks) we drop the dedicated fix button entirely.
+  if (
+    item.fixable &&
+    !FIX_FOLDED_INTO_RETRY.has(item.id) &&
+    (item.state === 'fail' || item.state === 'warn')
+  ) {
     const fixBtn = document.createElement('button');
     fixBtn.type = 'button';
     fixBtn.className = 'btn btn-sm btn-secondary check-action';
@@ -759,7 +811,6 @@ function defaultLabel(id) {
   switch (id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
-    case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
     case 'wsl':               return 'WSL installed with distro';
     case 'stack-images':      return 'Stack images available';
     case 'binary':            return 'Native miner binary available';
@@ -767,13 +818,8 @@ function defaultLabel(id) {
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Public API port ${port} — press Recheck to test`;
+    case 'port':              return `Public API port ${port} — press Retry to test`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
-    case 'port-dashboard':    return 'Dashboard port 20080 available';
-    case 'port-tls':          return 'TLS ports 80 + 443 available';
-    case 'rest-port-native':  return 'Native REST port available';
-    case 'firewall':
-      return `Local firewall allows validator P2P port ${validatorPort} (UDP+TCP)`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
   }
@@ -834,6 +880,32 @@ function mergeCheckUpdate(item) {
   }
 }
 
+// ─── Stack images: pull, then recheck ────────────────────────────────────────
+// The stack-images Recheck button pulls every image in the current profile
+// (node + dashboard + postgres + caddy as applicable) and then reruns the
+// check, so the user doesn't need a separate Pull Image action.
+async function pullStackImagesThenRecheck() {
+  // Optimistically show the running state so the button disables during the
+  // pull; the backend recheck below emits the real terminal state after.
+  const item = state.checks.get('stack-images');
+  if (item) {
+    state.checks.set('stack-images', {
+      ...item,
+      state: 'running',
+      label: 'Pulling stack images…',
+    });
+    renderChecklist();
+  }
+  try {
+    await invoke('pull_compose_images');
+  } catch (e) {
+    appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
+    finishPullProgress();
+  }
+  // Version reflects image freshness in Docker mode, so refresh it too.
+  await invoke('recheck', { ids: ['stack-images', 'version'] }).catch(console.error);
+}
+
 // ─── Fix action dispatcher ──────────────────────────────────────────────────
 async function runFix(id) {
   const item = state.checks.get(id);
@@ -892,13 +964,30 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   const id = li?.dataset.id;
   if (!id) return;
   if (btn.dataset.action === 'recheck') {
-    invoke('recheck', { ids: [id] }).catch(console.error);
+    const item = state.checks.get(id);
+    const failing = item && (item.state === 'fail' || item.state === 'warn');
+    if (id === 'stack-images') {
+      // stack-images always pulls on Retry (cache-busts :v0.2), then rechecks.
+      pullStackImagesThenRecheck();
+    } else if (FIX_FOLDED_INTO_RETRY.has(id) && failing) {
+      // binary / secret: Retry runs the fix, then rechecks — but only while
+      // failing, so a passing check isn't re-downloaded or its secret reset.
+      retryWithFix(id);
+    } else {
+      invoke('recheck', { ids: [id] }).catch(console.error);
+    }
   } else if (btn.dataset.action === 'fix') {
     runFix(id);
   }
 });
 
-// ─── Global Recheck All ──────────────────────────────────────────────────────
+// Run a check's fix (download binary, generate secret), then recheck it.
+async function retryWithFix(id) {
+  await runFix(id);
+  await invoke('recheck', { ids: [id] }).catch(console.error);
+}
+
+// ─── Global Retry All ─────────────────────────────────────────────────────────
 document.getElementById('btn-recheck-all').addEventListener('click', () => {
   invoke('recheck').catch(console.error);
 });
@@ -941,6 +1030,134 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
   state.logLines = [];
   document.getElementById('log-output').innerHTML = '';
 });
+
+// ─── Image pull progress ──────────────────────────────────────────────────────
+// docker compose --progress json streams per-layer events; we aggregate them
+// into one bar per image (summing the layer byte counts) and render them live
+// in the log drawer, hiding the panel once every image reports done.
+function friendlyImageName(id) {
+  // "Image registry.gitlab.com/ns/quip-miner-cpu:v0.2" -> "quip-miner-cpu:v0.2"
+  const ref = String(id).replace(/^Image\s+/, '');
+  const slash = ref.lastIndexOf('/');
+  return slash >= 0 ? ref.slice(slash + 1) : ref;
+}
+
+function handlePullProgress(ev) {
+  // Legacy {line} events (non-pull compose commands) have no id — ignore them.
+  if (!ev || typeof ev.id !== 'string') return;
+  if (!state.pull || !state.pull.active) {
+    state.pull = { active: true, title: 'Pulling stack images', images: new Map() };
+  }
+
+  const isImageLevel = !ev.parent_id && ev.id.startsWith('Image ');
+  const imageId = isImageLevel ? ev.id : ev.parent_id || ev.id;
+  let img = state.pull.images.get(imageId);
+  if (!img) {
+    img = { name: friendlyImageName(imageId), layers: new Map(), done: false };
+    state.pull.images.set(imageId, img);
+  }
+
+  if (isImageLevel) {
+    if (ev.status === 'Done' || ev.text === 'Pulled') img.done = true;
+  } else {
+    const layerDone = ev.text === 'Pull complete' || ev.text === 'Already exists';
+    const prev = img.layers.get(ev.id) || { cur: 0, tot: 0 };
+    const tot = Number(ev.total) || prev.tot;
+    img.layers.set(ev.id, {
+      cur: layerDone && tot ? tot : Math.max(prev.cur, Number(ev.current) || 0),
+      tot,
+    });
+  }
+
+  renderPullPanel();
+
+  const images = [...state.pull.images.values()];
+  if (images.length > 0 && images.every((i) => i.done)) {
+    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
+  }
+}
+
+function renderPullPanel() {
+  const panel = document.getElementById('pull-progress-panel');
+  if (!panel || !state.pull) return;
+  panel.style.display = '';
+
+  const title = document.createElement('div');
+  title.className = 'pull-progress-title';
+  title.textContent = state.pull.title || 'Downloading';
+  const rows = [title];
+
+  for (const img of state.pull.images.values()) {
+    const layers = [...img.layers.values()];
+    const tot = layers.reduce((s, l) => s + l.tot, 0);
+    const cur = layers.reduce((s, l) => s + l.cur, 0);
+    const pct = img.done ? 100 : tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : 0;
+
+    const row = document.createElement('div');
+    row.className = 'pp-row';
+
+    const name = document.createElement('span');
+    name.className = 'pp-name';
+    name.textContent = img.name;
+
+    const bar = document.createElement('span');
+    bar.className = 'pp-bar';
+    const fill = document.createElement('span');
+    fill.className = `pp-bar-fill${img.done ? ' done' : ''}`;
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+
+    const detail = document.createElement('span');
+    detail.className = 'pp-detail';
+    detail.textContent = img.done
+      ? 'done'
+      : tot > 0
+        ? `${toMB(cur)}/${toMB(tot)} MB`
+        : `${pct}%`;
+
+    row.append(name, bar, detail);
+    rows.push(row);
+  }
+  panel.replaceChildren(...rows);
+}
+
+function toMB(bytes) {
+  return (bytes / 1_048_576).toFixed(0);
+}
+
+function finishPullProgress() {
+  if (state._pullHideTimer) {
+    clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = null;
+  }
+  const panel = document.getElementById('pull-progress-panel');
+  if (panel) {
+    panel.style.display = 'none';
+    panel.replaceChildren();
+  }
+  state.pull = { active: false, images: new Map() };
+}
+
+// The native miner binary download reuses the same panel as a single bar.
+function handleBinaryDownloadProgress(ev) {
+  const { downloaded, total, done } = ev || {};
+  if (!state.pull || !state.pull.active) {
+    state.pull = { active: true, title: 'Downloading native miner', images: new Map() };
+  }
+  let img = state.pull.images.get('native-miner');
+  if (!img) {
+    img = { name: 'native miner', layers: new Map(), done: false };
+    state.pull.images.set('native-miner', img);
+  }
+  img.layers.set('binary', { cur: Number(downloaded) || 0, tot: Number(total) || 0 });
+  if (done) img.done = true;
+  renderPullPanel();
+  if (done) {
+    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
+  }
+}
 
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
 function isDockerMode() {
@@ -1145,6 +1362,11 @@ async function setupListeners() {
     }
   });
 
+  // Per-image pull bars (docker compose --progress json, aggregated per image).
+  await listen('pull-progress', (event) => {
+    handlePullProgress(event.payload);
+  });
+
   // Stop lifecycle — update the status pill immediately; backend also
   // emits container-status so we don't have to wait for the next poll.
   await listen('stop-complete', (event) => {
@@ -1180,6 +1402,7 @@ async function setupListeners() {
   });
 
   await listen('binary-download-progress', (event) => {
+    handleBinaryDownloadProgress(event.payload);
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {
@@ -1280,8 +1503,8 @@ async function init() {
     const settings = await invoke('get_settings');
     state.settings = settings;
     populateForm(settings);
-    document.getElementById('run-mode-select').value =
-      settings.run_mode || 'docker';
+    // The Metal toggle (rendered once the hardware survey lands) reflects
+    // run_mode; there is no separate run-mode control to seed here.
     document.getElementById('auto-update-enabled').checked =
       settings.auto_update_enabled ?? false;
     if (settings.active_tab && settings.active_tab !== 'status') {
@@ -1321,14 +1544,10 @@ async function init() {
   invoke('run_hardware_survey')
     .then((survey) => {
       state.hardwareSurvey = survey;
+      // Renders the checklist + GPU section (incl. the Metal toggle, whose
+      // state reflects run_mode). gpu_backend itself is derived from the
+      // survey in collectConfig, so there's nothing to seed here.
       updateRunModeUI();
-      const noSavedGpu =
-        !(state.settings?.node_config?.gpu_device_configs || []).some(
-          (d) => d.enabled
-        ) && state.settings?.node_config?.gpu_backend !== 'mps';
-      if (noSavedGpu && survey.gpu_backend !== 'none') {
-        document.getElementById('gpu-backend').value = survey.gpu_backend;
-      }
     })
     .catch(() => {});
 

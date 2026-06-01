@@ -68,7 +68,7 @@
               <span class="checklist-chevron"></span>
             </div>
           </button>
-          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Recheck All</button>
+          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Retry All</button>
         </div>
         <ul id="checklist" class="checklist"></ul>
       </div>
@@ -101,14 +101,6 @@
               <div class="form-group">
                 <label for="validator-port">Validator P2P Port</label>
                 <input type="number" id="validator-port" min="1024" max="65535" value="30033" />
-              </div>
-              <div class="form-group" id="run-mode-group" style="display:none;">
-                <label for="run-mode-select">Run Mode</label>
-                <select id="run-mode-select">
-                  <option value="docker">Docker</option>
-                  <option value="native">Native</option>
-                </select>
-                <div id="run-mode-warning" class="run-mode-warning" style="display:none;margin-top:4px;"></div>
               </div>
             </div>
             <div class="form-group">
@@ -149,6 +141,11 @@
                   </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
+                <div class="form-group" style="max-width:220px;">
+                  <label for="validator-rpc-port">Validator RPC Port <span style="color:var(--text-faint);font-weight:400;">(native mode)</span></label>
+                  <input type="number" id="validator-rpc-port" min="1024" max="65535" value="9944" />
+                  <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Host port the local miner uses to reach the validator's JSON-RPC.</div>
+                </div>
                 <div class="mining-config-grid">
                   <div class="form-group">
                     <label for="log-level">Log Level</label>
@@ -181,9 +178,6 @@
           <!-- Stack Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">Stack Configuration</div>
-            <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
-              Image is auto-selected: CUDA when any NVIDIA GPU is enabled, CPU otherwise. D-Wave mining activates on top of CPU miner mode.
-            </div>
             <div class="form-group" style="display:flex;align-items:center;gap:10px;">
               <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
               <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>
@@ -235,6 +229,21 @@
                 <span class="gpu-yielding-flag">&#127987;&#65039;</span>
                 <span>Yielding &#8212; GPU will yield to other applications when under load</span>
               </label>
+              <!-- Metal-only adaptive-cap knobs (shown when the GPU backend is Apple Metal) -->
+              <div id="metal-extra-settings" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+                <div style="font-size:12px;color:var(--text-faint);margin-bottom:10px;">
+                  Metal adaptive cap &#8212; active only when Yielding is on. Utilization above is the idle/headless cap (flat-out when nobody's at the Mac).
+                </div>
+                <div class="gpu-setting-row" style="margin-bottom:12px;">
+                  <label>Active utilization</label>
+                  <input type="range" id="metal-active-util" min="1" max="100" value="85" />
+                  <span id="metal-active-util-display" class="gpu-util-display">85%</span>
+                </div>
+                <div class="form-group" style="max-width:200px;margin-bottom:0;">
+                  <label for="metal-idle-after">Idle after <span style="color:var(--text-faint);font-weight:400;">(seconds)</span></label>
+                  <input type="number" id="metal-idle-after" min="1" max="3600" value="60" />
+                </div>
+              </div>
             </div>
           </div>
 
@@ -297,6 +306,7 @@
           <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
         </div>
       </div>
+      <div id="pull-progress-panel" class="pull-progress-panel" style="display:none;"></div>
       <div id="log-output" class="log-output"></div>
     </div>
 
