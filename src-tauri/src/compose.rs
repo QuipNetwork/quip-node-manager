@@ -312,7 +312,7 @@ pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/qui
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
-pub const COMPOSE_IMAGE_TAG: &str = "v0.2-preview";
+pub const COMPOSE_IMAGE_TAG: &str = "v0.2";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -794,7 +794,7 @@ mod tests {
             DASHBOARD_IMAGE,
             "registry.gitlab.com/quip.network/dashboard.quip.network"
         );
-        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2-preview");
+        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
     }
 
     #[test]
@@ -816,9 +816,9 @@ mod tests {
         assert!(env.contains("CERT_EMAIL=ops@example.com"));
         assert!(env.contains("ZEROSSL_API_KEY=zero"));
         assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
-        assert!(env.contains("QUIP_MINER_TAG=v0.2-preview"));
-        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2-preview"));
-        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2-preview"));
+        assert!(env.contains("QUIP_MINER_TAG=v0.2"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
         assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));

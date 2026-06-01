@@ -78,6 +78,17 @@ struct DwaveToml {
 #[derive(Default, Serialize)]
 struct MarkerToml {}
 
+/// v0.2 `[metal]` section. Carries shared GPU keys (`utilization`,
+/// `yielding`) plus the Metal-only adaptive-cap knobs directly, rather
+/// than relying on a shared `[gpu]` block.
+#[derive(Serialize)]
+struct MetalToml {
+    utilization: u8,
+    yielding: bool,
+    active_util: u8,
+    idle_after_s: u32,
+}
+
 #[derive(Serialize)]
 struct ConfigToml {
     miner: MinerToml,
@@ -87,7 +98,7 @@ struct ConfigToml {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     cuda: BTreeMap<String, CudaDeviceToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    metal: Option<MarkerToml>,
+    metal: Option<MetalToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modal: Option<MarkerToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,7 +160,14 @@ impl ConfigToml {
             .map(|d| (d.utilization, d.yielding))
             .unwrap_or((100, false));
 
-        let gpu = if effective_backend.is_some() && !enabled_devices.is_empty() {
+        // [gpu] holds shared defaults for the CUDA-style backends only. Metal
+        // carries its own tuning in [metal] (the protocol keeps Metal's
+        // adaptive-cap keys out of [gpu] inheritance), so MPS never emits it.
+        let gpu = if matches!(
+            effective_backend,
+            Some(GpuBackend::Local) | Some(GpuBackend::Modal)
+        ) && !enabled_devices.is_empty()
+        {
             Some(GpuToml {
                 utilization: gpu_util,
                 yielding: gpu_yield,
@@ -176,7 +194,14 @@ impl ConfigToml {
                     }
                 }
             }
-            Some(GpuBackend::Mps) => metal = Some(MarkerToml::default()),
+            Some(GpuBackend::Mps) => {
+                metal = Some(MetalToml {
+                    utilization: config.metal_config.utilization,
+                    yielding: config.metal_config.yielding,
+                    active_util: config.metal_config.active_util,
+                    idle_after_s: config.metal_config.idle_after_s,
+                })
+            }
             Some(GpuBackend::Modal) => modal = Some(MarkerToml::default()),
             None => {}
         }
@@ -241,7 +266,7 @@ pub async fn generate_config_toml(config: NodeConfig, run_mode: RunMode) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{DwaveConfig, GpuDeviceConfig};
+    use crate::settings::{DwaveConfig, GpuDeviceConfig, MetalConfig};
 
     fn cfg_with_gpu(backend: GpuBackend, devices: Vec<GpuDeviceConfig>) -> NodeConfig {
         NodeConfig {
@@ -347,22 +372,56 @@ mod tests {
     }
 
     #[test]
-    fn mps_backend_emits_gpu_globals_before_metal() {
-        let cfg = cfg_with_gpu(
-            GpuBackend::Mps,
-            vec![GpuDeviceConfig {
-                index: 0,
-                enabled: true,
+    fn mps_backend_writes_tuning_into_metal_section() {
+        // v0.2 [metal] carries its own utilization/yielding plus the
+        // Metal-only adaptive-cap keys; it does NOT rely on a shared [gpu]
+        // block (which the protocol reserves for CUDA inheritance).
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_config: MetalConfig {
                 utilization: 5,
                 yielding: true,
-            }],
-        );
+                active_util: 70,
+                idle_after_s: 30,
+            },
+            ..NodeConfig::default()
+        };
         let toml = render_config_toml(&cfg, &RunMode::Native);
-        let gpu = toml.find("[gpu]").expect("[gpu] section missing");
         let metal = toml.find("[metal]").expect("[metal] section missing");
-        assert!(gpu < metal, "[gpu] must precede [metal]");
-        assert!(toml[gpu..metal].contains("utilization = 5"));
-        assert!(toml[gpu..metal].contains("yielding = true"));
+        assert!(
+            !toml.contains("[gpu]"),
+            "Metal must not emit a shared [gpu] block"
+        );
+        assert!(toml[metal..].contains("utilization = 5"));
+        assert!(toml[metal..].contains("yielding = true"));
+        assert!(toml[metal..].contains("active_util = 70"));
+        assert!(toml[metal..].contains("idle_after_s = 30"));
+    }
+
+    #[test]
+    fn mps_metal_tuning_is_independent_of_cuda_device_toggles() {
+        // A disabled CUDA-style device entry must not suppress Metal tuning:
+        // Metal is a single implicit GPU driven by metal_config.
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            gpu_device_configs: vec![GpuDeviceConfig {
+                index: 0,
+                enabled: false,
+                utilization: 100,
+                yielding: false,
+            }],
+            metal_config: MetalConfig {
+                utilization: 42,
+                yielding: true,
+                active_util: 85,
+                idle_after_s: 60,
+            },
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+        let metal = toml.find("[metal]").expect("[metal] section missing");
+        assert!(!toml.contains("[gpu]"));
+        assert!(toml[metal..].contains("utilization = 42"));
     }
 
     #[test]

@@ -54,6 +54,29 @@ fn binary_path() -> std::path::PathBuf {
     data_dir().join("bin").join(binary_name())
 }
 
+/// Remove pre-v0.2 native binaries (named `quip-network-node-*`) and their
+/// `.release` markers from `bin_dir`. The v0.2 manager downloads and runs
+/// `quip-miner-*`, so the old files are dead weight (~60 MB). Returns the
+/// names of files removed. Best-effort: unreadable dirs yield an empty list.
+fn cleanup_legacy_native_binaries(bin_dir: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(bin_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("quip-network-node") && std::fs::remove_file(entry.path()).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
+}
+
+/// Best-effort cleanup of legacy native binaries in the live `bin` dir.
+pub fn cleanup_legacy_binaries() -> Vec<String> {
+    cleanup_legacy_native_binaries(&data_dir().join("bin"))
+}
+
 fn binary_release_marker_path() -> std::path::PathBuf {
     data_dir()
         .join("bin")
@@ -878,9 +901,30 @@ mod tests {
     }
 
     #[test]
-    fn release_download_url_uses_v02_preview_asset_path() {
+    fn cleanup_removes_legacy_node_binaries_keeps_current() {
+        let dir = std::env::temp_dir().join(format!("quip-bin-cleanup-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("quip-network-node-macos-arm64");
+        let legacy_marker = dir.join("quip-network-node-macos-arm64.release");
+        let current = dir.join(binary_name());
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&legacy_marker, b"v0.1").unwrap();
+        std::fs::write(&current, b"new").unwrap();
+
+        let removed = cleanup_legacy_native_binaries(&dir);
+
+        assert!(!legacy.exists(), "legacy binary should be removed");
+        assert!(!legacy_marker.exists(), "legacy marker should be removed");
+        assert!(current.exists(), "current binary must be kept");
+        assert!(removed.iter().any(|n| n == "quip-network-node-macos-arm64"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn release_download_url_uses_v02_asset_path() {
         let url = release_download_url();
-        assert!(url.contains("/releases/v0.2-preview/downloads/"));
+        assert!(url.contains("/releases/v0.2/downloads/"));
         assert!(url.ends_with(binary_name()));
     }
 

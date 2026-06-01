@@ -235,6 +235,21 @@
                 <span class="gpu-yielding-flag">&#127987;&#65039;</span>
                 <span>Yielding &#8212; GPU will yield to other applications when under load</span>
               </label>
+              <!-- Metal-only adaptive-cap knobs (shown when the GPU backend is Apple Metal) -->
+              <div id="metal-extra-settings" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+                <div style="font-size:12px;color:var(--text-faint);margin-bottom:10px;">
+                  Metal adaptive cap &#8212; active only when Yielding is on. Utilization above is the idle/headless cap (flat-out when nobody's at the Mac).
+                </div>
+                <div class="gpu-setting-row" style="margin-bottom:12px;">
+                  <label>Active utilization</label>
+                  <input type="range" id="metal-active-util" min="1" max="100" value="85" />
+                  <span id="metal-active-util-display" class="gpu-util-display">85%</span>
+                </div>
+                <div class="form-group" style="max-width:200px;margin-bottom:0;">
+                  <label for="metal-idle-after">Idle after <span style="color:var(--text-faint);font-weight:400;">(seconds)</span></label>
+                  <input type="number" id="metal-idle-after" min="1" max="3600" value="60" />
+                </div>
+              </div>
             </div>
           </div>
 

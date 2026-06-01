@@ -819,7 +819,6 @@ fn check_local_firewall(port: u16) -> (bool, String) {
 pub const ALL_CHECK_IDS: &[&str] = &[
     "docker",
     "docker-compose",
-    "stack-assets",
     "wsl",
     "stack-images",
     "binary",
@@ -840,7 +839,7 @@ pub const ALL_CHECK_IDS: &[&str] = &[
 pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
     match id {
         // Docker daemon + compose itself — required whenever compose will run.
-        "docker" | "docker-compose" | "stack-assets" | "stack-images" => ctx.compose_will_run(),
+        "docker" | "docker-compose" | "stack-images" => ctx.compose_will_run(),
         // Windows-only WSL probe. Docker mode only (Native is macOS-only).
         "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
         // Binary is native-mode only.
@@ -886,12 +885,6 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             "Docker Compose v2 available",
             true,
             Some(FixKind::InstallDocker),
-        ),
-        "stack-assets" => CheckItem::new(
-            id,
-            "Stack files staged (compose.yml + Caddyfile)",
-            true,
-            None,
         ),
         "wsl" => CheckItem::new(id, "WSL installed with distro", false, None),
         "stack-images" => {
@@ -1014,19 +1007,6 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
     } else {
         base.with_state(CheckState::Fail)
             .with_detail("install Docker Desktop, which ships with the `docker compose` CLI plugin")
-    }
-}
-
-async fn run_check_stack_assets(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("stack-assets", ctx);
-    let ok = crate::stack_assets::stack_compose_file().exists()
-        && crate::stack_assets::stack_caddyfile().exists()
-        && crate::stack_assets::stack_chain_spec_file().exists();
-    if ok {
-        base.with_state(CheckState::Pass)
-    } else {
-        base.with_state(CheckState::Warn)
-            .with_detail("stack files not staged yet — they'll be written on next Start")
     }
 }
 
@@ -1309,7 +1289,6 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
     match id {
         "docker" => run_check_docker(ctx).await,
         "docker-compose" => run_check_docker_compose(ctx).await,
-        "stack-assets" => run_check_stack_assets(ctx).await,
         "wsl" => run_check_wsl(ctx).await,
         "stack-images" => run_check_stack_images(ctx).await,
         "binary" => run_check_binary(ctx).await,
@@ -1594,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn required_stack_images_use_v02_preview_refs() {
+    fn required_stack_images_use_v02_refs() {
         let mut ctx = test_ctx();
         ctx.image_tag = ImageTag::Cuda;
         ctx.tls_enabled = true;
@@ -1602,9 +1581,9 @@ mod tests {
         assert_eq!(
             required_stack_images(&ctx),
             vec![
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2-preview",
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2-preview",
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2-preview",
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
                 "postgres:16",
                 "caddy:2-alpine",
             ]

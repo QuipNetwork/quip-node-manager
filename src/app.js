@@ -341,6 +341,12 @@ function renderGpuDevices() {
   const survey = state.hardwareSurvey;
   const devices = survey?.gpu_devices || [];
 
+  // Metal exposes adaptive-cap knobs; CUDA does not.
+  const metalExtra = document.getElementById('metal-extra-settings');
+  if (metalExtra) {
+    metalExtra.style.display = survey?.gpu_backend === 'metal' ? '' : 'none';
+  }
+
   list.replaceChildren();
 
   if (devices.length === 0) {
@@ -355,33 +361,40 @@ function renderGpuDevices() {
   globalSettings.style.pointerEvents = '';
 
   const savedConfigs = state.settings?.node_config?.gpu_device_configs || [];
+  const isMetal = survey.gpu_backend === 'metal';
 
   devices.forEach((dev) => {
     const saved = savedConfigs.find((c) => c.index === dev.index);
     const enabled = saved ? saved.enabled : false;
     const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
-    const backendLabel = survey.gpu_backend === 'metal' ? 'Metal' : 'CUDA';
+    const backendLabel = isMetal ? 'Metal' : 'CUDA';
 
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
 
-    const label = document.createElement('label');
-    label.className = 'gpu-toggle-switch';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'gpu-device-toggle';
-    checkbox.dataset.index = String(dev.index);
-    checkbox.checked = enabled;
-    const slider = document.createElement('span');
-    slider.className = 'gpu-toggle-slider';
-    label.appendChild(checkbox);
-    label.appendChild(slider);
+    // Metal is a single implicit GPU selected by the backend itself and tuned
+    // below — no per-device toggle (an off-switch here would misleadingly
+    // suggest Metal can be disabled while still selected). CUDA gets a toggle
+    // per device so individual cards can be enabled/disabled.
+    if (!isMetal) {
+      const label = document.createElement('label');
+      label.className = 'gpu-toggle-switch';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'gpu-device-toggle';
+      checkbox.dataset.index = String(dev.index);
+      checkbox.checked = enabled;
+      const slider = document.createElement('span');
+      slider.className = 'gpu-toggle-slider';
+      label.appendChild(checkbox);
+      label.appendChild(slider);
+      row.appendChild(label);
+    }
 
     const text = document.createElement('span');
     text.style.fontSize = '13px';
     text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
 
-    row.appendChild(label);
     row.appendChild(text);
     list.appendChild(row);
   });
@@ -451,6 +464,12 @@ document.getElementById('gpu-utilization').addEventListener('input', () => {
   document.getElementById('gpu-util-display').textContent = `${val}%`;
 });
 
+// ─── Metal active-utilization slider ─────────────────────────────────────────
+document.getElementById('metal-active-util').addEventListener('input', () => {
+  const val = document.getElementById('metal-active-util').value;
+  document.getElementById('metal-active-util-display').textContent = `${val}%`;
+});
+
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
 function collectConfig() {
   const gpuUtilization = parseInt(document.getElementById('gpu-utilization')?.value) || 80;
@@ -468,6 +487,16 @@ function collectConfig() {
       yielding: gpuYielding,
     });
   });
+
+  // Metal tuning is a standalone single-GPU config (the [metal] section);
+  // utilization/yielding are shared with the slider above, active_util and
+  // idle_after_s are Metal-only adaptive-cap knobs.
+  const metalConfig = {
+    utilization: gpuUtilization,
+    yielding: gpuYielding,
+    active_util: parseInt(document.getElementById('metal-active-util')?.value) || 85,
+    idle_after_s: parseInt(document.getElementById('metal-idle-after')?.value) || 60,
+  };
 
   const qpuToken = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
   const dwaveConfig = qpuToken
@@ -514,6 +543,7 @@ function collectConfig() {
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
+    metal_config: metalConfig,
     dwave_config: dwaveConfig,
     timeout: base.timeout ?? 3,
     heartbeat_interval: base.heartbeat_interval ?? 15,
@@ -594,12 +624,23 @@ function populateForm(settings) {
   // CPU Miner
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
 
-  // GPU Miner — utilization/yielding from first enabled device or defaults
+  // GPU Miner — for Metal, utilization/yielding come from metal_config;
+  // for CUDA, from the first enabled device (or defaults).
+  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
+  const metalCfg = c.metal_config ?? {};
   const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
-  const savedUtil = gpuCfg?.utilization ?? 80;
+  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
-  document.getElementById('gpu-yielding').checked = gpuCfg?.yielding ?? false;
+  document.getElementById('gpu-yielding').checked = isMetal
+    ? (metalCfg.yielding ?? true)
+    : (gpuCfg?.yielding ?? false);
+
+  // Metal-only adaptive-cap knobs
+  const activeUtil = metalCfg.active_util ?? 85;
+  document.getElementById('metal-active-util').value = activeUtil;
+  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
+  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
 
   // D-Wave
   const dw = c.dwave_config;

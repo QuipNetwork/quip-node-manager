@@ -112,6 +112,13 @@ pub fn run() {
             log_stream::stop_log_stream,
         ])
         .setup(|app| {
+            // ── One-time cleanup of pre-v0.2 native binaries ──────
+            // The v0.2 manager runs quip-miner-*; drop any leftover
+            // quip-network-node-* binary so it doesn't waste ~60 MB.
+            for name in crate::native::cleanup_legacy_binaries() {
+                eprintln!("Removed legacy native binary: {name}");
+            }
+
             // ── System tray ──────────────────────────────────────
             let show_i = MenuItemBuilder::with_id("show", "Show Window").build(app)?;
             let start_i = MenuItemBuilder::with_id("start", "Start Node").build(app)?;
