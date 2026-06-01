@@ -287,49 +287,38 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
   }
 });
 
-// ─── Run mode select ─────────────────────────────────────────────────────────
-document.getElementById('run-mode-select').addEventListener('change', async () => {
+// ─── Run mode ─────────────────────────────────────────────────────────
+//
+// run_mode has no dedicated UI control. On macOS it is driven by the Metal
+// GPU toggle in renderGpuDevices (on -> native/Metal, off -> docker/CPU);
+// everywhere else the manager always runs the Dockerized stack.
+
+/// Flip run_mode from the Metal toggle, persist, and re-run the checklist
+/// (the visible checks differ between native and docker — e.g. the native
+/// binary check).
+async function setMetalEnabled(enabled) {
   if (!state.settings) return;
-  state.settings.run_mode = document.getElementById('run-mode-select').value;
-  updateRunModeUI();
+  state.settings.run_mode = enabled ? 'native' : 'docker';
   await invoke('update_settings', { settings: state.settings }).catch(console.error);
   // Mode change invalidates the whole cache — backend reseeds and reruns.
   state.checks.clear();
   await invoke('recheck').catch(console.error);
-});
+  updateRunModeUI();
+}
 
 function updateRunModeUI() {
-  const survey = state.hardwareSurvey;
-  const isMac = survey?.os === 'macos';
+  const isMac = state.hardwareSurvey?.os === 'macos';
 
-  // Run Mode toggle is only available on macOS
-  const runModeGroup = document.getElementById('run-mode-group');
-  if (runModeGroup) {
-    runModeGroup.style.display = isMac ? '' : 'none';
-  }
-
-  // Force Docker on non-macOS
+  // Off macOS there is no Metal backend, so the manager always runs the
+  // Dockerized stack. On macOS run_mode reflects the Metal toggle.
   if (!isMac && state.settings) {
     state.settings.run_mode = 'docker';
   }
-
-  const mode = state.settings?.run_mode || 'docker';
-  const isDocker = mode === 'docker';
 
   // Checklist items are filtered by mode inside renderChecklist(); re-render
   // here because mode and the hardware survey (WSL visibility) can land
   // in either order during init.
   renderChecklist();
-
-  // Warnings (only relevant on macOS where the toggle exists)
-  const warning = document.getElementById('run-mode-warning');
-  if (isDocker && isMac) {
-    warning.textContent = '\u26A0 Mac Metal GPUs are not accessible in Docker.';
-    warning.style.display = '';
-  } else {
-    warning.style.display = 'none';
-  }
-
   renderGpuDevices();
 }
 
@@ -339,11 +328,14 @@ function renderGpuDevices() {
   const globalSettings = document.getElementById('gpu-global-settings');
   const survey = state.hardwareSurvey;
   const devices = survey?.gpu_devices || [];
+  const isMetal = survey?.gpu_backend === 'metal';
+  // On macOS the Metal toggle IS the run-mode selector: native = Metal on.
+  const metalEnabled = (state.settings?.run_mode || 'docker') === 'native';
 
-  // Metal exposes adaptive-cap knobs; CUDA does not.
+  // Metal exposes adaptive-cap knobs, but only while it's enabled; CUDA never.
   const metalExtra = document.getElementById('metal-extra-settings');
   if (metalExtra) {
-    metalExtra.style.display = survey?.gpu_backend === 'metal' ? '' : 'none';
+    metalExtra.style.display = isMetal && metalEnabled ? '' : 'none';
   }
 
   list.replaceChildren();
@@ -360,7 +352,6 @@ function renderGpuDevices() {
   globalSettings.style.pointerEvents = '';
 
   const savedConfigs = state.settings?.node_config?.gpu_device_configs || [];
-  const isMetal = survey.gpu_backend === 'metal';
 
   devices.forEach((dev) => {
     const saved = savedConfigs.find((c) => c.index === dev.index);
@@ -371,24 +362,29 @@ function renderGpuDevices() {
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
 
-    // Metal is a single implicit GPU selected by the backend itself and tuned
-    // below — no per-device toggle (an off-switch here would misleadingly
-    // suggest Metal can be disabled while still selected). CUDA gets a toggle
-    // per device so individual cards can be enabled/disabled.
-    if (!isMetal) {
-      const label = document.createElement('label');
-      label.className = 'gpu-toggle-switch';
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
+    const label = document.createElement('label');
+    label.className = 'gpu-toggle-switch';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    const slider = document.createElement('span');
+    slider.className = 'gpu-toggle-slider';
+
+    if (isMetal) {
+      // Metal is a single implicit GPU only reachable from the native miner,
+      // so its enable toggle doubles as the run-mode selector: on → native
+      // (Metal mining), off → docker (CPU mining).
+      checkbox.className = 'metal-enable-toggle';
+      checkbox.checked = metalEnabled;
+      checkbox.addEventListener('change', () => setMetalEnabled(checkbox.checked));
+    } else {
+      // CUDA gets a per-device toggle so individual cards can be enabled.
       checkbox.className = 'gpu-device-toggle';
       checkbox.dataset.index = String(dev.index);
       checkbox.checked = enabled;
-      const slider = document.createElement('span');
-      slider.className = 'gpu-toggle-slider';
-      label.appendChild(checkbox);
-      label.appendChild(slider);
-      row.appendChild(label);
     }
+    label.appendChild(checkbox);
+    label.appendChild(slider);
+    row.appendChild(label);
 
     const text = document.createElement('span');
     text.style.fontSize = '13px';
@@ -397,6 +393,16 @@ function renderGpuDevices() {
     row.appendChild(text);
     list.appendChild(row);
   });
+
+  // Make the Metal on/off → mining-mode consequence explicit.
+  if (isMetal) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:12px;color:var(--text-faint);padding:2px 0 0 0;';
+    hint.textContent = metalEnabled
+      ? 'Metal GPU mining enabled — runs the native miner.'
+      : 'Metal off — the node runs CPU mining via Docker.';
+    list.appendChild(hint);
+  }
 }
 
 // ─── TLS guide toggle ────────────────────────────────────────────────────────
@@ -1306,8 +1312,8 @@ async function init() {
     const settings = await invoke('get_settings');
     state.settings = settings;
     populateForm(settings);
-    document.getElementById('run-mode-select').value =
-      settings.run_mode || 'docker';
+    // The Metal toggle (rendered once the hardware survey lands) reflects
+    // run_mode; there is no separate run-mode control to seed here.
     document.getElementById('auto-update-enabled').checked =
       settings.auto_update_enabled ?? false;
     if (settings.active_tab && settings.active_tab !== 'status') {
@@ -1347,14 +1353,10 @@ async function init() {
   invoke('run_hardware_survey')
     .then((survey) => {
       state.hardwareSurvey = survey;
+      // Renders the checklist + GPU section (incl. the Metal toggle, whose
+      // state reflects run_mode). gpu_backend itself is derived from the
+      // survey in collectConfig, so there's nothing to seed here.
       updateRunModeUI();
-      const noSavedGpu =
-        !(state.settings?.node_config?.gpu_device_configs || []).some(
-          (d) => d.enabled
-        ) && state.settings?.node_config?.gpu_backend !== 'mps';
-      if (noSavedGpu && survey.gpu_backend !== 'none') {
-        document.getElementById('gpu-backend').value = survey.gpu_backend;
-      }
     })
     .catch(() => {});
 
