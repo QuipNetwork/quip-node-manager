@@ -5,10 +5,14 @@ use std::collections::BTreeMap;
 use std::fs;
 
 const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
+
 /// Native miner → local validator: the validator container publishes its raw
 /// JSON-RPC on the host loopback (see stack_assets), so the host-side miner
-/// connects directly rather than through Caddy's `/rpc` route.
-pub(crate) const NATIVE_VALIDATOR_RPC: &str = "ws://127.0.0.1:9944";
+/// connects directly rather than through Caddy's `/rpc` route. The host port
+/// is configurable (`validator_rpc_port`, default 9944).
+pub(crate) fn native_validator_rpc_url(config: &NodeConfig) -> String {
+    format!("ws://127.0.0.1:{}", config.validator_rpc_port)
+}
 const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
 const DOCKER_MINER_REST_PORT: u16 = 80;
@@ -118,7 +122,7 @@ impl ConfigToml {
             validators: if is_docker {
                 vec![DOCKER_VALIDATOR_RPC.to_string()]
             } else {
-                vec![NATIVE_VALIDATOR_RPC.to_string()]
+                vec![native_validator_rpc_url(config)]
             },
             signer_key: if is_docker {
                 DOCKER_SIGNER_KEY.to_string()

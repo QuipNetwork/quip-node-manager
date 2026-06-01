@@ -432,6 +432,7 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
         settings.node_config.validator_port,
         &settings.node_config.public_host,
         native_rest_port(&settings.node_config),
+        settings.node_config.validator_rpc_port,
     )?;
     // Write .env too: without it compose substitutes the compose.yml
     // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
@@ -515,6 +516,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.node_config.validator_port,
         &settings.node_config.public_host,
         rest_port,
+        settings.node_config.validator_rpc_port,
     )?;
 
     // (5) .env

@@ -141,6 +141,11 @@
                   </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
+                <div class="form-group" style="max-width:220px;">
+                  <label for="validator-rpc-port">Validator RPC Port <span style="color:var(--text-faint);font-weight:400;">(native mode)</span></label>
+                  <input type="number" id="validator-rpc-port" min="1024" max="65535" value="9944" />
+                  <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Host port the local miner uses to reach the validator's JSON-RPC.</div>
+                </div>
                 <div class="mining-config-grid">
                   <div class="form-group">
                     <label for="log-level">Log Level</label>

@@ -155,6 +155,9 @@ fn default_port() -> u16 {
 fn default_validator_port() -> u16 {
     30033
 }
+fn default_validator_rpc_port() -> u16 {
+    9944
+}
 fn default_listen() -> String {
     "::".to_string()
 }
@@ -206,6 +209,10 @@ pub struct NodeConfig {
     // v0.2: validator libp2p host port, mapped to container-internal 30333.
     #[serde(default = "default_validator_port")]
     pub validator_port: u16,
+    // v0.2 (Native mode): host port the validator's JSON-RPC (container 9944)
+    // is published on, and that the host-side miner connects to.
+    #[serde(default = "default_validator_rpc_port")]
+    pub validator_rpc_port: u16,
     // v0.1 legacy fields kept for app-settings.json compatibility.
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -294,6 +301,7 @@ impl Default for NodeConfig {
         NodeConfig {
             port: 20049,
             validator_port: 30033,
+            validator_rpc_port: 9944,
             listen: "::".to_string(),
             public_host: String::new(),
             public_port: None,

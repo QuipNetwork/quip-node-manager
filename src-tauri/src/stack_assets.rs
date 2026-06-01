@@ -46,11 +46,10 @@ const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
 /// defaults to 30033 and is also used for generated `--public-addr` values.
 const CONTAINER_VALIDATOR_PORT: u16 = 30333;
-/// Validator JSON-RPC port. In Native mode it's published on the host
-/// loopback so the host-side miner can reach `ws://127.0.0.1:9944` directly,
-/// rather than going through Caddy's `/rpc` route.
+/// Validator JSON-RPC port inside the container. In Native mode it's published
+/// on the host loopback (on a configurable host port, default 9944) so the
+/// host-side miner can connect directly rather than via Caddy's `/rpc` route.
 const CONTAINER_VALIDATOR_RPC_PORT: u16 = 9944;
-const HOST_VALIDATOR_RPC_PORT: u16 = 9944;
 
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
 pub fn stack_compose_file() -> PathBuf {
@@ -91,6 +90,7 @@ pub fn sync_stack_assets(
     validator_port: u16,
     public_host: &str,
     native_rest_port: u16,
+    validator_rpc_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
     for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
@@ -103,6 +103,7 @@ pub fn sync_stack_assets(
         public_api_port,
         validator_port,
         public_host,
+        validator_rpc_port,
     );
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
@@ -121,17 +122,24 @@ fn patch_compose_file(
     public_api_port: u16,
     validator_port: u16,
     public_host: &str,
+    validator_rpc_port: u16,
 ) -> String {
     let patched = patch_compose_ports(src, public_api_port, validator_port);
-    let patched = expose_native_validator_rpc(run_mode, &patched, validator_port);
+    let patched =
+        expose_native_validator_rpc(run_mode, &patched, validator_port, validator_rpc_port);
     patch_validator_public_addr(&patched, public_host, validator_port)
 }
 
 /// In Native mode, publish the validator's JSON-RPC port on the host loopback
-/// so the host-side miner can reach `ws://127.0.0.1:9944`. In Docker mode the
-/// miner is a container and reaches `quip-validator:9944` over the compose
-/// network, so no host publish is needed.
-fn expose_native_validator_rpc(run_mode: &RunMode, src: &str, validator_port: u16) -> String {
+/// (`127.0.0.1:<validator_rpc_port>`) so the host-side miner can reach it. In
+/// Docker mode the miner is a container and reaches `quip-validator:9944` over
+/// the compose network, so no host publish is needed.
+fn expose_native_validator_rpc(
+    run_mode: &RunMode,
+    src: &str,
+    validator_port: u16,
+    validator_rpc_port: u16,
+) -> String {
     if !matches!(run_mode, RunMode::Native) {
         return src.to_string();
     }
@@ -139,7 +147,7 @@ fn expose_native_validator_rpc(run_mode: &RunMode, src: &str, validator_port: u1
     // mapping lands inside the quip-validator service's `ports:` list.
     let udp_line = format!("      - \"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\"\n");
     let rpc_line =
-        format!("      - \"127.0.0.1:{HOST_VALIDATOR_RPC_PORT}:{CONTAINER_VALIDATOR_RPC_PORT}\"\n");
+        format!("      - \"127.0.0.1:{validator_rpc_port}:{CONTAINER_VALIDATOR_RPC_PORT}\"\n");
     src.replacen(&udp_line, &format!("{udp_line}{rpc_line}"), 1)
 }
 
@@ -244,6 +252,7 @@ mod tests {
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "node.example.com",
+            9944,
         );
         assert!(patched.contains("      - --public-addr=/dns4/node.example.com/tcp/30033\n"));
     }
@@ -256,6 +265,7 @@ mod tests {
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "1.2.3.4",
+            9944,
         );
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
@@ -265,6 +275,7 @@ mod tests {
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "[2001:db8::1]",
+            9944,
         );
         assert!(patched.contains("      - --public-addr=/ip6/2001:db8::1/tcp/30033\n"));
     }
@@ -277,22 +288,36 @@ mod tests {
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "",
+            9944,
         );
         assert!(!patched.contains("--public-addr"));
     }
 
     #[test]
-    fn native_mode_publishes_validator_rpc_on_loopback() {
+    fn native_mode_publishes_validator_rpc_on_configured_host_port() {
         let patched = patch_compose_file(
             &RunMode::Native,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "",
+            9944,
         );
         assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
         // Inserted right after the validator's UDP mapping, inside its ports.
         assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
+
+        // The host side honours the configured port; the container side is
+        // always the validator's fixed 9944.
+        let custom = patch_compose_file(
+            &RunMode::Native,
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "",
+            9955,
+        );
+        assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
     }
 
     #[test]
@@ -303,6 +328,7 @@ mod tests {
             CONTAINER_PUBLIC_API_PORT,
             30033,
             "",
+            9944,
         );
         assert!(!patched.contains("9944:9944"));
     }

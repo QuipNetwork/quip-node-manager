@@ -526,6 +526,7 @@ function collectConfig() {
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
     validator_port: parseInt(document.getElementById('validator-port').value) || 30033,
+    validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
     listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
@@ -595,6 +596,7 @@ function populateForm(settings) {
   // Validator / miner configuration
   document.getElementById('port').value = c.port ?? 20049;
   document.getElementById('validator-port').value = c.validator_port ?? 30033;
+  document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
 
   // Custom settings
