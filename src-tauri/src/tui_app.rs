@@ -277,6 +277,12 @@ pub struct TuiApp {
     last_status_check: Instant,
 }
 
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiApp {
     pub fn new() -> Self {
         let settings = crate::settings::load_settings();
@@ -579,11 +585,23 @@ impl TuiApp {
         // Auto-detect public IP when no public_host is configured
         if config.public_host.is_empty() {
             if let Ok(rt) = tokio::runtime::Runtime::new() {
-                if let Ok(ip) = rt.block_on(crate::network::detect_public_ip()) {
-                    self.set_status(format!("Auto-detected IP: {}", ip));
-                    config.public_host = ip;
+                match rt.block_on(crate::network::detect_public_ip()) {
+                    Ok(ip) => {
+                        self.set_status(format!("Auto-detected IP: {}", ip));
+                        config.public_host = ip;
+                    }
+                    Err(e) => self.set_status(format!(
+                        "Could not auto-detect public IP ({e}); node won't advertise a public address"
+                    )),
                 }
             }
+        }
+
+        // Native miner REST is loopback-only by design (the dashboard reaches
+        // it via host.docker.internal); force 127.0.0.1 so a promoted or
+        // user-set rest_host can't expose it. Mirrors start_native_node.
+        if run_mode == RunMode::Native {
+            config.rest_host = "127.0.0.1".to_string();
         }
 
         if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {

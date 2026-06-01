@@ -24,18 +24,13 @@ impl Default for RunMode {
 
 // ─── GPU types ──────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum GpuBackend {
+    #[default]
     Local,
     Modal,
     Mps,
-}
-
-impl Default for GpuBackend {
-    fn default() -> Self {
-        GpuBackend::Local
-    }
 }
 
 // ─── Image tag ──────────────────────────────────────────────────────────────

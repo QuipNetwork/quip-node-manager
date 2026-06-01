@@ -559,7 +559,7 @@ fn field_line<'a>(app: &TuiApp, id: &FocusId, label: &str, value: &str) -> Line<
     ])
 }
 
-fn field_value<'a>(app: &TuiApp, id: &FocusId, current: &str) -> String {
+fn field_value(app: &TuiApp, id: &FocusId, current: &str) -> String {
     if matches!(&app.edit_mode, EditMode::EditingField(f) if f == id) {
         app.form.edit_buf.clone()
     } else {

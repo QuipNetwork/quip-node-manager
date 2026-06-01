@@ -169,7 +169,7 @@ fn migrate_config_dir(config_dir: &Path, run_mode: &RunMode) -> Result<Migration
     }
 
     fs::create_dir_all(&backup_dir).map_err(|e| format!("create {}: {e}", backup_dir.display()))?;
-    move_existing_entries_to_backup(config_dir, &backup_dir)?;
+    backup_v01_entries(config_dir, &backup_dir, run_mode)?;
 
     fs::write(&config_path, migration.content)
         .map_err(|e| format!("write {}: {e}", config_path.display()))?;
@@ -181,22 +181,67 @@ fn migrate_config_dir(config_dir: &Path, run_mode: &RunMode) -> Result<Migration
     })
 }
 
-fn move_existing_entries_to_backup(config_dir: &Path, backup_dir: &Path) -> Result<(), String> {
+/// v0.1 native-mode node artifacts that live alongside manager state in the
+/// shared `<data_dir>` root. Only these are archived during a Native-mode
+/// migration; everything else (`node-secret.json` = the node identity,
+/// `app-settings.json`, the downloaded `bin/`, the native `keystore.json`, …)
+/// is manager-owned and must survive the migration.
+const V01_NATIVE_NODE_ENTRIES: &[&str] = &[
+    "config.toml",
+    "node.log",
+    "http.log",
+    "trust.db",
+    "telemetry",
+];
+
+/// Archive the v0.1 files the migration supersedes into `backup_dir`.
+///
+/// The backup scope is run-mode dependent because `config_dir` aliases very
+/// different directories:
+/// - **Docker**: `config_dir` is the dedicated `<data_dir>/data` subtree,
+///   which holds only node runtime state — sweep it wholesale.
+/// - **Native**: `config_dir` is the shared `<data_dir>` root, which also
+///   holds manager state. Moving it wholesale would relocate
+///   `node-secret.json` (resetting the node identity) and `app-settings.json`
+///   (resetting preferences) on the next start, so only the recognised v0.1
+///   node files are archived.
+fn backup_v01_entries(
+    config_dir: &Path,
+    backup_dir: &Path,
+    run_mode: &RunMode,
+) -> Result<(), String> {
+    match run_mode {
+        RunMode::Docker => move_all_entries_to_backup(config_dir, backup_dir),
+        RunMode::Native => move_named_entries_to_backup(config_dir, backup_dir),
+    }
+}
+
+fn move_all_entries_to_backup(config_dir: &Path, backup_dir: &Path) -> Result<(), String> {
     for entry in
         fs::read_dir(config_dir).map_err(|e| format!("read {}: {e}", config_dir.display()))?
     {
         let entry = entry.map_err(|e| format!("read {} entry: {e}", config_dir.display()))?;
-        let path = entry.path();
         let name = entry.file_name();
         if name.to_string_lossy() == BACKUP_DIR {
             continue;
         }
-
-        let dest = backup_dir.join(&name);
-        fs::rename(&path, &dest)
-            .map_err(|e| format!("move {} to {}: {e}", path.display(), dest.display()))?;
+        move_entry_to_backup(&entry.path(), &backup_dir.join(&name))?;
     }
     Ok(())
+}
+
+fn move_named_entries_to_backup(config_dir: &Path, backup_dir: &Path) -> Result<(), String> {
+    for name in V01_NATIVE_NODE_ENTRIES {
+        let src = config_dir.join(name);
+        if src.exists() {
+            move_entry_to_backup(&src, &backup_dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn move_entry_to_backup(src: &Path, dest: &Path) -> Result<(), String> {
+    fs::rename(src, dest).map_err(|e| format!("move {} to {}: {e}", src.display(), dest.display()))
 }
 
 fn migrate_env_file(path: &Path) -> Result<MigrationReport, String> {
@@ -624,6 +669,143 @@ signer_key = "/data/keystore.json"
         assert!(fs::read_to_string(dir.join("config.toml"))
             .unwrap()
             .contains("[miner]\n"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_migration_preserves_manager_files() {
+        let dir = unique_temp_dir("native-config");
+        fs::create_dir_all(&dir).unwrap();
+        // v0.1 node files sit at the shared <data_dir> root in Native mode...
+        fs::write(dir.join("config.toml"), CPU_V01).unwrap();
+        fs::write(dir.join("node.log"), "old log").unwrap();
+        fs::write(dir.join("trust.db"), "trust").unwrap();
+        // ...next to manager-owned state that MUST survive the migration.
+        fs::write(dir.join("node-secret.json"), "{\"secret\":\"keep\"}").unwrap();
+        fs::write(dir.join("app-settings.json"), "{\"keep\":true}").unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin").join("quip-network-node"), "binary").unwrap();
+
+        let report = migrate_config_dir(&dir, &RunMode::Native).unwrap();
+
+        assert!(report.changed);
+        // Old node files are archived and the new config is written in place.
+        assert!(dir.join(BACKUP_DIR).join("config.toml").exists());
+        assert!(dir.join(BACKUP_DIR).join("node.log").exists());
+        assert!(dir.join(BACKUP_DIR).join("trust.db").exists());
+        assert!(fs::read_to_string(dir.join("config.toml"))
+            .unwrap()
+            .contains("[miner]\n"));
+        // Manager state is left untouched — not relocated into the backup.
+        assert!(!dir.join(BACKUP_DIR).join("node-secret.json").exists());
+        assert!(!dir.join(BACKUP_DIR).join("app-settings.json").exists());
+        assert!(!dir.join(BACKUP_DIR).join("bin").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("node-secret.json")).unwrap(),
+            "{\"secret\":\"keep\"}"
+        );
+        assert!(dir.join("app-settings.json").exists());
+        assert!(dir.join("bin").join("quip-network-node").exists());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_refuses_when_backup_dir_already_exists() {
+        let dir = unique_temp_dir("backup-exists");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), CPU_V01).unwrap();
+        fs::create_dir_all(dir.join(BACKUP_DIR)).unwrap();
+
+        let err = migrate_config_dir(&dir, &RunMode::Docker).unwrap_err();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
+        // The original v0.1 config must be left untouched, not overwritten.
+        assert!(fs::read_to_string(dir.join("config.toml"))
+            .unwrap()
+            .contains("[global]"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn apply_to_node_config_fills_only_unset_fields() {
+        let promoted = PromotedMinerConfig {
+            node_name: Some("promoted-name".to_string()),
+            public_host: Some("promoted.example.com".to_string()),
+            public_port: Some(24444),
+            rest_host: Some("0.0.0.0".to_string()),
+            log_level: Some("trace".to_string()),
+            node_log: Some("/data/promoted.log".to_string()),
+        };
+
+        // A default NodeConfig is fully "unset" — every promoted value applies.
+        let mut empty = NodeConfig::default();
+        promoted.apply_to_node_config(&mut empty);
+        assert_eq!(empty.node_name, "promoted-name");
+        assert_eq!(empty.public_host, "promoted.example.com");
+        assert_eq!(empty.public_port, Some(24444));
+        assert_eq!(empty.rest_host, "0.0.0.0");
+        assert_eq!(empty.log_level, "trace");
+        assert_eq!(empty.node_log, "/data/promoted.log");
+
+        // User-set values must win over promoted ones (no silent clobber).
+        let mut user = NodeConfig {
+            node_name: "user-name".to_string(),
+            public_host: "user.example.com".to_string(),
+            public_port: Some(30000),
+            rest_host: "10.0.0.1".to_string(),
+            log_level: "debug".to_string(),
+            ..NodeConfig::default()
+        };
+        promoted.apply_to_node_config(&mut user);
+        assert_eq!(user.node_name, "user-name");
+        assert_eq!(user.public_host, "user.example.com");
+        assert_eq!(user.public_port, Some(30000));
+        assert_eq!(user.rest_host, "10.0.0.1");
+        assert_eq!(user.log_level, "debug");
+    }
+
+    #[test]
+    fn malformed_v01_config_is_refused() {
+        let err = migrate_config_content("not = valid = toml", &RunMode::Docker).unwrap_err();
+        assert!(err.contains("parse config.toml"), "unexpected error: {err}");
+
+        let err = migrate_config_content("global = 5\n", &RunMode::Docker).unwrap_err();
+        assert!(
+            err.contains("[global] section is not a table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn migrate_env_file_is_noop_when_already_migrated() {
+        let dir = unique_temp_dir("env-noop");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        let original = "PUID=501\nQUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944\n";
+        fs::write(&path, original).unwrap();
+
+        let report = migrate_env_file(&path).unwrap();
+
+        assert!(!report.changed);
+        // No backup churn and the file is left byte-for-byte untouched.
+        assert!(!dir.join(ENV_BACKUP_FILE).exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_env_file_refuses_when_backup_exists() {
+        let dir = unique_temp_dir("env-backup-exists");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        fs::write(&path, "QUIP_NODE_URL=http://quip-node:20100\n").unwrap();
+        fs::write(dir.join(ENV_BACKUP_FILE), "stale backup").unwrap();
+
+        let err = migrate_env_file(&path).unwrap_err();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
 
         fs::remove_dir_all(dir).unwrap();
     }

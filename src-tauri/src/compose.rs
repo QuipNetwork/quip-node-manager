@@ -493,9 +493,20 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
-        if let Ok(ip) = crate::network::detect_public_ip().await {
-            log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
-            settings.node_config.public_host = ip;
+        match crate::network::detect_public_ip().await {
+            Ok(ip) => {
+                log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+                settings.node_config.public_host = ip;
+            }
+            // Don't fail the start, but don't hide it either: without a
+            // public_host the validator advertises no public address.
+            Err(e) => log_err(
+                &app,
+                &format!(
+                    "Warning: could not auto-detect public IP ({e}); the node will not \
+                     advertise a public address. Set a public host in Settings."
+                ),
+            ),
         }
     }
 
@@ -530,7 +541,15 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (7) Clean slate. `down` is cheap and idempotent; removes stale
     // containers left behind when the user switches image_tag/profile.
     log_cmd(&app, "docker compose down");
-    let _ = run_compose_streaming(&app, vec!["down".into()]).await;
+    // Best-effort cleanup, but surface a failure: a wedged `down` (stuck
+    // container, dead daemon) turns the next `up` into a confusing
+    // name-conflict error whose root cause would otherwise be invisible.
+    if let Err(e) = run_compose_streaming(&app, vec!["down".into()]).await {
+        log_err(
+            &app,
+            &format!("Warning: pre-start cleanup (docker compose down) failed, continuing: {e}"),
+        );
+    }
 
     let profile = compose_profile(settings.image_tag);
 
@@ -726,6 +745,17 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
             .collect()
     };
 
+    // A genuinely empty stack reports no objects (empty stdout or `[]`). But if
+    // compose printed something we couldn't parse, reporting an empty/Stopped
+    // stack would be a lie — it masks a running stack and re-enables the Start
+    // button. Surface the parse failure instead.
+    if objects.is_empty() && !text.is_empty() && text != "[]" {
+        return Err(format!(
+            "could not parse `docker compose ps` output: {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+
     let mut services = Vec::new();
     for v in objects {
         let state = v
@@ -871,11 +901,13 @@ mod tests {
 
     #[test]
     fn env_lines_use_v02_dashboard_and_validator_keys() {
-        let mut settings = AppSettings::default();
-        settings.hostname = String::new();
-        settings.cert_email = "ops@example.com".to_string();
-        settings.zerossl_api_key = "zero".to_string();
-        settings.run_mode = RunMode::Docker;
+        let mut settings = AppSettings {
+            hostname: String::new(),
+            cert_email: "ops@example.com".to_string(),
+            zerossl_api_key: "zero".to_string(),
+            run_mode: RunMode::Docker,
+            ..AppSettings::default()
+        };
         settings.node_config.node_name = "validator-home".to_string();
         settings.node_config.num_cpus = 4;
 

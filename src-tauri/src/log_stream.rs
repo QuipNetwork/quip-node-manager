@@ -74,18 +74,14 @@ pub fn parse_log_line(line: &str) -> LogEntry {
 
     // Try structured quip-protocol format
     if line.starts_with('[') {
-        if let Some(after_brackets) = line
-            .find("] ")
-            .map(|i| {
-                let rest = &line[i + 2..];
-                if rest.starts_with('[') {
-                    rest.find("] ").map(|j| &rest[j + 2..])
-                } else {
-                    Some(rest)
-                }
-            })
-            .flatten()
-        {
+        if let Some(after_brackets) = line.find("] ").and_then(|i| {
+            let rest = &line[i + 2..];
+            if rest.starts_with('[') {
+                rest.find("] ").map(|j| &rest[j + 2..])
+            } else {
+                Some(rest)
+            }
+        }) {
             let parts: Vec<&str> = after_brackets.splitn(3, ' ').collect();
             if parts.len() >= 2 {
                 let level = match parts[1].to_uppercase().as_str() {

@@ -31,13 +31,39 @@ struct ReleaseLinks {
     self_url: String,
 }
 
-pub fn parse_semver(v: &str) -> (u64, u64, u64) {
+/// Parse a version like `v0.2.0`, `0.2.0`, or `0.2.0-rc1` into a comparable
+/// tuple `(major, minor, patch, prerelease)`.
+///
+/// A final release sorts ABOVE any pre-release of the same `major.minor.patch`
+/// (`0.2.0` > `0.2.0-rc2`), and pre-releases sort among themselves by their
+/// trailing number (`0.2.0-rc1` < `0.2.0-rc2`). Without pre-release ordering
+/// the in-app updater never offers an `rc` → `rc` bump, because the entire
+/// `-rcN` suffix parses to nothing and both versions collapse to the same
+/// `(major, minor, patch)`. Unparseable components default to 0.
+pub fn parse_semver(v: &str) -> (u64, u64, u64, u64) {
     let v = v.trim_start_matches('v');
-    let parts: Vec<&str> = v.split('.').collect();
-    let major = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (major, minor, patch)
+    let (core, prerelease) = match v.split_once('-') {
+        // A release has no pre-release suffix, so it outranks every `-rcN`.
+        None => (v, u64::MAX),
+        Some((core, pre)) => (core, parse_prerelease(pre)),
+    };
+    let mut parts = core.split('.');
+    let major = next_number(&mut parts);
+    let minor = next_number(&mut parts);
+    let patch = next_number(&mut parts);
+    (major, minor, patch, prerelease)
+}
+
+fn next_number<'a>(parts: &mut impl Iterator<Item = &'a str>) -> u64 {
+    parts.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// Extract the trailing integer from a pre-release identifier (`rc1` → 1,
+/// `rc.2` → 2). Used only to order pre-releases against each other; the
+/// identifier text itself is not significant.
+fn parse_prerelease(pre: &str) -> u64 {
+    let digits: String = pre.chars().filter(char::is_ascii_digit).collect();
+    digits.parse().unwrap_or(0)
 }
 
 #[tauri::command]
@@ -309,10 +335,19 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                 &app,
                 "[Auto-Update] New stack image detected, restarting...",
             );
-            let _ = crate::compose::stop_stack(app.clone()).await;
-            let _ = crate::compose::pull_compose_images(app.clone()).await;
-            let _ = crate::compose::start_stack(app.clone()).await;
-            emit_log(&app, "[Auto-Update] Restart complete.");
+            // Bail on the first failing step and report it — never claim
+            // "Restart complete." after a swallowed error, which would tell
+            // the user their node is up when stop succeeded but start didn't.
+            match auto_update_restart_stack(&app).await {
+                Ok(()) => emit_log(&app, "[Auto-Update] Restart complete."),
+                Err(e) => emit_error(
+                    &app,
+                    &format!(
+                        "[Auto-Update] Restart failed: {e}. Your node may be \
+                         stopped — open the app and start it manually."
+                    ),
+                ),
+            }
         }
 
         // Native binary: separate channel because the binary is not a
@@ -329,12 +364,45 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             info.version
                         ),
                     );
-                    let _ = crate::native::download_native_binary(app.clone()).await;
-                    emit_log(&app, "[Auto-Update] Binary updated.");
+                    match crate::native::download_native_binary(app.clone()).await {
+                        Ok(_) => emit_log(&app, "[Auto-Update] Binary updated."),
+                        Err(e) => {
+                            emit_error(&app, &format!("[Auto-Update] Binary download failed: {e}"))
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Stop → pull → start the compose stack, short-circuiting on the first error
+/// so a failed pull doesn't leave the stack torn down with a misleading
+/// success message.
+async fn auto_update_restart_stack(app: &tauri::AppHandle) -> Result<(), String> {
+    crate::compose::stop_stack(app.clone()).await?;
+    crate::compose::pull_compose_images(app.clone()).await?;
+    crate::compose::start_stack(app.clone()).await?;
+    Ok(())
+}
+
+fn emit_log(app: &tauri::AppHandle, msg: &str) {
+    emit_level(app, "INFO", msg);
+}
+
+fn emit_error(app: &tauri::AppHandle, msg: &str) {
+    emit_level(app, "ERROR", msg);
+}
+
+fn emit_level(app: &tauri::AppHandle, level: &str, msg: &str) {
+    let _ = app.emit(
+        "node-log",
+        serde_json::json!({
+            "timestamp": "",
+            "level": level,
+            "message": msg,
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -381,9 +449,11 @@ mod tests {
 
     #[test]
     fn relevant_images_include_validator_only_for_docker_mode() {
-        let mut settings = AppSettings::default();
-        settings.run_mode = RunMode::Docker;
-        settings.image_tag = ImageTag::Cuda;
+        let mut settings = AppSettings {
+            run_mode: RunMode::Docker,
+            image_tag: ImageTag::Cuda,
+            ..AppSettings::default()
+        };
 
         let docker_images: Vec<String> = relevant_images(&settings)
             .into_iter()
@@ -408,15 +478,17 @@ mod tests {
             vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
         );
     }
-}
 
-fn emit_log(app: &tauri::AppHandle, msg: &str) {
-    let _ = app.emit(
-        "node-log",
-        serde_json::json!({
-            "timestamp": "",
-            "level": "INFO",
-            "message": msg,
-        }),
-    );
+    #[test]
+    fn parse_semver_orders_release_candidates() {
+        // Pre-releases order by their trailing number...
+        assert!(parse_semver("0.2.0-rc1") < parse_semver("0.2.0-rc2"));
+        // ...and a final release outranks any of its pre-releases.
+        assert!(parse_semver("0.2.0-rc2") < parse_semver("0.2.0"));
+        // The `v` prefix is ignored; normal precedence still holds.
+        assert!(parse_semver("v0.2.0") > parse_semver("v0.1.5"));
+        assert!(parse_semver("0.2.0-rc1") > parse_semver("0.1.9"));
+        // Identical versions compare equal — no spurious update offered.
+        assert_eq!(parse_semver("0.2.0-rc1"), parse_semver("v0.2.0-rc1"));
+    }
 }

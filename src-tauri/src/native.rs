@@ -39,6 +39,12 @@ impl NativeProcessState {
     }
 }
 
+impl Default for NativeProcessState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn binary_name() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "quip-miner-macos-arm64"
@@ -178,12 +184,12 @@ fn installed_binary_release_tag() -> Option<String> {
 /// Record the release tag the on-disk binary came from, so update checks can
 /// compare against the latest release even when the binary's own `--version`
 /// string differs from the tag.
-fn write_binary_release_marker(tag: &str) {
+fn write_binary_release_marker(tag: &str) -> Result<(), String> {
     let path = binary_release_marker_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let _ = std::fs::write(path, tag);
+    std::fs::write(&path, tag).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn normalize_release_version(value: &str) -> String {
@@ -605,7 +611,15 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
-    write_binary_release_marker(&tag);
+    // Best-effort: the binary is already installed. A failed marker only
+    // affects update detection, so warn instead of failing the download — but
+    // don't swallow it silently, or stale-marker bugs become invisible.
+    if let Err(e) = write_binary_release_marker(&tag) {
+        log(format!(
+            "Warning: could not record release marker ({e}); \
+             update checks may keep re-offering this version"
+        ));
+    }
 
     let _ = app.emit(
         "binary-download-progress",
@@ -698,12 +712,34 @@ pub async fn start_native_node(
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
     crate::migration_v2::emit_report(&app, &migration);
 
-    // Auto-detect public IP when no public_host is configured
+    // Auto-detect public IP when no public_host is configured. A detection
+    // failure must not be silent: without a public_host the validator
+    // advertises no public address and peers can't dial in, so surface a
+    // warning the user can act on.
     if config.public_host.is_empty() {
-        if let Ok(ip) = crate::network::detect_public_ip().await {
-            config.public_host = ip;
+        match crate::network::detect_public_ip().await {
+            Ok(ip) => config.public_host = ip,
+            Err(e) => {
+                let _ = app.emit(
+                    "node-log",
+                    &LogEntry {
+                        timestamp: String::new(),
+                        level: "WARN".to_string(),
+                        message: format!(
+                            "Could not auto-detect public IP ({e}); the node will not \
+                             advertise a public address. Set a public host in Settings."
+                        ),
+                    },
+                );
+            }
         }
     }
+
+    // The native miner's REST API is loopback-only by design — the dashboard
+    // container reaches it via host.docker.internal. Force 127.0.0.1 so a
+    // promoted or user-set rest_host (e.g. 0.0.0.0) can't expose it on every
+    // interface. Mirrors the override in compose::start_stack.
+    config.rest_host = "127.0.0.1".to_string();
 
     // Write config.toml for native mode
     crate::config::write_config_toml(&config, &RunMode::Native)?;

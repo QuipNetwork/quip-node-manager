@@ -285,9 +285,10 @@ fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
         crate::compose::COMPOSE_IMAGE_TAG
     ));
     images.push("postgres:16".into());
-    if ctx.tls_enabled {
-        images.push("caddy:2-alpine".into());
-    }
+    // Caddy belongs to the cpu/cuda compose profiles (and the Native service
+    // list), so it always starts regardless of tls_enabled. Pre-flight must
+    // verify its image is present, or `docker compose up` fails pulling it.
+    images.push("caddy:2-alpine".into());
     images
 }
 
@@ -871,9 +872,10 @@ fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (Ch
             CheckState::Pass,
             format!("{noun} port {port} reachable (host responded)"),
         ),
-        PortProbeResult::ForwardReady => {
-            (CheckState::Pass, format!("{noun} port {port} TCP forward ready"))
-        }
+        PortProbeResult::ForwardReady => (
+            CheckState::Pass,
+            format!("{noun} port {port} TCP forward ready"),
+        ),
         PortProbeResult::Unreachable => (
             CheckState::Warn,
             format!("{noun} port {port} not reachable \u{2014} check router forward + firewall"),
@@ -881,7 +883,8 @@ fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (Ch
         PortProbeResult::Unverified => (
             CheckState::Warn,
             format!(
-                "{noun} port {port} \u{2014} couldn't externally verify (check.quip.network unreachable)"
+                "{noun} port {port} \u{2014} couldn't externally verify \
+                 (check.quip.network unreachable)"
             ),
         ),
         PortProbeResult::RateLimited {
@@ -889,7 +892,10 @@ fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (Ch
             endpoint,
         } => (
             CheckState::Pass,
-            format!("{noun} port {port} rate-limited by /{endpoint} \u{2014} retry in {retry_after_secs}s"),
+            format!(
+                "{noun} port {port} rate-limited by /{endpoint} \u{2014} \
+                 retry in {retry_after_secs}s"
+            ),
         ),
     }
 }
@@ -1284,5 +1290,15 @@ mod tests {
                 "caddy:2-alpine",
             ]
         );
+    }
+
+    #[test]
+    fn required_stack_images_include_caddy_without_tls() {
+        // Caddy always runs (it's in the cpu/cuda profile), so it must be a
+        // required image even when TLS is disabled.
+        let mut ctx = test_ctx();
+        ctx.tls_enabled = false;
+
+        assert!(required_stack_images(&ctx).contains(&"caddy:2-alpine".to_string()));
     }
 }
