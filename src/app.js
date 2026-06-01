@@ -107,8 +107,8 @@ document.addEventListener('change', (e) => {
   if (!e.target) return;
   if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
-    // TLS changes profile-specific port checks (port-dashboard / port-tls)
-    // without waiting for the next recheck cycle.
+    // TLS adds caddy:2-alpine to the required stack images — recheck so
+    // stack-images reflects it without waiting for the next cycle.
     invoke('recheck').catch(() => {});
   }
 });
@@ -164,10 +164,10 @@ function refreshDashboardTab() {
 // include ids that don't appear in state.checks for the current settings
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
-  'docker', 'docker-compose', 'stack-assets', 'wsl',
+  'docker', 'docker-compose', 'wsl',
   'stack-images', 'binary', 'version', 'secret',
-  'ip', 'hostname', 'port', 'port-validator', 'port-dashboard', 'port-tls',
-  'rest-port-native', 'firewall', 'dwave-key',
+  'ip', 'hostname', 'firewall-api', 'firewall-validator',
+  'port', 'port-validator', 'dwave-key',
 ];
 
 // State-to-icon mapping for the checklist. CSS class `state-<state>`
@@ -243,7 +243,7 @@ document.getElementById('port').addEventListener('change', async () => {
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port'] }).catch(console.error);
+    await invoke('recheck', { ids: ['firewall-api', 'port'] }).catch(console.error);
   }
 });
 
@@ -252,7 +252,7 @@ document.getElementById('validator-port').addEventListener('change', async () =>
   if (state.settings) {
     state.settings.node_config.validator_port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port-validator', 'firewall'] }).catch(console.error);
+    await invoke('recheck', { ids: ['firewall-validator', 'port-validator'] }).catch(console.error);
   }
 });
 
@@ -710,7 +710,6 @@ function setStatus(stateStr) {
 function visibleInMode(id, runMode) {
   const s = state.settings;
   const isDocker = (runMode || 'docker') === 'docker';
-  const tls = s?.tls_enabled ?? false;
   const hasDwave = !!s?.node_config?.dwave_config;
   // Compose runs in both Docker mode and Native mode. Native uses it for the
   // validator/dashboard support services even when the miner runs on the host.
@@ -719,22 +718,15 @@ function visibleInMode(id, runMode) {
   switch (id) {
     case 'docker':
     case 'docker-compose':
-    case 'stack-assets':
     case 'stack-images':
       return composeWillRun;
     case 'wsl':
       return isDocker && state.hardwareSurvey?.os === 'windows';
     case 'binary':
       return !isDocker;
-    case 'port-dashboard':
-      return composeWillRun && !tls;
-    case 'port-tls':
-      return composeWillRun && tls;
-    case 'rest-port-native':
-      return !isDocker;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / ports / firewall — always shown.
+    // version / secret / ip / hostname / firewall-* / ports — always shown.
     default:
       return true;
   }
@@ -800,7 +792,6 @@ function defaultLabel(id) {
   switch (id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
-    case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
     case 'wsl':               return 'WSL installed with distro';
     case 'stack-images':      return 'Stack images available';
     case 'binary':            return 'Native miner binary available';
@@ -808,13 +799,12 @@ function defaultLabel(id) {
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
+    case 'firewall-api':
+      return `Local firewall allows Public API port ${port} (UDP+TCP)`;
+    case 'firewall-validator':
+      return `Local firewall allows Validator P2P port ${validatorPort} (UDP+TCP)`;
     case 'port':              return `Public API port ${port} — press Recheck to test`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
-    case 'port-dashboard':    return 'Dashboard port 20080 available';
-    case 'port-tls':          return 'TLS ports 80 + 443 available';
-    case 'rest-port-native':  return 'Native REST port available';
-    case 'firewall':
-      return `Local firewall allows validator P2P port ${validatorPort} (UDP+TCP)`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
   }

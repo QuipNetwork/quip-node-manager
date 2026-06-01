@@ -133,9 +133,6 @@ pub struct CheckCtx {
     pub validator_port: u16,
     pub public_host: String,
     pub tls_enabled: bool,
-    /// The port the native binary exposes for dashboard telemetry in Native
-    /// mode. Passed into `rest-port-native` without recomputing defaults.
-    pub native_rest_port: u16,
     /// `true` iff the user has a [dwave] block in their NodeConfig (i.e.
     /// they're intending QPU mining). Controls visibility of `dwave-key`.
     pub has_dwave_config: bool,
@@ -146,16 +143,11 @@ pub struct CheckCtx {
     /// non-Tauri caller like the TUI — probes then run silently.
     pub app: Option<AppHandle>,
     public_ip: OnceCell<Option<String>>,
-    /// `true` iff `docker compose ps` reports any service as running — our
-    /// own stack legitimately holds ports 20080 / 80 / 443 in that case, so
-    /// the port-conflict checks should pass rather than warn.
-    stack_running: OnceCell<bool>,
 }
 
 impl CheckCtx {
     fn from_settings(app: Option<AppHandle>) -> Self {
         let settings = crate::settings::load_settings();
-        let native_rest_port = crate::compose::native_rest_port(&settings.node_config);
         let has_dwave_config = settings.node_config.dwave_config.is_some();
         let dwave_token_set = settings
             .node_config
@@ -170,12 +162,10 @@ impl CheckCtx {
             validator_port: settings.node_config.validator_port,
             public_host: settings.node_config.public_host,
             tls_enabled: settings.tls_enabled,
-            native_rest_port,
             has_dwave_config,
             dwave_token_set,
             app,
             public_ip: OnceCell::new(),
-            stack_running: OnceCell::new(),
         }
     }
 
@@ -196,23 +186,6 @@ impl CheckCtx {
     /// subsequent callers in the same recheck batch reuse the result.
     async fn public_ip(&self) -> Option<String> {
         self.public_ip.get_or_init(fetch_public_ip).await.clone()
-    }
-
-    /// Memoised "is our compose stack currently up?" probe. Any service
-    /// reporting `running=true` counts — covers healthy, starting, and
-    /// unhealthy-but-running cases, all of which hold their published
-    /// ports. Errors (docker missing, stack never started) fall back to
-    /// `false` so the port bind-test runs as before.
-    async fn stack_running(&self) -> bool {
-        *self
-            .stack_running
-            .get_or_init(|| async {
-                crate::compose::get_stack_status()
-                    .await
-                    .map(|s| s.services.iter().any(|svc| svc.running))
-                    .unwrap_or(false)
-            })
-            .await
     }
 
     /// Whether `docker compose` is expected to have anything to run. v0.2
@@ -317,13 +290,6 @@ fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
         images.push("caddy:2-alpine".into());
     }
     images
-}
-
-/// Bindability test for a TCP port. Used by port-dashboard / port-tls /
-/// rest-port-native to flag conflicts before the user presses Start.
-fn tcp_port_bindable(port: u16) -> bool {
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-    std::net::TcpListener::bind(addr).is_ok()
 }
 
 fn check_secret_exists() -> bool {
@@ -826,12 +792,10 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "secret",
     "ip",
     "hostname",
+    "firewall-api",
+    "firewall-validator",
     "port",
     "port-validator",
-    "port-dashboard",
-    "port-tls",
-    "rest-port-native",
-    "firewall",
     "dwave-key",
 ];
 
@@ -844,19 +808,15 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
         // Binary is native-mode only.
         "binary" => ctx.run_mode == RunMode::Native,
-        // New per-port bind checks. Only applicable when compose will run AND
-        // that profile actually binds the port.
-        "port-dashboard" => ctx.compose_will_run() && !ctx.tls_enabled,
-        "port-tls" => ctx.compose_will_run() && ctx.tls_enabled,
-        // Native mode makes the native binary bind a REST port that
-        // Docker containers reach via host.docker.internal.
-        "rest-port-native" => ctx.run_mode == RunMode::Native,
         // Visible whenever the user has a [dwave] block in NodeConfig
         // (i.e. they've opted into QPU mining). Passes if the token is
         // non-empty, fails otherwise.
         "dwave-key" => ctx.has_dwave_config,
-        // Everything else is always visible.
-        "version" | "secret" | "ip" | "hostname" | "port" | "port-validator" | "firewall" => true,
+        // Everything else is always visible: the two externally-probed
+        // ports (public API + validator libp2p) and the local firewall
+        // check for each of them.
+        "version" | "secret" | "ip" | "hostname" | "firewall-api"
+        | "firewall-validator" | "port" | "port-validator" => true,
         _ => false,
     }
 }
@@ -925,18 +885,19 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             false,
             None,
         ),
-        "port-dashboard" => CheckItem::new(id, "Dashboard port 20080 available", false, None),
-        "port-tls" => CheckItem::new(id, "TLS ports 80 + 443 available", false, None),
-        "rest-port-native" => CheckItem::new(
+        "firewall-api" => CheckItem::new(
             id,
-            &format!("Native REST port {} available", ctx.native_rest_port),
+            &format!(
+                "Local firewall allows Public API port {} (UDP+TCP)",
+                ctx.port
+            ),
             false,
             None,
         ),
-        "firewall" => CheckItem::new(
+        "firewall-validator" => CheckItem::new(
             id,
             &format!(
-                "Local firewall allows validator P2P port {} (UDP+TCP)",
+                "Local firewall allows Validator P2P port {} (UDP+TCP)",
                 ctx.validator_port
             ),
             false,
@@ -1166,9 +1127,13 @@ async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
     base.with_state(state).with_label(label)
 }
 
-async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("firewall", ctx);
-    let port = ctx.validator_port;
+/// Local OS-firewall check for one externally-reachable port. Both the
+/// public API port and the validator libp2p port get the same treatment:
+/// the result is warning-only (a blocked port is actionable but shouldn't
+/// hard-block Start), and the label is prefixed with `noun` so the user
+/// can tell the two apart.
+async fn run_check_firewall(ctx: &CheckCtx, id: &str, port: u16, noun: &str) -> CheckItem {
+    let base = idle_item(id, ctx);
     let (ok, label) = tokio::task::spawn_blocking(move || check_local_firewall(port))
         .await
         .unwrap_or((false, "Firewall check failed".into()));
@@ -1177,67 +1142,7 @@ async fn run_check_firewall(ctx: &CheckCtx) -> CheckItem {
     } else {
         CheckState::Warn
     };
-    base.with_state(state)
-        .with_label(format!("Validator P2P {}", label))
-}
-
-async fn run_check_port_dashboard(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("port-dashboard", ctx);
-    // Our own stack holds 20080 when up — a bind failure then is expected,
-    // not a conflict. Skip the bind test and pass.
-    if ctx.stack_running().await {
-        return base.with_state(CheckState::Pass);
-    }
-    let ok = tokio::task::spawn_blocking(|| tcp_port_bindable(20080))
-        .await
-        .unwrap_or(false);
-    if ok {
-        base.with_state(CheckState::Pass)
-    } else {
-        base.with_state(CheckState::Warn).with_detail(
-            "TCP 20080 already in use — another service will conflict with the dashboard",
-        )
-    }
-}
-
-async fn run_check_port_tls(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("port-tls", ctx);
-    // Our own caddy holds 80/443 when up — ditto port-dashboard.
-    if ctx.stack_running().await {
-        return base.with_state(CheckState::Pass);
-    }
-    let (ok_80, ok_443) =
-        tokio::task::spawn_blocking(|| (tcp_port_bindable(80), tcp_port_bindable(443)))
-            .await
-            .unwrap_or((false, false));
-    match (ok_80, ok_443) {
-        (true, true) => base.with_state(CheckState::Pass),
-        (false, true) => base
-            .with_state(CheckState::Warn)
-            .with_detail("TCP :80 in use — Caddy's ACME HTTP-01 challenge will fail"),
-        (true, false) => base
-            .with_state(CheckState::Warn)
-            .with_detail("TCP :443 in use — Caddy cannot serve HTTPS"),
-        (false, false) => base
-            .with_state(CheckState::Warn)
-            .with_detail("TCP :80 and :443 both in use — free them before enabling TLS"),
-    }
-}
-
-async fn run_check_rest_port_native(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("rest-port-native", ctx);
-    let port = ctx.native_rest_port;
-    let ok = tokio::task::spawn_blocking(move || tcp_port_bindable(port))
-        .await
-        .unwrap_or(false);
-    if ok {
-        base.with_state(CheckState::Pass).with_detail(
-            "Native node binds 127.0.0.1; dashboard reaches it via Docker Desktop's host.docker.internal",
-        )
-    } else {
-        base.with_state(CheckState::Warn)
-            .with_detail(format!("TCP {} already in use", port))
-    }
+    base.with_state(state).with_label(format!("{} {}", noun, label))
 }
 
 async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
@@ -1297,10 +1202,10 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
         "port-validator" => run_check_port_validator(ctx).await,
-        "port-dashboard" => run_check_port_dashboard(ctx).await,
-        "port-tls" => run_check_port_tls(ctx).await,
-        "rest-port-native" => run_check_rest_port_native(ctx).await,
-        "firewall" => run_check_firewall(ctx).await,
+        "firewall-api" => run_check_firewall(ctx, "firewall-api", ctx.port, "Public API").await,
+        "firewall-validator" => {
+            run_check_firewall(ctx, "firewall-validator", ctx.validator_port, "Validator P2P").await
+        }
         "version" => run_check_version(ctx).await,
         "dwave-key" => run_check_dwave_key(ctx).await,
         _ => idle_item(id, ctx)
@@ -1483,7 +1388,6 @@ pub async fn trigger_recheck_auto(app: AppHandle, ids: Vec<String>) {
 /// final CheckItems. For non-Tauri callers (TUI).
 pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     let settings = crate::settings::load_settings();
-    let native_rest_port = crate::compose::native_rest_port(&settings.node_config);
     let dwave_token_set = settings
         .node_config
         .dwave_config
@@ -1498,12 +1402,10 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         validator_port: settings.node_config.validator_port,
         public_host: settings.node_config.public_host,
         tls_enabled: settings.tls_enabled,
-        native_rest_port,
         has_dwave_config,
         dwave_token_set,
         app: None,
         public_ip: OnceCell::new(),
-        stack_running: OnceCell::new(),
     };
     let mut results = Vec::new();
     for id in visible_ids(&ctx) {
@@ -1531,12 +1433,10 @@ mod tests {
             validator_port: 30033,
             public_host: String::new(),
             tls_enabled: false,
-            native_rest_port: 20100,
             has_dwave_config: false,
             dwave_token_set: false,
             app: None,
             public_ip: OnceCell::new(),
-            stack_running: OnceCell::new(),
         }
     }
 
@@ -1552,21 +1452,52 @@ mod tests {
             idle_item("port-validator", &ctx).label,
             "Validator P2P port 30033 reachable"
         );
+    }
+
+    #[test]
+    fn firewall_check_covers_both_api_and_validator_ports() {
+        let ctx = test_ctx();
+
         assert_eq!(
-            idle_item("firewall", &ctx).label,
-            "Local firewall allows validator P2P port 30033 (UDP+TCP)"
+            idle_item("firewall-api", &ctx).label,
+            "Local firewall allows Public API port 20049 (UDP+TCP)"
         );
+        assert_eq!(
+            idle_item("firewall-validator", &ctx).label,
+            "Local firewall allows Validator P2P port 30033 (UDP+TCP)"
+        );
+    }
+
+    #[test]
+    fn checklist_only_probes_public_api_and_validator_ports() {
+        // Internal-plumbing port checks are gone entirely.
+        for removed in ["port-dashboard", "port-tls", "rest-port-native"] {
+            assert!(
+                !ALL_CHECK_IDS.contains(&removed),
+                "{removed} should be removed from the checklist"
+            );
+        }
+    }
+
+    #[test]
+    fn firewall_checks_precede_external_port_probes() {
+        // Both firewall (local) checks render above both check.quip.network
+        // reachability probes, validator port treated like the API port.
+        let ctx = test_ctx();
+        let ids = visible_ids(&ctx);
+        let pos = |want: &str| ids.iter().position(|id| id == want).unwrap();
+
+        assert!(pos("firewall-api") < pos("port"));
+        assert!(pos("firewall-api") < pos("port-validator"));
+        assert!(pos("firewall-validator") < pos("port"));
+        assert!(pos("firewall-validator") < pos("port-validator"));
+        // The two external probes stay adjacent, API before validator.
+        assert_eq!(pos("port-validator"), pos("port") + 1);
     }
 
     #[test]
     fn validator_port_check_is_visible_and_warning_only() {
         let ctx = test_ctx();
-        let ids = visible_ids(&ctx);
-
-        let api = ids.iter().position(|id| id == "port").unwrap();
-        let validator = ids.iter().position(|id| id == "port-validator").unwrap();
-        assert_eq!(validator, api + 1);
-
         let item = idle_item("port-validator", &ctx);
         assert!(!item.required);
         assert_eq!(item.fixable, None);
