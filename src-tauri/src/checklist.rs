@@ -691,7 +691,7 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(
             id,
-            &format!("Public API port {} — press Recheck to test", ctx.port),
+            &format!("Public API port {} — press Retry to test", ctx.port),
             false,
             None,
         ),
@@ -1222,7 +1222,7 @@ mod tests {
 
         assert_eq!(
             idle_item("port", &ctx).label,
-            "Public API port 20049 \u{2014} press Recheck to test"
+            "Public API port 20049 \u{2014} press Retry to test"
         );
         assert_eq!(
             idle_item("port-validator", &ctx).label,

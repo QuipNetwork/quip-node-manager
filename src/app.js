@@ -754,15 +754,24 @@ function renderChecklistItem(item) {
   const actions = document.createElement('div');
   actions.className = 'check-actions';
 
+  // stack-images folds the pull into its Retry (the click handler pulls
+  // first, then rechecks), so it gets one combined button instead of a
+  // separate Pull Image fix.
+  const isStackImages = item.id === 'stack-images';
+
   const recheckBtn = document.createElement('button');
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
   recheckBtn.dataset.action = 'recheck';
-  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Recheck';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Retry';
   recheckBtn.disabled = item.state === 'running';
   actions.appendChild(recheckBtn);
 
-  if (item.fixable && (item.state === 'fail' || item.state === 'warn')) {
+  if (
+    item.fixable &&
+    !isStackImages &&
+    (item.state === 'fail' || item.state === 'warn')
+  ) {
     const fixBtn = document.createElement('button');
     fixBtn.type = 'button';
     fixBtn.className = 'btn btn-sm btn-secondary check-action';
@@ -804,7 +813,7 @@ function defaultLabel(id) {
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Public API port ${port} — press Recheck to test`;
+    case 'port':              return `Public API port ${port} — press Retry to test`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
@@ -866,6 +875,31 @@ function mergeCheckUpdate(item) {
   }
 }
 
+// ─── Stack images: pull, then recheck ────────────────────────────────────────
+// The stack-images Recheck button pulls every image in the current profile
+// (node + dashboard + postgres + caddy as applicable) and then reruns the
+// check, so the user doesn't need a separate Pull Image action.
+async function pullStackImagesThenRecheck() {
+  // Optimistically show the running state so the button disables during the
+  // pull; the backend recheck below emits the real terminal state after.
+  const item = state.checks.get('stack-images');
+  if (item) {
+    state.checks.set('stack-images', {
+      ...item,
+      state: 'running',
+      label: 'Pulling stack images…',
+    });
+    renderChecklist();
+  }
+  try {
+    await invoke('pull_compose_images');
+  } catch (e) {
+    appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
+  }
+  // Version reflects image freshness in Docker mode, so refresh it too.
+  await invoke('recheck', { ids: ['stack-images', 'version'] }).catch(console.error);
+}
+
 // ─── Fix action dispatcher ──────────────────────────────────────────────────
 async function runFix(id) {
   const item = state.checks.get(id);
@@ -924,13 +958,17 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   const id = li?.dataset.id;
   if (!id) return;
   if (btn.dataset.action === 'recheck') {
-    invoke('recheck', { ids: [id] }).catch(console.error);
+    if (id === 'stack-images') {
+      pullStackImagesThenRecheck();
+    } else {
+      invoke('recheck', { ids: [id] }).catch(console.error);
+    }
   } else if (btn.dataset.action === 'fix') {
     runFix(id);
   }
 });
 
-// ─── Global Recheck All ──────────────────────────────────────────────────────
+// ─── Global Retry All ─────────────────────────────────────────────────────────
 document.getElementById('btn-recheck-all').addEventListener('click', () => {
   invoke('recheck').catch(console.error);
 });
