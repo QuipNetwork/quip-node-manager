@@ -166,8 +166,7 @@ function refreshDashboardTab() {
 const CHECK_ORDER = [
   'docker', 'docker-compose', 'wsl',
   'stack-images', 'binary', 'version', 'secret',
-  'ip', 'hostname', 'firewall-api', 'firewall-validator',
-  'port', 'port-validator', 'dwave-key',
+  'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
 // State-to-icon mapping for the checklist. CSS class `state-<state>`
@@ -243,7 +242,7 @@ document.getElementById('port').addEventListener('change', async () => {
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['firewall-api', 'port'] }).catch(console.error);
+    await invoke('recheck', { ids: ['port'] }).catch(console.error);
   }
 });
 
@@ -252,7 +251,7 @@ document.getElementById('validator-port').addEventListener('change', async () =>
   if (state.settings) {
     state.settings.node_config.validator_port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['firewall-validator', 'port-validator'] }).catch(console.error);
+    await invoke('recheck', { ids: ['port-validator'] }).catch(console.error);
   }
 });
 
@@ -726,7 +725,7 @@ function visibleInMode(id, runMode) {
       return !isDocker;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / firewall-* / ports — always shown.
+    // version / secret / ip / hostname / ports — always shown.
     default:
       return true;
   }
@@ -799,10 +798,6 @@ function defaultLabel(id) {
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'firewall-api':
-      return `Local firewall allows Public API port ${port} (UDP+TCP)`;
-    case 'firewall-validator':
-      return `Local firewall allows Validator P2P port ${validatorPort} (UDP+TCP)`;
     case 'port':              return `Public API port ${port} — press Recheck to test`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'dwave-key':         return 'D-Wave API token configured';

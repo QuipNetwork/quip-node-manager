@@ -2,7 +2,6 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -600,185 +599,6 @@ async fn check_hostname_dns(hostname: &str) -> Option<bool> {
     Some(json["match"].as_bool().unwrap_or(false))
 }
 
-// ─── Local firewall probe (platform-specific) ─────────────────────────────────
-
-#[cfg(target_os = "macos")]
-fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let out = crate::cmd::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
-        .arg("--getglobalstate")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    if text.contains("disabled") || text.contains("state = 0") {
-        Some((
-            true,
-            format!("macOS Firewall: Port {} open (UDP+TCP)", port),
-        ))
-    } else if text.contains("enabled") || text.contains("state = 1") {
-        Some((
-            true,
-            format!(
-                "macOS Firewall: Port {} open (ensure app allowed for UDP+TCP)",
-                port
-            ),
-        ))
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let out = crate::cmd::new("ufw").args(["status"]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if text.to_lowercase().contains("inactive") {
-        return Some((true, "ufw inactive".to_string()));
-    }
-    if text.to_lowercase().contains("active") {
-        let has_udp = text.contains(&format!("{}/udp", port));
-        let has_tcp = text.contains(&format!("{}/tcp", port));
-        if has_udp && has_tcp {
-            return Some((true, format!("ufw allows {}/udp and {}/tcp", port, port)));
-        }
-        let mut missing = Vec::new();
-        if !has_udp {
-            missing.push(format!("{}/udp", port));
-        }
-        if !has_tcp {
-            missing.push(format!("{}/tcp", port));
-        }
-        return Some((
-            false,
-            format!(
-                "ufw active \u{2014} run: sudo ufw allow {}",
-                missing.join(" && sudo ufw allow ")
-            ),
-        ));
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn os_firewall_check(port: u16) -> Option<(bool, String)> {
-    let state = crate::cmd::new("netsh")
-        .args(["advfirewall", "show", "allprofiles", "state"])
-        .output()
-        .ok()?;
-    let state_text = String::from_utf8_lossy(&state.stdout).to_lowercase();
-    let all_off = state_text
-        .lines()
-        .filter(|l| l.contains("state"))
-        .all(|l| l.contains("off"));
-    if all_off {
-        return Some((true, "Windows Firewall disabled".to_string()));
-    }
-    let rule = crate::cmd::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "show",
-            "rule",
-            "name=all",
-            "dir=in",
-        ])
-        .output()
-        .ok()?;
-    let rule_text = String::from_utf8_lossy(&rule.stdout);
-    let port_str = port.to_string();
-    let mut found_udp = false;
-    let mut found_tcp = false;
-    let mut cur_proto = String::new();
-    let mut port_match = false;
-    let mut is_allow = false;
-    for line in rule_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if port_match && is_allow {
-                if cur_proto == "udp" {
-                    found_udp = true;
-                }
-                if cur_proto == "tcp" {
-                    found_tcp = true;
-                }
-            }
-            cur_proto.clear();
-            port_match = false;
-            is_allow = false;
-            continue;
-        }
-        if let Some((key, val)) = trimmed.split_once(':') {
-            let key = key.trim().to_lowercase();
-            let val = val.trim().to_lowercase();
-            if key == "protocol" {
-                cur_proto = val.clone();
-            }
-            if key == "localport" && val.contains(&port_str) {
-                port_match = true;
-            }
-            if key == "action" && val == "allow" {
-                is_allow = true;
-            }
-        }
-    }
-    if port_match && is_allow {
-        if cur_proto == "udp" {
-            found_udp = true;
-        }
-        if cur_proto == "tcp" {
-            found_tcp = true;
-        }
-    }
-    if found_udp && found_tcp {
-        Some((
-            true,
-            format!("Windows Firewall allows {}/udp and {}/tcp", port, port),
-        ))
-    } else {
-        let mut missing = Vec::new();
-        if !found_udp {
-            missing.push("UDP");
-        }
-        if !found_tcp {
-            missing.push("TCP");
-        }
-        Some((
-            false,
-            format!(
-                "Windows Firewall may block {} \u{2014} add inbound {} rule(s) for port {}",
-                missing.join("+"),
-                missing.join(" and "),
-                port
-            ),
-        ))
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn os_firewall_check(_port: u16) -> Option<(bool, String)> {
-    None
-}
-
-fn check_local_firewall(port: u16) -> (bool, String) {
-    if let Some(result) = os_firewall_check(port) {
-        return result;
-    }
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-    let udp_ok = UdpSocket::bind(addr).is_ok();
-    let tcp_ok = std::net::TcpListener::bind(addr).is_ok();
-    match (udp_ok, tcp_ok) {
-        (true, true) => (true, format!("Port {} bindable locally (UDP+TCP)", port)),
-        (true, false) => (
-            false,
-            format!("Port {}: UDP bindable but TCP blocked", port),
-        ),
-        (false, true) => (
-            false,
-            format!("Port {}: TCP bindable but UDP blocked", port),
-        ),
-        (false, false) => (false, format!("Cannot bind port {} (UDP+TCP)", port)),
-    }
-}
-
 // ─── Check registry ───────────────────────────────────────────────────────────
 
 /// IDs of all checks in render order. Filter by `visible_for_mode`.
@@ -792,8 +612,6 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "secret",
     "ip",
     "hostname",
-    "firewall-api",
-    "firewall-validator",
     "port",
     "port-validator",
     "dwave-key",
@@ -813,10 +631,8 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         // non-empty, fails otherwise.
         "dwave-key" => ctx.has_dwave_config,
         // Everything else is always visible: the two externally-probed
-        // ports (public API + validator libp2p) and the local firewall
-        // check for each of them.
-        "version" | "secret" | "ip" | "hostname" | "firewall-api"
-        | "firewall-validator" | "port" | "port-validator" => true,
+        // ports — public API + validator libp2p.
+        "version" | "secret" | "ip" | "hostname" | "port" | "port-validator" => true,
         _ => false,
     }
 }
@@ -882,24 +698,6 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
         "port-validator" => CheckItem::new(
             id,
             &format!("Validator P2P port {} reachable", ctx.validator_port),
-            false,
-            None,
-        ),
-        "firewall-api" => CheckItem::new(
-            id,
-            &format!(
-                "Local firewall allows Public API port {} (UDP+TCP)",
-                ctx.port
-            ),
-            false,
-            None,
-        ),
-        "firewall-validator" => CheckItem::new(
-            id,
-            &format!(
-                "Local firewall allows Validator P2P port {} (UDP+TCP)",
-                ctx.validator_port
-            ),
             false,
             None,
         ),
@@ -1127,24 +925,6 @@ async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
     base.with_state(state).with_label(label)
 }
 
-/// Local OS-firewall check for one externally-reachable port. Both the
-/// public API port and the validator libp2p port get the same treatment:
-/// the result is warning-only (a blocked port is actionable but shouldn't
-/// hard-block Start), and the label is prefixed with `noun` so the user
-/// can tell the two apart.
-async fn run_check_firewall(ctx: &CheckCtx, id: &str, port: u16, noun: &str) -> CheckItem {
-    let base = idle_item(id, ctx);
-    let (ok, label) = tokio::task::spawn_blocking(move || check_local_firewall(port))
-        .await
-        .unwrap_or((false, "Firewall check failed".into()));
-    let state = if ok {
-        CheckState::Pass
-    } else {
-        CheckState::Warn
-    };
-    base.with_state(state).with_label(format!("{} {}", noun, label))
-}
-
 async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("dwave-key", ctx);
     if ctx.dwave_token_set {
@@ -1202,10 +982,6 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
         "port-validator" => run_check_port_validator(ctx).await,
-        "firewall-api" => run_check_firewall(ctx, "firewall-api", ctx.port, "Public API").await,
-        "firewall-validator" => {
-            run_check_firewall(ctx, "firewall-validator", ctx.validator_port, "Validator P2P").await
-        }
         "version" => run_check_version(ctx).await,
         "dwave-key" => run_check_dwave_key(ctx).await,
         _ => idle_item(id, ctx)
@@ -1455,23 +1231,17 @@ mod tests {
     }
 
     #[test]
-    fn firewall_check_covers_both_api_and_validator_ports() {
-        let ctx = test_ctx();
-
-        assert_eq!(
-            idle_item("firewall-api", &ctx).label,
-            "Local firewall allows Public API port 20049 (UDP+TCP)"
-        );
-        assert_eq!(
-            idle_item("firewall-validator", &ctx).label,
-            "Local firewall allows Validator P2P port 30033 (UDP+TCP)"
-        );
-    }
-
-    #[test]
     fn checklist_only_probes_public_api_and_validator_ports() {
-        // Internal-plumbing port checks are gone entirely.
-        for removed in ["port-dashboard", "port-tls", "rest-port-native"] {
+        // Internal-plumbing port checks and the duplicative local firewall
+        // checks are gone — only the two internet-reachability probes remain.
+        for removed in [
+            "port-dashboard",
+            "port-tls",
+            "rest-port-native",
+            "firewall",
+            "firewall-api",
+            "firewall-validator",
+        ] {
             assert!(
                 !ALL_CHECK_IDS.contains(&removed),
                 "{removed} should be removed from the checklist"
@@ -1480,19 +1250,12 @@ mod tests {
     }
 
     #[test]
-    fn firewall_checks_precede_external_port_probes() {
-        // Both firewall (local) checks render above both check.quip.network
-        // reachability probes, validator port treated like the API port.
+    fn validator_probe_immediately_follows_public_api_probe() {
         let ctx = test_ctx();
         let ids = visible_ids(&ctx);
-        let pos = |want: &str| ids.iter().position(|id| id == want).unwrap();
-
-        assert!(pos("firewall-api") < pos("port"));
-        assert!(pos("firewall-api") < pos("port-validator"));
-        assert!(pos("firewall-validator") < pos("port"));
-        assert!(pos("firewall-validator") < pos("port-validator"));
-        // The two external probes stay adjacent, API before validator.
-        assert_eq!(pos("port-validator"), pos("port") + 1);
+        let api = ids.iter().position(|id| id == "port").unwrap();
+        let validator = ids.iter().position(|id| id == "port-validator").unwrap();
+        assert_eq!(validator, api + 1);
     }
 
     #[test]
