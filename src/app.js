@@ -1044,7 +1044,7 @@ function handlePullProgress(ev) {
   // Legacy {line} events (non-pull compose commands) have no id — ignore them.
   if (!ev || typeof ev.id !== 'string') return;
   if (!state.pull || !state.pull.active) {
-    state.pull = { active: true, images: new Map() };
+    state.pull = { active: true, title: 'Pulling stack images', images: new Map() };
   }
 
   const isImageLevel = !ev.parent_id && ev.id.startsWith('Image ');
@@ -1083,7 +1083,7 @@ function renderPullPanel() {
 
   const title = document.createElement('div');
   title.className = 'pull-progress-title';
-  title.textContent = 'Pulling stack images';
+  title.textContent = state.pull.title || 'Downloading';
   const rows = [title];
 
   for (const img of state.pull.images.values()) {
@@ -1135,6 +1135,26 @@ function finishPullProgress() {
     panel.replaceChildren();
   }
   state.pull = { active: false, images: new Map() };
+}
+
+// The native miner binary download reuses the same panel as a single bar.
+function handleBinaryDownloadProgress(ev) {
+  const { downloaded, total, done } = ev || {};
+  if (!state.pull || !state.pull.active) {
+    state.pull = { active: true, title: 'Downloading native miner', images: new Map() };
+  }
+  let img = state.pull.images.get('native-miner');
+  if (!img) {
+    img = { name: 'native miner', layers: new Map(), done: false };
+    state.pull.images.set('native-miner', img);
+  }
+  img.layers.set('binary', { cur: Number(downloaded) || 0, tot: Number(total) || 0 });
+  if (done) img.done = true;
+  renderPullPanel();
+  if (done) {
+    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
+  }
 }
 
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
@@ -1380,6 +1400,7 @@ async function setupListeners() {
   });
 
   await listen('binary-download-progress', (event) => {
+    handleBinaryDownloadProgress(event.payload);
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {

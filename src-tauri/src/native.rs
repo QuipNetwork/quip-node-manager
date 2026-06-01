@@ -519,9 +519,6 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     }
 
     let total = resp.content_length();
-    if let Some(t) = total {
-        log(format!("Binary size: {:.1} MB", t as f64 / 1_048_576.0));
-    }
 
     // Stream to file
     let bin_dir = data_dir().join("bin");
@@ -531,8 +528,9 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     let tmp = dest.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("Cannot create file: {}", e))?;
 
+    // Progress is surfaced as a bar in the UI via binary-download-progress;
+    // no per-percent log lines.
     let mut downloaded: u64 = 0;
-    let mut last_pct: u64 = 0;
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
@@ -540,20 +538,6 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         file.write_all(&chunk)
             .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
-
-        // Log every 10%
-        if let Some(t) = total {
-            let pct = (downloaded * 100) / t;
-            if pct / 10 > last_pct / 10 {
-                log(format!(
-                    "Downloading... {:.1}/{:.1} MB ({}%)",
-                    downloaded as f64 / 1_048_576.0,
-                    t as f64 / 1_048_576.0,
-                    pct
-                ));
-                last_pct = pct;
-            }
-        }
 
         let _ = app.emit(
             "binary-download-progress",
