@@ -131,7 +131,6 @@ pub struct CheckCtx {
     /// Host-exposed validator libp2p port. The container still binds 30333.
     pub validator_port: u16,
     pub public_host: String,
-    pub tls_enabled: bool,
     /// `true` iff the user has a [dwave] block in their NodeConfig (i.e.
     /// they're intending QPU mining). Controls visibility of `dwave-key`.
     pub has_dwave_config: bool,
@@ -160,7 +159,6 @@ impl CheckCtx {
             port: settings.node_config.port,
             validator_port: settings.node_config.validator_port,
             public_host: settings.node_config.public_host,
-            tls_enabled: settings.tls_enabled,
             has_dwave_config,
             dwave_token_set,
             app,
@@ -185,12 +183,6 @@ impl CheckCtx {
     /// subsequent callers in the same recheck batch reuse the result.
     async fn public_ip(&self) -> Option<String> {
         self.public_ip.get_or_init(fetch_public_ip).await.clone()
-    }
-
-    /// Whether `docker compose` is expected to have anything to run. v0.2
-    /// always runs compose services in both Docker and Native manager modes.
-    fn compose_will_run(&self) -> bool {
-        true
     }
 }
 
@@ -624,8 +616,9 @@ pub const ALL_CHECK_IDS: &[&str] = &[
 /// Whether `id` is shown to the user for the current settings + run_mode.
 pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
     match id {
-        // Docker daemon + compose itself — required whenever compose will run.
-        "docker" | "docker-compose" | "stack-images" => ctx.compose_will_run(),
+        // Docker daemon + compose itself — v0.2 always runs compose services
+        // in both Docker and Native manager modes, so these are always shown.
+        "docker" | "docker-compose" | "stack-images" => true,
         // Windows-only WSL probe. Docker mode only (Native is macOS-only).
         "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
         // Binary is native-mode only.
@@ -1166,7 +1159,6 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         port: settings.node_config.port,
         validator_port: settings.node_config.validator_port,
         public_host: settings.node_config.public_host,
-        tls_enabled: settings.tls_enabled,
         has_dwave_config,
         dwave_token_set,
         app: None,
@@ -1197,7 +1189,6 @@ mod tests {
             port: 20049,
             validator_port: 30033,
             public_host: String::new(),
-            tls_enabled: false,
             has_dwave_config: false,
             dwave_token_set: false,
             app: None,
@@ -1278,8 +1269,9 @@ mod tests {
     fn required_stack_images_use_v02_refs() {
         let mut ctx = test_ctx();
         ctx.image_tag = ImageTag::Cuda;
-        ctx.tls_enabled = true;
 
+        // Caddy is always required (it's in the cpu/cuda profile), independent
+        // of any TLS setting.
         assert_eq!(
             required_stack_images(&ctx),
             vec![
@@ -1290,15 +1282,5 @@ mod tests {
                 "caddy:2-alpine",
             ]
         );
-    }
-
-    #[test]
-    fn required_stack_images_include_caddy_without_tls() {
-        // Caddy always runs (it's in the cpu/cuda profile), so it must be a
-        // required image even when TLS is disabled.
-        let mut ctx = test_ctx();
-        ctx.tls_enabled = false;
-
-        assert!(required_stack_images(&ctx).contains(&"caddy:2-alpine".to_string()));
     }
 }

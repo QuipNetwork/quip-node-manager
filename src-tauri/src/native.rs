@@ -735,13 +735,9 @@ pub async fn start_native_node(
         }
     }
 
-    // The native miner's REST API is loopback-only by design — the dashboard
-    // container reaches it via host.docker.internal. Force 127.0.0.1 so a
-    // promoted or user-set rest_host (e.g. 0.0.0.0) can't expose it on every
-    // interface. Mirrors the override in compose::start_stack.
-    config.rest_host = "127.0.0.1".to_string();
-
-    // Write config.toml for native mode
+    // Write config.toml for native mode. The renderer forces the native
+    // miner's REST host to loopback (it's reached via host.docker.internal),
+    // so no rest_host override is needed here.
     crate::config::write_config_toml(&config, &RunMode::Native)?;
 
     // Auto-provision the miner binary when it's missing — mirrors Docker

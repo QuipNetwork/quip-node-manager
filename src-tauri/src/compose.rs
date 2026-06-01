@@ -9,9 +9,7 @@ use crate::log_stream::LogStreamState;
 use crate::settings::{
     AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
-use crate::stack_assets::{
-    stack_caddyfile, stack_compose_file, stack_project_dir, sync_stack_assets,
-};
+use crate::stack_assets::{stack_compose_file, stack_project_dir, sync_stack_assets};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -77,14 +75,11 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 
 // ── profile + services selection ───────────────────────────────────────────
 
-/// Compose profile name for v0.2. The standard upstream profiles always
-/// include dashboard, postgres, Caddy, the selected miner, bootstrap, and
-/// validator.
+/// Compose profile name for v0.2 — the same string as the image's service
+/// name. The standard upstream profiles always include dashboard, postgres,
+/// Caddy, the selected miner, bootstrap, and validator.
 pub fn compose_profile(image_tag: ImageTag) -> &'static str {
-    match image_tag {
-        ImageTag::Cpu => "cpu",
-        ImageTag::Cuda => "cuda",
-    }
+    image_tag.service()
 }
 
 /// Explicit service list for `docker compose up -d [services...]`.
@@ -95,22 +90,10 @@ pub fn compose_profile(image_tag: ImageTag) -> &'static str {
 /// - Native mode: we skip the miner and bootstrap containers and hand compose
 ///   an explicit list of support services. The profile is still set so these
 ///   services are eligible, while positional args restrict startup to them.
-pub fn compose_services(run_mode: &RunMode, _tls_enabled: bool) -> &'static [&'static str] {
+pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     match run_mode {
         RunMode::Docker => &[],
         RunMode::Native => &["quip-validator", "dashboard", "postgres", "caddy"],
-    }
-}
-
-// ── Native REST port ───────────────────────────────────────────────────────
-
-/// Host REST port for the native miner path. Docker miners bind internal port
-/// 80 and are reached through Caddy's `/api/v1/*` route.
-pub fn native_rest_port(cfg: &NodeConfig) -> u16 {
-    if cfg.rest_insecure_port > 0 {
-        cfg.rest_insecure_port as u16
-    } else {
-        20100
     }
 }
 
@@ -212,9 +195,15 @@ fn render_env_lines(
     ];
 
     if settings.run_mode == RunMode::Docker {
-        lines.push("QUIP_VALIDATORS=ws://quip-validator:9944".to_string());
+        lines.push(format!(
+            "QUIP_VALIDATORS={}",
+            crate::config::DOCKER_VALIDATOR_RPC
+        ));
     }
-    lines.push("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944".to_string());
+    lines.push(format!(
+        "QUIP_VALIDATOR_RPC_URLS={}",
+        crate::config::DOCKER_VALIDATOR_RPC
+    ));
 
     lines
 }
@@ -431,7 +420,7 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
         settings.node_config.port,
         settings.node_config.validator_port,
         &settings.node_config.public_host,
-        native_rest_port(&settings.node_config),
+        crate::config::native_rest_port(&settings.node_config),
         settings.node_config.validator_rpc_port,
     )?;
     // Write .env too: without it compose substitutes the compose.yml
@@ -455,7 +444,7 @@ async fn pull_compose_images_for_settings(
         profile.into(),
         "pull".into(),
     ];
-    for s in compose_services(&settings.run_mode, settings.tls_enabled) {
+    for s in compose_services(&settings.run_mode) {
         args.push((*s).into());
     }
 
@@ -510,12 +499,12 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    let rest_port = native_rest_port(&settings.node_config);
+    let rest_port = crate::config::native_rest_port(&settings.node_config);
 
-    // (3) Keep the native REST override isolated to Native mode so the Docker
-    // v0.2 config always uses internal miner REST port 80.
+    // (3) Materialise the resolved native REST port so config rendering and the
+    // staged Caddyfile both publish the same port. (rest_host is forced to
+    // loopback inside the config renderer.)
     if settings.run_mode == RunMode::Native {
-        settings.node_config.rest_host = "127.0.0.1".to_string();
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
 
@@ -559,7 +548,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (9) Up.
     let mut up_args: Vec<String> =
         vec!["--profile".into(), profile.into(), "up".into(), "-d".into()];
-    for s in compose_services(&settings.run_mode, settings.tls_enabled) {
+    for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
     log_cmd(
@@ -835,14 +824,6 @@ pub async fn get_stack_config() -> Result<String, String> {
     }
 }
 
-// Silence unused-import warnings while the module sits alongside docker.rs
-// during step 4. stack_caddyfile is re-exported for callers that want the
-// patched Caddyfile path for diagnostics.
-#[allow(dead_code)]
-pub(crate) fn _caddyfile_path() -> PathBuf {
-    stack_caddyfile()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,19 +836,19 @@ mod tests {
 
     #[test]
     fn compose_services_docker_uses_profile_defaults() {
-        assert!(compose_services(&RunMode::Docker, true).is_empty());
-        assert!(compose_services(&RunMode::Docker, false).is_empty());
+        assert!(compose_services(&RunMode::Docker).is_empty());
     }
 
     #[test]
     fn compose_services_native_runs_only_support_services() {
+        let services = compose_services(&RunMode::Native);
         assert_eq!(
-            compose_services(&RunMode::Native, false),
+            services,
             ["quip-validator", "dashboard", "postgres", "caddy"]
         );
-        assert!(!compose_services(&RunMode::Native, true).contains(&"cpu"));
-        assert!(!compose_services(&RunMode::Native, true).contains(&"cuda"));
-        assert!(!compose_services(&RunMode::Native, true).contains(&"quip-bootstrap"));
+        assert!(!services.contains(&"cpu"));
+        assert!(!services.contains(&"cuda"));
+        assert!(!services.contains(&"quip-bootstrap"));
     }
 
     #[test]

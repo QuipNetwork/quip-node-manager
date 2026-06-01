@@ -597,13 +597,8 @@ impl TuiApp {
             }
         }
 
-        // Native miner REST is loopback-only by design (the dashboard reaches
-        // it via host.docker.internal); force 127.0.0.1 so a promoted or
-        // user-set rest_host can't expose it. Mirrors start_native_node.
-        if run_mode == RunMode::Native {
-            config.rest_host = "127.0.0.1".to_string();
-        }
-
+        // The config renderer forces the native miner's REST host to loopback
+        // (reached via host.docker.internal), so no rest_host override here.
         if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
             self.set_status(format!("Config error: {}", e));
             return;
@@ -633,7 +628,7 @@ impl TuiApp {
             config.port,
             config.validator_port,
             &config.public_host,
-            crate::compose::native_rest_port(config),
+            crate::config::native_rest_port(config),
             config.validator_rpc_port,
         ) {
             self.set_status(format!("Stack asset error: {}", e));

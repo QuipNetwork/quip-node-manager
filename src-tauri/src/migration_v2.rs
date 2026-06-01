@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::config::{
+    DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_HOST, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY,
+    DOCKER_VALIDATOR_RPC,
+};
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
 use std::path::Path;
@@ -7,11 +11,6 @@ use toml::{Table, Value};
 
 const BACKUP_DIR: &str = ".v0.1_backup";
 const ENV_BACKUP_FILE: &str = ".env.v0.1_backup";
-const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
-const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
-const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
-const DOCKER_MINER_REST_PORT: i64 = 80;
-const DEFAULT_NATIVE_REST_PORT: i64 = 20100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfigSchema {
@@ -449,11 +448,11 @@ fn default_rest_host(run_mode: &RunMode, global: &Table) -> String {
 
 fn default_rest_port(run_mode: &RunMode, global: &Table) -> i64 {
     match run_mode {
-        RunMode::Docker => DOCKER_MINER_REST_PORT,
+        RunMode::Docker => i64::from(DOCKER_MINER_REST_PORT),
         RunMode::Native => i64_from_table(global, "rest_insecure_port")
             .or_else(|| i64_from_table(global, "rest_port"))
             .filter(|port| *port > 0)
-            .unwrap_or(DEFAULT_NATIVE_REST_PORT),
+            .unwrap_or(i64::from(DEFAULT_NATIVE_REST_PORT)),
     }
 }
 

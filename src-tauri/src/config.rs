@@ -4,7 +4,14 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 
-const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
+// Shared v0.2 Docker-mode miner contract. Both this module (fresh config
+// rendering) and `migration_v2` (v0.1 → v0.2 upgrade) must agree on these, so
+// they live in one place.
+pub(crate) const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
+pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
+pub(crate) const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
+pub(crate) const DOCKER_MINER_REST_PORT: u16 = 80;
+pub(crate) const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
 
 /// Native miner → local validator: the validator container publishes its raw
 /// JSON-RPC on the host loopback (see stack_assets), so the host-side miner
@@ -13,12 +20,11 @@ const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
 pub(crate) fn native_validator_rpc_url(config: &NodeConfig) -> String {
     format!("ws://127.0.0.1:{}", config.validator_rpc_port)
 }
-const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
-const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
-const DOCKER_MINER_REST_PORT: u16 = 80;
-const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
 
-fn native_rest_port(config: &NodeConfig) -> u16 {
+/// Host REST port for the native miner. This is the single source of truth for
+/// the port the miner binds (rendered into config.toml here) AND the port the
+/// dashboard's Caddyfile routes to (via `stack_assets`); both must agree.
+pub(crate) fn native_rest_port(config: &NodeConfig) -> u16 {
     if config.rest_insecure_port > 0 {
         config.rest_insecure_port as u16
     } else if config.rest_port > 0 {
@@ -29,8 +35,7 @@ fn native_rest_port(config: &NodeConfig) -> u16 {
 }
 
 fn native_signer_key() -> String {
-    data_dir()
-        .join("keystore.json")
+    crate::native::native_signer_key_path()
         .to_string_lossy()
         .to_string()
 }
@@ -129,10 +134,14 @@ impl ConfigToml {
             } else {
                 native_signer_key()
             },
+            // Native miner REST is loopback-only by design — the dashboard
+            // container reaches it via host.docker.internal. Forcing it here
+            // (rather than at each start path) keeps the invariant in one
+            // place so a promoted or user-set rest_host can't expose it.
             rest_host: if is_docker {
                 DOCKER_MINER_REST_HOST.to_string()
             } else {
-                config.rest_host.clone()
+                "127.0.0.1".to_string()
             },
             rest_port: if is_docker {
                 DOCKER_MINER_REST_PORT
@@ -366,7 +375,9 @@ mod tests {
     fn native_config_renders_host_local_miner_paths() {
         let cfg = NodeConfig {
             port: 21049,
-            rest_host: "127.0.0.1".to_string(),
+            // A non-loopback rest_host must be overridden to 127.0.0.1 by the
+            // renderer (native REST is loopback-only).
+            rest_host: "0.0.0.0".to_string(),
             rest_insecure_port: 20123,
             ..NodeConfig::default()
         };
