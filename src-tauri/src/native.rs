@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
-const PROTOCOL_RELEASE_TAG: &str = crate::compose::COMPOSE_IMAGE_TAG;
 const PUBLIC_TESTNET_FAUCET_URL: &str = "https://faucet.testnet.quip.network";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
@@ -83,12 +82,51 @@ fn binary_release_marker_path() -> std::path::PathBuf {
         .join(format!("{}.release", binary_name()))
 }
 
-fn release_download_url() -> String {
-    format!(
-        "https://gitlab.com/quip.network/quip-protocol/-/releases/{}/downloads/{}",
-        PROTOCOL_RELEASE_TAG,
-        binary_name()
-    )
+/// Fetch the quip-protocol releases list (GitLab returns them newest-first).
+async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json::Value> {
+    let url = format!(
+        "https://gitlab.com/api/v4/projects/{}/releases?per_page=20",
+        PROTOCOL_PROJECT
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "quip-node-manager")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+/// The most recent release that ships `asset_name`. Releases come back
+/// newest-first, so the first match wins — this tracks whatever the latest
+/// release is tagged (`v0.2`, `v0.2.0rc1`, …) and skips older releases that
+/// only carry the legacy asset name.
+fn find_latest_binary_release<'a>(
+    releases: &'a serde_json::Value,
+    asset_name: &str,
+) -> Option<&'a serde_json::Value> {
+    releases
+        .as_array()?
+        .iter()
+        .find(|rel| release_has_binary_asset(rel, asset_name))
+}
+
+/// Direct download URL for `asset_name` within `release`. Prefers the stable
+/// `direct_asset_url` permalink, falling back to the job-artifact `url`.
+fn release_asset_url(release: &serde_json::Value, asset_name: &str) -> Option<String> {
+    release["assets"]["links"]
+        .as_array()?
+        .iter()
+        .find(|link| link["name"].as_str() == Some(asset_name))
+        .and_then(|link| {
+            link["direct_asset_url"]
+                .as_str()
+                .or_else(|| link["url"].as_str())
+                .map(str::to_string)
+        })
 }
 
 fn installed_binary_release_tag() -> Option<String> {
@@ -98,12 +136,15 @@ fn installed_binary_release_tag() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn write_binary_release_marker() {
+/// Record the release tag the on-disk binary came from, so update checks can
+/// compare against the latest release even when the binary's own `--version`
+/// string differs from the tag.
+fn write_binary_release_marker(tag: &str) {
     let path = binary_release_marker_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, PROTOCOL_RELEASE_TAG);
+    let _ = std::fs::write(path, tag);
 }
 
 fn normalize_release_version(value: &str) -> String {
@@ -420,13 +461,14 @@ pub fn installed_binary_version() -> Option<String> {
     }
 }
 
-/// Download the configured v0.2 native miner binary from GitLab releases.
+/// Download the latest native miner binary from GitLab releases. Tracks the
+/// most recent release that ships this platform's asset, so release-candidate
+/// tags (e.g. `v0.2.0rc1`) are picked up automatically.
 #[tauri::command]
 pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
-    let url = release_download_url();
 
     let log = |msg: String| {
         let entry = serde_json::json!({
@@ -437,7 +479,23 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         let _ = app.emit("node-log", entry);
     };
 
-    log(format!("Downloading {}", url));
+    // Resolve the latest release that actually ships this binary (rc-aware).
+    let meta_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let releases = fetch_protocol_releases(&meta_client)
+        .await
+        .ok_or_else(|| "Could not list quip-protocol releases".to_string())?;
+    let release = find_latest_binary_release(&releases, name)
+        .ok_or_else(|| format!("No published quip-protocol release ships {name} yet"))?;
+    let tag = release["tag_name"].as_str().unwrap_or_default().to_string();
+    let url = release_asset_url(release, name)
+        .ok_or_else(|| format!("Release {tag} has no download link for {name}"))?;
+
+    log(format!("Downloading {name} ({tag})"));
+    log(format!("From {url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -521,7 +579,7 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         perms.set_mode(0o755);
         std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
     }
-    write_binary_release_marker();
+    write_binary_release_marker(&tag);
 
     let _ = app.emit(
         "binary-download-progress",
@@ -532,11 +590,10 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         },
     );
 
-    let version = installed_binary_version()
-        .unwrap_or_else(|| normalize_release_version(PROTOCOL_RELEASE_TAG));
+    let version = installed_binary_version().unwrap_or_else(|| normalize_release_version(&tag));
     log(format!(
         "Installed {} from {} (binary version: {})",
-        name, PROTOCOL_RELEASE_TAG, version
+        name, tag, version
     ));
 
     Ok(version)
@@ -559,22 +616,17 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = format!(
-        "https://gitlab.com/api/v4/projects/{}/releases/{}",
-        PROTOCOL_PROJECT, PROTOCOL_RELEASE_TAG
-    );
-    let release: serde_json::Value = match client
-        .get(&url)
-        .header("User-Agent", "quip-node-manager")
-        .send()
-        .await
-    {
-        Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => return Ok(None),
+    let Some(releases) = fetch_protocol_releases(&client).await else {
+        return Ok(None);
     };
-
-    let tag = release["tag_name"].as_str().unwrap_or(PROTOCOL_RELEASE_TAG);
-    if tag.is_empty() || !release_has_binary_asset(&release, binary_name()) {
+    let Some(release) = find_latest_binary_release(&releases, binary_name()) else {
+        return Ok(None);
+    };
+    let tag = release["tag_name"].as_str().unwrap_or_default();
+    let Some(url) = release_asset_url(release, binary_name()) else {
+        return Ok(None);
+    };
+    if tag.is_empty() {
         return Ok(None);
     }
 
@@ -587,7 +639,7 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
     if !current_tag_matches && !current_version_matches {
         Ok(Some(crate::update::UpdateInfo {
             version: normalize_release_version(tag),
-            url: release_download_url(),
+            url,
             notes: release["description"].as_str().unwrap_or("").to_string(),
         }))
     } else {
@@ -939,10 +991,50 @@ mod tests {
     }
 
     #[test]
-    fn release_download_url_uses_v02_asset_path() {
-        let url = release_download_url();
-        assert!(url.contains("/releases/v0.2/downloads/"));
-        assert!(url.ends_with(binary_name()));
+    fn picks_latest_release_that_ships_the_current_binary() {
+        // GitLab returns releases newest-first. The v0.2 rc ships the
+        // quip-miner-* asset; the older v0.1.x release only has the legacy
+        // quip-network-node-* asset, so it must be skipped.
+        let releases = serde_json::json!([
+            {
+                "tag_name": "v0.2.0rc1",
+                "assets": { "links": [
+                    { "name": binary_name(),
+                      "direct_asset_url": "https://example/releases/v0.2.0rc1/downloads/bin" }
+                ]}
+            },
+            {
+                "tag_name": "v0.1.20",
+                "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] }
+            }
+        ]);
+
+        let rel = find_latest_binary_release(&releases, binary_name()).expect("a match");
+        assert_eq!(rel["tag_name"], "v0.2.0rc1");
+        assert_eq!(
+            release_asset_url(rel, binary_name()).as_deref(),
+            Some("https://example/releases/v0.2.0rc1/downloads/bin")
+        );
+    }
+
+    #[test]
+    fn no_release_shipping_the_binary_resolves_to_none() {
+        let releases = serde_json::json!([
+            { "tag_name": "v0.1.20",
+              "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] } }
+        ]);
+        assert!(find_latest_binary_release(&releases, binary_name()).is_none());
+    }
+
+    #[test]
+    fn asset_url_falls_back_to_url_when_no_direct_asset_url() {
+        let rel = serde_json::json!({
+            "assets": { "links": [ { "name": binary_name(), "url": "https://example/u" } ] }
+        });
+        assert_eq!(
+            release_asset_url(&rel, binary_name()).as_deref(),
+            Some("https://example/u")
+        );
     }
 
     #[test]
@@ -967,6 +1059,8 @@ mod tests {
     fn release_version_normalization_accepts_preview_tags() {
         assert_eq!(normalize_release_version("v0.2-preview"), "0.2-preview");
         assert_eq!(normalize_release_version("0.2-preview"), "0.2-preview");
+        // Release-candidate tags normalize too, so equality checks match.
+        assert_eq!(normalize_release_version("v0.2.0rc1"), "0.2.0rc1");
     }
 
     #[test]
