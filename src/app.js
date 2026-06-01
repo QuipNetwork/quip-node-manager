@@ -895,6 +895,7 @@ async function pullStackImagesThenRecheck() {
     await invoke('pull_compose_images');
   } catch (e) {
     appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
+    finishPullProgress();
   }
   // Version reflects image freshness in Docker mode, so refresh it too.
   await invoke('recheck', { ids: ['stack-images', 'version'] }).catch(console.error);
@@ -1011,6 +1012,114 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
   state.logLines = [];
   document.getElementById('log-output').innerHTML = '';
 });
+
+// ─── Image pull progress ──────────────────────────────────────────────────────
+// docker compose --progress json streams per-layer events; we aggregate them
+// into one bar per image (summing the layer byte counts) and render them live
+// in the log drawer, hiding the panel once every image reports done.
+function friendlyImageName(id) {
+  // "Image registry.gitlab.com/ns/quip-miner-cpu:v0.2" -> "quip-miner-cpu:v0.2"
+  const ref = String(id).replace(/^Image\s+/, '');
+  const slash = ref.lastIndexOf('/');
+  return slash >= 0 ? ref.slice(slash + 1) : ref;
+}
+
+function handlePullProgress(ev) {
+  // Legacy {line} events (non-pull compose commands) have no id — ignore them.
+  if (!ev || typeof ev.id !== 'string') return;
+  if (!state.pull || !state.pull.active) {
+    state.pull = { active: true, images: new Map() };
+  }
+
+  const isImageLevel = !ev.parent_id && ev.id.startsWith('Image ');
+  const imageId = isImageLevel ? ev.id : ev.parent_id || ev.id;
+  let img = state.pull.images.get(imageId);
+  if (!img) {
+    img = { name: friendlyImageName(imageId), layers: new Map(), done: false };
+    state.pull.images.set(imageId, img);
+  }
+
+  if (isImageLevel) {
+    if (ev.status === 'Done' || ev.text === 'Pulled') img.done = true;
+  } else {
+    const layerDone = ev.text === 'Pull complete' || ev.text === 'Already exists';
+    const prev = img.layers.get(ev.id) || { cur: 0, tot: 0 };
+    const tot = Number(ev.total) || prev.tot;
+    img.layers.set(ev.id, {
+      cur: layerDone && tot ? tot : Math.max(prev.cur, Number(ev.current) || 0),
+      tot,
+    });
+  }
+
+  renderPullPanel();
+
+  const images = [...state.pull.images.values()];
+  if (images.length > 0 && images.every((i) => i.done)) {
+    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
+  }
+}
+
+function renderPullPanel() {
+  const panel = document.getElementById('pull-progress-panel');
+  if (!panel || !state.pull) return;
+  panel.style.display = '';
+
+  const title = document.createElement('div');
+  title.className = 'pull-progress-title';
+  title.textContent = 'Pulling stack images';
+  const rows = [title];
+
+  for (const img of state.pull.images.values()) {
+    const layers = [...img.layers.values()];
+    const tot = layers.reduce((s, l) => s + l.tot, 0);
+    const cur = layers.reduce((s, l) => s + l.cur, 0);
+    const pct = img.done ? 100 : tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : 0;
+
+    const row = document.createElement('div');
+    row.className = 'pp-row';
+
+    const name = document.createElement('span');
+    name.className = 'pp-name';
+    name.textContent = img.name;
+
+    const bar = document.createElement('span');
+    bar.className = 'pp-bar';
+    const fill = document.createElement('span');
+    fill.className = `pp-bar-fill${img.done ? ' done' : ''}`;
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+
+    const detail = document.createElement('span');
+    detail.className = 'pp-detail';
+    detail.textContent = img.done
+      ? 'done'
+      : tot > 0
+        ? `${toMB(cur)}/${toMB(tot)} MB`
+        : `${pct}%`;
+
+    row.append(name, bar, detail);
+    rows.push(row);
+  }
+  panel.replaceChildren(...rows);
+}
+
+function toMB(bytes) {
+  return (bytes / 1_048_576).toFixed(0);
+}
+
+function finishPullProgress() {
+  if (state._pullHideTimer) {
+    clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = null;
+  }
+  const panel = document.getElementById('pull-progress-panel');
+  if (panel) {
+    panel.style.display = 'none';
+    panel.replaceChildren();
+  }
+  state.pull = { active: false, images: new Map() };
+}
 
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
 function isDockerMode() {
@@ -1213,6 +1322,11 @@ async function setupListeners() {
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
+  });
+
+  // Per-image pull bars (docker compose --progress json, aggregated per image).
+  await listen('pull-progress', (event) => {
+    handlePullProgress(event.payload);
   });
 
   // Stop lifecycle — update the status pill immediately; backend also
