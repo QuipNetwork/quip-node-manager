@@ -189,6 +189,12 @@ const FIX_LABELS = {
   Delegate:        'Update',
 };
 
+// Checks whose fix is folded into the Retry button: Retry runs the fix
+// (only when the check is failing — re-downloading or, worse, regenerating
+// the node secret on a passing check would be wasteful/destructive) and
+// then rechecks. These show a single Retry button, no separate fix.
+const FIX_FOLDED_INTO_RETRY = new Set(['stack-images', 'binary', 'secret']);
+
 // ─── Tab switching ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
@@ -754,11 +760,6 @@ function renderChecklistItem(item) {
   const actions = document.createElement('div');
   actions.className = 'check-actions';
 
-  // stack-images folds the pull into its Retry (the click handler pulls
-  // first, then rechecks), so it gets one combined button instead of a
-  // separate Pull Image fix.
-  const isStackImages = item.id === 'stack-images';
-
   const recheckBtn = document.createElement('button');
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
@@ -767,9 +768,11 @@ function renderChecklistItem(item) {
   recheckBtn.disabled = item.state === 'running';
   actions.appendChild(recheckBtn);
 
+  // For checks whose fix is folded into Retry (Retry runs the fix, then
+  // rechecks) we drop the dedicated fix button entirely.
   if (
     item.fixable &&
-    !isStackImages &&
+    !FIX_FOLDED_INTO_RETRY.has(item.id) &&
     (item.state === 'fail' || item.state === 'warn')
   ) {
     const fixBtn = document.createElement('button');
@@ -959,8 +962,15 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   const id = li?.dataset.id;
   if (!id) return;
   if (btn.dataset.action === 'recheck') {
+    const item = state.checks.get(id);
+    const failing = item && (item.state === 'fail' || item.state === 'warn');
     if (id === 'stack-images') {
+      // stack-images always pulls on Retry (cache-busts :v0.2), then rechecks.
       pullStackImagesThenRecheck();
+    } else if (FIX_FOLDED_INTO_RETRY.has(id) && failing) {
+      // binary / secret: Retry runs the fix, then rechecks — but only while
+      // failing, so a passing check isn't re-downloaded or its secret reset.
+      retryWithFix(id);
     } else {
       invoke('recheck', { ids: [id] }).catch(console.error);
     }
@@ -968,6 +978,12 @@ document.getElementById('checklist').addEventListener('click', (e) => {
     runFix(id);
   }
 });
+
+// Run a check's fix (download binary, generate secret), then recheck it.
+async function retryWithFix(id) {
+  await runFix(id);
+  await invoke('recheck', { ids: [id] }).catch(console.error);
+}
 
 // ─── Global Retry All ─────────────────────────────────────────────────────────
 document.getElementById('btn-recheck-all').addEventListener('click', () => {
