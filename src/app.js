@@ -147,19 +147,6 @@ function refreshDashboardTab() {
   // would otherwise override `hidden` and keep both elements visible.
   const show = (el, display) => { el.style.display = display; };
 
-  // Postgres rejected the dashboard's password (see `verify_dashboard_db`):
-  // show the actionable error + Reset button instead of "Starting dashboard…",
-  // which would otherwise spin forever.
-  if (state.dashboardDbError && !dashRunning) {
-    if (msg) msg.textContent = state.dashboardDbError;
-    if (resetBtn) show(resetBtn, 'inline-block');
-    show(empty, 'flex');
-    show(frame, 'none');
-    if (frame.getAttribute('src') !== 'about:blank') frame.src = 'about:blank';
-    return;
-  }
-  if (resetBtn) show(resetBtn, 'none');
-
   // Compare against the raw content attribute, not the IDL `frame.src`
   // getter — the latter returns the URL-normalized form (trailing slash
   // appended to `http://host:port`) and would differ from our computed
@@ -167,13 +154,20 @@ function refreshDashboardTab() {
   // place on the page.
   const currentSrc = frame.getAttribute('src');
   if (!dashRunning) {
-    if (msg) msg.textContent = 'Starting dashboard…';
+    // Placeholder whenever the dashboard isn't up. The Reset button is always
+    // offered here so the operator can recreate the dashboard DB on demand
+    // (e.g. to clear a stale cached identity), not only on a detected
+    // password mismatch. Only the mismatch detail is shown (when present); no
+    // generic "starting" text.
+    if (msg) msg.textContent = state.dashboardDbError || '';
+    if (resetBtn) show(resetBtn, 'inline-block');
     show(empty, 'flex');
     show(frame, 'none');
     if (currentSrc !== 'about:blank') frame.src = 'about:blank';
   } else {
     // The dashboard is up — any earlier password mismatch is resolved.
     state.dashboardDbError = null;
+    if (resetBtn) show(resetBtn, 'none');
     if (currentSrc !== url) frame.src = url;
     show(empty, 'none');
     show(frame, 'block');

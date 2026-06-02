@@ -695,21 +695,36 @@ fn probe_postgres_auth(password: &str) -> PgAuthProbe {
     }
 }
 
-/// Recreate the dashboard's Postgres volume from scratch to recover from a
-/// password mismatch (see `verify_dashboard_db`): bring the stack down so no
-/// container holds the volume, remove only `quip_pgdata` (the validator,
-/// keystore, trust db and caddy state are untouched), then start the stack
-/// again so Postgres re-initialises with the current password.
+/// Delete the dashboard's database + indexer state. Used to clear stale
+/// dashboard data (e.g. a cached node identity) or recover from a Postgres
+/// password mismatch (see `verify_dashboard_db`).
+///
+/// This ONLY deletes data — it does not run `docker compose up` or start
+/// anything. It force-removes the dashboard + Postgres containers (by their
+/// fixed names) so the data volume is free, deletes that volume, and clears the
+/// dashboard's bind-mounted data folder. The validator, miner and Caddy are
+/// left as-is. The dashboard comes back, empty, on the next Start.
+///
+/// In v0.2 the dashboard keeps everything in Postgres (`quip_pgdata`) — chain
+/// index, indexer state, and the cached `self_address`; the `dashboard-data`
+/// folder is unused but cleared for good measure.
 #[tauri::command]
 pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     log_cmd(&app, "Resetting dashboard database");
-    if let Err(e) = run_compose_streaming(&app, vec!["down".into()]).await {
-        log_err(
-            &app,
-            &format!("Warning: docker compose down failed during reset, continuing: {e}"),
-        );
-    }
 
+    // Force-remove only the dashboard + Postgres containers (by fixed name) so
+    // the data volume is free to delete. Best-effort: missing containers just
+    // error per-name, which we ignore. Deliberately no `compose up`.
+    log_cmd(&app, "docker rm -f quip-postgres quip-dashboard");
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["rm", "-f", PG_CONTAINER, "quip-dashboard"])
+            .output()
+    })
+    .await;
+
+    // Delete the Postgres data volume (the database + indexer state, including
+    // the cached self identity).
     log_cmd(&app, &format!("docker volume rm {PGDATA_VOLUME}"));
     let rm = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
@@ -720,7 +735,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     match rm {
         Ok(o) if o.status.success() => {}
-        // "No such volume" means there's nothing to reset — proceed to start.
+        // "No such volume" means there's nothing to delete — fine.
         Ok(o) if String::from_utf8_lossy(&o.stderr).contains("No such volume") => {}
         Ok(o) => {
             return Err(format!(
@@ -731,8 +746,24 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
         Err(e) => return Err(format!("failed to remove {PGDATA_VOLUME}: {e}")),
     }
 
-    // Postgres re-initialises with the current password on the next up.
-    start_stack(app).await
+    // Clear the dashboard's bind-mounted data folder, then recreate it so the
+    // mount target exists and stays host-owned on the next Start.
+    let dash_data = crate::settings::data_dir().join("dashboard-data");
+    if let Err(e) = std::fs::remove_dir_all(&dash_data) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log_err(
+                &app,
+                &format!("Warning: clearing {} failed: {e}", dash_data.display()),
+            );
+        }
+    }
+    let _ = std::fs::create_dir_all(&dash_data);
+
+    log_output(
+        &app,
+        "Dashboard database cleared. Start the node to bring the dashboard back up.",
+    );
+    Ok(())
 }
 
 /// Stop the compose stack. Named volumes (quip_pgdata, quip_caddy-data,
