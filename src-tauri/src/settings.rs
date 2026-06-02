@@ -485,7 +485,7 @@ pub fn ensure_data_dir() -> Result<(), String> {
 
 /// Postgres password for the dashboard's database, generated once on first
 /// access and persisted in bootstrap.json. Never regenerated — rotating
-/// would desync from the existing `quip-pgdata` volume.
+/// would desync from the existing `quip_pgdata` volume.
 pub fn postgres_password() -> String {
     let mut cfg = load_bootstrap();
     if let Some(p) = cfg.postgres_password.as_ref().filter(|s| !s.is_empty()) {

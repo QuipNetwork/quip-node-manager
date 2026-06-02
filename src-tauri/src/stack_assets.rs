@@ -129,7 +129,23 @@ fn patch_compose_file(
     let patched = patch_compose_ports(src, public_api_port, validator_port);
     let patched =
         expose_native_validator_rpc(run_mode, &patched, validator_port, validator_rpc_port);
-    patch_validator_public_addr(&patched, public_host, validator_port)
+    let patched = patch_validator_public_addr(&patched, public_host, validator_port);
+    strip_volume_names(&patched)
+}
+
+/// Drop the fixed `name: quip-*` directives from the top-level `volumes:`
+/// block so each volume is scoped to the compose project (`quip_<key>`) rather
+/// than a global name. The upstream compose pins `name: quip-pgdata` (and the
+/// caddy volumes), which makes them collide with any other Quip stack on the
+/// same host — e.g. a developer running the raw `docker compose`. Sharing the
+/// Postgres volume across stacks breaks the dashboard: `POSTGRES_PASSWORD` is
+/// only applied when the data dir is first initialised, so a volume created by
+/// one stack keeps its original password and authentication fails for the
+/// other.
+fn strip_volume_names(src: &str) -> String {
+    src.replace("\n    name: quip-pgdata", "")
+        .replace("\n    name: quip-caddy-data", "")
+        .replace("\n    name: quip-caddy-config", "")
 }
 
 /// In Native mode, publish the validator's JSON-RPC port on the host loopback
@@ -227,6 +243,29 @@ mod tests {
         let patched = patch_compose_ports(COMPOSE_YML, 20052, CONTAINER_VALIDATOR_PORT);
         assert!(patched.contains("\"20052:20049\""));
         assert!(!patched.contains("\"20049:20049\""));
+    }
+
+    #[test]
+    fn strip_volume_names_removes_fixed_global_names() {
+        let patched = strip_volume_names(COMPOSE_YML);
+        // No volume keeps a fixed global `name:` — compose now scopes them to
+        // the project (quip_pgdata, quip_caddy-data, quip_caddy-config).
+        assert!(!patched.contains("name: quip-pgdata"));
+        assert!(!patched.contains("name: quip-caddy-data"));
+        assert!(!patched.contains("name: quip-caddy-config"));
+        // The volume keys themselves are preserved.
+        assert!(patched.contains("\n  pgdata:"));
+        assert!(patched.contains("\n  caddy-data:"));
+        assert!(patched.contains("\n  caddy-config:"));
+    }
+
+    #[test]
+    fn strip_volume_names_leaves_container_names_untouched() {
+        // `container_name:` is a different directive — it must survive so the
+        // cleanup/reaping logic can still find containers by name.
+        let patched = strip_volume_names(COMPOSE_YML);
+        assert!(patched.contains("container_name: quip-postgres"));
+        assert!(patched.contains("container_name: quip-dashboard"));
     }
 
     #[test]

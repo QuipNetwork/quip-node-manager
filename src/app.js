@@ -33,6 +33,10 @@ const state = {
   // Merged from `checklist-update` events; rendered by renderChecklist().
   checks: new Map(),
   hardwareSurvey: null,
+  // Set by the `dashboard-db-mismatch` event when Postgres rejects the
+  // dashboard's password; cleared once the dashboard comes up. Drives the
+  // error message + Reset button in the dashboard placeholder.
+  dashboardDbError: null,
 };
 
 const DEFAULT_DASHBOARD_HOSTNAME = ':20049';
@@ -130,6 +134,7 @@ function refreshDashboardTab() {
   const frame = document.getElementById('dashboard-frame');
   const empty = document.getElementById('dashboard-empty');
   const msg = document.getElementById('dashboard-empty-msg');
+  const resetBtn = document.getElementById('dashboard-reset-btn');
   if (!frame || !empty) return; // tab markup not present on first load
 
   const url = dashboardUrl(state.settings);
@@ -141,6 +146,19 @@ function refreshDashboardTab() {
   // placeholder has `display: flex` in CSS (for its centered layout) which
   // would otherwise override `hidden` and keep both elements visible.
   const show = (el, display) => { el.style.display = display; };
+
+  // Postgres rejected the dashboard's password (see `verify_dashboard_db`):
+  // show the actionable error + Reset button instead of "Starting dashboard…",
+  // which would otherwise spin forever.
+  if (state.dashboardDbError && !dashRunning) {
+    if (msg) msg.textContent = state.dashboardDbError;
+    if (resetBtn) show(resetBtn, 'inline-block');
+    show(empty, 'flex');
+    show(frame, 'none');
+    if (frame.getAttribute('src') !== 'about:blank') frame.src = 'about:blank';
+    return;
+  }
+  if (resetBtn) show(resetBtn, 'none');
 
   // Compare against the raw content attribute, not the IDL `frame.src`
   // getter — the latter returns the URL-normalized form (trailing slash
@@ -154,6 +172,8 @@ function refreshDashboardTab() {
     show(frame, 'none');
     if (currentSrc !== 'about:blank') frame.src = 'about:blank';
   } else {
+    // The dashboard is up — any earlier password mismatch is resolved.
+    state.dashboardDbError = null;
     if (currentSrc !== url) frame.src = url;
     show(empty, 'none');
     show(frame, 'block');
@@ -222,6 +242,28 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
   const expanded = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!expanded));
   section.style.display = expanded ? 'none' : '';
+});
+
+// ─── Dashboard database reset ─────────────────────────────────────────────────
+// Shown only after a `dashboard-db-mismatch`: recreate the Postgres volume and
+// bring the stack back up. The button stays disabled while the (potentially
+// slow) down → rm → start sequence runs; progress streams to the Logs tab.
+document.getElementById('dashboard-reset-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('dashboard-reset-btn');
+  const msg = document.getElementById('dashboard-empty-msg');
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = 'Resetting dashboard database…';
+  try {
+    await invoke('reset_dashboard_database');
+    state.dashboardDbError = null;
+  } catch (e) {
+    state.dashboardDbError = `Reset failed: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
+  } finally {
+    if (btn) btn.disabled = false;
+    refreshDashboardTab();
+    pollStatus();
+  }
 });
 
 // ─── Log drawer toggle ──────────────────────────────────────────────────────
@@ -1332,6 +1374,15 @@ async function setupListeners() {
     // to refresh state.stack and the dashboard iframe visibility.
     void event;
     pollStatus();
+  });
+
+  // Postgres rejected the dashboard's password — surface the actionable error
+  // and the Reset button on the Dashboard tab.
+  await listen('dashboard-db-mismatch', (event) => {
+    const { message } = event.payload || {};
+    state.dashboardDbError = message || 'Dashboard database password mismatch.';
+    appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
+    refreshDashboardTab();
   });
 
   // Update notifications

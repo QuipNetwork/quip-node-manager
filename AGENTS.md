@@ -161,7 +161,7 @@ starts.
 |------|------------------------|---------|
 | `app-settings.json` | settings.rs (user preferences) | UI toggles + NodeConfig |
 | `config.toml` | config.rs on every Start | Node config (bind-mounted into the node container in Docker mode; read directly by the binary in Native mode) |
-| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_VALIDATOR_RPC_URLS (always), QUIP_VALIDATORS (Docker only); mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2.) |
+| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_VALIDATORS (Docker only); mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
 | `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>` |
 | `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
@@ -171,8 +171,11 @@ starts.
 | `node-secret.json` | secret.rs | `{ "secret": "<64-hex>" }` — read by secret.rs and gates the `secret` pre-flight check, but NOT written into config.toml in v0.2. The node's actual signing identity is `keystore.json` (Docker `/data/keystore.json`, Native `keystore.json`). |
 | `bin/quip-miner-*` | native.rs | Downloaded native miner binary (`quip-miner-macos-arm64` / `-x86_64`). Legacy pre-v0.2 `quip-network-node-*` binaries here are auto-deleted on launch. |
 
-Named Docker volumes (survive `docker compose down` by design):
-`quip-pgdata`, `quip-caddy-data`, `quip-caddy-config`.
+Project-scoped Docker volumes (survive `docker compose down` by design):
+`quip_pgdata`, `quip_caddy-data`, `quip_caddy-config`. The upstream compose
+pins fixed global `name:`s (`quip-pgdata`, …); the manager strips them at
+stage time (`stack_assets::strip_volume_names`) so they don't collide with
+other Quip stacks on the same host.
 
 Bootstrap state at `~/.config/quip-node-manager/bootstrap.json`:
 holds a `data_dir` override plus a per-install `postgres_password`

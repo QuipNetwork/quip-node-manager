@@ -124,6 +124,22 @@ pub(crate) fn compose_cmd() -> Command {
     c
 }
 
+// ── postgres identity ──────────────────────────────────────────────────────
+
+/// Postgres role + database the dashboard authenticates as. These mirror the
+/// compose defaults (`${POSTGRES_USER:-quip}` / `${POSTGRES_DB:-quip}`); the
+/// manager never overrides them in `.env`.
+const PG_USER: &str = "quip";
+const PG_DB: &str = "quip";
+/// Fixed container name from the compose `container_name:` directive.
+const PG_CONTAINER: &str = "quip-postgres";
+/// Project-scoped Postgres data volume. Compose names volumes `<project>_<key>`
+/// and we run under `--project-name quip` with a `pgdata` volume key (the fixed
+/// global `name:` is stripped at stage time — see `stack_assets`), so the data
+/// lands in `quip_pgdata`. Resetting this volume forces Postgres to
+/// re-initialise with the current `POSTGRES_PASSWORD`.
+pub const PGDATA_VOLUME: &str = "quip_pgdata";
+
 // ── .env generation ────────────────────────────────────────────────────────
 
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
@@ -200,10 +216,11 @@ fn render_env_lines(
             crate::config::DOCKER_VALIDATOR_RPC
         ));
     }
-    lines.push(format!(
-        "QUIP_VALIDATOR_RPC_URLS={}",
-        crate::config::DOCKER_VALIDATOR_RPC
-    ));
+    // QUIP_VALIDATOR_RPC_URLS is intentionally NOT set here. The dashboard uses
+    // it for both the chain RPC and (by stripping /rpc) the local miner REST,
+    // so it must resolve both from one host — Caddy's internal :8088 listener.
+    // We defer to the compose default (`ws://quip-caddy:8088/rpc`) so there's a
+    // single source of truth in the upstream nodes.quip.network config.
 
     lines
 }
@@ -562,11 +579,164 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
             }
         ),
     );
-    run_compose_streaming(&app, up_args).await
+    let up_result = run_compose_streaming(&app, up_args).await;
+
+    // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
+    // or foreign data volume keeps an old password and would otherwise leave
+    // the dashboard crash-looping behind a silent 502.
+    if up_result.is_ok() {
+        verify_dashboard_db(&app).await;
+    }
+    up_result
 }
 
-/// Stop the compose stack. Named volumes (quip-pgdata, quip-caddy-data,
-/// quip-caddy-config) are preserved by default — `down` removes containers
+/// Result of probing the dashboard's Postgres credentials against the live
+/// volume.
+enum PgAuthProbe {
+    /// The current password authenticated successfully.
+    Ok,
+    /// Postgres rejected the current password (`28P01`) — the data volume was
+    /// initialised with a different one.
+    AuthFailed,
+    /// Postgres never became ready in time, or failed for a non-auth reason.
+    /// We don't raise the mismatch alarm in this case to avoid false positives.
+    Inconclusive,
+}
+
+/// After the stack is up, confirm the dashboard's Postgres credentials match
+/// the existing data volume. Postgres only applies `POSTGRES_PASSWORD` when it
+/// first initialises a data dir, so a volume left over from another stack (or a
+/// lost bootstrap.json) keeps its original password and the dashboard's startup
+/// migration crash-loops with `28P01 password authentication failed` — which
+/// the user only sees as a 502 behind Caddy. Surface it explicitly via the
+/// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
+/// are unaffected, so we don't abort the whole start.
+async fn verify_dashboard_db(app: &AppHandle) {
+    let password = crate::settings::postgres_password();
+    let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
+        .await
+        .unwrap_or(PgAuthProbe::Inconclusive);
+    match outcome {
+        PgAuthProbe::Ok | PgAuthProbe::Inconclusive => {}
+        PgAuthProbe::AuthFailed => {
+            let msg = format!(
+                "Dashboard database password mismatch: the existing `{PGDATA_VOLUME}` volume \
+                 was initialised with a different password (e.g. by another Quip stack), so the \
+                 dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
+                 Dashboard tab to recreate it."
+            );
+            log_err(app, &msg);
+            let _ = app.emit(
+                "dashboard-db-mismatch",
+                serde_json::json!({ "message": msg }),
+            );
+        }
+    }
+}
+
+/// Wait (bounded) for `quip-postgres` to accept connections, then attempt an
+/// authenticated TCP query with the current password. TCP (`-h 127.0.0.1`)
+/// exercises the same password path the dashboard uses, unlike the local socket
+/// which the official image leaves as `trust`. `PGPASSWORD` is passed via the
+/// environment so it never lands in logs or `ps`.
+fn probe_postgres_auth(password: &str) -> PgAuthProbe {
+    let mut ready = false;
+    for _ in 0..30 {
+        let r = crate::cmd::new("docker")
+            .args([
+                "exec",
+                PG_CONTAINER,
+                "pg_isready",
+                "-U",
+                PG_USER,
+                "-d",
+                PG_DB,
+            ])
+            .output();
+        if matches!(r, Ok(ref o) if o.status.success()) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !ready {
+        return PgAuthProbe::Inconclusive;
+    }
+
+    let pgpass = format!("PGPASSWORD={password}");
+    let output = crate::cmd::new("docker")
+        .args([
+            "exec",
+            "-e",
+            pgpass.as_str(),
+            PG_CONTAINER,
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            PG_USER,
+            "-d",
+            PG_DB,
+            "-tAc",
+            "select 1",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => PgAuthProbe::Ok,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if err.contains("password authentication failed") || err.contains("28P01") {
+                PgAuthProbe::AuthFailed
+            } else {
+                PgAuthProbe::Inconclusive
+            }
+        }
+        Err(_) => PgAuthProbe::Inconclusive,
+    }
+}
+
+/// Recreate the dashboard's Postgres volume from scratch to recover from a
+/// password mismatch (see `verify_dashboard_db`): bring the stack down so no
+/// container holds the volume, remove only `quip_pgdata` (the validator,
+/// keystore, trust db and caddy state are untouched), then start the stack
+/// again so Postgres re-initialises with the current password.
+#[tauri::command]
+pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
+    log_cmd(&app, "Resetting dashboard database");
+    if let Err(e) = run_compose_streaming(&app, vec!["down".into()]).await {
+        log_err(
+            &app,
+            &format!("Warning: docker compose down failed during reset, continuing: {e}"),
+        );
+    }
+
+    log_cmd(&app, &format!("docker volume rm {PGDATA_VOLUME}"));
+    let rm = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["volume", "rm", PGDATA_VOLUME])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match rm {
+        Ok(o) if o.status.success() => {}
+        // "No such volume" means there's nothing to reset — proceed to start.
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("No such volume") => {}
+        Ok(o) => {
+            return Err(format!(
+                "failed to remove {PGDATA_VOLUME}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))
+        }
+        Err(e) => return Err(format!("failed to remove {PGDATA_VOLUME}: {e}")),
+    }
+
+    // Postgres re-initialises with the current password on the next up.
+    start_stack(app).await
+}
+
+/// Stop the compose stack. Named volumes (quip_pgdata, quip_caddy-data,
+/// quip_caddy-config) are preserved by default — `down` removes containers
 /// and the project network only.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
@@ -907,7 +1077,9 @@ mod tests {
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
         assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));
-        assert!(env.contains("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944"));
+        // QUIP_VALIDATOR_RPC_URLS is deferred to the compose default
+        // (ws://quip-caddy:8088/rpc), not written into .env.
+        assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
         assert!(!env.contains("QUIP_NODE_URL"));
         assert!(!env.contains("QUIP_NODE_TOKEN"));
         assert!(!env.contains("QUIP_FAUCET_URL"));
@@ -958,7 +1130,8 @@ mod tests {
         let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
 
         assert!(!env.contains("QUIP_VALIDATORS="));
-        assert!(env.contains("QUIP_VALIDATOR_RPC_URLS=ws://quip-validator:9944"));
+        // Deferred to the compose default in both modes (see above).
+        assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
     }
 
     #[test]

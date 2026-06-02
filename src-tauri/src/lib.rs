@@ -83,6 +83,7 @@ pub fn run() {
             compose::pull_compose_images,
             compose::start_stack,
             compose::stop_stack,
+            compose::reset_dashboard_database,
             compose::get_stack_status,
             compose::get_stack_config,
             // Hardware
