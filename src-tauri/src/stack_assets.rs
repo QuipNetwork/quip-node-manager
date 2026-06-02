@@ -12,7 +12,8 @@
 //!   - compose.yml: Caddy's host-published public API port is rewritten
 //!     from upstream 20049 to the user configured API port.
 //!   - compose.yml: the validator libp2p host port is rewritten from
-//!     upstream 30333 to the manager default/configured 30033.
+//!     upstream 30333 to the configured `validator_port` (default 30333,
+//!     i.e. a no-op 1:1 mapping unless the user overrides it).
 //!   - compose.yml: when `public_host` is set, the validator command gets
 //!     a matching `--public-addr=<multiaddr>` using the public validator port.
 //!   - Caddyfile: the optional local faucet route is stripped; the manager
@@ -44,7 +45,8 @@ const CHAIN_SPEC: &str =
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
-/// defaults to 30033 and is also used for generated `--public-addr` values.
+/// defaults to the same 30333 and is also used for generated
+/// `--public-addr` values.
 const CONTAINER_VALIDATOR_PORT: u16 = 30333;
 /// Validator JSON-RPC port inside the container. In Native mode it's published
 /// on the host loopback (on a configurable host port, default 9944) so the

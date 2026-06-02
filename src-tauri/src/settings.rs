@@ -148,7 +148,7 @@ fn default_port() -> u16 {
     20049
 }
 fn default_validator_port() -> u16 {
-    30033
+    30333
 }
 fn default_validator_rpc_port() -> u16 {
     9944
@@ -201,7 +201,9 @@ pub struct NodeConfig {
     // v0.2: public Caddy/API/dashboard/RPC host port.
     #[serde(default = "default_port")]
     pub port: u16,
-    // v0.2: validator libp2p host port, mapped to container-internal 30333.
+    // v0.2: validator libp2p host port. Defaults to 30333 to match the
+    // container-internal libp2p port (substrate's upstream default), so the
+    // host publish is a 1:1 mapping unless the user overrides it.
     #[serde(default = "default_validator_port")]
     pub validator_port: u16,
     // v0.2 (Native mode): host port the validator's JSON-RPC (container 9944)
@@ -295,7 +297,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             port: 20049,
-            validator_port: 30033,
+            validator_port: 30333,
             validator_rpc_port: 9944,
             listen: "::".to_string(),
             public_host: String::new(),
@@ -589,7 +591,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.port, 20049);
-        assert_eq!(config.validator_port, 30033);
+        assert_eq!(config.validator_port, 30333);
     }
 
     #[test]
@@ -628,7 +630,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.node_config.port, 20444);
-        assert_eq!(settings.node_config.validator_port, 30033);
+        assert_eq!(settings.node_config.validator_port, 30333);
         assert_eq!(settings.node_config.node_name, "legacy-node");
         assert_eq!(settings.image_tag, ImageTag::Cpu);
         assert_eq!(settings.hostname, ":20049");

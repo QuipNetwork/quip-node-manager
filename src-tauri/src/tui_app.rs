@@ -186,7 +186,7 @@ impl FormState {
     ) -> crate::settings::NodeConfig {
         let mut nc = base.clone();
         nc.port = self.port.parse().unwrap_or(20049);
-        nc.validator_port = self.validator_port.parse().unwrap_or(30033);
+        nc.validator_port = self.validator_port.parse().unwrap_or(30333);
         nc.node_name = self.node_name.clone();
         nc.auto_mine = self.auto_mine;
         nc.public_host = if self.public_host_enabled {

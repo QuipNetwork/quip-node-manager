@@ -253,7 +253,7 @@ document.getElementById('port').addEventListener('change', async () => {
 });
 
 document.getElementById('validator-port').addEventListener('change', async () => {
-  const port = parseInt(document.getElementById('validator-port').value) || 30033;
+  const port = parseInt(document.getElementById('validator-port').value) || 30333;
   if (state.settings) {
     state.settings.node_config.validator_port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
@@ -525,7 +525,7 @@ function collectConfig() {
 
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
-    validator_port: parseInt(document.getElementById('validator-port').value) || 30033,
+    validator_port: parseInt(document.getElementById('validator-port').value) || 30333,
     validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
     listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
@@ -595,7 +595,7 @@ function populateForm(settings) {
 
   // Validator / miner configuration
   document.getElementById('port').value = c.port ?? 20049;
-  document.getElementById('validator-port').value = c.validator_port ?? 30033;
+  document.getElementById('validator-port').value = c.validator_port ?? 30333;
   document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
 

@@ -93,8 +93,9 @@ quip-node-manager/
   - `80/tcp + 443/tcp` — Caddy ACME/TLS (always published; TLS only provisioned
     when `QUIP_HOSTNAME` is a real DNS name).
   - `<settings.node_config.validator_port>:30333/tcp + /udp` — validator libp2p
-    peering (host default 30033, container 30333). Must be reachable from the
-    public internet for chain peering.
+    peering (host default 30333, container 30333 — a 1:1 mapping unless the user
+    overrides the host port). Must be reachable from the public internet for
+    chain peering.
   - `127.0.0.1:<validator_rpc_port>:9944` (Native mode only) — validator raw
     JSON-RPC published on host loopback (default 9944) so the host-side miner
     connects via `ws://127.0.0.1:9944`.
@@ -202,7 +203,7 @@ It stages the embedded compose.yml, Caddyfile, and chain spec
 
 2. **compose.yml `--public-addr`** (when `public_host` is set): a
    `--public-addr=<multiaddr>` arg (built from `public_host` + `validator_port`,
-   e.g. `/dns4/host/tcp/30033` or `/ip4/.../tcp/30033`) is inserted into the
+   e.g. `/dns4/host/tcp/30333` or `/ip4/.../tcp/30333`) is inserted into the
    validator command after `--validator`.
 
 3. **compose.yml validator RPC publish** (Native mode only): a
@@ -231,7 +232,7 @@ validator/API ports:
 | setting (`NodeConfig`) | container port | host default | published as |
 |------------------------|----------------|--------------|--------------|
 | `port` | Caddy 20049 (public API) | 20049 | `<port>:20049` |
-| `validator_port` | validator libp2p 30333 | 30033 | `<validator_port>:30333/tcp+udp` |
+| `validator_port` | validator libp2p 30333 | 30333 | `<validator_port>:30333/tcp+udp` |
 | `validator_rpc_port` | validator JSON-RPC 9944 | 9944 | Native only: `127.0.0.1:<validator_rpc_port>:9944` |
 
 For the miner's own `config.toml`: `config.rs` emits `public_port` verbatim from
