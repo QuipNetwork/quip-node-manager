@@ -957,8 +957,8 @@ pub async fn stop_native_node(
 
     let rc_app = app.clone();
     tokio::spawn(async move {
-        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into(), "version".into()])
-            .await;
+        // The binary check now covers both presence and freshness.
+        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
     });
 
     Ok(())

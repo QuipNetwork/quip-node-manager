@@ -165,7 +165,7 @@ function refreshDashboardTab() {
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
   'docker', 'docker-compose', 'wsl',
-  'stack-images', 'binary', 'version', 'secret',
+  'stack-images', 'binary', 'secret',
   'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
@@ -186,7 +186,6 @@ const FIX_LABELS = {
   PullImage:       'Pull Image',
   DownloadBinary:  'Download & Install',
   GenerateSecret:  'Generate Secret',
-  Delegate:        'Update',
 };
 
 // Checks whose fix is folded into the Retry button: Retry runs the fix
@@ -807,14 +806,13 @@ function renderChecklist() {
 
 function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
-  const validatorPort = state.settings?.node_config?.validator_port ?? 30033;
+  const validatorPort = state.settings?.node_config?.validator_port ?? 30333;
   switch (id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
     case 'wsl':               return 'WSL installed with distro';
     case 'stack-images':      return 'Stack images available';
     case 'binary':            return 'Native miner binary available';
-    case 'version':           return 'Node version up to date';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
@@ -872,10 +870,15 @@ function mergeCheckUpdate(item) {
   state.checks.set(item.id, item);
   renderChecklist();
 
-  // The version check resolves the "v<app> (node <node>)" label in the
-  // header. When version transitions to a terminal state the node version
-  // may have changed (pull/download fixes), so refresh the display.
-  if (item.id === 'version' && item.state !== 'idle' && item.state !== 'running') {
+  // The stack-images (Docker) and binary (Native) checks now cover node
+  // freshness too. When either reaches a terminal state the node version may
+  // have changed (a pull/download update fix ran), so refresh the header's
+  // "v<app> (node <node>)" label.
+  if (
+    (item.id === 'stack-images' || item.id === 'binary') &&
+    item.state !== 'idle' &&
+    item.state !== 'running'
+  ) {
     refreshNodeVersion();
   }
 }
@@ -902,8 +905,7 @@ async function pullStackImagesThenRecheck() {
     appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
     finishPullProgress();
   }
-  // Version reflects image freshness in Docker mode, so refresh it too.
-  await invoke('recheck', { ids: ['stack-images', 'version'] }).catch(console.error);
+  await invoke('recheck', { ids: ['stack-images'] }).catch(console.error);
 }
 
 // ─── Fix action dispatcher ──────────────────────────────────────────────────
@@ -950,9 +952,6 @@ async function runFix(id) {
         console.error('Failed to generate secret:', e);
       }
       return;
-
-    case 'Delegate':
-      return runFix(fix.arg);
   }
 }
 

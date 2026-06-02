@@ -30,8 +30,6 @@ pub enum FixKind {
     PullImage,
     DownloadBinary,
     GenerateSecret,
-    /// Delegate to another check's fix (e.g. version → image or binary).
-    Delegate(String),
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -604,7 +602,6 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "wsl",
     "stack-images",
     "binary",
-    "version",
     "secret",
     "ip",
     "hostname",
@@ -629,7 +626,7 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         "dwave-key" => ctx.has_dwave_config,
         // Everything else is always visible: the two externally-probed
         // ports — public API + validator libp2p.
-        "version" | "secret" | "ip" | "hostname" | "port" | "port-validator" => true,
+        "secret" | "ip" | "hostname" | "port" | "port-validator" => true,
         _ => false,
     }
 }
@@ -668,15 +665,6 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             "Native miner binary available",
             true,
             Some(FixKind::DownloadBinary),
-        ),
-        "version" => CheckItem::new(
-            id,
-            "Node version up to date",
-            false,
-            Some(FixKind::Delegate(match ctx.run_mode {
-                RunMode::Docker => "stack-images".into(),
-                RunMode::Native => "binary".into(),
-            })),
         ),
         "secret" => CheckItem::new(
             id,
@@ -766,6 +754,9 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
+/// Stack images: a single check covering both presence and freshness. Any
+/// missing image → Fail (pull via Retry); all present but a newer core image
+/// exists → Warn (pull via Retry); all present and current → Pass.
 async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("stack-images", ctx);
     let images = required_stack_images(ctx);
@@ -782,24 +773,59 @@ async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
     })
     .await
     .unwrap_or_default();
-    if missing.is_empty() {
-        base.with_state(CheckState::Pass)
-    } else {
-        base.with_state(CheckState::Fail)
-            .with_detail(format!("missing: {}", missing.join(", ")))
+    if !missing.is_empty() {
+        return base
+            .with_state(CheckState::Fail)
+            .with_detail(format!("missing: {}", missing.join(", ")));
+    }
+    match crate::update::check_docker_core_image_update(ctx.image_tag).await {
+        Ok(Some((image, _))) => base.with_state(CheckState::Warn).with_label(format!(
+            "{} image outdated \u{2014} pull {}",
+            image.display_name(),
+            crate::compose::COMPOSE_IMAGE_TAG
+        )),
+        Ok(_) => base
+            .with_state(CheckState::Pass)
+            .with_label("Miner + validator images up to date"),
+        // Images are present, but we couldn't reach the registry to confirm
+        // they're current. Green would over-claim, so warn (the stack still
+        // runs — a Warn never blocks start).
+        Err(e) => base
+            .with_state(CheckState::Warn)
+            .with_label("Stack images present (update check failed)")
+            .with_detail(e),
     }
 }
 
+/// Native miner binary: a single check covering both presence and freshness.
+/// Missing → Fail (install via Retry); present but a newer release exists →
+/// Warn (update via Retry); present and current → Pass.
 async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("binary", ctx);
-    let ok = tokio::task::spawn_blocking(crate::native::is_binary_available)
+    let available = tokio::task::spawn_blocking(crate::native::is_binary_available)
         .await
         .unwrap_or(false);
-    if ok {
-        base.with_state(CheckState::Pass)
-    } else {
-        base.with_state(CheckState::Fail)
-            .with_detail("run Download & Install")
+    if !available {
+        return base
+            .with_state(CheckState::Fail)
+            .with_label("Native miner binary not installed")
+            .with_detail("run Download & Install");
+    }
+    match crate::native::check_binary_update().await {
+        Ok(Some(info)) => base.with_state(CheckState::Warn).with_label(format!(
+            "Native miner outdated \u{2014} v{} available",
+            info.version
+        )),
+        Ok(None) => base
+            .with_state(CheckState::Pass)
+            .with_label("Native miner binary up to date"),
+        // Binary is installed, but we couldn't reach the release feed to
+        // confirm it's current. Green would over-claim, so warn (the binary
+        // still runs — a Warn never blocks start).
+        Err(e) => base
+            .with_state(CheckState::Warn)
+            .with_label("Native miner binary installed (update check failed)")
+            .with_detail(e),
     }
 }
 
@@ -917,40 +943,6 @@ async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
-async fn run_check_version(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("version", ctx);
-    match ctx.run_mode {
-        RunMode::Docker => match crate::update::check_docker_core_image_update(ctx.image_tag).await
-        {
-            Ok(Some((image, _))) => base.with_state(CheckState::Warn).with_label(format!(
-                "{} image outdated \u{2014} pull {}",
-                image.display_name(),
-                crate::compose::COMPOSE_IMAGE_TAG
-            )),
-            Ok(_) => base
-                .with_state(CheckState::Pass)
-                .with_label("Miner + validator images up to date"),
-            Err(e) => base
-                .with_state(CheckState::Warn)
-                .with_label("Node version (unable to check)")
-                .with_detail(e),
-        },
-        RunMode::Native => match crate::native::check_binary_update().await {
-            Ok(Some(info)) => base.with_state(CheckState::Warn).with_label(format!(
-                "Native miner outdated \u{2014} v{} available",
-                info.version
-            )),
-            Ok(None) => base
-                .with_state(CheckState::Pass)
-                .with_label("Native miner binary up to date"),
-            Err(e) => base
-                .with_state(CheckState::Warn)
-                .with_label("Node version (unable to check)")
-                .with_detail(e),
-        },
-    }
-}
-
 /// Dispatch by id. Unknown ids return a Skip item.
 async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
     match id {
@@ -964,7 +956,6 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
         "port-validator" => run_check_port_validator(ctx).await,
-        "version" => run_check_version(ctx).await,
         "dwave-key" => run_check_dwave_key(ctx).await,
         _ => idle_item(id, ctx)
             .with_state(CheckState::Skip)
@@ -1187,7 +1178,7 @@ mod tests {
             run_mode: RunMode::Docker,
             image_tag: ImageTag::Cpu,
             port: 20049,
-            validator_port: 30033,
+            validator_port: 30333,
             public_host: String::new(),
             has_dwave_config: false,
             dwave_token_set: false,
@@ -1206,8 +1197,21 @@ mod tests {
         );
         assert_eq!(
             idle_item("port-validator", &ctx).label,
-            "Validator P2P port 30033 reachable"
+            "Validator P2P port 30333 reachable"
         );
+    }
+
+    #[test]
+    fn version_check_is_merged_into_availability_checks() {
+        // The standalone "version" freshness check was folded into the
+        // availability checks — stack-images (Docker) and binary (Native) —
+        // so each artifact has one check covering presence + up-to-date-ness.
+        assert!(
+            !ALL_CHECK_IDS.contains(&"version"),
+            "version should be merged into stack-images / binary"
+        );
+        assert!(ALL_CHECK_IDS.contains(&"stack-images"));
+        assert!(ALL_CHECK_IDS.contains(&"binary"));
     }
 
     #[test]
