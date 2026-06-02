@@ -27,8 +27,6 @@ pub enum CheckState {
 #[serde(tag = "kind", content = "arg")]
 pub enum FixKind {
     InstallDocker,
-    PullImage,
-    DownloadBinary,
     GenerateSecret,
 }
 
@@ -657,15 +655,10 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             Some(FixKind::InstallDocker),
         ),
         "wsl" => CheckItem::new(id, "WSL installed with distro", false, None),
-        "stack-images" => {
-            CheckItem::new(id, "Stack images available", true, Some(FixKind::PullImage))
-        }
-        "binary" => CheckItem::new(
-            id,
-            "Native miner binary available",
-            true,
-            Some(FixKind::DownloadBinary),
-        ),
+        // stack-images and binary are not separately "fixable": their Retry
+        // recheck downloads (pull / binary fetch) as part of running the check.
+        "stack-images" => CheckItem::new(id, "Stack images available", true, None),
+        "binary" => CheckItem::new(id, "Native miner binary available", true, None),
         "secret" => CheckItem::new(
             id,
             "Node secret configured",
@@ -754,9 +747,23 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
-/// Stack images: a single check covering both presence and freshness. Any
-/// missing image → Fail (pull via Retry); all present but a newer core image
-/// exists → Warn (pull via Retry); all present and current → Pass.
+/// Return the subset of `images` not present in the local Docker image store.
+async fn missing_stack_images(images: Vec<String>) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        images
+            .into_iter()
+            .filter(|img| !docker_image_present(img))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Stack images: every run first attempts `docker compose pull` so a retry
+/// actively fetches any missing or updated images before reporting (compose
+/// only downloads layers that are absent or changed, and emits progress to the
+/// Logs tab). If the pull can't reach the registry we fall back to reporting on
+/// whatever is already cached locally rather than blocking on the network.
 async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("stack-images", ctx);
     let images = required_stack_images(ctx);
@@ -765,57 +772,91 @@ async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
             .with_state(CheckState::Skip)
             .with_detail("no compose images needed for this profile");
     }
-    let missing: Vec<String> = tokio::task::spawn_blocking(move || {
-        images
-            .into_iter()
-            .filter(|img| !docker_image_present(img))
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
+
+    // Download first. Skipped when there's no app handle (e.g. unit tests).
+    // A pull failure is non-fatal — we still report on the local cache below.
+    let pull_err = match &ctx.app {
+        Some(app) => crate::compose::pull_compose_images(app.clone()).await.err(),
+        None => None,
+    };
+
+    let missing = missing_stack_images(images).await;
     if !missing.is_empty() {
+        let detail = match &pull_err {
+            Some(e) => format!("missing: {} \u{2014} {}", missing.join(", "), e),
+            None => format!("missing: {}", missing.join(", ")),
+        };
         return base
             .with_state(CheckState::Fail)
-            .with_detail(format!("missing: {}", missing.join(", ")));
+            .with_label("Stack images unavailable")
+            .with_detail(detail);
     }
-    match crate::update::check_docker_core_image_update(ctx.image_tag).await {
-        Ok(Some((image, _))) => base.with_state(CheckState::Warn).with_label(format!(
-            "{} image outdated \u{2014} pull {}",
-            image.display_name(),
-            crate::compose::COMPOSE_IMAGE_TAG
-        )),
-        Ok(_) => base
+
+    match pull_err {
+        // Present locally but the registry was unreachable, so we're running on
+        // possibly-stale images. Warn rather than claim up to date (a Warn
+        // never blocks start).
+        Some(e) => base
+            .with_state(CheckState::Warn)
+            .with_label("Stack images present (pull failed)")
+            .with_detail(e),
+        None => base
             .with_state(CheckState::Pass)
             .with_label("Miner + validator images up to date"),
-        // Images are present, but we couldn't reach the registry to confirm
-        // they're current. Green would over-claim, so warn (the stack still
-        // runs — a Warn never blocks start).
-        Err(e) => base
-            .with_state(CheckState::Warn)
-            .with_label("Stack images present (update check failed)")
-            .with_detail(e),
     }
 }
 
-/// Native miner binary: a single check covering both presence and freshness.
-/// Missing → Fail (install via Retry); present but a newer release exists →
-/// Warn (update via Retry); present and current → Pass.
+/// An outdated binary was detected: fetch the update now (a retry downloads
+/// updates too) and report the result. Falls back to a Warn if there's no app
+/// handle or the download fails.
+async fn fetch_binary_update(ctx: &CheckCtx, base: CheckItem, version: &str) -> CheckItem {
+    let outdated = base
+        .clone()
+        .with_state(CheckState::Warn)
+        .with_label(format!(
+            "Native miner outdated \u{2014} v{} available",
+            version
+        ));
+    let Some(app) = &ctx.app else {
+        return outdated;
+    };
+    match crate::native::download_native_binary(app.clone()).await {
+        Ok(_) => base
+            .with_state(CheckState::Pass)
+            .with_label(format!("Native miner updated to v{}", version)),
+        Err(e) => outdated.with_detail(e),
+    }
+}
+
+/// Native miner binary. Mirrors the stack-images check: a retry actively
+/// fetches the binary before reporting — a missing binary is downloaded and an
+/// outdated one is updated. A current binary is left untouched (the PyInstaller
+/// binary is large, so the full download is gated on need rather than re-run
+/// every retry; Docker images differ only because compose pulls layer deltas).
 async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("binary", ctx);
-    let available = tokio::task::spawn_blocking(crate::native::is_binary_available)
+    let mut available = tokio::task::spawn_blocking(crate::native::is_binary_available)
         .await
         .unwrap_or(false);
+
+    // Missing → download before reporting. Skipped when there's no app handle.
     if !available {
-        return base
-            .with_state(CheckState::Fail)
-            .with_label("Native miner binary not installed")
-            .with_detail("run Download & Install");
+        if let Some(app) = &ctx.app {
+            let _ = crate::native::download_native_binary(app.clone()).await;
+            available = tokio::task::spawn_blocking(crate::native::is_binary_available)
+                .await
+                .unwrap_or(false);
+        }
+        if !available {
+            return base
+                .with_state(CheckState::Fail)
+                .with_label("Native miner binary not installed")
+                .with_detail("download failed \u{2014} check your connection and retry");
+        }
     }
+
     match crate::native::check_binary_update().await {
-        Ok(Some(info)) => base.with_state(CheckState::Warn).with_label(format!(
-            "Native miner outdated \u{2014} v{} available",
-            info.version
-        )),
+        Ok(Some(info)) => fetch_binary_update(ctx, base, &info.version).await,
         Ok(None) => base
             .with_state(CheckState::Pass)
             .with_label("Native miner binary up to date"),

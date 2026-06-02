@@ -183,16 +183,15 @@ const STATE_ICON = {
 // Fix button labels, keyed by FixKind.kind.
 const FIX_LABELS = {
   InstallDocker:   'Install Docker',
-  PullImage:       'Pull Image',
-  DownloadBinary:  'Download & Install',
   GenerateSecret:  'Generate Secret',
 };
 
-// Checks whose fix is folded into the Retry button: Retry runs the fix
-// (only when the check is failing — re-downloading or, worse, regenerating
-// the node secret on a passing check would be wasteful/destructive) and
-// then rechecks. These show a single Retry button, no separate fix.
-const FIX_FOLDED_INTO_RETRY = new Set(['stack-images', 'binary', 'secret']);
+// Secret generation is folded into the Retry button: Retry generates the
+// secret (only when the check is failing — regenerating it on a passing check
+// would be destructive) and then rechecks, so there's no separate fix button.
+// Downloads (stack images, native binary) are performed by the backend check
+// itself on recheck, so their Retry is just a plain recheck.
+const FIX_FOLDED_INTO_RETRY = new Set(['secret']);
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach((btn) => {
@@ -883,31 +882,6 @@ function mergeCheckUpdate(item) {
   }
 }
 
-// ─── Stack images: pull, then recheck ────────────────────────────────────────
-// The stack-images Recheck button pulls every image in the current profile
-// (node + dashboard + postgres + caddy as applicable) and then reruns the
-// check, so the user doesn't need a separate Pull Image action.
-async function pullStackImagesThenRecheck() {
-  // Optimistically show the running state so the button disables during the
-  // pull; the backend recheck below emits the real terminal state after.
-  const item = state.checks.get('stack-images');
-  if (item) {
-    state.checks.set('stack-images', {
-      ...item,
-      state: 'running',
-      label: 'Pulling stack images…',
-    });
-    renderChecklist();
-  }
-  try {
-    await invoke('pull_compose_images');
-  } catch (e) {
-    appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${e}` });
-    finishPullProgress();
-  }
-  await invoke('recheck', { ids: ['stack-images'] }).catch(console.error);
-}
-
 // ─── Fix action dispatcher ──────────────────────────────────────────────────
 async function runFix(id) {
   const item = state.checks.get(id);
@@ -917,26 +891,6 @@ async function runFix(id) {
   switch (fix.kind) {
     case 'InstallDocker':
       openUrl('https://docs.docker.com/get-docker/');
-      return;
-
-    case 'PullImage': {
-      // Pulls every image in the current profile (node + dashboard +
-      // postgres + caddy as applicable). The old tag-specific call is
-      // obsolete — image selection happens inside compose now.
-      try {
-        await invoke('pull_compose_images');
-      } catch (e) {
-        console.error('Pull failed:', e);
-      }
-      return;
-    }
-
-    case 'DownloadBinary':
-      try {
-        await invoke('download_native_binary');
-      } catch (e) {
-        appendLog({ timestamp: '', level: 'ERROR', message: `Download failed: ${e}` });
-      }
       return;
 
     case 'GenerateSecret':
@@ -965,12 +919,10 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   if (btn.dataset.action === 'recheck') {
     const item = state.checks.get(id);
     const failing = item && (item.state === 'fail' || item.state === 'warn');
-    if (id === 'stack-images') {
-      // stack-images always pulls on Retry (cache-busts :v0.2), then rechecks.
-      pullStackImagesThenRecheck();
-    } else if (FIX_FOLDED_INTO_RETRY.has(id) && failing) {
-      // binary / secret: Retry runs the fix, then rechecks — but only while
-      // failing, so a passing check isn't re-downloaded or its secret reset.
+    if (FIX_FOLDED_INTO_RETRY.has(id) && failing) {
+      // secret: Retry generates the secret, then rechecks — but only while
+      // failing, so a passing check isn't reset. Downloads (stack images,
+      // native binary) are pulled by the backend check itself on recheck.
       retryWithFix(id);
     } else {
       invoke('recheck', { ids: [id] }).catch(console.error);
@@ -980,7 +932,7 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   }
 });
 
-// Run a check's fix (download binary, generate secret), then recheck it.
+// Run a check's fix (generate secret), then recheck it.
 async function retryWithFix(id) {
   await runFix(id);
   await invoke('recheck', { ids: [id] }).catch(console.error);
