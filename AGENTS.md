@@ -281,8 +281,13 @@ Probe responses are classified into `ProbeOutcome` with these rules:
 - `Unreachable` (Warn) — `Timeout` (either branch)
 - `Unverified` (Warn) — `ServiceError`: check.quip.network was down/errored, so
   we couldn't verify (no green check we didn't earn)
-- `RateLimited { retry_after_secs, endpoint }` (Pass) — service rate-limited;
-  `is_externally_reachable()` treats it as passing
+- `RateLimited { retry_after_secs, endpoint }` (Warn) — service rate-limited
+  (HTTP 429), so we couldn't verify; the retry time is shown so the user can
+  recheck after the cool-down. Not a green check we didn't earn.
+
+A check only goes **green** when check.quip.network positively confirmed the
+port (`Verified`/`ForwardReady`); `is_externally_reachable()` is true for those
+two and nothing else.
 
 **Design rule:** *any response from the host means the router forward is
 working; only a connect-level timeout fails the check.* ALPN mismatches,

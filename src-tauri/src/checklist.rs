@@ -353,9 +353,9 @@ pub enum PortProbeResult {
     /// HTTP 5xx, non-JSON body). We can't confirm external reachability, so
     /// we surface a warning rather than a misleading green check.
     Unverified,
-    /// check.quip.network rate-limited the request. We can't verify right
-    /// now but the port may well be fine — treat as passing until the
-    /// cool-down expires and a real recheck can run.
+    /// check.quip.network rate-limited the request. We couldn't verify
+    /// reachability, so this is a warning (not a green check) — the user can
+    /// recheck once the cool-down expires. The retry time is preserved for UX.
     RateLimited {
         /// Seconds until the ban is expected to lift, per the service's
         /// `retry_after_seconds` field.
@@ -366,11 +366,11 @@ pub enum PortProbeResult {
 }
 
 impl PortProbeResult {
+    /// True only when check.quip.network positively confirmed the port was
+    /// reachable. A rate-limit, service error, or any other non-confirmation
+    /// is *not* a pass — we never claim reachability we didn't measure.
     pub fn is_externally_reachable(self) -> bool {
-        matches!(
-            self,
-            Self::Verified | Self::ForwardReady | Self::RateLimited { .. }
-        )
+        matches!(self, Self::Verified | Self::ForwardReady)
     }
 }
 
@@ -386,8 +386,8 @@ enum ProbeOutcome {
     /// Service returned success-key=false AND the error indicates no
     /// response at the UDP/TCP layer (timeout, unreachable, no route).
     Timeout,
-    /// HTTP 429 with `retry_after_seconds`. We can't verify right now,
-    /// so we optimistically pass but preserve the retry time for the UX.
+    /// HTTP 429 with `retry_after_seconds`. We can't verify right now, so
+    /// we surface a warning but preserve the retry time for the UX.
     RateLimited(u64),
     /// Any other failure — HTTP 5xx, non-JSON body, client-side network
     /// error. Treated as lenient-pass (not the user's fault).
@@ -884,10 +884,10 @@ fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (Ch
             retry_after_secs,
             endpoint,
         } => (
-            CheckState::Pass,
+            CheckState::Warn,
             format!(
-                "{noun} port {port} rate-limited by /{endpoint} \u{2014} \
-                 retry in {retry_after_secs}s"
+                "{noun} port {port} \u{2014} couldn't externally verify \
+                 (/{endpoint} rate-limited, retry in {retry_after_secs}s)"
             ),
         ),
     }
@@ -1246,6 +1246,23 @@ mod tests {
             let (state, _) = port_probe_state_label(result, "Validator P2P", 30033);
             assert_eq!(state, CheckState::Pass);
         }
+    }
+
+    #[test]
+    fn rate_limited_probe_warns_not_passes() {
+        let result = PortProbeResult::RateLimited {
+            retry_after_secs: 2909,
+            endpoint: "checkport",
+        };
+        let (state, label) = port_probe_state_label(result, "Validator P2P", 30333);
+        assert_eq!(state, CheckState::Warn);
+        assert!(
+            label.contains("couldn't externally verify"),
+            "label was: {label}"
+        );
+        assert!(label.contains("2909s"), "label was: {label}");
+        // Only a positive response from check.quip.network counts as reachable.
+        assert!(!result.is_externally_reachable());
     }
 
     #[test]
