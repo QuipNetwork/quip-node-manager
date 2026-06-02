@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Quip Node Manager installer for Windows.
-# Usage: irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc3/scripts/install.ps1 | iex
+# Usage: irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc4/scripts/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
