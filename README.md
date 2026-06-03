@@ -7,13 +7,13 @@ Desktop application for running and monitoring [Quip](https://gitlab.com/quip.ne
 **macOS / Linux:**
 
 ```sh
-curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.sh | sh
+curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
+irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0/scripts/install.ps1 | iex
 ```
 
 ## Manual Download
@@ -59,7 +59,7 @@ Click **More info**, then **Run anyway**.
 - **Two run modes** -- Docker (default on Windows/Linux) drives the full container stack; Native (macOS) runs a standalone binary on the host and still runs the dashboard/postgres containers, wired to the host via `host.docker.internal`
 - **Per-image type** -- CPU, CUDA (NVIDIA GPU), or QPU (D-Wave) — selected from the Stack Configuration panel
 - **Dashboard + TLS toggles** -- optional dashboard (Postgres-backed telemetry UI) and optional Caddy reverse proxy with automatic Let's Encrypt certificates
-- **Pre-flight checklist** -- verifies Docker + Compose v2 availability, stack asset staging, all stack images, node secret, public IP, port forwarding, and local port conflicts (20080/80/443/native REST) before starting
+- **Pre-flight checklist** -- verifies Docker + Compose v2 availability, stack asset staging, node secret, public IP, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
 - **Live log streaming** -- tails `docker compose logs -f <node>` in a collapsible drawer; switches to `data/node.log` once the node writes to it
 - **GPU configuration** -- detects CUDA and Metal devices, per-device enable/disable, utilization slider, yielding mode
 - **D-Wave QPU support** -- optional quantum processing unit configuration with daily budget controls
@@ -77,13 +77,15 @@ Click **More info**, then **Run anyway**.
 
 ### Setup
 
-This repo vendors the compose stack via a git submodule. After cloning:
+This repo vendors the compose stack via a git submodule. After cloning, fetch the
+submodule at the commit locked by this repo:
 
 ```sh
-git submodule update --init --recursive
+make fetch-submodules
 ```
 
-(Or clone with `git clone --recurse-submodules` to do this in one step.)
+(Equivalent to `git submodule update --init --recursive`, or clone with
+`git clone --recurse-submodules` to do this in one step.)
 
 ### Commands
 

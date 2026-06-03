@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::log_stream::LogEntry;
-use crate::settings::{data_dir, RunMode};
+use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
 use serde::Serialize;
+use std::path::Path;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
+const PUBLIC_TESTNET_FAUCET_URL: &str = "https://faucet.testnet.quip.network";
+const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(90);
 
 #[derive(Serialize, Clone, Debug)]
 pub struct NativeNodeStatus {
@@ -35,22 +39,161 @@ impl NativeProcessState {
     }
 }
 
+impl Default for NativeProcessState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn binary_name() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "quip-network-node-macos-arm64"
+        "quip-miner-macos-arm64"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "quip-network-node-macos-x86_64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "quip-network-node-linux-x86_64"
-    } else if cfg!(target_os = "windows") {
-        "quip-network-node-windows-x86_64.exe"
+        "quip-miner-macos-x86_64"
     } else {
-        "quip-network-node"
+        "quip-miner"
     }
 }
 
 fn binary_path() -> std::path::PathBuf {
     data_dir().join("bin").join(binary_name())
+}
+
+/// Remove pre-v0.2 native binaries (named `quip-network-node-*`) and their
+/// `.release` markers from `bin_dir`. The v0.2 manager downloads and runs
+/// `quip-miner-*`, so the old files are dead weight (~60 MB). Returns the
+/// names of files removed. Best-effort: unreadable dirs yield an empty list.
+fn cleanup_legacy_native_binaries(bin_dir: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(bin_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("quip-network-node") && std::fs::remove_file(entry.path()).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
+}
+
+/// Best-effort cleanup of legacy native binaries in the live `bin` dir.
+pub fn cleanup_legacy_binaries() -> Vec<String> {
+    cleanup_legacy_native_binaries(&data_dir().join("bin"))
+}
+
+fn binary_release_marker_path() -> std::path::PathBuf {
+    data_dir()
+        .join("bin")
+        .join(format!("{}.release", binary_name()))
+}
+
+/// Fetch the quip-protocol releases list (GitLab returns them newest-first).
+async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json::Value> {
+    let url = format!(
+        "https://gitlab.com/api/v4/projects/{}/releases?per_page=20",
+        PROTOCOL_PROJECT
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "quip-node-manager")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+/// (tag, asset_url, description) for every release that ships `asset_name`,
+/// newest-first (GitLab returns releases newest-first). This tracks whatever
+/// the latest releases are tagged (`v0.2`, `v0.2.0rc1`, …) and skips older
+/// releases that only carry the legacy asset name.
+fn binary_release_candidates(
+    releases: &serde_json::Value,
+    asset_name: &str,
+) -> Vec<(String, String, String)> {
+    releases
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rel| {
+            let tag = rel["tag_name"].as_str()?.to_string();
+            let url = release_asset_url(rel, asset_name)?;
+            let desc = rel["description"].as_str().unwrap_or("").to_string();
+            Some((tag, url, desc))
+        })
+        .collect()
+}
+
+/// A release asset link is registered in the API as soon as the release is
+/// tagged, but the artifact behind it 404s until its build job finishes. A
+/// HEAD is unreliable (GitLab answers 200 at the redirect layer), so probe
+/// with a 1-byte ranged GET — a 404 means "not built yet".
+async fn asset_is_downloadable(client: &reqwest::Client, url: &str) -> bool {
+    match client
+        .get(url)
+        .header("User-Agent", "quip-node-manager")
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status() != reqwest::StatusCode::NOT_FOUND,
+        Err(_) => false,
+    }
+}
+
+/// Newest release whose `asset_name` artifact is actually downloadable. Skips
+/// just-tagged releases whose build hasn't produced the artifact yet.
+async fn resolve_latest_downloadable_release(
+    client: &reqwest::Client,
+    releases: &serde_json::Value,
+    asset_name: &str,
+) -> Option<(String, String, String)> {
+    for candidate in binary_release_candidates(releases, asset_name) {
+        if asset_is_downloadable(client, &candidate.1).await {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Direct download URL for `asset_name` within `release`. Prefers the stable
+/// `direct_asset_url` permalink, falling back to the job-artifact `url`.
+fn release_asset_url(release: &serde_json::Value, asset_name: &str) -> Option<String> {
+    release["assets"]["links"]
+        .as_array()?
+        .iter()
+        .find(|link| link["name"].as_str() == Some(asset_name))
+        .and_then(|link| {
+            link["direct_asset_url"]
+                .as_str()
+                .or_else(|| link["url"].as_str())
+                .map(str::to_string)
+        })
+}
+
+fn installed_binary_release_tag() -> Option<String> {
+    std::fs::read_to_string(binary_release_marker_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Record the release tag the on-disk binary came from, so update checks can
+/// compare against the latest release even when the binary's own `--version`
+/// string differs from the tag.
+fn write_binary_release_marker(tag: &str) -> Result<(), String> {
+    let path = binary_release_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, tag).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn normalize_release_version(value: &str) -> String {
+    value.trim().trim_start_matches('v').to_ascii_lowercase()
 }
 
 pub fn is_binary_available() -> bool {
@@ -64,6 +207,177 @@ fn pid_file_path() -> std::path::PathBuf {
 
 fn node_output_log_path() -> std::path::PathBuf {
     data_dir().join("node-output.log")
+}
+
+pub(crate) fn native_miner_validator_url(config: &NodeConfig) -> String {
+    crate::config::native_validator_rpc_url(config)
+}
+
+fn validator_rpc_http_probe_url(validator_url: &str) -> String {
+    validator_url
+        .strip_prefix("ws://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            validator_url
+                .strip_prefix("wss://")
+                .map(|rest| format!("https://{rest}"))
+        })
+        .unwrap_or_else(|| validator_url.to_string())
+}
+
+pub(crate) fn native_miner_subcommand(config: &NodeConfig) -> &'static str {
+    if config.dwave_config.is_some() {
+        return "qpu";
+    }
+
+    if matches!(config.gpu_backend, GpuBackend::Mps | GpuBackend::Modal)
+        || config
+            .gpu_device_configs
+            .iter()
+            .any(|device| device.enabled)
+    {
+        return "gpu";
+    }
+
+    "cpu"
+}
+
+pub(crate) fn native_miner_args(config: &NodeConfig, config_path: &Path) -> Vec<String> {
+    let subcommand = native_miner_subcommand(config);
+    let signer_key = native_signer_key_path().to_string_lossy().to_string();
+    vec![
+        subcommand.to_string(),
+        "--config".to_string(),
+        config_path.to_string_lossy().to_string(),
+        "--signer-key".to_string(),
+        signer_key,
+        "--faucet-url".to_string(),
+        PUBLIC_TESTNET_FAUCET_URL.to_string(),
+    ]
+}
+
+pub(crate) fn native_signer_key_path() -> std::path::PathBuf {
+    data_dir().join("keystore.json")
+}
+
+pub(crate) fn native_keygen_args(signer_key: &Path) -> Vec<String> {
+    vec![
+        "keygen".to_string(),
+        "--out".to_string(),
+        signer_key.to_string_lossy().to_string(),
+    ]
+}
+
+pub(crate) fn ensure_native_signer_key(bin: &Path) -> Result<bool, String> {
+    let signer_key = native_signer_key_path();
+    if signer_key.exists() {
+        return Ok(false);
+    }
+
+    let work_dir = data_dir();
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
+
+    let output = crate::cmd::new(bin)
+        .args(native_keygen_args(&signer_key))
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|e| format!("Failed to generate native miner keystore: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            return Err(format!("Native miner keygen failed: {}", output.status));
+        }
+        return Err(format!(
+            "Native miner keygen failed: {}: {}",
+            output.status, detail
+        ));
+    }
+
+    if !signer_key.exists() {
+        return Err(format!(
+            "Native miner keygen finished but did not create {}",
+            signer_key.display()
+        ));
+    }
+
+    Ok(true)
+}
+
+async fn wait_for_native_miner_validator_rpc(
+    app: &tauri::AppHandle,
+    validator_url: &str,
+) -> Result<(), String> {
+    // TODO: Revisit this readiness gate; it likely needs another pass to make
+    // the flow and diagnostics more eloquent.
+    let probe_url = validator_rpc_http_probe_url(validator_url);
+    let _ = app.emit(
+        "node-log",
+        &LogEntry {
+            timestamp: String::new(),
+            level: "INFO".to_string(),
+            message: format!("Waiting for validator RPC at {validator_url}"),
+        },
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "system_health",
+        "params": [],
+    });
+    let start = std::time::Instant::now();
+    let mut last_error = String::from("not checked yet");
+
+    while start.elapsed() < NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT {
+        match client.post(&probe_url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) if status.is_success() => {
+                        if serde_json::from_str::<serde_json::Value>(&text)
+                            .map(|value| {
+                                value.get("result").is_some() || value.get("error").is_some()
+                            })
+                            .unwrap_or(false)
+                        {
+                            let _ = app.emit(
+                                "node-log",
+                                &LogEntry {
+                                    timestamp: String::new(),
+                                    level: "INFO".to_string(),
+                                    message: format!("Validator RPC is ready at {validator_url}"),
+                                },
+                            );
+                            return Ok(());
+                        }
+                        last_error = format!("unexpected RPC response: {text}");
+                    }
+                    Ok(text) => {
+                        last_error = format!("HTTP {status}: {text}");
+                    }
+                    Err(e) => {
+                        last_error = format!("HTTP {status}, read error: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = e.to_string();
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    Err(format!(
+        "Validator RPC not ready at {validator_url} after {}s: {last_error}",
+        NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT.as_secs()
+    ))
 }
 
 fn write_pid(pid: u32) {
@@ -185,21 +499,21 @@ pub fn installed_binary_version() -> Option<String> {
         .unwrap_or(text.trim())
         .trim_start_matches('v')
         .to_string();
-    if version.is_empty() { None } else { Some(version) }
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
 }
 
-/// Download the latest binary from GitLab releases.
+/// Download the latest native miner binary from GitLab releases. Tracks the
+/// most recent release that ships this platform's asset, so release-candidate
+/// tags (e.g. `v0.2.0rc1`) are picked up automatically.
 #[tauri::command]
-pub async fn download_native_binary(
-    app: tauri::AppHandle,
-) -> Result<String, String> {
+pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
-    let url = format!(
-        "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
-        name
-    );
 
     let log = |msg: String| {
         let entry = serde_json::json!({
@@ -210,7 +524,26 @@ pub async fn download_native_binary(
         let _ = app.emit("node-log", entry);
     };
 
-    log(format!("Downloading {}", url));
+    // Resolve the latest release that actually ships this binary (rc-aware).
+    let meta_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let releases = fetch_protocol_releases(&meta_client)
+        .await
+        .ok_or_else(|| "Could not list quip-protocol releases".to_string())?;
+    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "The latest quip-protocol release ships {name}, but its artifact \
+                 isn't available yet — the build may still be running. Try again shortly."
+            )
+        })?;
+
+    log(format!("Downloading {name} ({tag})"));
+    log(format!("From {url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -234,47 +567,25 @@ pub async fn download_native_binary(
     }
 
     let total = resp.content_length();
-    if let Some(t) = total {
-        log(format!(
-            "Binary size: {:.1} MB",
-            t as f64 / 1_048_576.0
-        ));
-    }
 
     // Stream to file
     let bin_dir = data_dir().join("bin");
-    std::fs::create_dir_all(&bin_dir)
-        .map_err(|e| format!("Cannot create bin dir: {}", e))?;
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("Cannot create bin dir: {}", e))?;
 
     let dest = binary_path();
     let tmp = dest.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|e| format!("Cannot create file: {}", e))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("Cannot create file: {}", e))?;
 
+    // Progress is surfaced as a bar in the UI via binary-download-progress;
+    // no per-percent log lines.
     let mut downloaded: u64 = 0;
-    let mut last_pct: u64 = 0;
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| format!("Download error: {}", e))?;
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
         file.write_all(&chunk)
             .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
-
-        // Log every 10%
-        if let Some(t) = total {
-            let pct = (downloaded * 100) / t;
-            if pct / 10 > last_pct / 10 {
-                log(format!(
-                    "Downloading... {:.1}/{:.1} MB ({}%)",
-                    downloaded as f64 / 1_048_576.0,
-                    t as f64 / 1_048_576.0,
-                    pct
-                ));
-                last_pct = pct;
-            }
-        }
 
         let _ = app.emit(
             "binary-download-progress",
@@ -288,8 +599,7 @@ pub async fn download_native_binary(
     drop(file);
 
     // Move tmp → final
-    std::fs::rename(&tmp, &dest)
-        .map_err(|e| format!("Cannot install binary: {}", e))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("Cannot install binary: {}", e))?;
 
     // chmod +x on Unix
     #[cfg(unix)]
@@ -299,8 +609,16 @@ pub async fn download_native_binary(
             .map_err(|e| e.to_string())?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)
-            .map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+    }
+    // Best-effort: the binary is already installed. A failed marker only
+    // affects update detection, so warn instead of failing the download — but
+    // don't swallow it silently, or stale-marker bugs become invisible.
+    if let Err(e) = write_binary_release_marker(&tag) {
+        log(format!(
+            "Warning: could not record release marker ({e}); \
+             update checks may keep re-offering this version"
+        ));
     }
 
     let _ = app.emit(
@@ -312,23 +630,22 @@ pub async fn download_native_binary(
         },
     );
 
-    let version =
-        installed_binary_version().unwrap_or("unknown".into());
-    log(format!("Installed {} v{}", name, version));
+    let version = installed_binary_version().unwrap_or_else(|| normalize_release_version(&tag));
+    log(format!(
+        "Installed {} from {} (binary version: {})",
+        name, tag, version
+    ));
 
     Ok(version)
 }
 
-/// Check if a newer binary is available from GitLab releases.
+/// Check if the configured v0.2 native miner release is installed.
 #[tauri::command]
-pub async fn check_binary_update(
-) -> Result<Option<crate::update::UpdateInfo>, String> {
-    let current = match tokio::task::spawn_blocking(
-        installed_binary_version,
-    )
-    .await
-    .ok()
-    .flatten()
+pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
+    let current = match tokio::task::spawn_blocking(installed_binary_version)
+        .await
+        .ok()
+        .flatten()
     {
         Some(v) => v,
         None => return Ok(None),
@@ -339,45 +656,31 @@ pub async fn check_binary_update(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let url = format!(
-        "https://gitlab.com/api/v4/projects/{}/releases",
-        PROTOCOL_PROJECT
-    );
-    let releases: Vec<serde_json::Value> = match client
-        .get(&url)
-        .header("User-Agent", "quip-node-manager")
-        .send()
-        .await
-    {
-        Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => return Ok(None),
-    };
-
-    let Some(latest) = releases.first() else {
+    let Some(releases) = fetch_protocol_releases(&client).await else {
         return Ok(None);
     };
-
-    let tag = latest["tag_name"]
-        .as_str()
-        .unwrap_or("")
-        .trim_start_matches('v');
+    // Only offer an update we can actually install — a just-tagged release
+    // whose artifact build hasn't finished is skipped until it's downloadable.
+    let Some((tag, url, description)) =
+        resolve_latest_downloadable_release(&client, &releases, binary_name()).await
+    else {
+        return Ok(None);
+    };
     if tag.is_empty() {
         return Ok(None);
     }
 
-    if crate::update::parse_semver(tag)
-        > crate::update::parse_semver(&current)
-    {
+    let current_tag_matches = installed_binary_release_tag()
+        .map(|installed| installed == tag)
+        .unwrap_or(false);
+    let current_version_matches =
+        normalize_release_version(&current) == normalize_release_version(&tag);
+
+    if !current_tag_matches && !current_version_matches {
         Ok(Some(crate::update::UpdateInfo {
-            version: tag.to_string(),
-            url: format!(
-                "https://gitlab.com/quip.network/quip-protocol/-/releases/permalink/latest/downloads/{}",
-                binary_name()
-            ),
-            notes: latest["description"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
+            version: normalize_release_version(&tag),
+            url,
+            notes: description,
         }))
     } else {
         Ok(None)
@@ -392,10 +695,7 @@ pub async fn start_native_node(
     // Check for already-running process (in-memory or orphan from PID file)
     if let Some(child) = state.child.lock().unwrap().as_ref() {
         let pid = child.id();
-        return Err(format!(
-            "Node already running (PID {})",
-            pid
-        ));
+        return Err(format!("Node already running (PID {})", pid));
     }
     if let Some(pid) = detect_orphan_node() {
         return Err(format!(
@@ -407,20 +707,60 @@ pub async fn start_native_node(
     let settings = crate::settings::load_settings();
     let mut config = settings.node_config;
 
-    // Auto-detect public IP when no public_host is configured
+    let migration = crate::migration_v2::migrate_for_run_mode(&RunMode::Native)?;
+    migration.promoted.apply_to_node_config(&mut config);
+    crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
+    crate::migration_v2::emit_report(&app, &migration);
+
+    // Auto-detect public IP when no public_host is configured. A detection
+    // failure must not be silent: without a public_host the validator
+    // advertises no public address and peers can't dial in, so surface a
+    // warning the user can act on.
     if config.public_host.is_empty() {
-        if let Ok(ip) = crate::network::detect_public_ip().await {
-            config.public_host = ip;
+        match crate::network::detect_public_ip().await {
+            Ok(ip) => config.public_host = ip,
+            Err(e) => {
+                let _ = app.emit(
+                    "node-log",
+                    &LogEntry {
+                        timestamp: String::new(),
+                        level: "WARN".to_string(),
+                        message: format!(
+                            "Could not auto-detect public IP ({e}); the node will not \
+                             advertise a public address. Set a public host in Settings."
+                        ),
+                    },
+                );
+            }
         }
     }
 
-    // Write config.toml for native mode
+    // Write config.toml for native mode. The renderer forces the native
+    // miner's REST host to loopback (it's reached via host.docker.internal),
+    // so no rest_host override is needed here.
     crate::config::write_config_toml(&config, &RunMode::Native)?;
 
+    // Auto-provision the miner binary when it's missing — mirrors Docker
+    // mode pulling images on start, so a fresh or relocated data dir doesn't
+    // dead-end here.
     let bin = binary_path();
     if !bin.exists() {
+        let _ = app.emit(
+            "node-log",
+            &LogEntry {
+                timestamp: String::new(),
+                level: "INFO".to_string(),
+                message: format!(
+                    "Native miner binary not found at {} — downloading…",
+                    bin.display()
+                ),
+            },
+        );
+        download_native_binary(app.clone()).await?;
+    }
+    if !bin.exists() {
         return Err(format!(
-            "Node binary not found at {}",
+            "Native miner binary still missing at {} after download",
             bin.display()
         ));
     }
@@ -437,11 +777,28 @@ pub async fn start_native_node(
         .map_err(|e| format!("Cannot clone log file: {}", e))?;
 
     let work_dir = data_dir();
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|e| format!("Cannot create data dir: {}", e))?;
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
 
+    if ensure_native_signer_key(&bin)? {
+        let _ = app.emit(
+            "node-log",
+            &LogEntry {
+                timestamp: String::new(),
+                level: "INFO".to_string(),
+                message: format!(
+                    "Generated native miner keystore at {}",
+                    native_signer_key_path().display()
+                ),
+            },
+        );
+    }
+
+    let validator_url = native_miner_validator_url(&config);
+    wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
+
+    let miner_args = native_miner_args(&config, &config_path);
     let mut cmd = crate::cmd::new(&bin);
-    cmd.args(["--config", &config_path.to_string_lossy()])
+    cmd.args(&miner_args)
         .current_dir(&work_dir)
         .stdout(log_file)
         .stderr(log_file_err);
@@ -461,11 +818,7 @@ pub async fn start_native_node(
     let pid = child.id();
 
     // Log the command
-    let cmd_msg = format!(
-        "$ {} --config {}",
-        bin.display(),
-        config_path.display()
-    );
+    let cmd_msg = format!("$ {} {}", bin.display(), miner_args.join(" "));
     let _ = app.emit(
         "node-log",
         &LogEntry {
@@ -479,7 +832,7 @@ pub async fn start_native_node(
         &LogEntry {
             timestamp: String::new(),
             level: "INFO".to_string(),
-            message: format!("Native node started (PID {})", pid),
+            message: format!("Native miner started (PID {})", pid),
         },
     );
 
@@ -491,15 +844,12 @@ pub async fn start_native_node(
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
-    Ok(format!("Native node started (PID {})", pid))
+    Ok(format!("Native miner started (PID {})", pid))
 }
 
 /// Tail node logs: starts with node-output.log (process stdout),
 /// then switches to node.log once the node creates it.
-fn start_log_tail(
-    app: tauri::AppHandle,
-    stop_flag: Arc<Mutex<bool>>,
-) {
+fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
     use crate::log_stream::{start_log_stream_for_app, FallbackSource};
     let path = node_output_log_path();
     let _ = app.emit(
@@ -539,8 +889,7 @@ pub async fn start_native_log_tail(
 /// Outer deadline for the native stop path. `kill_pid` itself takes ~2s
 /// (SIGTERM → sleep → SIGKILL on Unix) so 5s gives real escalation room
 /// without letting a stuck process block the UI forever.
-const NATIVE_STOP_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const NATIVE_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stop the native node process with verify + auto-recheck.
 ///
@@ -562,9 +911,8 @@ pub async fn stop_native_node(
         let pid = guard.as_ref().map(|c| c.id());
         (pid, guard.take())
     };
-    let orphan_pid = read_pid().filter(|pid| {
-        child_pid.map(|cp| cp != *pid).unwrap_or(true) && is_process_alive(*pid)
-    });
+    let orphan_pid = read_pid()
+        .filter(|pid| child_pid.map(|cp| cp != *pid).unwrap_or(true) && is_process_alive(*pid));
 
     // Do the blocking kill work in a bounded thread so the async runtime
     // stays responsive and we can time out cleanly.
@@ -589,9 +937,7 @@ pub async fn stop_native_node(
     remove_pid();
 
     let timed_out = kill_result.is_err();
-    let still_alive = child_pid
-        .map(is_process_alive)
-        .unwrap_or(false)
+    let still_alive = child_pid.map(is_process_alive).unwrap_or(false)
         || orphan_pid.map(is_process_alive).unwrap_or(false);
 
     if timed_out || still_alive {
@@ -607,18 +953,12 @@ pub async fn stop_native_node(
         return Err(msg.to_string());
     }
 
-    let _ = app.emit(
-        "stop-complete",
-        serde_json::json!({ "success": true }),
-    );
+    let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
 
     let rc_app = app.clone();
     tokio::spawn(async move {
-        crate::checklist::trigger_recheck_auto(
-            rc_app,
-            vec!["binary".into(), "version".into()],
-        )
-        .await;
+        // The binary check now covers both presence and freshness.
+        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
     });
 
     Ok(())
@@ -664,4 +1004,182 @@ pub async fn get_native_node_status(
 #[tauri::command]
 pub async fn check_native_binary() -> Result<bool, String> {
     Ok(is_binary_available())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_binary_name_uses_v02_miner_asset() {
+        assert!(binary_name().starts_with("quip-miner"));
+        assert!(!binary_name().starts_with("quip-network-node"));
+    }
+
+    #[test]
+    fn cleanup_removes_legacy_node_binaries_keeps_current() {
+        let dir = std::env::temp_dir().join(format!("quip-bin-cleanup-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("quip-network-node-macos-arm64");
+        let legacy_marker = dir.join("quip-network-node-macos-arm64.release");
+        let current = dir.join(binary_name());
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&legacy_marker, b"v0.1").unwrap();
+        std::fs::write(&current, b"new").unwrap();
+
+        let removed = cleanup_legacy_native_binaries(&dir);
+
+        assert!(!legacy.exists(), "legacy binary should be removed");
+        assert!(!legacy_marker.exists(), "legacy marker should be removed");
+        assert!(current.exists(), "current binary must be kept");
+        assert!(removed.iter().any(|n| n == "quip-network-node-macos-arm64"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn candidates_are_newest_first_and_skip_legacy_asset_releases() {
+        // GitLab returns releases newest-first. The v0.2 rcs ship the
+        // quip-miner-* asset; the older v0.1.x release only has the legacy
+        // quip-network-node-* asset, so it must be excluded.
+        let releases = serde_json::json!([
+            {
+                "tag_name": "v0.2.0rc2",
+                "description": "rc2 notes",
+                "assets": { "links": [
+                    { "name": binary_name(),
+                      "direct_asset_url": "https://example/releases/v0.2.0rc2/downloads/bin" }
+                ]}
+            },
+            {
+                "tag_name": "v0.2.0rc1",
+                "assets": { "links": [
+                    { "name": binary_name(),
+                      "direct_asset_url": "https://example/releases/v0.2.0rc1/downloads/bin" }
+                ]}
+            },
+            {
+                "tag_name": "v0.1.20",
+                "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] }
+            }
+        ]);
+
+        let candidates = binary_release_candidates(&releases, binary_name());
+        let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(tags, vec!["v0.2.0rc2", "v0.2.0rc1"]);
+        assert_eq!(
+            candidates[0].1,
+            "https://example/releases/v0.2.0rc2/downloads/bin"
+        );
+        assert_eq!(candidates[0].2, "rc2 notes");
+    }
+
+    #[test]
+    fn no_release_shipping_the_binary_yields_no_candidates() {
+        let releases = serde_json::json!([
+            { "tag_name": "v0.1.20",
+              "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] } }
+        ]);
+        assert!(binary_release_candidates(&releases, binary_name()).is_empty());
+    }
+
+    #[test]
+    fn asset_url_falls_back_to_url_when_no_direct_asset_url() {
+        let rel = serde_json::json!({
+            "assets": { "links": [ { "name": binary_name(), "url": "https://example/u" } ] }
+        });
+        assert_eq!(
+            release_asset_url(&rel, binary_name()).as_deref(),
+            Some("https://example/u")
+        );
+    }
+
+    #[test]
+    fn release_version_normalization_accepts_preview_tags() {
+        assert_eq!(normalize_release_version("v0.2-preview"), "0.2-preview");
+        assert_eq!(normalize_release_version("0.2-preview"), "0.2-preview");
+        // Release-candidate tags normalize too, so equality checks match.
+        assert_eq!(normalize_release_version("v0.2.0rc1"), "0.2.0rc1");
+    }
+
+    #[test]
+    fn native_miner_args_pass_config_signer_and_public_faucet() {
+        let cfg = NodeConfig::default();
+        let args = native_miner_args(&cfg, Path::new("/tmp/config.toml"));
+        let signer_key = native_signer_key_path().to_string_lossy().to_string();
+
+        assert_eq!(
+            args,
+            vec![
+                "cpu".to_string(),
+                "--config".to_string(),
+                "/tmp/config.toml".to_string(),
+                "--signer-key".to_string(),
+                signer_key,
+                "--faucet-url".to_string(),
+                PUBLIC_TESTNET_FAUCET_URL.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_keygen_args_write_to_configured_signer_path() {
+        let args = native_keygen_args(Path::new("/tmp/quip-data/keystore.json"));
+
+        assert_eq!(
+            args,
+            vec!["keygen", "--out", "/tmp/quip-data/keystore.json"]
+        );
+    }
+
+    #[test]
+    fn native_miner_subcommand_prefers_qpu_over_gpu() {
+        let cfg = NodeConfig {
+            dwave_config: Some(crate::settings::DwaveConfig::default()),
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(native_miner_subcommand(&cfg), "qpu");
+    }
+
+    #[test]
+    fn native_miner_subcommand_uses_gpu_for_mps() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(native_miner_subcommand(&cfg), "gpu");
+    }
+
+    #[test]
+    fn native_miner_validator_url_uses_configured_raw_rpc_port() {
+        // Native miner connects to the validator's raw RPC on the configured
+        // host port (default 9944), not Caddy's /rpc route.
+        let cfg = NodeConfig::default();
+        assert_eq!(native_miner_validator_url(&cfg), "ws://127.0.0.1:9944");
+
+        let custom = NodeConfig {
+            validator_rpc_port: 9955,
+            ..NodeConfig::default()
+        };
+        assert_eq!(native_miner_validator_url(&custom), "ws://127.0.0.1:9955");
+    }
+
+    #[test]
+    fn validator_rpc_http_probe_url_converts_websocket_urls() {
+        assert_eq!(
+            validator_rpc_http_probe_url("ws://127.0.0.1:20049/rpc"),
+            "http://127.0.0.1:20049/rpc"
+        );
+        assert_eq!(
+            validator_rpc_http_probe_url("wss://node.example.com/rpc"),
+            "https://node.example.com/rpc"
+        );
+        assert_eq!(
+            validator_rpc_http_probe_url("http://127.0.0.1:20049/rpc"),
+            "http://127.0.0.1:20049/rpc"
+        );
+    }
 }

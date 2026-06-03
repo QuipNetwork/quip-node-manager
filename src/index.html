@@ -68,7 +68,7 @@
               <span class="checklist-chevron"></span>
             </div>
           </button>
-          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Recheck All</button>
+          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Retry All</button>
         </div>
         <ul id="checklist" class="checklist"></ul>
       </div>
@@ -82,9 +82,9 @@
 
         <div id="config-section">
 
-          <!-- Node Configuration -->
+          <!-- Validator / Miner Configuration -->
           <div class="config-section-divider">
-            <div class="section-heading">Node Configuration</div>
+            <div class="section-heading">Validator &amp; Miner</div>
             <div class="form-group" style="margin-bottom:12px;">
               <label for="data-dir">Storage Directory</label>
               <div style="display:flex;gap:8px;align-items:center;">
@@ -95,20 +95,12 @@
             </div>
             <div class="mining-config-grid">
               <div class="form-group">
-                <label for="port">Port (UDP+TCP)</label>
+                <label for="port">Public API Port</label>
                 <input type="number" id="port" min="1024" max="65535" value="20049" />
               </div>
               <div class="form-group">
-                <label for="listen">Listen Address</label>
-                <input type="text" id="listen" value="::" readonly />
-              </div>
-              <div class="form-group" id="run-mode-group" style="display:none;">
-                <label for="run-mode-select">Run Mode</label>
-                <select id="run-mode-select">
-                  <option value="docker">Docker</option>
-                  <option value="native">Native</option>
-                </select>
-                <div id="run-mode-warning" class="run-mode-warning" style="display:none;margin-top:4px;"></div>
+                <label for="validator-port">Validator P2P Port</label>
+                <input type="number" id="validator-port" min="1024" max="65535" value="30333" />
               </div>
             </div>
             <div class="form-group">
@@ -118,10 +110,6 @@
                 <button id="btn-show-secret" class="btn btn-sm btn-secondary">Show</button>
                 <button id="btn-regen-secret" class="btn btn-sm btn-secondary">Regenerate</button>
               </div>
-            </div>
-            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
-              <input type="checkbox" id="auto-mine" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-              <label for="auto-mine" style="margin:0;cursor:pointer;">Auto-mine when no peers found</label>
             </div>
             <div class="form-group" style="margin-bottom:0;">
               <label for="node-name">Node Name <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
@@ -139,7 +127,7 @@
                 <div class="form-group">
                   <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                     <input type="checkbox" id="public-host-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advertised to peers)</span></label>
+                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advanced external address)</span></label>
                   </div>
                   <div class="mining-config-grid">
                     <div class="form-group" style="margin-bottom:0;">
@@ -153,27 +141,12 @@
                   </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
-                <div class="form-group">
-                  <label for="peers">Bootstrap Peers <span style="color:var(--text-faint);font-weight:400;">(one per line — leave empty for defaults)</span></label>
-                  <textarea id="peers" rows="4" placeholder="qpu-1.nodes.quip.network:20049&#10;cpu-1.quip.carback.us:20049&#10;gpu-1.quip.carback.us:20049&#10;gpu-2.quip.carback.us:20049"></textarea>
+                <div class="form-group" style="max-width:220px;">
+                  <label for="validator-rpc-port">Validator RPC Port <span style="color:var(--text-faint);font-weight:400;">(native mode)</span></label>
+                  <input type="number" id="validator-rpc-port" min="1024" max="65535" value="9944" />
+                  <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Host port the local miner uses to reach the validator's JSON-RPC.</div>
                 </div>
                 <div class="mining-config-grid">
-                  <div class="form-group">
-                    <label for="timeout">Timeout <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
-                    <input type="number" id="timeout" min="1" max="60" value="3" />
-                  </div>
-                  <div class="form-group">
-                    <label for="heartbeat-interval">Heartbeat Interval <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
-                    <input type="number" id="heartbeat-interval" min="1" max="300" value="15" />
-                  </div>
-                  <div class="form-group">
-                    <label for="heartbeat-timeout">Heartbeat Timeout <span style="color:var(--text-faint);font-weight:400;">(s)</span></label>
-                    <input type="number" id="heartbeat-timeout" min="1" max="3600" value="300" />
-                  </div>
-                  <div class="form-group">
-                    <label for="fanout">Fanout <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                    <input type="number" id="fanout" min="1" max="50" placeholder="default" />
-                  </div>
                   <div class="form-group">
                     <label for="log-level">Log Level</label>
                     <select id="log-level">
@@ -183,90 +156,13 @@
                       <option value="error">error</option>
                     </select>
                   </div>
-                  <div class="form-group" style="display:flex;align-items:center;gap:10px;padding-top:18px;">
-                    <input type="checkbox" id="verify-tls" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="verify-tls" style="margin:0;cursor:pointer;">Verify TLS</label>
+                  <div class="form-group">
+                    <label for="node-log">Node Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                    <input type="text" id="node-log" placeholder="e.g. logs/quip-node.log" />
                   </div>
-                </div>
-
-                <!-- Telemetry -->
-                <div style="margin-top:16px;">
-                  <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-                    <input type="checkbox" id="telemetry-enabled" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="telemetry-enabled" style="margin:0;cursor:pointer;">Enable Telemetry</label>
-                  </div>
-                  <div class="form-group" style="max-width:300px;">
-                    <label for="telemetry-dir">Telemetry Directory</label>
-                    <input type="text" id="telemetry-dir" value="telemetry" />
-                  </div>
-                </div>
-
-                <!-- TLS Certificates -->
-                <div style="margin-top:16px;">
-                  <div class="section-heading" style="font-size:13px;">TLS Certificates</div>
-                  <div class="mining-config-grid">
-                    <div class="form-group">
-                      <label for="tls-cert-file">Cert File <span style="color:var(--text-faint);font-weight:400;">(leave empty for self-signed)</span></label>
-                      <input type="text" id="tls-cert-file" placeholder="Leave empty for self-signed" />
-                    </div>
-                    <div class="form-group">
-                      <label for="tls-key-file">Key File</label>
-                      <input type="text" id="tls-key-file" placeholder="Leave empty for self-signed" />
-                    </div>
-                  </div>
-                  <!-- TLS Walkthrough -->
-                  <button id="btn-tls-guide-toggle" class="checklist-toggle" style="padding:4px 0;" aria-expanded="false">
-                    <span style="font-size:12px;color:var(--text-dim);">TLS Certificate Setup Guide</span>
-                    <span class="checklist-chevron"></span>
-                  </button>
-                  <div id="tls-guide" style="display:none;padding:12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;color:var(--text-dim);margin-top:4px;">
-                    <p style="margin:0 0 8px;">By default, your node auto-generates <strong>self-signed certificates</strong> for encrypted peer-to-peer communication. This is sufficient for most users.</p>
-                    <p style="margin:0 0 8px;">For publicly-accessible nodes, use <strong>Let's Encrypt</strong> for trusted certs:</p>
-                    <p style="margin:0 0 4px;font-weight:600;">Docker Mode</p>
-                    <ul style="margin:0 0 8px;padding-left:20px;">
-                      <li>Set your public hostname above</li>
-                      <li>Set env: <code>CERT_EMAIL=you@example.com</code></li>
-                      <li>Expose port 80: <code>-p 80:80/tcp</code></li>
-                      <li>Certbot runs automatically on startup; renews daily at 3am</li>
-                    </ul>
-                    <p style="margin:0 0 4px;font-weight:600;">Native Mode</p>
-                    <ul style="margin:0;padding-left:20px;">
-                      <li>Obtain certs manually (certbot, acme.sh, etc.)</li>
-                      <li>Set the cert/key file paths above</li>
-                    </ul>
-                  </div>
-                </div>
-
-                <!-- REST API -->
-                <div style="margin-top:16px;">
-                  <div class="section-heading" style="font-size:13px;">REST API <span style="color:var(--text-faint);font-weight:400;">(disabled by default)</span></div>
-                  <div class="mining-config-grid">
-                    <div class="form-group">
-                      <label for="rest-host">Host</label>
-                      <input type="text" id="rest-host" value="127.0.0.1" />
-                    </div>
-                    <div class="form-group">
-                      <label for="rest-port">HTTPS Port <span style="color:var(--text-faint);font-weight:400;">(-1 = disabled)</span></label>
-                      <input type="number" id="rest-port" value="-1" />
-                    </div>
-                    <div class="form-group">
-                      <label for="rest-insecure-port">HTTP Port <span style="color:var(--text-faint);font-weight:400;">(-1 = disabled)</span></label>
-                      <input type="number" id="rest-insecure-port" value="-1" />
-                    </div>
-                  </div>
-                </div>
-
-                <!-- Log file paths -->
-                <div style="margin-top:16px;">
-                  <div class="mining-config-grid">
-                    <div class="form-group">
-                      <label for="node-log">Node Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                      <input type="text" id="node-log" placeholder="e.g. logs/quip-node.log" />
-                    </div>
-                    <div class="form-group">
-                      <label for="http-log">HTTP Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                      <input type="text" id="http-log" placeholder="e.g. logs/quip-http.log" />
-                    </div>
+                  <div class="form-group">
+                    <label for="http-log">HTTP Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
+                    <input type="text" id="http-log" placeholder="e.g. logs/quip-http.log" />
                   </div>
                 </div>
 
@@ -282,22 +178,18 @@
           <!-- Stack Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">Stack Configuration</div>
-            <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
-              Image is auto-selected: CUDA when any NVIDIA GPU is enabled (see GPU Miner Configuration below), CPU otherwise. Setting a D-Wave token in QPU Miner Configuration activates QPU mining on top of the CPU image.
-            </div>
-            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
-              <input type="checkbox" id="dashboard-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-              <label for="dashboard-enabled" style="margin:0;cursor:pointer;">Enable dashboard <span style="color:var(--text-faint);font-weight:400;">(telemetry UI + Postgres)</span></label>
-            </div>
             <div class="form-group" style="display:flex;align-items:center;gap:10px;">
               <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
               <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>
             </div>
             <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
               <div class="form-group">
-                <label for="dashboard-hostname">Dashboard Hostname</label>
-                <input type="text" id="dashboard-hostname" placeholder="localhost:20080" />
-                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Use <code>localhost:20080</code> for local HTTP, or a real DNS name to trigger automatic Let's Encrypt certs.</div>
+                <label for="hostname">Caddy/API Hostname</label>
+                <input type="text" id="hostname" placeholder=":20049" />
+                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">
+                  <code>:20049</code> for local HTTP, or
+                  <code>example.com, example.com:20049</code> for public TLS.
+                </div>
               </div>
               <div class="form-group">
                 <label for="cert-email">ACME Email <span style="color:var(--text-faint);font-weight:400;">(required for Let's Encrypt)</span></label>
@@ -337,18 +229,33 @@
                 <span class="gpu-yielding-flag">&#127987;&#65039;</span>
                 <span>Yielding &#8212; GPU will yield to other applications when under load</span>
               </label>
+              <!-- Metal-only adaptive-cap knobs (shown when the GPU backend is Apple Metal) -->
+              <div id="metal-extra-settings" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+                <div style="font-size:12px;color:var(--text-faint);margin-bottom:10px;">
+                  Metal adaptive cap &#8212; active only when Yielding is on. Utilization above is the idle/headless cap (flat-out when nobody's at the Mac).
+                </div>
+                <div class="gpu-setting-row" style="margin-bottom:12px;">
+                  <label>Active utilization</label>
+                  <input type="range" id="metal-active-util" min="1" max="100" value="85" />
+                  <span id="metal-active-util-display" class="gpu-util-display">85%</span>
+                </div>
+                <div class="form-group" style="max-width:200px;margin-bottom:0;">
+                  <label for="metal-idle-after">Idle after <span style="color:var(--text-faint);font-weight:400;">(seconds)</span></label>
+                  <input type="number" id="metal-idle-after" min="1" max="3600" value="60" />
+                </div>
+              </div>
             </div>
           </div>
 
-          <!-- QPU Miner Configuration -->
+          <!-- D-Wave Mining Configuration -->
           <div class="config-section-divider">
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-              <div class="section-heading" style="margin:0;">QPU Miner Configuration</div>
-              <button id="btn-qpu-toggle" class="btn btn-sm btn-secondary">Have D-Wave / QPU Access? Click here</button>
+              <div class="section-heading" style="margin:0;">D-Wave Mining</div>
+              <button id="btn-qpu-toggle" class="btn btn-sm btn-secondary">Configure D-Wave Access</button>
             </div>
             <div id="qpu-section" style="display:none;margin-top:16px;">
               <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
-                Solver: Advantage2_System1.13 &middot; Region: NA West 1
+                Runs on top of CPU miner mode. Solver: Advantage2_System1.13 &middot; Region: NA West 1
               </div>
               <div class="mining-config-grid">
                 <div class="form-group">
@@ -378,7 +285,10 @@
     <!-- Dashboard Tab -->
     <div id="tab-dashboard" class="tab-content">
       <div id="dashboard-empty" class="dashboard-placeholder" style="display:none;">
-        <span id="dashboard-empty-msg">Dashboard disabled — enable it in the Status tab to see metrics here.</span>
+        <span id="dashboard-empty-msg"></span>
+        <button id="dashboard-reset-btn" class="btn btn-secondary" style="display:none;margin-top:12px;">
+          Reset dashboard database
+        </button>
       </div>
       <iframe
         id="dashboard-frame"
@@ -399,6 +309,7 @@
           <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
         </div>
       </div>
+      <div id="pull-progress-panel" class="pull-progress-panel" style="display:none;"></div>
       <div id="log-output" class="log-output"></div>
     </div>
 

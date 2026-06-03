@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Quip Node Manager installer for macOS and Linux.
-# Usage: curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0/scripts/install.sh | sh
 set -eu
 
 REPO="quip.network%2Fquip-node-manager"
@@ -56,10 +56,12 @@ curl -fSL --progress-bar -o "$DEST" "$URL" || error "Download failed."
 case "$PLATFORM" in
   macos)
     info "Mounting DMG..."
+    # The mount point is the trailing column of hdiutil's output and can
+    # contain spaces (e.g. "/Volumes/Quip Node Manager"). Capture from
+    # /Volumes/ to end of line; splitting on whitespace would truncate it.
     MOUNT_DIR=$(hdiutil attach "$DEST" -nobrowse -noautoopen 2>/dev/null \
-      | tail -1 | awk '{print $NF}')
-    [ -z "$MOUNT_DIR" ] && MOUNT_DIR=$(hdiutil attach "$DEST" -nobrowse -noautoopen 2>/dev/null \
-      | grep '/Volumes' | sed 's/.*\(\/Volumes\/.*\)/\1/')
+      | grep -o '/Volumes/.*' | head -1)
+    [ -z "$MOUNT_DIR" ] && error "Failed to mount DMG."
     APP_NAME=$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' | head -1)
     if [ -z "$APP_NAME" ]; then
       hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true

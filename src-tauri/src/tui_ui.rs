@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
+    Frame,
 };
 
 use crate::log_stream::LogEntry;
@@ -29,8 +29,8 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(6),   // main content
-            log_height,           // log panel
+            Constraint::Min(6),    // main content
+            log_height,            // log panel
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -92,7 +92,12 @@ fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
 
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(state_text, Style::default().fg(state_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            state_text,
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled(id_part, Style::default().fg(DIM)),
         Span::raw("   "),
@@ -129,24 +134,25 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
         .filter(|c| {
             matches!(
                 c.state,
-                crate::checklist::CheckState::Pass
-                    | crate::checklist::CheckState::Skip
+                crate::checklist::CheckState::Pass | crate::checklist::CheckState::Skip
             )
         })
         .count();
     let total = app.checks.len();
     let summary = if total == 0 {
-        if app.checklist_running { " (running…)".to_string() } else { String::new() }
+        if app.checklist_running {
+            " (running…)".to_string()
+        } else {
+            String::new()
+        }
     } else {
         format!(" {}/{} passing", passed, total)
     };
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {} Requirements{}", arrow, summary),
-            toggle_style,
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {} Requirements{}", arrow, summary),
+        toggle_style,
+    )]));
 
     if app.checklist_expanded {
         for check in &app.checks {
@@ -161,7 +167,11 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
             if check.id == "port" {
                 // Port item gets an inline Recheck button.
                 let recheck_style = focus_style(app, &FocusId::CheckPort);
-                let btn = if app.port_checking { "[ Checking… ]" } else { "[ Recheck ]" };
+                let btn = if app.port_checking {
+                    "[ Checking… ]"
+                } else {
+                    "[ Recheck ]"
+                };
                 lines.push(Line::from(vec![
                     Span::raw("     "),
                     Span::styled(sym, Style::default().fg(col)),
@@ -177,7 +187,11 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
             }
         }
         let run_style = focus_style(app, &FocusId::RunChecklist);
-        let label = if app.checklist_running { "[ Running… ]" } else { "[ Run Checks ]" };
+        let label = if app.checklist_running {
+            "[ Running… ]"
+        } else {
+            "[ Run Checks ]"
+        };
         lines.push(Line::from(vec![
             Span::raw("     "),
             btn_span(label, run_style),
@@ -189,7 +203,11 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
 fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     let toggle_style = focus_style(app, &FocusId::ConfigToggle);
     let arrow = if app.config_expanded { "▼" } else { "▶" };
-    let suffix = if !app.config_expanded { "  (collapsed)" } else { "" };
+    let suffix = if !app.config_expanded {
+        "  (collapsed)"
+    } else {
+        ""
+    };
     lines.push(Line::from(Span::styled(
         format!("  {} Configuration{}", arrow, suffix),
         toggle_style,
@@ -218,21 +236,21 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
     ]));
 
-    // Port
+    // Public API port
     lines.push(field_line(
-        app, &FocusId::Port, "Port", &field_value(app, &FocusId::Port, &app.form.port),
+        app,
+        &FocusId::Port,
+        "Public API",
+        &field_value(app, &FocusId::Port, &app.form.port),
     ));
 
-    // Listen (read-only)
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{:<16} ", "Listen"), Style::default().fg(DIM)),
-        Span::styled(
-            app.settings.node_config.listen.clone(),
-            Style::default().fg(DIM),
-        ),
-        Span::styled("  (read-only)", Style::default().fg(DIM)),
-    ]));
+    // Validator P2P port
+    lines.push(field_line(
+        app,
+        &FocusId::ValidatorPort,
+        "Validator P2P",
+        &field_value(app, &FocusId::ValidatorPort, &app.form.validator_port),
+    ));
 
     // Node Secret
     let secret_display = if app.secret_visible {
@@ -246,16 +264,9 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         Span::raw("  "),
         btn_span("[ Show ]", focus_style(app, &FocusId::SecretShow)),
         Span::raw("  "),
-        btn_span("[ Regenerate ]", focus_style(app, &FocusId::SecretRegenerate)),
-    ]));
-
-    // Auto-mine checkbox
-    let checked = if app.form.auto_mine { "[x]" } else { "[ ]" };
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(
-            format!("{} Auto-mine", checked),
-            focus_style(app, &FocusId::AutoMine),
+        btn_span(
+            "[ Regenerate ]",
+            focus_style(app, &FocusId::SecretRegenerate),
         ),
     ]));
 
@@ -275,7 +286,11 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     )));
 
     if app.custom_expanded {
-        let ph_check = if app.form.public_host_enabled { "[x]" } else { "[ ]" };
+        let ph_check = if app.form.public_host_enabled {
+            "[x]"
+        } else {
+            "[ ]"
+        };
         lines.push(Line::from(vec![
             Span::raw("      "),
             Span::styled(
@@ -302,43 +317,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 &field_value(app, &FocusId::PublicPortInput, &port_display),
             ));
         }
-        lines.push(field_line(
-            app,
-            &FocusId::Peers,
-            "Peers",
-            &field_value(app, &FocusId::Peers, &app.form.peers.replace('\n', ", ")),
-        ));
-
-        // Advanced fields
-        lines.push(field_line(
-            app, &FocusId::Timeout, "  Timeout (s)",
-            &field_value(app, &FocusId::Timeout, &app.form.timeout),
-        ));
-        lines.push(field_line(
-            app, &FocusId::HeartbeatInterval, "  HB Interval",
-            &field_value(app, &FocusId::HeartbeatInterval, &app.form.heartbeat_interval),
-        ));
-        lines.push(field_line(
-            app, &FocusId::HeartbeatTimeout, "  HB Timeout",
-            &field_value(app, &FocusId::HeartbeatTimeout, &app.form.heartbeat_timeout),
-        ));
-        let fanout_display = if app.form.fanout.is_empty() {
-            "(default)".to_string()
-        } else {
-            app.form.fanout.clone()
-        };
-        lines.push(field_line(
-            app, &FocusId::Fanout, "  Fanout",
-            &field_value(app, &FocusId::Fanout, &fanout_display),
-        ));
-        let tls_check = if app.form.verify_tls { "[x]" } else { "[ ]" };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Verify TLS", tls_check),
-                focus_style(app, &FocusId::VerifyTls),
-            ),
-        ]));
         let log_levels = ["info", "debug", "warn", "error"];
         let ll_display = if log_levels.contains(&app.form.log_level.as_str()) {
             app.form.log_level.clone()
@@ -346,62 +324,40 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             field_value(app, &FocusId::LogLevel, &app.form.log_level)
         };
         lines.push(field_line(
-            app, &FocusId::LogLevel, "  Log Level",
+            app,
+            &FocusId::LogLevel,
+            "  Log Level",
             &ll_display,
         ));
 
-        // TLS Certificates
-        lines.push(field_line(
-            app, &FocusId::TlsCertFile, "  TLS Cert",
-            &field_value(app, &FocusId::TlsCertFile,
-                &if app.form.tls_cert_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_cert_file.clone() }),
-        ));
-        lines.push(field_line(
-            app, &FocusId::TlsKeyFile, "  TLS Key",
-            &field_value(app, &FocusId::TlsKeyFile,
-                &if app.form.tls_key_file.is_empty() { "(self-signed)".to_string() } else { app.form.tls_key_file.clone() }),
-        ));
-
-        // REST API
-        lines.push(field_line(
-            app, &FocusId::RestHost, "  REST Host",
-            &field_value(app, &FocusId::RestHost, &app.form.rest_host),
-        ));
-        lines.push(field_line(
-            app, &FocusId::RestPort, "  REST HTTPS",
-            &field_value(app, &FocusId::RestPort, &app.form.rest_port),
-        ));
-        lines.push(field_line(
-            app, &FocusId::RestInsecurePort, "  REST HTTP",
-            &field_value(app, &FocusId::RestInsecurePort, &app.form.rest_insecure_port),
-        ));
-
-        // Telemetry
-        let telem_check = if app.form.telemetry_enabled { "[x]" } else { "[ ]" };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Telemetry", telem_check),
-                focus_style(app, &FocusId::TelemetryEnabled),
-            ),
-        ]));
-        if app.form.telemetry_enabled {
-            lines.push(field_line(
-                app, &FocusId::TelemetryDir, "  Telemetry Dir",
-                &field_value(app, &FocusId::TelemetryDir, &app.form.telemetry_dir),
-            ));
-        }
-
         // Log files
         lines.push(field_line(
-            app, &FocusId::NodeLog, "  Node Log",
-            &field_value(app, &FocusId::NodeLog,
-                &if app.form.node_log.is_empty() { "(none)".to_string() } else { app.form.node_log.clone() }),
+            app,
+            &FocusId::NodeLog,
+            "  Node Log",
+            &field_value(
+                app,
+                &FocusId::NodeLog,
+                &if app.form.node_log.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    app.form.node_log.clone()
+                },
+            ),
         ));
         lines.push(field_line(
-            app, &FocusId::HttpLog, "  HTTP Log",
-            &field_value(app, &FocusId::HttpLog,
-                &if app.form.http_log.is_empty() { "(none)".to_string() } else { app.form.http_log.clone() }),
+            app,
+            &FocusId::HttpLog,
+            "  HTTP Log",
+            &field_value(
+                app,
+                &FocusId::HttpLog,
+                &if app.form.http_log.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    app.form.http_log.clone()
+                },
+            ),
         ));
 
         // Auto-update
@@ -457,31 +413,38 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ]));
     }
 
-    // QPU toggle
+    // D-Wave mining toggle
     let qpu_check = if app.qpu_expanded { "[x]" } else { "[ ]" };
     lines.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
-            format!("{} D-Wave / QPU Access", qpu_check),
+            format!("{} D-Wave Mining", qpu_check),
             focus_style(app, &FocusId::QpuToggle),
         ),
     ]));
     if app.qpu_expanded {
         lines.push(Line::from(Span::styled(
-            "      Solver: Advantage2_System1.13 · Region: NA West 1",
+            "      Runs on CPU miner mode · Advantage2_System1.13 · NA West 1",
             Style::default().fg(DIM),
         )));
         let masked_key = if app.form.qpu_api_key.is_empty() {
             String::new()
         } else {
-            format!("{}…", &app.form.qpu_api_key[..4.min(app.form.qpu_api_key.len())])
+            format!(
+                "{}…",
+                &app.form.qpu_api_key[..4.min(app.form.qpu_api_key.len())]
+            )
         };
         lines.push(field_line(
-            app, &FocusId::QpuApiKey, "  Token",
+            app,
+            &FocusId::QpuApiKey,
+            "  Token",
             &field_value(app, &FocusId::QpuApiKey, &masked_key),
         ));
         lines.push(field_line(
-            app, &FocusId::QpuDailyBudget, "  Daily Budget",
+            app,
+            &FocusId::QpuDailyBudget,
+            "  Daily Budget",
             &field_value(app, &FocusId::QpuDailyBudget, &app.form.qpu_daily_budget),
         ));
     }
@@ -538,7 +501,9 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
         Span::styled(format!("{:8} ", ts), Style::default().fg(DIM)),
         Span::styled(
             format!("{:<5} ", entry.level),
-            Style::default().fg(level_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(level_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(entry.message.clone()),
     ])
@@ -568,12 +533,7 @@ fn btn_span(label: &str, style: Style) -> Span<'static> {
     Span::styled(label.to_string(), style)
 }
 
-fn field_line<'a>(
-    app: &TuiApp,
-    id: &FocusId,
-    label: &str,
-    value: &str,
-) -> Line<'a> {
+fn field_line<'a>(app: &TuiApp, id: &FocusId, label: &str, value: &str) -> Line<'a> {
     let focused = app.focus == *id;
     let label_style = if focused {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -599,7 +559,7 @@ fn field_line<'a>(
     ])
 }
 
-fn field_value<'a>(app: &TuiApp, id: &FocusId, current: &str) -> String {
+fn field_value(app: &TuiApp, id: &FocusId, current: &str) -> String {
     if matches!(&app.edit_mode, EditMode::EditingField(f) if f == id) {
         app.form.edit_buf.clone()
     } else {
@@ -608,8 +568,8 @@ fn field_value<'a>(app: &TuiApp, id: &FocusId, current: &str) -> String {
 }
 
 fn shorten_image(image: &str) -> String {
-    // registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
-    // → .../quip-network-node-cpu:latest
+    // registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2
+    // → .../quip-miner-cpu:v0.2
     if let Some(slash) = image.rfind('/') {
         format!(".../{}", &image[slash + 1..])
     } else {

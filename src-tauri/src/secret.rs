@@ -23,10 +23,8 @@ fn generate_hex_secret() -> String {
 pub async fn get_node_secret() -> Result<String, String> {
     let path = secret_path();
     if path.exists() {
-        let content =
-            fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let ns: NodeSecret =
-            serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let ns: NodeSecret = serde_json::from_str(&content).map_err(|e| e.to_string())?;
         Ok(ns.secret)
     } else {
         generate_node_secret().await
@@ -40,8 +38,7 @@ pub async fn generate_node_secret() -> Result<String, String> {
     let ns = NodeSecret {
         secret: secret.clone(),
     };
-    let content =
-        serde_json::to_string_pretty(&ns).map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(&ns).map_err(|e| e.to_string())?;
     fs::write(secret_path(), content).map_err(|e| e.to_string())?;
     Ok(secret)
 }

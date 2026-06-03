@@ -5,16 +5,14 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, DwaveConfig, RunMode};
+use crate::settings::{AppSettings, DwaveConfig, RunMode, StackHealth};
 
-// Legacy single-container status used by the TUI's inline `docker run` flow.
-// The TUI is a fallback for the GUI and doesn't yet drive the compose stack;
-// the GUI's StackStatus replaced this shape for Tauri-facing callers.
+// Compact status used by the TUI. The GUI exposes the full StackStatus shape.
 #[derive(Clone, Debug)]
 pub struct ContainerStatus {
     pub running: bool,
@@ -35,15 +33,14 @@ pub enum FocusId {
     ConfigToggle,
     RunMode,
     Port,
+    ValidatorPort,
     SecretShow,
     SecretRegenerate,
-    AutoMine,
     NodeName,
     CustomToggle,
     PublicHostEnable,
     PublicHostInput,
     PublicPortInput,
-    Peers,
     CpuCores,
     GpuEnable,
     GpuUtilization,
@@ -54,19 +51,7 @@ pub enum FocusId {
     ApplyRestart,
     AutoUpdate,
     // Advanced (inside Custom Settings)
-    Timeout,
-    HeartbeatInterval,
-    HeartbeatTimeout,
-    Fanout,
-    VerifyTls,
     LogLevel,
-    TlsCertFile,
-    TlsKeyFile,
-    RestHost,
-    RestPort,
-    RestInsecurePort,
-    TelemetryEnabled,
-    TelemetryDir,
     NodeLog,
     HttpLog,
 }
@@ -99,6 +84,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct FormState {
     pub port: String,
+    pub validator_port: String,
     pub node_name: String,
     pub auto_mine: bool,
     pub run_mode_idx: usize, // 0=Docker, 1=Native
@@ -109,7 +95,6 @@ pub struct FormState {
     pub cpu_cores: String,
     pub gpu_utilization: u8,
     pub gpu_yielding: bool,
-    pub qpu_enabled: bool,
     pub qpu_api_key: String,
     pub qpu_daily_budget: String,
     // Advanced settings
@@ -138,11 +123,14 @@ pub struct FormState {
 impl FormState {
     pub fn from_settings(s: &AppSettings) -> Self {
         let nc = &s.node_config;
-        let (qpu_enabled, dw) = match &nc.dwave_config {
-            Some(q) => (true, q.clone()),
-            None => (false, DwaveConfig::default()),
+        let dw = match &nc.dwave_config {
+            Some(q) => q.clone(),
+            None => DwaveConfig::default(),
         };
-        let first_gpu = nc.gpu_device_configs.iter().find(|d| d.enabled)
+        let first_gpu = nc
+            .gpu_device_configs
+            .iter()
+            .find(|d| d.enabled)
             .or_else(|| nc.gpu_device_configs.first());
         let run_mode_idx = match s.run_mode {
             RunMode::Docker => 0,
@@ -150,20 +138,17 @@ impl FormState {
         };
         FormState {
             port: nc.port.to_string(),
+            validator_port: nc.validator_port.to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
-            public_host_enabled: !nc.public_host.is_empty()
-                || nc.public_port.is_some(),
+            public_host_enabled: !nc.public_host.is_empty() || nc.public_port.is_some(),
             public_host: nc.public_host.clone(),
-            public_port: nc.public_port
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            public_port: nc.public_port.map(|p| p.to_string()).unwrap_or_default(),
             peers: nc.peers.join("\n"),
             cpu_cores: nc.num_cpus.to_string(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
             gpu_yielding: first_gpu.map(|d| d.yielding).unwrap_or(false),
-            qpu_enabled,
             qpu_api_key: dw.token,
             qpu_daily_budget: dw.daily_budget,
             timeout: nc.timeout.to_string(),
@@ -188,12 +173,20 @@ impl FormState {
     }
 
     pub fn run_mode(&self) -> RunMode {
-        if self.run_mode_idx == 1 { RunMode::Native } else { RunMode::Docker }
+        if self.run_mode_idx == 1 {
+            RunMode::Native
+        } else {
+            RunMode::Docker
+        }
     }
 
-    pub fn to_node_config(&self, base: &crate::settings::NodeConfig) -> crate::settings::NodeConfig {
+    pub fn to_node_config(
+        &self,
+        base: &crate::settings::NodeConfig,
+    ) -> crate::settings::NodeConfig {
         let mut nc = base.clone();
         nc.port = self.port.parse().unwrap_or(20049);
+        nc.validator_port = self.validator_port.parse().unwrap_or(30333);
         nc.node_name = self.node_name.clone();
         nc.auto_mine = self.auto_mine;
         nc.public_host = if self.public_host_enabled {
@@ -219,17 +212,18 @@ impl FormState {
             d.utilization = self.gpu_utilization;
             d.yielding = self.gpu_yielding;
         }
-        nc.dwave_config = if self.qpu_enabled {
+        let dwave_token = self.qpu_api_key.trim();
+        nc.dwave_config = if dwave_token.is_empty() {
+            None
+        } else {
             Some(DwaveConfig {
-                token: self.qpu_api_key.clone(),
+                token: dwave_token.to_string(),
                 solver: "Advantage2_System1.13".to_string(),
                 dwave_region_url: "https://na-west-1.cloud.dwavesys.com/sapi/v2/".to_string(),
                 daily_budget: self.qpu_daily_budget.clone(),
                 qpu_min_blocks_for_estimation: None,
                 qpu_ema_alpha: None,
             })
-        } else {
-            None
         };
         nc.timeout = self.timeout.parse().unwrap_or(3);
         nc.heartbeat_interval = self.heartbeat_interval.parse().unwrap_or(15);
@@ -283,10 +277,17 @@ pub struct TuiApp {
     last_status_check: Instant,
 }
 
+impl Default for TuiApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiApp {
     pub fn new() -> Self {
         let settings = crate::settings::load_settings();
         let form = FormState::from_settings(&settings);
+        let qpu_expanded = !form.qpu_api_key.is_empty();
         let (tx, rx) = mpsc::sync_channel(512);
         let secret = load_secret_sync();
         let log_stop = Arc::new(Mutex::new(false));
@@ -321,7 +322,7 @@ impl TuiApp {
             checklist_expanded: true,
             config_expanded: false,
             custom_expanded: false,
-            qpu_expanded: false,
+            qpu_expanded,
             node_secret: secret,
             secret_visible: false,
             status_message: None,
@@ -400,16 +401,24 @@ impl TuiApp {
                 // Update the port check item in the checks list.
                 let port = self.settings.node_config.port;
                 if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
-                    item.state = if passed { CheckState::Pass } else { CheckState::Warn };
-                    item.label = if passed {
-                        format!("Port {} forwarded", port)
+                    item.state = if passed {
+                        CheckState::Pass
                     } else {
-                        format!("Port {} — no connection received", port)
+                        CheckState::Warn
+                    };
+                    item.label = if passed {
+                        format!("Public API port {} reachable", port)
+                    } else {
+                        format!("Public API port {} \u{2014} no TCP response", port)
                     };
                 }
                 self.port_checking = false;
                 self.port_check_rx = None;
-                let msg = if passed { "Port is reachable!" } else { "No connection received within 15s" };
+                let msg = if passed {
+                    "Public API port is reachable"
+                } else {
+                    "No TCP response received"
+                };
                 self.set_status(msg);
             }
         }
@@ -424,27 +433,27 @@ impl TuiApp {
         // Show checking status immediately.
         if let Some(item) = self.checks.iter_mut().find(|c| c.id == "port") {
             item.state = CheckState::Running;
-            item.label = format!("Port {} — checking via public IP…", port);
+            item.label = format!("Public API port {} \u{2014} checking via public IP…", port);
         } else {
             self.checks.push(CheckItem {
                 id: "port".to_string(),
                 state: CheckState::Running,
-                label: format!("Port {} — checking via public IP…", port),
+                label: format!("Public API port {} \u{2014} checking via public IP…", port),
                 detail: None,
                 required: false,
                 fixable: None,
                 updated_at_ms: 0,
             });
         }
-        self.set_status(format!("Checking port {} via public IP…", port));
+        self.set_status(format!("Checking public API port {} via public IP…", port));
 
         let (tx, rx) = mpsc::sync_channel::<bool>(1);
         self.port_check_rx = Some(rx);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let passed = rt.block_on(
-                crate::checklist::probe_port_forwarding_with_default_ip(port),
-            );
+            let passed = rt.block_on(crate::checklist::probe_public_api_port_with_default_ip(
+                port,
+            ));
             let _ = tx.send(passed);
         });
     }
@@ -470,9 +479,13 @@ impl TuiApp {
                 let running = if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         #[cfg(unix)]
-                        { unsafe { libc::kill(pid, 0) == 0 } }
+                        {
+                            unsafe { libc::kill(pid, 0) == 0 }
+                        }
                         #[cfg(windows)]
-                        { true } // Assume running if PID file exists on Windows
+                        {
+                            true
+                        } // Assume running if PID file exists on Windows
                     } else {
                         false
                     }
@@ -483,48 +496,66 @@ impl TuiApp {
                     running,
                     container_id: None,
                     image: String::new(),
-                    status_text: if running { "running (native)".to_string() } else { "not running".to_string() },
-                };
-            }
-            RunMode::Docker => {
-                let output = crate::cmd::new("docker")
-                    .args([
-                        "inspect",
-                        "--format",
-                        "{{.Id}}\t{{.State.Running}}\t{{.Config.Image}}\t{{.State.Status}}",
-                        "quip-node",
-                    ])
-                    .output();
-                self.status = match output {
-                    Ok(o) if o.status.success() => {
-                        let line = String::from_utf8_lossy(&o.stdout);
-                        let parts: Vec<&str> = line.trim().split('\t').collect();
-                        if parts.len() >= 4 {
-                            ContainerStatus {
-                                running: parts[1] == "true",
-                                container_id: Some(
-                                    parts[0][..12.min(parts[0].len())].to_string(),
-                                ),
-                                image: parts[2].to_string(),
-                                status_text: parts[3].to_string(),
-                            }
-                        } else {
-                            ContainerStatus {
-                                running: false,
-                                container_id: None,
-                                image: String::new(),
-                                status_text: "unknown".to_string(),
-                            }
-                        }
-                    }
-                    _ => ContainerStatus {
-                        running: false,
-                        container_id: None,
-                        image: String::new(),
-                        status_text: "not found".to_string(),
+                    status_text: if running {
+                        "running (native)".to_string()
+                    } else {
+                        "not running".to_string()
                     },
                 };
             }
+            RunMode::Docker => {
+                self.status = self.stack_status_for_tui();
+            }
+        }
+    }
+
+    fn stack_status_for_tui(&self) -> ContainerStatus {
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "cannot create runtime".to_string(),
+            };
+        };
+        let Ok(stack) = rt.block_on(crate::compose::get_stack_status()) else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "compose status unavailable".to_string(),
+            };
+        };
+
+        let selected_service = self.form.image_tag.service();
+        let selected = stack
+            .services
+            .iter()
+            .find(|s| s.service == selected_service)
+            .or_else(|| {
+                stack
+                    .services
+                    .iter()
+                    .find(|s| s.service == "quip-validator")
+            })
+            .or_else(|| stack.services.iter().find(|s| s.running))
+            .or_else(|| stack.services.first());
+
+        let running = matches!(stack.overall, StackHealth::Running | StackHealth::Degraded);
+        let Some(service) = selected else {
+            return ContainerStatus {
+                running: false,
+                container_id: None,
+                image: String::new(),
+                status_text: "not found".to_string(),
+            };
+        };
+
+        ContainerStatus {
+            running,
+            container_id: Some(service.name.clone()),
+            image: service.image.clone(),
+            status_text: format!("{} ({:?})", service.status_text, stack.overall),
         }
     }
 
@@ -534,16 +565,40 @@ impl TuiApp {
         let run_mode = self.form.run_mode();
         let mut config = self.form.to_node_config(&self.settings.node_config);
 
+        match crate::migration_v2::migrate_for_run_mode(&run_mode) {
+            Ok(report) => {
+                report.promoted.apply_to_node_config(&mut config);
+                if let Err(e) = crate::migration_v2::persist_promoted_settings(&report.promoted) {
+                    self.set_status(format!("Migration settings error: {}", e));
+                    return;
+                }
+                if report.changed {
+                    self.set_status("Migrated v0.1 node data to v0.2 layout");
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("Migration error: {}", e));
+                return;
+            }
+        }
+
         // Auto-detect public IP when no public_host is configured
         if config.public_host.is_empty() {
             if let Ok(rt) = tokio::runtime::Runtime::new() {
-                if let Ok(ip) = rt.block_on(crate::network::detect_public_ip()) {
-                    self.set_status(format!("Auto-detected IP: {}", ip));
-                    config.public_host = ip;
+                match rt.block_on(crate::network::detect_public_ip()) {
+                    Ok(ip) => {
+                        self.set_status(format!("Auto-detected IP: {}", ip));
+                        config.public_host = ip;
+                    }
+                    Err(e) => self.set_status(format!(
+                        "Could not auto-detect public IP ({e}); node won't advertise a public address"
+                    )),
                 }
             }
         }
 
+        // The config renderer forces the native miner's REST host to loopback
+        // (reached via host.docker.internal), so no rest_host override here.
         if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
             self.set_status(format!("Config error: {}", e));
             return;
@@ -557,74 +612,72 @@ impl TuiApp {
     }
 
     fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        // Remove any stale container first
-        let _ = crate::cmd::new("docker").args(["rm", "-f", "quip-node"]).output();
+        // Remove the legacy single-container TUI path if it was used before
+        // the manager moved to the v0.2 compose stack.
+        let _ = crate::cmd::new("docker")
+            .args(["rm", "-f", "quip-node"])
+            .output();
 
-        let data_dir = crate::settings::data_dir();
-        let data_mount = format!("{}:/data", data_dir.display());
-        let image = format!(
-            "{}:latest",
-            crate::compose::image_for_tag(self.settings.image_tag)
-        );
+        let mut settings = self.settings.clone();
+        settings.node_config = config.clone();
+        settings.image_tag = self.form.image_tag;
+        settings.run_mode = RunMode::Docker;
 
-        let quip_mode = if config.gpu_device_configs.iter().any(|d| d.enabled)
-            && self.settings.image_tag == crate::settings::ImageTag::Cuda
-        {
-            "gpu"
-        } else {
-            "cpu"
-        };
+        if let Err(e) = crate::stack_assets::sync_stack_assets(
+            &RunMode::Docker,
+            config.port,
+            config.validator_port,
+            &config.public_host,
+            crate::config::native_rest_port(config),
+            config.validator_rpc_port,
+        ) {
+            self.set_status(format!("Stack asset error: {}", e));
+            return;
+        }
+        if let Err(e) = crate::compose::write_env_file(&settings) {
+            self.set_status(format!("Env error: {}", e));
+            return;
+        }
 
-        let mut args = vec![
-            "run".to_string(),
-            "-d".to_string(),
-            "--name".to_string(),
-            "quip-node".to_string(),
-            "-p".to_string(),
-            format!("{}:{}/udp", config.port, config.port),
-            "-v".to_string(),
-            data_mount,
-            "-e".to_string(),
-            format!("QUIP_MODE={}", quip_mode),
-            "-e".to_string(),
-            format!("QUIP_PORT={}", config.port),
-            "-e".to_string(),
-            format!("QUIP_LISTEN={}", config.listen),
-            "-e".to_string(),
-            format!("QUIP_AUTO_MINE={}", config.auto_mine),
-        ];
-        if !config.peers.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_PEERS={}", config.peers.join(",")));
-        }
-        if !config.public_host.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_PUBLIC_HOST={}", config.public_host));
-        }
-        if !config.node_name.is_empty() {
-            args.push("-e".to_string());
-            args.push(format!("QUIP_NODE_NAME={}", config.node_name));
-        }
-        if quip_mode == "gpu" {
-            args.push("--gpus".to_string());
-            args.push("all".to_string());
-        }
-        args.push(image);
+        let profile = crate::compose::compose_profile(settings.image_tag);
 
-        match crate::cmd::new("docker").args(&args).output() {
-            Ok(o) if o.status.success() => {
-                self.set_status("Node started (Docker)");
-                self.refresh_status();
-            }
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr).to_string();
-                self.set_status(format!("Start failed: {}", err.trim()));
-            }
-            Err(e) => self.set_status(format!("Start failed: {}", e)),
+        self.set_status("Stopping existing compose stack...");
+        let _ = crate::compose::compose_cmd().args(["down"]).output();
+
+        self.set_status("Pulling compose images...");
+        if !self.run_compose_step(&["--profile", profile, "pull"], "Pull failed") {
+            return;
+        }
+
+        self.set_status("Starting compose stack...");
+        if self.run_compose_step(&["--profile", profile, "up", "-d"], "Start failed") {
+            self.set_status("Stack started (Docker)");
+            self.refresh_status();
         }
     }
 
-    fn start_node_native(&mut self, _config: &crate::settings::NodeConfig) {
+    fn run_compose_step(&mut self, args: &[&str], label: &str) -> bool {
+        match crate::compose::compose_cmd().args(args).output() {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let detail = stderr.trim();
+                if detail.is_empty() {
+                    self.set_status(format!("{}: {}", label, stdout.trim()));
+                } else {
+                    self.set_status(format!("{}: {}", label, detail));
+                }
+                false
+            }
+            Err(e) => {
+                self.set_status(format!("{}: {}", label, e));
+                false
+            }
+        }
+    }
+
+    fn start_node_native(&mut self, config: &crate::settings::NodeConfig) {
         if !crate::native::is_binary_available() {
             self.set_status("No native binary found. Download it first.");
             return;
@@ -636,13 +689,15 @@ impl TuiApp {
             let bin = data_dir.join("bin").join(crate::native::binary_name());
             let config_path = data_dir.join("config.toml");
             let log_path = data_dir.join("node-output.log");
+            let _ = crate::native::ensure_native_signer_key(&bin)?;
+            let miner_args = crate::native::native_miner_args(config, &config_path);
             let log_file = std::fs::File::create(&log_path)
                 .map_err(|e| format!("Cannot create log file: {}", e))?;
-            let log_err = log_file.try_clone()
+            let log_err = log_file
+                .try_clone()
                 .map_err(|e| format!("Cannot clone log file: {}", e))?;
             let child = crate::cmd::new(&bin)
-                .arg("--config")
-                .arg(&config_path)
+                .args(&miner_args)
                 .stdout(log_file)
                 .stderr(log_err)
                 .spawn()
@@ -662,17 +717,16 @@ impl TuiApp {
     fn stop_node(&mut self) {
         match self.form.run_mode() {
             RunMode::Docker => {
-                let _ = crate::cmd::new("docker").args(["stop", "quip-node"]).output();
-                let _ = crate::cmd::new("docker")
-                    .args(["rm", "-f", "quip-node"])
-                    .output();
+                let _ = crate::compose::compose_cmd().args(["down"]).output();
             }
             RunMode::Native => {
                 let pid_path = crate::settings::data_dir().join("node.pid");
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<i32>() {
                         #[cfg(unix)]
-                        unsafe { libc::kill(-pid, libc::SIGTERM); }
+                        unsafe {
+                            libc::kill(-pid, libc::SIGTERM);
+                        }
                         #[cfg(windows)]
                         {
                             let _ = crate::cmd::new("taskkill")
@@ -710,8 +764,7 @@ impl TuiApp {
 
     fn regenerate_secret(&mut self) {
         use rand::Rng;
-        let bytes: Vec<u8> =
-            (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
+        let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
         let secret = hex::encode(bytes);
         let path = crate::settings::data_dir().join("node-secret.json");
         let content = format!("{{\"secret\":\"{}\"}}", secret);
@@ -756,9 +809,9 @@ impl TuiApp {
         if self.config_expanded {
             list.push(FocusId::RunMode);
             list.push(FocusId::Port);
+            list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
-            list.push(FocusId::AutoMine);
             list.push(FocusId::NodeName);
             list.push(FocusId::CustomToggle);
             if self.custom_expanded {
@@ -767,22 +820,7 @@ impl TuiApp {
                     list.push(FocusId::PublicHostInput);
                     list.push(FocusId::PublicPortInput);
                 }
-                list.push(FocusId::Peers);
-                list.push(FocusId::Timeout);
-                list.push(FocusId::HeartbeatInterval);
-                list.push(FocusId::HeartbeatTimeout);
-                list.push(FocusId::Fanout);
-                list.push(FocusId::VerifyTls);
                 list.push(FocusId::LogLevel);
-                list.push(FocusId::TlsCertFile);
-                list.push(FocusId::TlsKeyFile);
-                list.push(FocusId::RestHost);
-                list.push(FocusId::RestPort);
-                list.push(FocusId::RestInsecurePort);
-                list.push(FocusId::TelemetryEnabled);
-                if self.form.telemetry_enabled {
-                    list.push(FocusId::TelemetryDir);
-                }
                 list.push(FocusId::NodeLog);
                 list.push(FocusId::HttpLog);
                 list.push(FocusId::AutoUpdate);

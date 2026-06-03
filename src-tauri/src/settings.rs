@@ -24,18 +24,13 @@ impl Default for RunMode {
 
 // ─── GPU types ──────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum GpuBackend {
+    #[default]
     Local,
     Modal,
     Mps,
-}
-
-impl Default for GpuBackend {
-    fn default() -> Self {
-        GpuBackend::Local
-    }
 }
 
 // ─── Image tag ──────────────────────────────────────────────────────────────
@@ -46,9 +41,7 @@ impl Default for GpuBackend {
 /// QPU is *not* a separate image — D-Wave mining activates via the
 /// `[dwave]` section in config.toml on top of the CPU image, so the
 /// operator's choice reduces to "do I have an NVIDIA GPU or not".
-#[derive(
-    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq,
-)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageTag {
     #[default]
@@ -81,6 +74,34 @@ impl Default for GpuDeviceConfig {
             enabled: true,
             utilization: 80,
             yielding: false,
+        }
+    }
+}
+
+/// Apple Metal (MPS) tuning. A Mac exposes a single implicit GPU, so this
+/// is a standalone config rather than a per-device list. Maps 1:1 to the
+/// v0.2 `[metal]` section: `utilization`/`yielding` are shared GPU keys,
+/// `active_util`/`idle_after_s` are Metal-only adaptive-cap knobs the
+/// protocol keeps out of `[gpu]` inheritance.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MetalConfig {
+    /// Idle/headless occupancy cap (1-100). Flat-out when nobody's present.
+    pub utilization: u8,
+    /// Enable the adaptive cap monitor (HID-idle / thermal / battery sensing).
+    pub yielding: bool,
+    /// Occupancy cap (%) while the user is present.
+    pub active_util: u8,
+    /// Seconds of no input before going idle/flat-out.
+    pub idle_after_s: u32,
+}
+
+impl Default for MetalConfig {
+    fn default() -> Self {
+        MetalConfig {
+            utilization: 100,
+            yielding: true,
+            active_util: 85,
+            idle_after_s: 60,
         }
     }
 }
@@ -123,30 +144,73 @@ impl Default for DwaveConfig {
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 
-fn default_port() -> u16 { 20049 }
-fn default_listen() -> String { "::".to_string() }
-fn default_num_cpus() -> u32 { 1 }
-fn default_timeout() -> u32 { 3 }
-fn default_heartbeat_interval() -> u32 { 15 }
-fn default_heartbeat_timeout() -> u32 { 300 }
-fn default_log_level() -> String { "info".to_string() }
+fn default_port() -> u16 {
+    20049
+}
+fn default_validator_port() -> u16 {
+    30333
+}
+fn default_validator_rpc_port() -> u16 {
+    9944
+}
+fn default_listen() -> String {
+    "::".to_string()
+}
+fn default_num_cpus() -> u32 {
+    1
+}
+fn default_timeout() -> u32 {
+    3
+}
+fn default_heartbeat_interval() -> u32 {
+    15
+}
+fn default_heartbeat_timeout() -> u32 {
+    300
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 fn default_genesis_config() -> String {
     "genesis_block.json".to_string()
 }
-fn default_tofu() -> bool { true }
-fn default_trust_db() -> String { "~/.quip/trust.db".to_string() }
-fn default_rest_host() -> String { "127.0.0.1".to_string() }
-fn default_rest_port() -> i16 { -1 }
-fn default_telemetry_enabled() -> bool { true }
-fn default_telemetry_dir() -> String { "telemetry".to_string() }
+fn default_tofu() -> bool {
+    true
+}
+fn default_trust_db() -> String {
+    "~/.quip/trust.db".to_string()
+}
+fn default_rest_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_rest_port() -> i16 {
+    -1
+}
+fn default_telemetry_enabled() -> bool {
+    true
+}
+fn default_telemetry_dir() -> String {
+    "telemetry".to_string()
+}
 
 // ─── Node config ────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeConfig {
     // Network
+    // v0.2: public Caddy/API/dashboard/RPC host port.
     #[serde(default = "default_port")]
     pub port: u16,
+    // v0.2: validator libp2p host port. Defaults to 30333 to match the
+    // container-internal libp2p port (substrate's upstream default), so the
+    // host publish is a 1:1 mapping unless the user overrides it.
+    #[serde(default = "default_validator_port")]
+    pub validator_port: u16,
+    // v0.2 (Native mode): host port the validator's JSON-RPC (container 9944)
+    // is published on, and that the host-side miner connects to.
+    #[serde(default = "default_validator_rpc_port")]
+    pub validator_rpc_port: u16,
+    // v0.1 legacy fields kept for app-settings.json compatibility.
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default)]
@@ -211,6 +275,8 @@ pub struct NodeConfig {
     pub gpu_backend: GpuBackend,
     #[serde(default)]
     pub gpu_device_configs: Vec<GpuDeviceConfig>,
+    #[serde(default)]
+    pub metal_config: MetalConfig,
 
     // D-Wave QPU
     #[serde(default)]
@@ -231,6 +297,8 @@ impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             port: 20049,
+            validator_port: 30333,
+            validator_rpc_port: 9944,
             listen: "::".to_string(),
             public_host: String::new(),
             public_port: None,
@@ -255,6 +323,7 @@ impl Default for NodeConfig {
             num_cpus: 1,
             gpu_backend: GpuBackend::Local,
             gpu_device_configs: vec![],
+            metal_config: MetalConfig::default(),
             dwave_config: None,
             timeout: 3,
             heartbeat_interval: 15,
@@ -266,9 +335,8 @@ impl Default for NodeConfig {
 
 // ─── App settings ───────────────────────────────────────────────────────────
 
-fn default_true() -> bool { true }
-fn default_dashboard_hostname() -> String {
-    "localhost:20080".to_string()
+fn default_hostname() -> String {
+    ":20049".to_string()
 }
 
 /// Accept the old `"qpu"` string (briefly shipped to users) as an alias for
@@ -295,12 +363,10 @@ pub struct AppSettings {
     pub window_maximized: bool,
     #[serde(default, deserialize_with = "deserialize_image_tag_compat")]
     pub image_tag: ImageTag,
-    #[serde(default = "default_true")]
-    pub dashboard_enabled: bool,
     #[serde(default)]
     pub tls_enabled: bool,
-    #[serde(default = "default_dashboard_hostname")]
-    pub dashboard_hostname: String,
+    #[serde(default = "default_hostname", alias = "dashboard_hostname")]
+    pub hostname: String,
     #[serde(default)]
     pub cert_email: String,
     #[serde(default)]
@@ -318,9 +384,8 @@ impl Default for AppSettings {
             active_tab: "status".to_string(),
             window_maximized: false,
             image_tag: ImageTag::default(),
-            dashboard_enabled: true,
             tls_enabled: false,
-            dashboard_hostname: default_dashboard_hostname(),
+            hostname: default_hostname(),
             cert_email: String::new(),
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
@@ -380,8 +445,7 @@ struct BootstrapConfig {
 }
 
 fn bootstrap_path() -> PathBuf {
-    let config = dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".config"));
+    let config = dirs::config_dir().unwrap_or_else(|| dirs::home_dir().unwrap().join(".config"));
     config.join("quip-node-manager").join("bootstrap.json")
 }
 
@@ -397,8 +461,7 @@ fn save_bootstrap(cfg: &BootstrapConfig) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let content = serde_json::to_string_pretty(cfg)
-        .map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     fs::write(path, content).map_err(|e| e.to_string())
 }
 
@@ -422,7 +485,7 @@ pub fn ensure_data_dir() -> Result<(), String> {
 
 /// Postgres password for the dashboard's database, generated once on first
 /// access and persisted in bootstrap.json. Never regenerated — rotating
-/// would desync from the existing `quip-pgdata` volume.
+/// would desync from the existing `quip_pgdata` volume.
 pub fn postgres_password() -> String {
     let mut cfg = load_bootstrap();
     if let Some(p) = cfg.postgres_password.as_ref().filter(|s| !s.is_empty()) {
@@ -459,9 +522,7 @@ pub fn load_settings() -> AppSettings {
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
     ensure_data_dir()?;
-    let content =
-        serde_json::to_string_pretty(settings)
-            .map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), content).map_err(|e| e.to_string())
 }
 
@@ -471,9 +532,7 @@ pub async fn get_settings() -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub async fn update_settings(
-    mut settings: AppSettings,
-) -> Result<(), String> {
+pub async fn update_settings(mut settings: AppSettings) -> Result<(), String> {
     // Native mode is only supported on macOS
     if !cfg!(target_os = "macos") {
         settings.run_mode = RunMode::Docker;
@@ -508,9 +567,7 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
     } else {
         // Validate path is writable
         let p = PathBuf::from(&path);
-        fs::create_dir_all(&p).map_err(|e| {
-            format!("Cannot create directory {}: {}", path, e)
-        })?;
+        fs::create_dir_all(&p).map_err(|e| format!("Cannot create directory {}: {}", path, e))?;
         Some(path)
     };
     // Load-modify-save so we don't wipe postgres_password when changing the
@@ -518,4 +575,64 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
     let mut cfg = load_bootstrap();
     cfg.data_dir = new_dir;
     save_bootstrap(&cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn node_config_defaults_validator_port_for_legacy_json() {
+        let config: NodeConfig = serde_json::from_value(json!({
+            "port": 20049,
+            "listen": "::"
+        }))
+        .unwrap();
+
+        assert_eq!(config.port, 20049);
+        assert_eq!(config.validator_port, 30333);
+    }
+
+    #[test]
+    fn app_settings_default_hostname_is_public_api_port() {
+        assert_eq!(AppSettings::default().hostname, ":20049");
+    }
+
+    #[test]
+    fn app_settings_deserializes_legacy_dashboard_hostname_alias() {
+        let settings: AppSettings = serde_json::from_value(json!({
+            "node_config": {},
+            "active_tab": "status",
+            "window_maximized": false,
+            "image_tag": "cpu",
+            "dashboard_hostname": "node.example.com, node.example.com:20049"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            settings.hostname,
+            "node.example.com, node.example.com:20049"
+        );
+    }
+
+    #[test]
+    fn app_settings_deserializes_legacy_qpu_image_without_losing_fields() {
+        let settings: AppSettings = serde_json::from_value(json!({
+            "node_config": {
+                "port": 20444,
+                "node_name": "legacy-node"
+            },
+            "active_tab": "status",
+            "window_maximized": false,
+            "image_tag": "qpu"
+        }))
+        .unwrap();
+
+        assert_eq!(settings.node_config.port, 20444);
+        assert_eq!(settings.node_config.validator_port, 30333);
+        assert_eq!(settings.node_config.node_name, "legacy-node");
+        assert_eq!(settings.image_tag, ImageTag::Cpu);
+        assert_eq!(settings.hostname, ":20049");
+    }
 }

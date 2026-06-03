@@ -14,3 +14,6 @@ src-tauri/telemetry/
 
 # Claude-specific (not for cross-tool sharing)
 CLAUDE.md
+
+# Intellij
+.idea

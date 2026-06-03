@@ -35,24 +35,20 @@ pub fn list_nvidia_gpus() -> Vec<GpuDevice> {
         ])
         .output();
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(3, ',');
-                    let index = parts.next()?.trim().parse().ok()?;
-                    let name = parts.next()?.trim().to_string();
-                    let mem: Option<u32> = parts
-                        .next()
-                        .and_then(|s| s.trim().parse().ok());
-                    Some(GpuDevice {
-                        index,
-                        name,
-                        memory_mb: mem,
-                    })
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, ',');
+                let index = parts.next()?.trim().parse().ok()?;
+                let name = parts.next()?.trim().to_string();
+                let mem: Option<u32> = parts.next().and_then(|s| s.trim().parse().ok());
+                Some(GpuDevice {
+                    index,
+                    name,
+                    memory_mb: mem,
                 })
-                .collect()
-        }
+            })
+            .collect(),
         _ => vec![],
     }
 }
@@ -92,11 +88,7 @@ fn detect_docker_version() -> Option<String> {
         .output()
         .ok()?;
     if output.status.success() {
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string(),
-        )
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
     }
@@ -109,11 +101,7 @@ fn detect_python() -> Option<String> {
         .ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout);
-        Some(
-            text.trim()
-                .trim_start_matches("Python ")
-                .to_string(),
-        )
+        Some(text.trim().trim_start_matches("Python ").to_string())
     } else {
         None
     }
@@ -199,9 +187,7 @@ pub async fn list_gpu_devices() -> Result<Vec<GpuDevice>, String> {
 }
 
 #[tauri::command]
-pub async fn run_hardware_survey(
-    app: tauri::AppHandle,
-) -> Result<HardwareSurvey, String> {
+pub async fn run_hardware_survey(app: tauri::AppHandle) -> Result<HardwareSurvey, String> {
     use tauri::Emitter;
 
     let survey = tokio::task::spawn_blocking(run_survey)
@@ -241,24 +227,17 @@ pub async fn run_hardware_survey(
     }
     match &survey.docker_version {
         Some(v) => log(format!("[Hardware Survey] Docker: v{}", v)),
-        None => log(
-            "[Hardware Survey] Docker: not installed".to_string(),
-        ),
+        None => log("[Hardware Survey] Docker: not installed".to_string()),
     }
     match &survey.python_version {
         Some(v) => log(format!("[Hardware Survey] Python: {}", v)),
-        None => log(
-            "[Hardware Survey] Python: not found".to_string(),
-        ),
+        None => log("[Hardware Survey] Python: not found".to_string()),
     }
     let mode_str = match survey.recommended_mode {
         RunMode::Docker => "Docker",
         RunMode::Native => "Native",
     };
-    log(format!(
-        "[Hardware Survey] Recommended mode: {}",
-        mode_str
-    ));
+    log(format!("[Hardware Survey] Recommended mode: {}", mode_str));
 
     Ok(survey)
 }
