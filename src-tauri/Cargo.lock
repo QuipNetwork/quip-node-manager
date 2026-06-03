@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "quip-node-manager"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "dirs 5.0.1",
@@ -3123,6 +3123,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]

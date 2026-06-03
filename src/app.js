@@ -23,6 +23,8 @@ const state = {
   // { services: [{name, service, running, health, status_text, image}], overall }
   stack: null,
   checksPassed: false,
+  starting: false,
+  stopping: false,
   detectedGpus: [], // { index, name }
   logLines: [],
   MAX_LOG_LINES: 500,
@@ -31,47 +33,108 @@ const state = {
   // Merged from `checklist-update` events; rendered by renderChecklist().
   checks: new Map(),
   hardwareSurvey: null,
+  // Set by the `dashboard-db-mismatch` event when Postgres rejects the
+  // dashboard's password; cleared once the dashboard comes up. Drives the
+  // error message + Reset button in the dashboard placeholder.
+  dashboardDbError: null,
+  // Highest pull generation that has received its `pull-complete`. Progress
+  // events at or below this are stale (a late layer event from a finished
+  // pull) and must not reopen the panel. See handlePullProgress.
+  pullCompletedGen: 0,
 };
+
+const DEFAULT_DASHBOARD_HOSTNAME = ':20049';
+const CADDY_PUBLIC_API_PORT = 20049;
+
+function publicHostName(value) {
+  let host = (value || '').trim();
+  if (!host) return '';
+  const schemeIndex = host.indexOf('://');
+  if (schemeIndex >= 0) host = host.slice(schemeIndex + 3);
+  if (host.includes('@')) host = host.split('@').pop();
+  host = host.split(/[/?#]/)[0].trim();
+  if (host.startsWith('[')) {
+    host = host.slice(1).split(']')[0].trim();
+  } else if ((host.match(/:/g) || []).length === 1) {
+    host = host.split(':')[0].trim();
+  }
+  return /\s/.test(host) ? '' : host.replace(/\.$/, '');
+}
+
+function isIpAddress(hostname) {
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) ||
+    (hostname.includes(':') && /^[0-9a-f:]+$/i.test(hostname));
+}
+
+function isPublicDnsHost(hostname) {
+  if (!hostname || isIpAddress(hostname)) return false;
+  const lower = hostname.toLowerCase();
+  return lower !== 'localhost' &&
+    !lower.endsWith('.localhost') &&
+    !lower.endsWith('.local');
+}
+
+function dashboardHostnameForSettings(settings) {
+  const publicHost = publicHostName(settings?.node_config?.public_host);
+  if (isPublicDnsHost(publicHost)) {
+    return `${publicHost}, ${publicHost}:${CADDY_PUBLIC_API_PORT}`;
+  }
+  // Mirror resolved_caddy_hostname: only honor the hostname field when it holds
+  // a real public DNS host (incl. the `host, host:20049` form). localhost / an
+  // IP / a bare or edited port normalize to the port-only default so the iframe
+  // targets plain HTTP on the (remapped) API port instead of an auto-HTTPS host.
+  const fallback = (settings?.hostname || '').trim();
+  const fallbackHost = publicHostName(fallback.split(',')[0]);
+  if (isPublicDnsHost(fallbackHost)) {
+    return fallback;
+  }
+  return DEFAULT_DASHBOARD_HOSTNAME;
+}
+
+function dashboardHostForBrowser(settings) {
+  const configured = dashboardHostnameForSettings(settings);
+  const firstHost = (configured || DEFAULT_DASHBOARD_HOSTNAME)
+    .split(',')[0]
+    .trim() || DEFAULT_DASHBOARD_HOSTNAME;
+  if (firstHost === DEFAULT_DASHBOARD_HOSTNAME) {
+    return `localhost:${settings?.node_config?.port || CADDY_PUBLIC_API_PORT}`;
+  }
+  return firstHost.startsWith(':') ? `localhost${firstHost}` : firstHost;
+}
+
+function isLocalDashboardHost(hostname) {
+  return hostname.startsWith('localhost') ||
+    hostname.startsWith('127.0.0.1') ||
+    hostname.startsWith('[::1]');
+}
 
 // ─── Stack Configuration UI ─────────────────────────────────────────────────
 
-// Show the TLS subsettings block only when both dashboard and TLS are on.
-// TLS without the dashboard is meaningless (Caddy only fronts the dashboard
-// in this stack) so we disable the TLS checkbox when dashboard is off.
+// Show certificate subsettings only when TLS is enabled. The dashboard is
+// always part of the v0.2 stack.
 function updateStackUiVisibility() {
-  const dashEl = document.getElementById('dashboard-enabled');
   const tlsEl = document.getElementById('tls-enabled');
   const subs = document.getElementById('tls-subsettings');
-  if (!dashEl || !tlsEl || !subs) return;
+  if (!tlsEl || !subs) return;
 
-  const dash = dashEl.checked;
-  tlsEl.disabled = !dash;
-  if (!dash) tlsEl.checked = false;
-  subs.style.display = dash && tlsEl.checked ? '' : 'none';
+  subs.style.display = tlsEl.checked ? '' : 'none';
 }
 
 document.addEventListener('change', (e) => {
   if (!e.target) return;
-  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
+  if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
-  }
-  if (e.target.id === 'dashboard-enabled' || e.target.id === 'tls-enabled') {
-    // These settings change the compose profile; refresh the checklist so
-    // the user sees profile-specific items (rest-port-native, port-tls, …)
-    // without waiting for the next recheck cycle.
-    invoke('recheck').catch(() => {});
   }
 });
 
 // ─── Dashboard tab iframe wiring ────────────────────────────────────────────
 
 function dashboardUrl(settings) {
-  if (!settings?.dashboard_enabled) return null;
-  const hostname = settings.dashboard_hostname || 'localhost:20080';
+  const hostname = dashboardHostForBrowser(settings);
   // ACME via Caddy only when TLS is on AND the hostname is a real DNS name
   // (localhost can't get a public cert). In every other case plain HTTP on
   // whatever port was configured.
-  if (settings.tls_enabled && !hostname.startsWith('localhost')) {
+  if (settings.tls_enabled && !isLocalDashboardHost(hostname)) {
     return `https://${hostname.replace(/:.*/, '')}`;
   }
   return `http://${hostname}`;
@@ -81,12 +144,22 @@ function refreshDashboardTab() {
   const frame = document.getElementById('dashboard-frame');
   const empty = document.getElementById('dashboard-empty');
   const msg = document.getElementById('dashboard-empty-msg');
+  const resetBtn = document.getElementById('dashboard-reset-btn');
   if (!frame || !empty) return; // tab markup not present on first load
 
   const url = dashboardUrl(state.settings);
-  const dashRunning = state.stack?.services?.some(
-    (s) => (s.service === 'dashboard' || s.service === 'dashboard-direct') && s.running,
+  // Only load the iframe once the dashboard is actually serving: running AND
+  // (healthy or no healthcheck). Loading it while the dashboard/Caddy are still
+  // starting lands the iframe on a connection-error page that never recovers —
+  // refreshDashboardTab won't re-set an unchanged `src`, so it stays stuck
+  // until a manual reload. The dashboard image ships a healthcheck, and Caddy
+  // starts after it, so "healthy" implies the front door is up.
+  const dashSvc = state.stack?.services?.find(
+    (s) => s.service === 'dashboard' || s.service === 'dashboard-direct',
   );
+  const dashRunning = !!dashSvc?.running
+    && dashSvc.health !== 'starting'
+    && dashSvc.health !== 'unhealthy';
 
   // Toggle via style.display rather than the `hidden` attribute — the
   // placeholder has `display: flex` in CSS (for its centered layout) which
@@ -99,17 +172,21 @@ function refreshDashboardTab() {
   // string on every tick, reloading the iframe and resetting the user's
   // place on the page.
   const currentSrc = frame.getAttribute('src');
-  if (!url) {
-    if (msg) msg.textContent = 'Dashboard disabled — enable it in the Status tab.';
-    show(empty, 'flex');
-    show(frame, 'none');
-    if (currentSrc !== 'about:blank') frame.src = 'about:blank';
-  } else if (!dashRunning) {
-    if (msg) msg.textContent = 'Starting dashboard…';
+  if (!dashRunning) {
+    // Placeholder whenever the dashboard isn't up. The Reset button is always
+    // offered here so the operator can recreate the dashboard DB on demand
+    // (e.g. to clear a stale cached identity), not only on a detected
+    // password mismatch. Only the mismatch detail is shown (when present); no
+    // generic "starting" text.
+    if (msg) msg.textContent = state.dashboardDbError || '';
+    if (resetBtn) show(resetBtn, 'inline-block');
     show(empty, 'flex');
     show(frame, 'none');
     if (currentSrc !== 'about:blank') frame.src = 'about:blank';
   } else {
+    // The dashboard is up — any earlier password mismatch is resolved.
+    state.dashboardDbError = null;
+    if (resetBtn) show(resetBtn, 'none');
     if (currentSrc !== url) frame.src = url;
     show(empty, 'none');
     show(frame, 'block');
@@ -120,10 +197,9 @@ function refreshDashboardTab() {
 // include ids that don't appear in state.checks for the current settings
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
-  'docker', 'docker-compose', 'stack-assets', 'wsl',
-  'stack-images', 'binary', 'version', 'secret',
-  'ip', 'hostname', 'port', 'port-dashboard', 'port-tls',
-  'rest-port-native', 'firewall', 'dwave-key',
+  'docker', 'docker-compose', 'wsl',
+  'binary', 'secret',
+  'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
 // State-to-icon mapping for the checklist. CSS class `state-<state>`
@@ -140,32 +216,35 @@ const STATE_ICON = {
 // Fix button labels, keyed by FixKind.kind.
 const FIX_LABELS = {
   InstallDocker:   'Install Docker',
-  PullImage:       'Pull Image',
-  DownloadBinary:  'Download & Install',
   GenerateSecret:  'Generate Secret',
-  Delegate:        'Update',
 };
 
+// Secret generation is folded into the Retry button: Retry generates the
+// secret (only when the check is failing — regenerating it on a passing check
+// would be destructive) and then rechecks, so there's no separate fix button.
+// Downloads (stack images, native binary) are performed by the backend check
+// itself on recheck, so their Retry is just a plain recheck.
+const FIX_FOLDED_INTO_RETRY = new Set(['secret']);
+
 // ─── Tab switching ──────────────────────────────────────────────────────────
+// Activate a tab by name (e.g. 'status', 'dashboard'). Used by the tab buttons
+// and by flows that need to navigate the user programmatically.
+function activateTab(tab) {
+  document
+    .querySelectorAll('.tab-btn')
+    .forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document
+    .querySelectorAll('.tab-content')
+    .forEach((c) => c.classList.toggle('active', c.id === `tab-${tab}`));
+  if (state.settings) {
+    state.settings.active_tab = tab;
+    invoke('update_settings', { settings: state.settings }).catch(console.error);
+  }
+  if (tab === 'dashboard') refreshDashboardTab();
+}
+
 document.querySelectorAll('.tab-btn').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const tab = btn.dataset.tab;
-    document
-      .querySelectorAll('.tab-btn')
-      .forEach((b) => b.classList.remove('active'));
-    document
-      .querySelectorAll('.tab-content')
-      .forEach((c) => c.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById(`tab-${tab}`).classList.add('active');
-    if (state.settings) {
-      state.settings.active_tab = tab;
-      invoke('update_settings', { settings: state.settings }).catch(
-        console.error
-      );
-    }
-    if (tab === 'dashboard') refreshDashboardTab();
-  });
+  btn.addEventListener('click', () => activateTab(btn.dataset.tab));
 });
 
 // ─── Configuration section toggle ────────────────────────────────────────────
@@ -175,6 +254,31 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
   const expanded = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!expanded));
   section.style.display = expanded ? 'none' : '';
+});
+
+// ─── Dashboard database reset ─────────────────────────────────────────────────
+// Offered whenever the dashboard isn't running (e.g. to clear a stale cached
+// identity or recover from a Postgres password mismatch). Data-only: it deletes
+// the Postgres volume + indexer data and does NOT start anything. A missing
+// volume is treated as success by the backend. On success we send the user back
+// to the Status Monitor tab; on failure we stay and show the error.
+document.getElementById('dashboard-reset-btn')?.addEventListener('click', async () => {
+  const btn = document.getElementById('dashboard-reset-btn');
+  const msg = document.getElementById('dashboard-empty-msg');
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = 'Resetting dashboard database…';
+  try {
+    await invoke('reset_dashboard_database');
+    state.dashboardDbError = null;
+    await pollStatus();
+    activateTab('status');
+  } catch (e) {
+    state.dashboardDbError = `Reset failed: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
+    refreshDashboardTab();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 });
 
 // ─── Log drawer toggle ──────────────────────────────────────────────────────
@@ -199,7 +303,16 @@ document.getElementById('port').addEventListener('change', async () => {
   if (state.settings) {
     state.settings.node_config.port = port;
     await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port', 'firewall'] }).catch(console.error);
+    await invoke('recheck', { ids: ['port'] }).catch(console.error);
+  }
+});
+
+document.getElementById('validator-port').addEventListener('change', async () => {
+  const port = parseInt(document.getElementById('validator-port').value) || 30333;
+  if (state.settings) {
+    state.settings.node_config.validator_port = port;
+    await invoke('update_settings', { settings: state.settings }).catch(console.error);
+    await invoke('recheck', { ids: ['port-validator'] }).catch(console.error);
   }
 });
 
@@ -235,49 +348,38 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
   }
 });
 
-// ─── Run mode select ─────────────────────────────────────────────────────────
-document.getElementById('run-mode-select').addEventListener('change', async () => {
+// ─── Run mode ─────────────────────────────────────────────────────────
+//
+// run_mode has no dedicated UI control. On macOS it is driven by the Metal
+// GPU toggle in renderGpuDevices (on -> native/Metal, off -> docker/CPU);
+// everywhere else the manager always runs the Dockerized stack.
+
+/// Flip run_mode from the Metal toggle, persist, and re-run the checklist
+/// (the visible checks differ between native and docker — e.g. the native
+/// binary check).
+async function setMetalEnabled(enabled) {
   if (!state.settings) return;
-  state.settings.run_mode = document.getElementById('run-mode-select').value;
-  updateRunModeUI();
+  state.settings.run_mode = enabled ? 'native' : 'docker';
   await invoke('update_settings', { settings: state.settings }).catch(console.error);
   // Mode change invalidates the whole cache — backend reseeds and reruns.
   state.checks.clear();
   await invoke('recheck').catch(console.error);
-});
+  updateRunModeUI();
+}
 
 function updateRunModeUI() {
-  const survey = state.hardwareSurvey;
-  const isMac = survey?.os === 'macos';
+  const isMac = state.hardwareSurvey?.os === 'macos';
 
-  // Run Mode toggle is only available on macOS
-  const runModeGroup = document.getElementById('run-mode-group');
-  if (runModeGroup) {
-    runModeGroup.style.display = isMac ? '' : 'none';
-  }
-
-  // Force Docker on non-macOS
+  // Off macOS there is no Metal backend, so the manager always runs the
+  // Dockerized stack. On macOS run_mode reflects the Metal toggle.
   if (!isMac && state.settings) {
     state.settings.run_mode = 'docker';
   }
-
-  const mode = state.settings?.run_mode || 'docker';
-  const isDocker = mode === 'docker';
 
   // Checklist items are filtered by mode inside renderChecklist(); re-render
   // here because mode and the hardware survey (WSL visibility) can land
   // in either order during init.
   renderChecklist();
-
-  // Warnings (only relevant on macOS where the toggle exists)
-  const warning = document.getElementById('run-mode-warning');
-  if (isDocker && isMac) {
-    warning.textContent = '\u26A0 Mac Metal GPUs are not accessible in Docker.';
-    warning.style.display = '';
-  } else {
-    warning.style.display = 'none';
-  }
-
   renderGpuDevices();
 }
 
@@ -287,6 +389,15 @@ function renderGpuDevices() {
   const globalSettings = document.getElementById('gpu-global-settings');
   const survey = state.hardwareSurvey;
   const devices = survey?.gpu_devices || [];
+  const isMetal = survey?.gpu_backend === 'metal';
+  // On macOS the Metal toggle IS the run-mode selector: native = Metal on.
+  const metalEnabled = (state.settings?.run_mode || 'docker') === 'native';
+
+  // Metal exposes adaptive-cap knobs, but only while it's enabled; CUDA never.
+  const metalExtra = document.getElementById('metal-extra-settings');
+  if (metalExtra) {
+    metalExtra.style.display = isMetal && metalEnabled ? '' : 'none';
+  }
 
   list.replaceChildren();
 
@@ -307,7 +418,7 @@ function renderGpuDevices() {
     const saved = savedConfigs.find((c) => c.index === dev.index);
     const enabled = saved ? saved.enabled : false;
     const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
-    const backendLabel = survey.gpu_backend === 'metal' ? 'Metal' : 'CUDA';
+    const backendLabel = isMetal ? 'Metal' : 'CUDA';
 
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
@@ -316,22 +427,43 @@ function renderGpuDevices() {
     label.className = 'gpu-toggle-switch';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
-    checkbox.className = 'gpu-device-toggle';
-    checkbox.dataset.index = String(dev.index);
-    checkbox.checked = enabled;
     const slider = document.createElement('span');
     slider.className = 'gpu-toggle-slider';
+
+    if (isMetal) {
+      // Metal is a single implicit GPU only reachable from the native miner,
+      // so its enable toggle doubles as the run-mode selector: on → native
+      // (Metal mining), off → docker (CPU mining).
+      checkbox.className = 'metal-enable-toggle';
+      checkbox.checked = metalEnabled;
+      checkbox.addEventListener('change', () => setMetalEnabled(checkbox.checked));
+    } else {
+      // CUDA gets a per-device toggle so individual cards can be enabled.
+      checkbox.className = 'gpu-device-toggle';
+      checkbox.dataset.index = String(dev.index);
+      checkbox.checked = enabled;
+    }
     label.appendChild(checkbox);
     label.appendChild(slider);
+    row.appendChild(label);
 
     const text = document.createElement('span');
     text.style.fontSize = '13px';
     text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
 
-    row.appendChild(label);
     row.appendChild(text);
     list.appendChild(row);
   });
+
+  // Make the Metal on/off → mining-mode consequence explicit.
+  if (isMetal) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:12px;color:var(--text-faint);padding:2px 0 0 0;';
+    hint.textContent = metalEnabled
+      ? 'Metal GPU mining enabled — runs the native miner.'
+      : 'Metal off — the node runs CPU mining via Docker.';
+    list.appendChild(hint);
+  }
 }
 
 // ─── TLS guide toggle ────────────────────────────────────────────────────────
@@ -381,21 +513,27 @@ document.getElementById('public-host-enable').addEventListener('change', () => {
   }
 });
 
-// ─── QPU section toggle ───────────────────────────────────────────────────────
+// ─── D-Wave section toggle ───────────────────────────────────────────────────
 document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
   const section = document.getElementById('qpu-section');
   const btn = document.getElementById('btn-qpu-toggle');
   const isVisible = section.style.display !== 'none';
   section.style.display = isVisible ? 'none' : 'block';
   btn.textContent = isVisible
-    ? 'Have D-Wave / QPU Access? Click here'
-    : 'Hide QPU Configuration';
+    ? 'Configure D-Wave Access'
+    : 'Hide D-Wave Configuration';
 });
 
 // ─── GPU utilization slider ──────────────────────────────────────────────────
 document.getElementById('gpu-utilization').addEventListener('input', () => {
   const val = document.getElementById('gpu-utilization').value;
   document.getElementById('gpu-util-display').textContent = `${val}%`;
+});
+
+// ─── Metal active-utilization slider ─────────────────────────────────────────
+document.getElementById('metal-active-util').addEventListener('input', () => {
+  const val = document.getElementById('metal-active-util').value;
+  document.getElementById('metal-active-util-display').textContent = `${val}%`;
 });
 
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
@@ -416,6 +554,16 @@ function collectConfig() {
     });
   });
 
+  // Metal tuning is a standalone single-GPU config (the [metal] section);
+  // utilization/yielding are shared with the slider above, active_util and
+  // idle_after_s are Metal-only adaptive-cap knobs.
+  const metalConfig = {
+    utilization: gpuUtilization,
+    yielding: gpuYielding,
+    active_util: parseInt(document.getElementById('metal-active-util')?.value) || 85,
+    idle_after_s: parseInt(document.getElementById('metal-idle-after')?.value) || 60,
+  };
+
   const qpuToken = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
   const dwaveConfig = qpuToken
     ? {
@@ -428,14 +576,13 @@ function collectConfig() {
       }
     : null;
 
-  const fanoutRaw = document.getElementById('fanout')?.value?.trim();
-  const fanout = fanoutRaw ? (parseInt(fanoutRaw) || null) : null;
-
   const base = state.settings?.node_config ?? {};
 
   return {
     port: parseInt(document.getElementById('port').value) || 20049,
-    listen: document.getElementById('listen')?.value?.trim() || '::',
+    validator_port: parseInt(document.getElementById('validator-port').value) || 30333,
+    validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
+    listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
       : '',
@@ -443,37 +590,32 @@ function collectConfig() {
       ? (parseInt(document.getElementById('public-port')?.value) || null)
       : null,
     node_name: document.getElementById('node-name')?.value?.trim() ?? '',
-    peers: document
-      .getElementById('peers')
-      .value.split('\n')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-    auto_mine: document.getElementById('auto-mine')?.checked ?? false,
+    peers: base.peers ?? [],
+    auto_mine: base.auto_mine ?? false,
     secret: state.settings?.node_config?.secret ?? '',
     genesis_config: base.genesis_config ?? 'genesis_block.json',
     tofu: base.tofu ?? true,
     trust_db: base.trust_db ?? '~/.quip/trust.db',
-    tls_cert_file: document.getElementById('tls-cert-file')?.value?.trim() ?? '',
-    tls_key_file: document.getElementById('tls-key-file')?.value?.trim() ?? '',
-    verify_tls: document.getElementById('verify-tls')?.checked ?? false,
-    rest_host: document.getElementById('rest-host')?.value?.trim() ?? '127.0.0.1',
-    rest_port: parseInt(document.getElementById('rest-port')?.value) ?? -1,
-    rest_insecure_port: parseInt(document.getElementById('rest-insecure-port')?.value) ?? -1,
-    telemetry_enabled: document.getElementById('telemetry-enabled')?.checked ?? true,
-    telemetry_dir: document.getElementById('telemetry-dir')?.value?.trim() ?? 'telemetry',
+    tls_cert_file: base.tls_cert_file ?? '',
+    tls_key_file: base.tls_key_file ?? '',
+    verify_tls: base.verify_tls ?? false,
+    rest_host: base.rest_host ?? '127.0.0.1',
+    rest_port: base.rest_port ?? -1,
+    rest_insecure_port: base.rest_insecure_port ?? -1,
+    telemetry_enabled: base.telemetry_enabled ?? true,
+    telemetry_dir: base.telemetry_dir ?? 'telemetry',
     log_level: document.getElementById('log-level')?.value || 'info',
     node_log: document.getElementById('node-log')?.value?.trim() ?? '',
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
+    metal_config: metalConfig,
     dwave_config: dwaveConfig,
-    timeout: parseInt(document.getElementById('timeout')?.value) || 3,
-    heartbeat_interval:
-      parseInt(document.getElementById('heartbeat-interval')?.value) || 15,
-    heartbeat_timeout:
-      parseInt(document.getElementById('heartbeat-timeout')?.value) || 300,
-    fanout,
+    timeout: base.timeout ?? 3,
+    heartbeat_interval: base.heartbeat_interval ?? 15,
+    heartbeat_timeout: base.heartbeat_timeout ?? 300,
+    fanout: base.fanout ?? null,
   };
 }
 
@@ -485,19 +627,17 @@ function applyFormToSettings() {
     document.getElementById('auto-update-enabled')?.checked ?? false;
 
   // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
-  // enabled, CPU otherwise. QPU mining is a config.toml [dwave] concern, not
-  // a separate image — so there's no QPU option to pick here.
+  // enabled, CPU otherwise. D-Wave mining is a config.toml [dwave] concern,
+  // not a separate image.
   const hasEnabledCuda = (state.settings.node_config.gpu_device_configs || [])
     .some((d) => d.enabled) && state.hardwareSurvey?.gpu_backend === 'cuda';
   state.settings.image_tag = hasEnabledCuda ? 'cuda' : 'cpu';
 
-  state.settings.dashboard_enabled =
-    document.getElementById('dashboard-enabled')?.checked ?? true;
   state.settings.tls_enabled =
     document.getElementById('tls-enabled')?.checked ?? false;
-  state.settings.dashboard_hostname =
-    document.getElementById('dashboard-hostname')?.value?.trim() ||
-    'localhost:20080';
+  state.settings.hostname =
+    document.getElementById('hostname')?.value?.trim() ||
+    DEFAULT_DASHBOARD_HOSTNAME;
   state.settings.cert_email =
     document.getElementById('cert-email')?.value?.trim() || '';
   state.settings.zerossl_api_key =
@@ -508,53 +648,31 @@ function applyFormToSettings() {
 function populateForm(settings) {
   const c = settings.node_config;
 
-  // Node Configuration
+  // Validator / miner configuration
   document.getElementById('port').value = c.port ?? 20049;
-  document.getElementById('listen').value = c.listen || '::';
+  document.getElementById('validator-port').value = c.validator_port ?? 30333;
+  document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
-  document.getElementById('auto-mine').checked = c.auto_mine ?? false;
 
   // Custom settings
   document.getElementById('node-name').value = c.node_name ?? '';
   const publicHost = c.public_host ?? '';
   const publicPort = c.public_port ?? null;
-  if (publicHost || publicPort) {
-    document.getElementById('public-host-enable').checked = true;
-    document.getElementById('public-host').disabled = false;
-    document.getElementById('public-port').disabled = false;
-    document.getElementById('public-host').value = publicHost;
-    document.getElementById('public-port').value = publicPort ?? '';
-  }
-  document.getElementById('peers').value = (c.peers || []).join('\n');
-  document.getElementById('timeout').value = c.timeout ?? 3;
-  document.getElementById('heartbeat-interval').value =
-    c.heartbeat_interval ?? 15;
-  document.getElementById('heartbeat-timeout').value =
-    c.heartbeat_timeout ?? 300;
-  if (c.fanout != null) {
-    document.getElementById('fanout').value = c.fanout;
-  }
+  const publicOverrideEnabled = !!(publicHost || publicPort);
+  document.getElementById('public-host-enable').checked = publicOverrideEnabled;
+  document.getElementById('public-host').disabled = !publicOverrideEnabled;
+  document.getElementById('public-port').disabled = !publicOverrideEnabled;
+  document.getElementById('public-host').value = publicHost;
+  document.getElementById('public-port').value = publicPort ?? '';
   document.getElementById('log-level').value = c.log_level ?? 'info';
-  document.getElementById('verify-tls').checked = c.verify_tls ?? false;
-
-  // New fields
-  document.getElementById('telemetry-enabled').checked = c.telemetry_enabled ?? true;
-  document.getElementById('telemetry-dir').value = c.telemetry_dir ?? 'telemetry';
-  document.getElementById('tls-cert-file').value = c.tls_cert_file ?? '';
-  document.getElementById('tls-key-file').value = c.tls_key_file ?? '';
-  document.getElementById('rest-host').value = c.rest_host ?? '127.0.0.1';
-  document.getElementById('rest-port').value = c.rest_port ?? -1;
-  document.getElementById('rest-insecure-port').value = c.rest_insecure_port ?? -1;
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
 
   // Stack Configuration (image_tag is auto-derived, no UI control)
-  document.getElementById('dashboard-enabled').checked =
-    settings.dashboard_enabled ?? true;
   document.getElementById('tls-enabled').checked =
     settings.tls_enabled ?? false;
-  document.getElementById('dashboard-hostname').value =
-    settings.dashboard_hostname ?? 'localhost:20080';
+  document.getElementById('hostname').value =
+    settings.hostname ?? DEFAULT_DASHBOARD_HOSTNAME;
   document.getElementById('cert-email').value = settings.cert_email ?? '';
   document.getElementById('zerossl-api-key').value =
     settings.zerossl_api_key ?? '';
@@ -563,15 +681,9 @@ function populateForm(settings) {
   // Auto-expand custom settings if any non-default values are set
   const hasCustom =
     publicHost || publicPort ||
-    (c.peers || []).length > 0 ||
-    c.timeout !== 3 ||
-    c.heartbeat_interval !== 15 ||
-    c.heartbeat_timeout !== 300 ||
-    c.fanout != null ||
     c.log_level !== 'info' ||
-    (c.verify_tls ?? false) ||
-    (c.tls_cert_file ?? '') ||
-    (c.rest_port ?? -1) > 0;
+    (c.node_log ?? '') ||
+    (c.http_log ?? '');
   if (hasCustom) {
     document.getElementById('btn-custom-toggle').setAttribute('aria-expanded', 'true');
     document.getElementById('custom-settings-section').style.display = '';
@@ -580,14 +692,25 @@ function populateForm(settings) {
   // CPU Miner
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
 
-  // GPU Miner — utilization/yielding from first enabled device or defaults
+  // GPU Miner — for Metal, utilization/yielding come from metal_config;
+  // for CUDA, from the first enabled device (or defaults).
+  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
+  const metalCfg = c.metal_config ?? {};
   const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
-  const savedUtil = gpuCfg?.utilization ?? 80;
+  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
-  document.getElementById('gpu-yielding').checked = gpuCfg?.yielding ?? false;
+  document.getElementById('gpu-yielding').checked = isMetal
+    ? (metalCfg.yielding ?? true)
+    : (gpuCfg?.yielding ?? false);
 
-  // QPU / D-Wave
+  // Metal-only adaptive-cap knobs
+  const activeUtil = metalCfg.active_util ?? 85;
+  document.getElementById('metal-active-util').value = activeUtil;
+  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
+  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
+
+  // D-Wave
   const dw = c.dwave_config;
   if (dw) {
     document.getElementById('qpu-api-key').value = dw.token ?? '';
@@ -595,7 +718,7 @@ function populateForm(settings) {
     if (dw.token) {
       document.getElementById('qpu-section').style.display = 'block';
       document.getElementById('btn-qpu-toggle').textContent =
-        'Hide QPU Configuration';
+        'Hide D-Wave Configuration';
     }
   }
   // GPU device list rendered after list_gpu_devices call in init
@@ -604,10 +727,14 @@ function populateForm(settings) {
 // ─── Start/Stop/Apply enable state ───────────────────────────────────────────
 function updateStartStopState() {
   const running = state.containerRunning || state.nativeRunning;
-  document.getElementById('btn-start').disabled =
-    !state.checksPassed || running;
-  document.getElementById('btn-stop').disabled = !running;
-  document.getElementById('btn-apply').disabled = !state.checksPassed;
+  const startBtn = document.getElementById('btn-start');
+  const stopBtn = document.getElementById('btn-stop');
+  startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
+  startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+  stopBtn.disabled = !running || state.starting || state.stopping;
+  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  document.getElementById('btn-apply').disabled =
+    !state.checksPassed || state.starting || state.stopping;
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -651,33 +778,23 @@ function setStatus(stateStr) {
 function visibleInMode(id, runMode) {
   const s = state.settings;
   const isDocker = (runMode || 'docker') === 'docker';
-  const dashboard = s?.dashboard_enabled ?? true;
-  const tls = s?.tls_enabled ?? false;
   const hasDwave = !!s?.node_config?.dwave_config;
-  // Compose runs whenever we're in Docker mode, OR Native mode with the
-  // dashboard on (dashboard+postgres[+caddy] run via compose even when
-  // the node runs as a host binary).
-  const composeWillRun = isDocker || dashboard;
+  // Compose runs in both Docker mode and Native mode. Native uses it for the
+  // validator/dashboard support services even when the miner runs on the host.
+  const composeWillRun = true;
 
   switch (id) {
     case 'docker':
     case 'docker-compose':
-    case 'stack-assets':
     case 'stack-images':
       return composeWillRun;
     case 'wsl':
       return isDocker && state.hardwareSurvey?.os === 'windows';
     case 'binary':
       return !isDocker;
-    case 'port-dashboard':
-      return composeWillRun && dashboard && !tls;
-    case 'port-tls':
-      return composeWillRun && dashboard && tls;
-    case 'rest-port-native':
-      return !isDocker && dashboard;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / port / firewall — always shown.
+    // version / secret / ip / hostname / ports — always shown.
     default:
       return true;
   }
@@ -704,11 +821,17 @@ function renderChecklistItem(item) {
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
   recheckBtn.dataset.action = 'recheck';
-  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Recheck';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Retry';
   recheckBtn.disabled = item.state === 'running';
   actions.appendChild(recheckBtn);
 
-  if (item.fixable && (item.state === 'fail' || item.state === 'warn')) {
+  // For checks whose fix is folded into Retry (Retry runs the fix, then
+  // rechecks) we drop the dedicated fix button entirely.
+  if (
+    item.fixable &&
+    !FIX_FOLDED_INTO_RETRY.has(item.id) &&
+    (item.state === 'fail' || item.state === 'warn')
+  ) {
     const fixBtn = document.createElement('button');
     fixBtn.type = 'button';
     fixBtn.className = 'btn btn-sm btn-secondary check-action';
@@ -739,22 +862,18 @@ function renderChecklist() {
 
 function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
+  const validatorPort = state.settings?.node_config?.validator_port ?? 30333;
   switch (id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
-    case 'stack-assets':      return 'Stack files staged (compose.yml + Caddyfile)';
     case 'wsl':               return 'WSL installed with distro';
     case 'stack-images':      return 'Stack images available';
-    case 'binary':            return 'Node binary available';
-    case 'version':           return 'Node version up to date';
+    case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Port ${port} — press Recheck to test`;
-    case 'port-dashboard':    return 'Dashboard port 20080 available';
-    case 'port-tls':          return 'TLS ports 80 + 443 available';
-    case 'rest-port-native':  return 'Native REST port available';
-    case 'firewall':          return 'Local firewall allows port (UDP+TCP)';
+    case 'port':              return `Public API port ${port} — press Retry to test`;
+    case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
   }
@@ -807,10 +926,15 @@ function mergeCheckUpdate(item) {
   state.checks.set(item.id, item);
   renderChecklist();
 
-  // The version check resolves the "v<app> (node <node>)" label in the
-  // header. When version transitions to a terminal state the node version
-  // may have changed (pull/download fixes), so refresh the display.
-  if (item.id === 'version' && item.state !== 'idle' && item.state !== 'running') {
+  // The stack-images (Docker) and binary (Native) checks now cover node
+  // freshness too. When either reaches a terminal state the node version may
+  // have changed (a pull/download update fix ran), so refresh the header's
+  // "v<app> (node <node>)" label.
+  if (
+    (item.id === 'stack-images' || item.id === 'binary') &&
+    item.state !== 'idle' &&
+    item.state !== 'running'
+  ) {
     refreshNodeVersion();
   }
 }
@@ -826,26 +950,6 @@ async function runFix(id) {
       openUrl('https://docs.docker.com/get-docker/');
       return;
 
-    case 'PullImage': {
-      // Pulls every image in the current profile (node + dashboard +
-      // postgres + caddy as applicable). The old tag-specific call is
-      // obsolete — image selection happens inside compose now.
-      try {
-        await invoke('pull_compose_images');
-      } catch (e) {
-        console.error('Pull failed:', e);
-      }
-      return;
-    }
-
-    case 'DownloadBinary':
-      try {
-        await invoke('download_native_binary');
-      } catch (e) {
-        appendLog({ timestamp: '', level: 'ERROR', message: `Download failed: ${e}` });
-      }
-      return;
-
     case 'GenerateSecret':
       try {
         const secret = await invoke('generate_node_secret');
@@ -859,9 +963,6 @@ async function runFix(id) {
         console.error('Failed to generate secret:', e);
       }
       return;
-
-    case 'Delegate':
-      return runFix(fix.arg);
   }
 }
 
@@ -873,13 +974,28 @@ document.getElementById('checklist').addEventListener('click', (e) => {
   const id = li?.dataset.id;
   if (!id) return;
   if (btn.dataset.action === 'recheck') {
-    invoke('recheck', { ids: [id] }).catch(console.error);
+    const item = state.checks.get(id);
+    const failing = item && (item.state === 'fail' || item.state === 'warn');
+    if (FIX_FOLDED_INTO_RETRY.has(id) && failing) {
+      // secret: Retry generates the secret, then rechecks — but only while
+      // failing, so a passing check isn't reset. Downloads (stack images,
+      // native binary) are pulled by the backend check itself on recheck.
+      retryWithFix(id);
+    } else {
+      invoke('recheck', { ids: [id] }).catch(console.error);
+    }
   } else if (btn.dataset.action === 'fix') {
     runFix(id);
   }
 });
 
-// ─── Global Recheck All ──────────────────────────────────────────────────────
+// Run a check's fix (generate secret), then recheck it.
+async function retryWithFix(id) {
+  await runFix(id);
+  await invoke('recheck', { ids: [id] }).catch(console.error);
+}
+
+// ─── Global Retry All ─────────────────────────────────────────────────────────
 document.getElementById('btn-recheck-all').addEventListener('click', () => {
   invoke('recheck').catch(console.error);
 });
@@ -923,6 +1039,162 @@ document.getElementById('btn-clear-log').addEventListener('click', () => {
   document.getElementById('log-output').innerHTML = '';
 });
 
+// ─── Image pull progress ──────────────────────────────────────────────────────
+// docker compose --progress json streams per-layer events; we aggregate them
+// into one bar per image (summing the layer byte counts) and render them live
+// in the log drawer, hiding the panel once every image reports done.
+function friendlyImageName(id) {
+  // "Image registry.gitlab.com/ns/quip-miner-cpu:v0.2" -> "quip-miner-cpu:v0.2"
+  const ref = String(id).replace(/^Image\s+/, '');
+  const slash = ref.lastIndexOf('/');
+  return slash >= 0 ? ref.slice(slash + 1) : ref;
+}
+
+function handlePullProgress(ev) {
+  // Legacy {line} events (non-pull compose commands) have no id — ignore them.
+  if (!ev || typeof ev.id !== 'string') return;
+
+  // Generation gating. Each pull is stamped with a monotonic `gen` by the
+  // backend; `pull-complete` records it in pullCompletedGen. An event at or
+  // below that watermark is a late straggler from a pull we've already closed
+  // (event delivery across the backend's reader threads is not ordered), so
+  // dropping it is what keeps the panel from being resurrected after it hides.
+  const gen = Number(ev.gen) || 0;
+  if (gen <= state.pullCompletedGen) return;
+
+  // A higher generation (or no live session) starts a fresh panel; a lower one
+  // belongs to a superseded pull and is ignored.
+  if (!state.pull || !state.pull.active || gen > state.pull.gen) {
+    state.pull = { active: true, gen, title: 'Pulling stack images', images: new Map() };
+  } else if (gen < state.pull.gen) {
+    return;
+  }
+
+  const isImageLevel = !ev.parent_id && ev.id.startsWith('Image ');
+  const imageId = isImageLevel ? ev.id : ev.parent_id || ev.id;
+  let img = state.pull.images.get(imageId);
+  if (!img) {
+    img = { name: friendlyImageName(imageId), layers: new Map(), done: false };
+    state.pull.images.set(imageId, img);
+  }
+
+  if (isImageLevel) {
+    if (ev.status === 'Done' || ev.text === 'Pulled') img.done = true;
+  } else {
+    // The presence of any layer event is what distinguishes an image that is
+    // actually downloading from one that was already up to date — the latter
+    // emits only image-level Working/Done events and no layers, so it never
+    // gets a row (see renderPullPanel).
+    const layerDone = ev.text === 'Pull complete' || ev.text === 'Already exists';
+    const prev = img.layers.get(ev.id) || { cur: 0, tot: 0 };
+    const tot = Number(ev.total) || prev.tot;
+    img.layers.set(ev.id, {
+      cur: layerDone && tot ? tot : Math.max(prev.cur, Number(ev.current) || 0),
+      tot,
+    });
+  }
+
+  renderPullPanel();
+  // The panel is closed authoritatively by `pull-complete` (generation-keyed),
+  // not by counting per-image "Pulled" events — that accounting could miss an
+  // image's terminal event and, after closing, be reopened by a straggler.
+}
+
+function renderPullPanel() {
+  const panel = document.getElementById('pull-progress-panel');
+  if (!panel || !state.pull) return;
+
+  // Only images that produced layer events are actually being downloaded;
+  // already-up-to-date images emit only image-level Working/Done events and are
+  // omitted. If nothing is downloading, the panel stays hidden entirely rather
+  // than flashing a bare title.
+  const downloading = [...state.pull.images.values()].filter((img) => img.layers.size > 0);
+  if (downloading.length === 0) {
+    panel.style.display = 'none';
+    panel.replaceChildren();
+    return;
+  }
+  panel.style.display = '';
+
+  const title = document.createElement('div');
+  title.className = 'pull-progress-title';
+  title.textContent = state.pull.title || 'Downloading';
+  const rows = [title];
+
+  for (const img of downloading) {
+    const layers = [...img.layers.values()];
+    const tot = layers.reduce((s, l) => s + l.tot, 0);
+    const cur = layers.reduce((s, l) => s + l.cur, 0);
+    const pct = img.done ? 100 : tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : 0;
+
+    const row = document.createElement('div');
+    row.className = 'pp-row';
+
+    const name = document.createElement('span');
+    name.className = 'pp-name';
+    name.textContent = img.name;
+
+    const bar = document.createElement('span');
+    bar.className = 'pp-bar';
+    const fill = document.createElement('span');
+    fill.className = `pp-bar-fill${img.done ? ' done' : ''}`;
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+
+    const detail = document.createElement('span');
+    detail.className = 'pp-detail';
+    detail.textContent = img.done
+      ? 'done'
+      : tot > 0
+        ? `${toMB(cur)}/${toMB(tot)} MB`
+        : `${pct}%`;
+
+    row.append(name, bar, detail);
+    rows.push(row);
+  }
+  panel.replaceChildren(...rows);
+}
+
+function toMB(bytes) {
+  return (bytes / 1_048_576).toFixed(0);
+}
+
+function finishPullProgress() {
+  if (state._pullHideTimer) {
+    clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = null;
+  }
+  const panel = document.getElementById('pull-progress-panel');
+  if (panel) {
+    panel.style.display = 'none';
+    panel.replaceChildren();
+  }
+  state.pull = null;
+}
+
+// The native miner binary download reuses the same panel as a single bar.
+function handleBinaryDownloadProgress(ev) {
+  const { downloaded, total, done } = ev || {};
+  if (!state.pull || !state.pull.active) {
+    // gen: Infinity keeps a late docker `pull-complete` (always a finite
+    // generation) from closing this native-miner download, which shares the
+    // panel but isn't part of the docker pull generation sequence.
+    state.pull = { active: true, gen: Infinity, title: 'Downloading native miner', images: new Map() };
+  }
+  let img = state.pull.images.get('native-miner');
+  if (!img) {
+    img = { name: 'native miner', layers: new Map(), done: false };
+    state.pull.images.set('native-miner', img);
+  }
+  img.layers.set('binary', { cur: Number(downloaded) || 0, tot: Number(total) || 0 });
+  if (done) img.done = true;
+  renderPullPanel();
+  if (done) {
+    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
+    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
+  }
+}
+
 // ─── Helpers for run-mode dispatch ────────────────────────────────────────────
 function isDockerMode() {
   return (state.settings?.run_mode ?? 'docker') === 'docker';
@@ -943,13 +1215,10 @@ async function startNode() {
     await invoke('start_stack');
     await invoke('start_log_stream');
   } else {
-    // Native mode: run the binary on the host + (optionally) the
-    // compose stack's non-node services (dashboard+postgres+caddy) so
-    // the user still gets the dashboard UI.
+    // Native mode: run the binary on the host + the compose stack's
+    // non-node services so the user still gets the dashboard UI.
+    await invoke('start_stack');
     await invoke('start_native_node');
-    if (state.settings?.dashboard_enabled) {
-      try { await invoke('start_stack'); } catch (e) { console.error('stack start:', e); }
-    }
   }
   collapseConfig();
 }
@@ -960,28 +1229,38 @@ async function stopNode() {
     await invoke('stop_stack');
   } else {
     await invoke('stop_native_node');
-    if (state.settings?.dashboard_enabled) {
-      try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
-    }
+    try { await invoke('stop_stack'); } catch (e) { console.error('stack stop:', e); }
   }
 }
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 document.getElementById('btn-start').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
+  state.starting = true;
+  updateStartStopState();
   applyStatus.textContent = 'Starting\u2026';
+  appendLog({ timestamp: '', level: 'INFO', message: 'Starting node manager stack…' });
   try {
+    if (!state.settings) throw new Error('settings are not loaded yet');
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     await startNode();
     applyStatus.textContent = 'Node started.';
     await pollStatus();
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Start failed: ${e}` });
+  } finally {
+    state.starting = false;
+    updateStartStopState();
   }
 });
 
 document.getElementById('btn-stop').addEventListener('click', async () => {
+  const applyStatus = document.getElementById('apply-status');
+  state.stopping = true;
+  updateStartStopState();
+  applyStatus.textContent = 'Stopping\u2026';
   try {
     await stopNode();
     state.containerRunning = false;
@@ -989,17 +1268,25 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     setStatus('stopped');
     updateStartStopState();
     expandConfig();
+    applyStatus.textContent = 'Node stopped.';
   } catch (e) {
-    console.error(e);
+    applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${e}` });
+  } finally {
+    state.stopping = false;
+    updateStartStopState();
   }
 });
 
 // ─── Apply & Restart ──────────────────────────────────────────────────────────
 document.getElementById('btn-apply').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
+  state.starting = true;
+  updateStartStopState();
   applyStatus.textContent = 'Applying\u2026';
   try {
+    if (!state.settings) throw new Error('settings are not loaded yet');
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     const running = isDockerMode() ? state.containerRunning : state.nativeRunning;
     if (running) {
@@ -1015,6 +1302,10 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Apply failed: ${e}` });
+  } finally {
+    state.starting = false;
+    updateStartStopState();
   }
 });
 
@@ -1097,14 +1388,28 @@ async function setupListeners() {
     updateStartStopState();
   });
 
-  // Docker pull lifecycle — pull-complete always triggers a backend-side
-  // recheck of image+version, so the UI auto-updates without us doing
-  // anything here beyond logging terminal outcomes.
+  // Docker pull lifecycle. The backend emits this when the `docker compose
+  // pull` process exits — the authoritative "pull is over" signal. Hide the
+  // progress panel here rather than relying solely on counting per-image
+  // "Pulled" events, which can miss an image's terminal event on some
+  // platforms and leave the panel stuck open.
   await listen('pull-complete', (event) => {
-    const { success, error } = event.payload || {};
+    const { gen, success, error } = event.payload || {};
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
+    // Mark this generation closed so any straggler progress event can't reopen
+    // the panel, then hide it if the live session is this pull (or older).
+    const closed = Number(gen) || 0;
+    state.pullCompletedGen = Math.max(state.pullCompletedGen, closed);
+    if (!state.pull || state.pull.gen === undefined || state.pull.gen <= closed) {
+      finishPullProgress();
+    }
+  });
+
+  // Per-image pull bars (docker compose --progress json, aggregated per image).
+  await listen('pull-progress', (event) => {
+    handlePullProgress(event.payload);
   });
 
   // Stop lifecycle — update the status pill immediately; backend also
@@ -1123,6 +1428,15 @@ async function setupListeners() {
     pollStatus();
   });
 
+  // Postgres rejected the dashboard's password — surface the actionable error
+  // and the Reset button on the Dashboard tab.
+  await listen('dashboard-db-mismatch', (event) => {
+    const { message } = event.payload || {};
+    state.dashboardDbError = message || 'Dashboard database password mismatch.';
+    appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
+    refreshDashboardTab();
+  });
+
   // Update notifications
   await listen('image-update-available', () => {
     appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
@@ -1131,7 +1445,7 @@ async function setupListeners() {
 
   await listen('binary-update-available', (event) => {
     const info = event.payload;
-    appendLog({ timestamp: '', level: 'INFO', message: `New binary v${info.version} available. Download to update.` });
+    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Download to update.` });
     refreshNodeVersion();
   });
 
@@ -1142,13 +1456,14 @@ async function setupListeners() {
   });
 
   await listen('binary-download-progress', (event) => {
+    handleBinaryDownloadProgress(event.payload);
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {
-      if (statusEl) statusEl.textContent = 'Installing binary\u2026';
+      if (statusEl) statusEl.textContent = 'Installing native miner\u2026';
     } else if (total) {
       const pct = Math.round((downloaded / total) * 100);
-      if (statusEl) statusEl.textContent = `Downloading binary: ${pct}%`;
+      if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
     }
   });
 }
@@ -1242,8 +1557,8 @@ async function init() {
     const settings = await invoke('get_settings');
     state.settings = settings;
     populateForm(settings);
-    document.getElementById('run-mode-select').value =
-      settings.run_mode || 'docker';
+    // The Metal toggle (rendered once the hardware survey lands) reflects
+    // run_mode; there is no separate run-mode control to seed here.
     document.getElementById('auto-update-enabled').checked =
       settings.auto_update_enabled ?? false;
     if (settings.active_tab && settings.active_tab !== 'status') {
@@ -1283,14 +1598,10 @@ async function init() {
   invoke('run_hardware_survey')
     .then((survey) => {
       state.hardwareSurvey = survey;
+      // Renders the checklist + GPU section (incl. the Metal toggle, whose
+      // state reflects run_mode). gpu_backend itself is derived from the
+      // survey in collectConfig, so there's nothing to seed here.
       updateRunModeUI();
-      const noSavedGpu =
-        !(state.settings?.node_config?.gpu_device_configs || []).some(
-          (d) => d.enabled
-        ) && state.settings?.node_config?.gpu_backend !== 'mps';
-      if (noSavedGpu && survey.gpu_backend !== 'none') {
-        document.getElementById('gpu-backend').value = survey.gpu_backend;
-      }
     })
     .catch(() => {});
 

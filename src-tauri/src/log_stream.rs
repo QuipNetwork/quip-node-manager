@@ -3,8 +3,8 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 #[derive(Serialize, Clone, Debug)]
@@ -74,16 +74,15 @@ pub fn parse_log_line(line: &str) -> LogEntry {
 
     // Try structured quip-protocol format
     if line.starts_with('[') {
-        if let Some(after_brackets) = line.find("] ").map(|i| {
+        if let Some(after_brackets) = line.find("] ").and_then(|i| {
             let rest = &line[i + 2..];
             if rest.starts_with('[') {
                 rest.find("] ").map(|j| &rest[j + 2..])
             } else {
                 Some(rest)
             }
-        }).flatten() {
-            let parts: Vec<&str> =
-                after_brackets.splitn(3, ' ').collect();
+        }) {
+            let parts: Vec<&str> = after_brackets.splitn(3, ' ').collect();
             if parts.len() >= 2 {
                 let level = match parts[1].to_uppercase().as_str() {
                     "ERROR" | "ERROR:" => "ERROR",
@@ -141,11 +140,8 @@ fn node_log_path() -> PathBuf {
 
 /// Tail a log file: backfill last 200 lines, then follow new output.
 /// Handles rotation/truncation by reopening when the file shrinks.
-fn tail_file<F>(
-    path: &std::path::Path,
-    stop: &Mutex<bool>,
-    emit: &F,
-) where
+fn tail_file<F>(path: &std::path::Path, stop: &Mutex<bool>, emit: &F)
+where
     F: Fn(LogEntry) -> bool,
 {
     let open = || std::fs::File::open(path);
@@ -159,14 +155,20 @@ fn tail_file<F>(
     let lines: Vec<&str> = existing.lines().collect();
     let start = lines.len().saturating_sub(200);
     for line in &lines[start..] {
-        if *stop.lock().unwrap() { return; }
-        if !emit(parse_log_line(line)) { return; }
+        if *stop.lock().unwrap() {
+            return;
+        }
+        if !emit(parse_log_line(line)) {
+            return;
+        }
     }
 
     let mut pos = file.seek(SeekFrom::End(0)).unwrap_or(0);
     let mut buf = String::new();
     loop {
-        if *stop.lock().unwrap() { break; }
+        if *stop.lock().unwrap() {
+            break;
+        }
 
         let reopened = match std::fs::metadata(path) {
             Ok(meta) if meta.len() < pos => true,
@@ -178,9 +180,7 @@ fn tail_file<F>(
                 file = f;
                 pos = 0;
             } else {
-                std::thread::sleep(
-                    std::time::Duration::from_millis(500),
-                );
+                std::thread::sleep(std::time::Duration::from_millis(500));
                 continue;
             }
         }
@@ -188,15 +188,17 @@ fn tail_file<F>(
         buf.clear();
         match file.read_to_string(&mut buf) {
             Ok(0) => {
-                std::thread::sleep(
-                    std::time::Duration::from_millis(250),
-                );
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
             Ok(n) => {
                 pos += n as u64;
                 for line in buf.lines() {
-                    if *stop.lock().unwrap() { return; }
-                    if !emit(parse_log_line(line)) { return; }
+                    if *stop.lock().unwrap() {
+                        return;
+                    }
+                    if !emit(parse_log_line(line)) {
+                        return;
+                    }
                 }
             }
             Err(_) => break,
@@ -209,8 +211,8 @@ fn tail_file<F>(
 /// The source to stream while waiting for node.log to appear.
 pub enum FallbackSource {
     /// Stream `docker compose logs -f --no-log-prefix <service>`. The
-    /// service name is one of `cpu`, `cuda`, `qpu` — resolved from the
-    /// caller's current `image_tag`.
+    /// miner service name is `cpu` or `cuda`, resolved from the caller's
+    /// current `image_tag`.
     ComposeLogs { service: String },
     /// Tail a file (e.g. node-output.log for native stdout capture)
     File(PathBuf),
@@ -272,10 +274,7 @@ fn stream_with_fallback<F>(
         // Wrap the stop check: stop if either the global stop or
         // fallback_stop is signalled
         let combined_stop = Mutex::new(false);
-        let check_stop = || {
-            *stop2.lock().unwrap()
-                || *fallback_stop2.lock().unwrap()
-        };
+        let check_stop = || *stop2.lock().unwrap() || *fallback_stop2.lock().unwrap();
 
         match fallback {
             FallbackSource::ComposeLogs { service } => {
@@ -291,11 +290,17 @@ fn stream_with_fallback<F>(
                 let mut child = match crate::cmd::new("docker")
                     .args([
                         "compose",
-                        "-f", &compose_file,
-                        "--project-directory", &project_dir,
-                        "--project-name", "quip",
-                        "logs", "-f", "--no-log-prefix",
-                        "--tail", "100",
+                        "-f",
+                        &compose_file,
+                        "--project-directory",
+                        &project_dir,
+                        "--project-name",
+                        "quip",
+                        "logs",
+                        "-f",
+                        "--no-log-prefix",
+                        "--tail",
+                        "100",
                         &service,
                     ])
                     .stdout(Stdio::piped())
@@ -320,9 +325,7 @@ fn stream_with_fallback<F>(
                 let emit_err = Arc::clone(&emit2);
                 let stderr_thread = std::thread::spawn(move || {
                     for line in BufReader::new(stderr).lines() {
-                        if *stop_err.lock().unwrap()
-                            || *fallback_stop_err.lock().unwrap()
-                        {
+                        if *stop_err.lock().unwrap() || *fallback_stop_err.lock().unwrap() {
                             break;
                         }
                         if let Ok(line) = line {
@@ -334,9 +337,13 @@ fn stream_with_fallback<F>(
                 });
 
                 for line in BufReader::new(stdout).lines() {
-                    if check_stop() { break; }
+                    if check_stop() {
+                        break;
+                    }
                     if let Ok(line) = line {
-                        if !emit2(parse_log_line(&line)) { break; }
+                        if !emit2(parse_log_line(&line)) {
+                            break;
+                        }
                     }
                 }
                 let _ = child.kill();
@@ -346,7 +353,9 @@ fn stream_with_fallback<F>(
             FallbackSource::File(path) => {
                 // Tail the fallback file until told to stop
                 tail_file(&path, &combined_stop, &|entry| {
-                    if check_stop() { return false; }
+                    if check_stop() {
+                        return false;
+                    }
                     emit2(entry)
                 });
             }
@@ -358,10 +367,14 @@ fn stream_with_fallback<F>(
     // so this loop naturally stays in fallback mode when nothing in
     // this run writes to node.log.
     loop {
-        if *stop.lock().unwrap() { break; }
+        if *stop.lock().unwrap() {
+            break;
+        }
         if is_current(&log_path) {
             if let Ok(meta) = std::fs::metadata(&log_path) {
-                if meta.len() > 0 { break; }
+                if meta.len() > 0 {
+                    break;
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -371,7 +384,9 @@ fn stream_with_fallback<F>(
     *fallback_stop.lock().unwrap() = true;
     let _ = fallback_handle.join();
 
-    if *stop.lock().unwrap() { return; }
+    if *stop.lock().unwrap() {
+        return;
+    }
 
     // Phase 2: tail node.log
     tail_file(&log_path, &stop, &*emit);
@@ -395,13 +410,12 @@ pub fn start_log_stream_for_app(
 }
 
 /// Start log streaming without Tauri — sends entries via mpsc channel.
-pub fn start_log_stream_core(
-    tx: SyncSender<LogEntry>,
-    stop: Arc<Mutex<bool>>,
-) {
+pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
     let child_pid = Arc::new(Mutex::new(None));
-    let service =
-        crate::settings::load_settings().image_tag.service().to_string();
+    let service = crate::settings::load_settings()
+        .image_tag
+        .service()
+        .to_string();
     std::thread::spawn(move || {
         stream_with_fallback(
             FallbackSource::ComposeLogs { service },
@@ -417,8 +431,10 @@ pub async fn start_log_stream(
     app: tauri::AppHandle,
     state: tauri::State<'_, LogStreamState>,
 ) -> Result<(), String> {
-    let service =
-        crate::settings::load_settings().image_tag.service().to_string();
+    let service = crate::settings::load_settings()
+        .image_tag
+        .service()
+        .to_string();
     let _ = app.emit(
         "node-log",
         serde_json::json!({
@@ -451,9 +467,7 @@ pub async fn start_log_stream(
 }
 
 #[tauri::command]
-pub async fn stop_log_stream(
-    state: tauri::State<'_, LogStreamState>,
-) -> Result<(), String> {
+pub async fn stop_log_stream(state: tauri::State<'_, LogStreamState>) -> Result<(), String> {
     // Kill the child FIRST so BufReader::lines() unblocks immediately.
     state.kill_child();
     *state.stop_flag.lock().unwrap() = true;

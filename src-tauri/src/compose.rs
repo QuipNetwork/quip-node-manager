@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `docker compose`-based stack orchestration — replaces the single
-//! `docker run quip-node` path from docker.rs.
+//! `docker compose`-based stack orchestration.
 //!
-//! Docker mode drives the full stack (node + dashboard + postgres + caddy).
-//! Native mode starts only the non-node services (`dashboard`+`postgres`,
-//! plus `caddy` if TLS is on) and expects the native binary to run the node
-//! on the host; the dashboard reaches it via `host.docker.internal`.
+//! Docker mode drives the full v0.2 stack (miner + validator + dashboard +
+//! postgres + caddy). Native mode starts the host miner plus Docker-side
+//! validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
 use crate::settings::{
-    AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth,
-    StackStatus,
+    AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
-use crate::stack_assets::{
-    stack_caddyfile, stack_compose_file, stack_project_dir, sync_stack_assets,
-};
+use crate::stack_assets::{stack_compose_file, stack_project_dir, sync_stack_assets};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Monotonic id stamped on every `pull-progress` / `pull-complete` event of a
+/// single pull. The frontend uses it to ignore stale events delivered out of
+/// order (a late layer event arriving after the pull's `pull-complete` must not
+/// resurrect the progress panel) and to treat `pull-complete` as the one
+/// authoritative "this pull is over" signal.
+static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // ── logging helpers (moved verbatim from docker.rs) ────────────────────────
 
@@ -80,32 +83,11 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 
 // ── profile + services selection ───────────────────────────────────────────
 
-/// Compose profile name for `(image_tag, dashboard, tls)`. TLS without
-/// dashboard is meaningless in this stack (Caddy only fronts the dashboard),
-/// so we collapse the TLS branch when dashboard is off.
-pub fn compose_profile(
-    image_tag: ImageTag,
-    dashboard: bool,
-    tls: bool,
-) -> &'static str {
-    match (image_tag, dashboard, tls) {
-        (ImageTag::Cpu, true, true) => "cpu",
-        (ImageTag::Cpu, true, false) => "cpu-notls",
-        (ImageTag::Cpu, false, _) => "cpu-nodash",
-        (ImageTag::Cuda, true, true) => "cuda",
-        (ImageTag::Cuda, true, false) => "cuda-notls",
-        (ImageTag::Cuda, false, _) => "cuda-nodash",
-    }
-}
-
-/// Whether the compose stack is skipped entirely. True iff Native mode with
-/// dashboard disabled — the user wants the bare native binary and nothing
-/// else. Every other combo runs some compose services.
-pub fn compose_skipped(
-    run_mode: &RunMode,
-    dashboard_enabled: bool,
-) -> bool {
-    *run_mode == RunMode::Native && !dashboard_enabled
+/// Compose profile name for v0.2 — the same string as the image's service
+/// name. The standard upstream profiles always include dashboard, postgres,
+/// Caddy, the selected miner, and validator.
+pub fn compose_profile(image_tag: ImageTag) -> &'static str {
+    image_tag.service()
 }
 
 /// Explicit service list for `docker compose up -d [services...]`.
@@ -113,36 +95,13 @@ pub fn compose_skipped(
 /// - Docker mode: empty slice means "start every service the profile allows"
 ///   (compose default). We don't enumerate because the profile already gates
 ///   things down to the correct set.
-/// - Native mode: we skip the node container and hand compose an explicit
-///   list of the non-node services. The profile is still set (dashboard/
-///   postgres/caddy are profile-gated), but the positional args restrict
-///   startup to just those.
-pub fn compose_services(
-    run_mode: &RunMode,
-    tls_enabled: bool,
-) -> &'static [&'static str] {
-    match (run_mode, tls_enabled) {
-        (RunMode::Docker, _) => &[],
-        (RunMode::Native, true) => &["dashboard", "postgres", "caddy"],
-        (RunMode::Native, false) => &["dashboard-direct", "postgres"],
-    }
-}
-
-// ── Native REST port ───────────────────────────────────────────────────────
-
-/// Port the node exposes for the dashboard to poll. Used for both modes:
-///   - Native + dashboard: host binds `127.0.0.1:<port>`; dashboard reaches
-///     it via `host.docker.internal:<port>` from inside the container.
-///   - Docker + dashboard: node container binds `0.0.0.0:<port>`; dashboard
-///     reaches it via the `quip-node` compose network alias.
-/// Honors the user-configured `rest_insecure_port` when set; otherwise falls
-/// back to 20100 (non-privileged — the containerized node runs as the host
-/// PUID, so ports <1024 are out of reach without capabilities).
-pub fn native_rest_port(cfg: &NodeConfig) -> u16 {
-    if cfg.rest_insecure_port > 0 {
-        cfg.rest_insecure_port as u16
-    } else {
-        20100
+/// - Native mode: we skip the miner container and hand compose an explicit
+///   list of support services. The profile is still set so these services are
+///   eligible, while positional args restrict startup to them.
+pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
+    match run_mode {
+        RunMode::Docker => &[],
+        RunMode::Native => &["quip-validator", "dashboard", "postgres", "caddy"],
     }
 }
 
@@ -157,7 +116,7 @@ fn to_forward_slash(p: PathBuf) -> String {
 /// `docker compose -f <data_dir>/docker-compose.yml --project-directory
 /// <data_dir> --project-name quip` — the common prefix for every compose
 /// invocation.
-fn compose_cmd() -> Command {
+pub(crate) fn compose_cmd() -> Command {
     let compose_file = to_forward_slash(stack_compose_file());
     let project_dir = to_forward_slash(stack_project_dir());
     let mut c = crate::cmd::new("docker");
@@ -173,48 +132,33 @@ fn compose_cmd() -> Command {
     c
 }
 
+// ── postgres identity ──────────────────────────────────────────────────────
+
+/// Postgres role + database the dashboard authenticates as. These mirror the
+/// compose defaults (`${POSTGRES_USER:-quip}` / `${POSTGRES_DB:-quip}`); the
+/// manager never overrides them in `.env`.
+const PG_USER: &str = "quip";
+const PG_DB: &str = "quip";
+/// Fixed container name from the compose `container_name:` directive.
+const PG_CONTAINER: &str = "quip-postgres";
+/// Project-scoped Postgres data volume. Compose names volumes `<project>_<key>`
+/// and we run under `--project-name quip` with a `pgdata` volume key (the fixed
+/// global `name:` is stripped at stage time — see `stack_assets`), so the data
+/// lands in `quip_pgdata`. Resetting this volume forces Postgres to
+/// re-initialise with the current `POSTGRES_PASSWORD`.
+pub const PGDATA_VOLUME: &str = "quip_pgdata";
+
 // ── .env generation ────────────────────────────────────────────────────────
 
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
 /// there is no merge with an existing file.
-fn write_env_file(settings: &AppSettings) -> Result<(), String> {
+pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
-    let dwave_key = settings
-        .node_config
-        .dwave_config
-        .as_ref()
-        .map(|d| d.token.clone())
-        .unwrap_or_default();
     let pg_password = crate::settings::postgres_password();
-
-    let mut lines = vec![
-        format!("PUID={puid}"),
-        format!("PGID={pgid}"),
-        format!("QUIP_HOSTNAME={}", settings.dashboard_hostname),
-        format!("CERT_EMAIL={}", settings.cert_email),
-        format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
-        format!("DWAVE_API_KEY={dwave_key}"),
-        format!("POSTGRES_PASSWORD={pg_password}"),
-    ];
-
-    // Point the dashboard at the node's REST endpoint. The compose default
-    // is `http://quip-node:80`, but port 80 would require the containerized
-    // node to run as root. Override to a non-privileged port that we also
-    // force on the node side below.
-    //   - Native : host-bound binary reached via host.docker.internal
-    //   - Docker : node container reached via the `quip-node` compose alias
-    if settings.dashboard_enabled {
-        let port = native_rest_port(&settings.node_config);
-        let host = match settings.run_mode {
-            RunMode::Native => "host.docker.internal",
-            RunMode::Docker => "quip-node",
-        };
-        lines.push(format!("QUIP_NODE_URL=http://{host}:{port}"));
-    }
+    let lines = render_env_lines(settings, puid, pgid, &pg_password);
 
     let path = stack_project_dir().join(".env");
-    fs::write(&path, lines.join("\n") + "\n")
-        .map_err(|e| format!("write .env: {e}"))?;
+    fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
 
     // Best-effort 0600: DWAVE_API_KEY and POSTGRES_PASSWORD shouldn't be
     // world-readable on shared systems.
@@ -227,15 +171,143 @@ fn write_env_file(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
+fn cpu_set_for_config(cfg: &NodeConfig) -> String {
+    match cfg.num_cpus {
+        0 | 1 => "0".to_string(),
+        n => format!("0-{}", n - 1),
+    }
+}
+
+fn render_env_lines(
+    settings: &AppSettings,
+    puid: u32,
+    pgid: u32,
+    pg_password: &str,
+) -> Vec<String> {
+    let dwave_key = settings
+        .node_config
+        .dwave_config
+        .as_ref()
+        .map(|d| d.token.clone())
+        .unwrap_or_default();
+    let hostname = crate::hostnames::resolved_caddy_hostname(
+        &settings.node_config.public_host,
+        &settings.hostname,
+    );
+    let validator_name = if settings.node_config.node_name.trim().is_empty() {
+        "quip-validator"
+    } else {
+        settings.node_config.node_name.trim()
+    };
+
+    // GPU SM cap for NVIDIA MPS (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE on the cuda
+    // service). Use the first enabled GPU device's utilization; default to 100
+    // (no cap) when none is configured. Only the cuda service reads it.
+    let gpu_utilization = settings
+        .node_config
+        .gpu_device_configs
+        .iter()
+        .find(|d| d.enabled)
+        .map(|d| d.utilization)
+        .unwrap_or(100);
+
+    let mut lines = vec![
+        format!("PUID={puid}"),
+        format!("PGID={pgid}"),
+        format!("QUIP_HOSTNAME={hostname}"),
+        format!("CERT_EMAIL={}", settings.cert_email),
+        format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
+        format!("DWAVE_API_KEY={dwave_key}"),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        format!("QUIP_MINER_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_DASHBOARD_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_VALIDATOR_TAG={COMPOSE_IMAGE_TAG}"),
+        format!(
+            "QUIP_MINER_CPUSET={}",
+            cpu_set_for_config(&settings.node_config)
+        ),
+        format!("VALIDATOR_NAME={validator_name}"),
+        format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
+    ];
+
+    if settings.run_mode == RunMode::Docker {
+        lines.push(format!(
+            "QUIP_VALIDATORS={}",
+            crate::config::DOCKER_VALIDATOR_RPC
+        ));
+    }
+    // QUIP_VALIDATOR_RPC_URLS is intentionally NOT set here. The dashboard uses
+    // it for both the chain RPC and (by stripping /rpc) the local miner REST,
+    // so it must resolve both from one host — Caddy's internal :8088 listener.
+    // We defer to the compose default (`ws://quip-caddy:8088/rpc`) so there's a
+    // single source of truth in the upstream nodes.quip.network config.
+
+    lines
+}
+
 // ── streaming compose output ───────────────────────────────────────────────
 
 /// Default timeout for long-running compose ops (pull, up). Compose itself
 /// respects context timeouts; this is a backstop against a wedged daemon.
 const COMPOSE_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
-async fn run_compose_streaming(
+/// How to surface a compose command's output.
+#[derive(Clone, Copy)]
+enum StdoutMode {
+    /// Emit each raw line to node-log (used by up/down).
+    Log,
+    /// Parse `docker compose --progress json` events (emitted on stderr) into
+    /// structured `pull-progress` events stamped with the given pull generation.
+    /// Only image-level milestones and unparseable lines reach node-log, so the
+    /// console isn't flooded with per-layer churn.
+    PullJson(u64),
+}
+
+/// Parse one `--progress json` line and emit a structured `pull-progress`
+/// event. Returns `true` if the line was a recognised progress event (so the
+/// caller can skip treating it as error output). Image-level milestones are
+/// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
+/// record without the per-layer noise.
+fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    // Image-level events have no parent layer; mirror them to the log.
+    if value.get("parent_id").is_none() && id.starts_with("Image ") {
+        let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = app.emit(
+            "node-log",
+            serde_json::json!({
+                "timestamp": "",
+                "level": "INFO",
+                "message": format!("{} {}", text, id.trim_start_matches("Image ")),
+            }),
+        );
+    }
+    // Stamp the generation so the frontend can discard events from a pull it has
+    // already closed (see PULL_GENERATION).
+    if let Some(obj) = value.as_object_mut() {
+        let _ = obj.insert("gen".into(), serde_json::json!(gen));
+    }
+    let _ = app.emit("pull-progress", value);
+    true
+}
+
+async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
+    run_compose_streaming_mode(app, args, StdoutMode::Log).await
+}
+
+async fn run_compose_streaming_mode(
     app: &AppHandle,
     args: Vec<String>,
+    mode: StdoutMode,
 ) -> Result<(), String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
@@ -252,10 +324,9 @@ async fn run_compose_streaming(
         let app_out = app.clone();
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = app_out.emit(
-                    "pull-progress",
-                    serde_json::json!({ "line": &line }),
-                );
+                if matches!(mode, StdoutMode::Log) {
+                    let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                }
                 let _ = app_out.emit(
                     "node-log",
                     serde_json::json!({
@@ -267,10 +338,17 @@ async fn run_compose_streaming(
             }
         });
 
+        // docker compose writes `--progress json` events to stderr, so the
+        // PullJson parsing lives here. Non-progress lines stay error output.
         let app_err = app.clone();
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let StdoutMode::PullJson(gen) = mode {
+                    if emit_pull_progress_json(&app_err, gen, &line) {
+                        continue;
+                    }
+                }
                 let _ = app_err.emit(
                     "node-log",
                     serde_json::json!({
@@ -321,10 +399,12 @@ async fn run_compose_streaming(
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-const CPU_IMAGE: &str =
-    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu";
-const CUDA_IMAGE: &str =
-    "registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda";
+pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu";
+pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda";
+pub const VALIDATOR_IMAGE: &str =
+    "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node";
+pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
+pub const COMPOSE_IMAGE_TAG: &str = "v0.2";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -371,189 +451,448 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 }
 
 /// Pull every image needed by the current profile + service list. Runs
-/// `docker compose --profile <p> pull [services...]` so the daemon talks to
-/// the registry for each entry even if local copies exist (cache-bust for
-/// `:latest` tags).
+/// `docker compose --profile <p> pull [services...]` so the daemon checks the
+/// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     let settings = crate::settings::load_settings();
-    if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
-        return Ok(());
-    }
 
     // Ensure assets are staged before compose tries to read the compose file.
     sync_stack_assets(
         &settings.run_mode,
         settings.node_config.port,
-        native_rest_port(&settings.node_config),
+        settings.node_config.validator_port,
+        &settings.node_config.public_host,
+        crate::config::native_rest_port(&settings.node_config),
+        settings.node_config.validator_rpc_port,
     )?;
+    // Write .env too: without it compose substitutes the compose.yml
+    // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
+    // start sequence) would silently fetch the wrong tag.
+    write_env_file(&settings)?;
 
-    let profile = compose_profile(
-        settings.image_tag,
-        settings.dashboard_enabled,
-        settings.tls_enabled,
-    );
+    pull_compose_images_for_settings(&app, &settings).await
+}
 
-    let mut args: Vec<String> =
-        vec!["--profile".into(), profile.into(), "pull".into()];
-    for s in compose_services(&settings.run_mode, settings.tls_enabled) {
+async fn pull_compose_images_for_settings(
+    app: &AppHandle,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    let profile = compose_profile(settings.image_tag);
+
+    let mut args: Vec<String> = vec![
+        "--progress".into(),
+        "json".into(),
+        "--profile".into(),
+        profile.into(),
+        "pull".into(),
+    ];
+    for s in compose_services(&settings.run_mode) {
         args.push((*s).into());
     }
 
-    log_cmd(&app, &format!("docker compose --profile {profile} pull ..."));
-    run_compose_streaming(&app, args).await
+    // Allocate this pull's generation up front so every progress event and the
+    // terminal pull-complete carry the same id.
+    let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+
+    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
+    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson(gen)).await;
+
+    // Tell the UI the pull is over so it can hide the progress panel. Process
+    // exit is the authoritative "pull is done" signal: per-image "Pulled"
+    // accounting can miss an image's terminal event on some platforms, and a
+    // late progress event delivered after this one is discarded by the frontend
+    // because its generation is already closed.
+    let _ = app.emit(
+        "pull-complete",
+        serde_json::json!({
+            "gen": gen,
+            "success": result.is_ok(),
+            "error": result.as_ref().err().cloned().unwrap_or_default(),
+        }),
+    );
+    result
+}
+
+/// Best-effort start of the per-user NVIDIA MPS control daemon so the cuda
+/// container (which runs `ipc: host` and mounts `/tmp/nvidia-mps`) can share
+/// the GPU's SMs in hardware, capped at the operator's configured utilization.
+///
+/// Linux + native NVIDIA only: MPS is unsupported under WSL2 / Docker Desktop,
+/// so this is compiled out on other platforms. Non-fatal — a missing
+/// `nvidia-cuda-mps-control` binary or an already-running daemon just leaves
+/// MPS inactive, and the miner falls back to software / NVML throttling.
+#[cfg(target_os = "linux")]
+async fn ensure_mps_daemon(app: &AppHandle) {
+    let out = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("nvidia-cuda-mps-control")
+            .arg("-d")
+            .output()
+    })
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            log_cmd(app, "nvidia-cuda-mps-control -d");
+            log_output(app, "Started NVIDIA MPS control daemon for GPU SM sharing.");
+        }
+        // Non-success is almost always "an instance is already running" — fine.
+        // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
+        Ok(Ok(o)) => {
+            let detail = String::from_utf8_lossy(&o.stderr);
+            let detail = detail.trim();
+            if !detail.is_empty() {
+                log_output(
+                    app,
+                    &format!("NVIDIA MPS daemon already active or unavailable: {detail}"),
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
 ///
 /// Sequence:
-///   1. sync_stack_assets (staging + Caddyfile patch for Native)
-///   2. write .env (credentials, QUIP_NODE_URL for Native)
-///   3. auto-detect public_host in Docker mode
-///   4. force rest_host=0.0.0.0 + rest_insecure_port in Native+dashboard
-///   5. write_config_toml
-///   6. docker compose down  (clean slate; no-op on first start)
-///   7. docker compose --profile <p> pull
-///   8. docker compose --profile <p> up -d [services...]
+///   1. migrate existing v0.1 config/env, if present
+///   2. auto-detect public_host in Docker mode
+///   3. force native miner REST settings when Native mode is used
+///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   5. write .env
+///   6. write_config_toml
+///   7. docker compose down  (clean slate; no-op on first start)
+///   8. docker compose --profile <p> pull
+///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
 
-    if compose_skipped(&settings.run_mode, settings.dashboard_enabled) {
-        log_cmd(
-            &app,
-            "Native mode with dashboard disabled — no compose stack to start.",
-        );
-        return Ok(());
-    }
-
-    let rest_port = native_rest_port(&settings.node_config);
-
-    // (1) Stage assets.
-    sync_stack_assets(&settings.run_mode, settings.node_config.port, rest_port)?;
+    // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
+    // manager-owned files. Promoted fields keep hand-edited public host/port
+    // values from being lost by the generated config.
+    let migration = crate::migration_v2::migrate_for_run_mode(&settings.run_mode)?;
+    migration
+        .promoted
+        .apply_to_node_config(&mut settings.node_config);
+    crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
+    crate::migration_v2::emit_report(&app, &migration);
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
-    if settings.run_mode == RunMode::Docker
-        && settings.node_config.public_host.is_empty()
-    {
-        if let Ok(ip) = crate::network::detect_public_ip().await {
-            log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
-            settings.node_config.public_host = ip;
+    if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
+        match crate::network::detect_public_ip().await {
+            Ok(ip) => {
+                log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+                settings.node_config.public_host = ip;
+            }
+            // Don't fail the start, but don't hide it either: without a
+            // public_host the validator advertises no public address.
+            Err(e) => log_err(
+                &app,
+                &format!(
+                    "Warning: could not auto-detect public IP ({e}); the node will not \
+                     advertise a public address. Set a public host in Settings."
+                ),
+            ),
         }
     }
 
-    // (3) Force REST on whenever the dashboard is enabled — it's how the
-    // dashboard polls telemetry. The default NodeConfig has REST disabled
-    // (rest_insecure_port = -1), so without this override the dashboard
-    // silently can't reach the node.
-    //   - Native : bind 127.0.0.1. Docker Desktop's vpnkit proxies
-    //              host.docker.internal to the host's loopback, so 0.0.0.0
-    //              isn't needed — and 127.0.0.1 avoids leaking this
-    //              unauthenticated admin port onto the LAN. (Native mode is
-    //              macOS-only; Linux Docker CE would need a different bind.)
-    //   - Docker : bind 0.0.0.0 inside the container so the dashboard can
-    //              reach it across the compose network via the `quip-node`
-    //              alias. The port isn't published to the host, so LAN
-    //              exposure isn't a concern.
-    // We mutate the in-memory copy only — app-settings.json on disk is
-    // untouched.
-    if settings.dashboard_enabled {
-        let bind = match settings.run_mode {
-            RunMode::Native => "127.0.0.1",
-            RunMode::Docker => "0.0.0.0",
-        };
-        settings.node_config.rest_host = bind.to_string();
+    let rest_port = crate::config::native_rest_port(&settings.node_config);
+
+    // (3) Materialise the resolved native REST port so config rendering and the
+    // staged Caddyfile both publish the same port. (rest_host is forced to
+    // loopback inside the config renderer.)
+    if settings.run_mode == RunMode::Native {
         settings.node_config.rest_insecure_port = rest_port as i16;
     }
 
-    // (4) .env
-    write_env_file(&settings)?;
-
-    // (5) config.toml (host side, bind-mounted into the node container in
-    // Docker mode; read directly by the native binary in Native mode).
-    log_cmd(&app, "Writing config.toml");
-    crate::config::write_config_toml(
-        &settings.node_config,
+    // (4) Stage assets after migration/auto-detection so public_host can drive
+    // the validator's public address.
+    sync_stack_assets(
         &settings.run_mode,
+        settings.node_config.port,
+        settings.node_config.validator_port,
+        &settings.node_config.public_host,
+        rest_port,
+        settings.node_config.validator_rpc_port,
     )?;
 
-    // (6) Clean slate. `down` is cheap and idempotent; removes stale
-    // containers left behind when the user switches image_tag/profile.
-    log_cmd(&app, "docker compose down");
-    let _ = run_compose_streaming(&app, vec!["down".into()]).await;
+    // (5) .env
+    write_env_file(&settings)?;
 
-    let profile = compose_profile(
-        settings.image_tag,
-        settings.dashboard_enabled,
-        settings.tls_enabled,
-    );
+    // (6) config.toml (host side, bind-mounted into the node container in
+    // Docker mode; read directly by the native binary in Native mode).
+    log_cmd(&app, "Writing config.toml");
+    crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
-    // (7) Pull (always — cache-bust :latest).
-    pull_compose_images(app.clone()).await?;
+    let profile = compose_profile(settings.image_tag);
 
-    // (8) Up.
+    // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
+    pull_compose_images_for_settings(&app, &settings).await?;
+
+    // Start the host NVIDIA MPS daemon before the cuda container so it can
+    // attach (native Linux GPU hosts only; no-op everywhere else).
+    #[cfg(target_os = "linux")]
+    {
+        if settings.run_mode == RunMode::Docker && settings.image_tag == ImageTag::Cuda {
+            ensure_mps_daemon(&app).await;
+        }
+    }
+
+    // (8) Up. There is no separate `down`: Stop only stops the containers, so a
+    // normal restart reuses them and compose recreates just what changed.
+    // `--remove-orphans` reaps containers for services the current compose no
+    // longer declares (e.g. the removed quip-bootstrap) without destroying the
+    // rest.
     let mut up_args: Vec<String> = vec![
         "--profile".into(),
         profile.into(),
         "up".into(),
         "-d".into(),
+        "--remove-orphans".into(),
     ];
-    for s in compose_services(&settings.run_mode, settings.tls_enabled) {
+    for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
     log_cmd(
         &app,
         &format!(
-            "docker compose --profile {profile} up -d{}",
-            if up_args.len() > 4 {
-                format!(" {}", up_args[4..].join(" "))
+            "docker compose --profile {profile} up -d --remove-orphans{}",
+            if up_args.len() > 5 {
+                format!(" {}", up_args[5..].join(" "))
             } else {
                 String::new()
             }
         ),
     );
-    run_compose_streaming(&app, up_args).await
+    let mut up_result = run_compose_streaming(&app, up_args.clone()).await;
+
+    // `up` only fails like this when a leftover container is holding one of our
+    // fixed container_names and compose can't reconcile it — e.g. one created
+    // by an older version under a different project label, which surfaces as a
+    // name conflict rather than a container to recreate. Reap the known names
+    // (and image orphans) once, then retry. This runs ONLY on failure, so a
+    // normal start never force-removes anything.
+    if let Err(e) = &up_result {
+        log_err(
+            &app,
+            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
+        );
+        force_remove_known_containers(&app).await;
+        sweep_orphan_node_containers(&app).await;
+        up_result = run_compose_streaming(&app, up_args).await;
+    }
+
+    // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
+    // or foreign data volume keeps an old password and would otherwise leave
+    // the dashboard crash-looping behind a silent 502.
+    if up_result.is_ok() {
+        verify_dashboard_db(&app).await;
+    }
+    up_result
 }
 
-/// Stop the compose stack. Named volumes (quip-pgdata, quip-caddy-data,
-/// quip-caddy-config) are preserved by default — `down` removes containers
-/// and the project network only.
+/// Result of probing the dashboard's Postgres credentials against the live
+/// volume.
+enum PgAuthProbe {
+    /// The current password authenticated successfully.
+    Ok,
+    /// Postgres rejected the current password (`28P01`) — the data volume was
+    /// initialised with a different one.
+    AuthFailed,
+    /// Postgres never became ready in time, or failed for a non-auth reason.
+    /// We don't raise the mismatch alarm in this case to avoid false positives.
+    Inconclusive,
+}
+
+/// After the stack is up, confirm the dashboard's Postgres credentials match
+/// the existing data volume. Postgres only applies `POSTGRES_PASSWORD` when it
+/// first initialises a data dir, so a volume left over from another stack (or a
+/// lost bootstrap.json) keeps its original password and the dashboard's startup
+/// migration crash-loops with `28P01 password authentication failed` — which
+/// the user only sees as a 502 behind Caddy. Surface it explicitly via the
+/// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
+/// are unaffected, so we don't abort the whole start.
+async fn verify_dashboard_db(app: &AppHandle) {
+    let password = crate::settings::postgres_password();
+    let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
+        .await
+        .unwrap_or(PgAuthProbe::Inconclusive);
+    match outcome {
+        PgAuthProbe::Ok | PgAuthProbe::Inconclusive => {}
+        PgAuthProbe::AuthFailed => {
+            let msg = format!(
+                "Dashboard database password mismatch: the existing `{PGDATA_VOLUME}` volume \
+                 was initialised with a different password (e.g. by another Quip stack), so the \
+                 dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
+                 Dashboard tab to recreate it."
+            );
+            log_err(app, &msg);
+            let _ = app.emit(
+                "dashboard-db-mismatch",
+                serde_json::json!({ "message": msg }),
+            );
+        }
+    }
+}
+
+/// Wait (bounded) for `quip-postgres` to accept connections, then attempt an
+/// authenticated TCP query with the current password. TCP (`-h 127.0.0.1`)
+/// exercises the same password path the dashboard uses, unlike the local socket
+/// which the official image leaves as `trust`. `PGPASSWORD` is passed via the
+/// environment so it never lands in logs or `ps`.
+fn probe_postgres_auth(password: &str) -> PgAuthProbe {
+    let mut ready = false;
+    for _ in 0..30 {
+        let r = crate::cmd::new("docker")
+            .args([
+                "exec",
+                PG_CONTAINER,
+                "pg_isready",
+                "-U",
+                PG_USER,
+                "-d",
+                PG_DB,
+            ])
+            .output();
+        if matches!(r, Ok(ref o) if o.status.success()) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !ready {
+        return PgAuthProbe::Inconclusive;
+    }
+
+    let pgpass = format!("PGPASSWORD={password}");
+    let output = crate::cmd::new("docker")
+        .args([
+            "exec",
+            "-e",
+            pgpass.as_str(),
+            PG_CONTAINER,
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            PG_USER,
+            "-d",
+            PG_DB,
+            "-tAc",
+            "select 1",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => PgAuthProbe::Ok,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if err.contains("password authentication failed") || err.contains("28P01") {
+                PgAuthProbe::AuthFailed
+            } else {
+                PgAuthProbe::Inconclusive
+            }
+        }
+        Err(_) => PgAuthProbe::Inconclusive,
+    }
+}
+
+/// Delete the dashboard's database + indexer state. Used to clear stale
+/// dashboard data (e.g. a cached node identity) or recover from a Postgres
+/// password mismatch (see `verify_dashboard_db`).
+///
+/// This ONLY deletes data — it does not run `docker compose up` or start
+/// anything. It force-removes the dashboard + Postgres containers (by their
+/// fixed names) so the data volume is free, deletes that volume, and clears the
+/// dashboard's bind-mounted data folder. The validator, miner and Caddy are
+/// left as-is. The dashboard comes back, empty, on the next Start.
+///
+/// In v0.2 the dashboard keeps everything in Postgres (`quip_pgdata`) — chain
+/// index, indexer state, and the cached `self_address`; the `dashboard-data`
+/// folder is unused but cleared for good measure.
+#[tauri::command]
+pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
+    log_cmd(&app, "Resetting dashboard database");
+
+    // Force-remove only the dashboard + Postgres containers (by fixed name) so
+    // the data volume is free to delete. Best-effort: missing containers just
+    // error per-name, which we ignore. Deliberately no `compose up`.
+    log_cmd(&app, "docker rm -f quip-postgres quip-dashboard");
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["rm", "-f", PG_CONTAINER, "quip-dashboard"])
+            .output()
+    })
+    .await;
+
+    // Delete the Postgres data volume (the database + indexer state, including
+    // the cached self identity).
+    log_cmd(&app, &format!("docker volume rm {PGDATA_VOLUME}"));
+    let rm = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("docker")
+            .args(["volume", "rm", PGDATA_VOLUME])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match rm {
+        Ok(o) if o.status.success() => {}
+        // "No such volume" means there's nothing to delete — fine.
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("No such volume") => {}
+        Ok(o) => {
+            return Err(format!(
+                "failed to remove {PGDATA_VOLUME}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))
+        }
+        Err(e) => return Err(format!("failed to remove {PGDATA_VOLUME}: {e}")),
+    }
+
+    // Clear the dashboard's bind-mounted data folder, then recreate it so the
+    // mount target exists and stays host-owned on the next Start.
+    let dash_data = crate::settings::data_dir().join("dashboard-data");
+    if let Err(e) = std::fs::remove_dir_all(&dash_data) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log_err(
+                &app,
+                &format!("Warning: clearing {} failed: {e}", dash_data.display()),
+            );
+        }
+    }
+    let _ = std::fs::create_dir_all(&dash_data);
+
+    log_output(
+        &app,
+        "Dashboard database cleared. Start the node to bring the dashboard back up.",
+    );
+    Ok(())
+}
+
+/// Stop the compose stack. Uses `docker compose stop`, which halts the
+/// containers but leaves them — and the project network and named volumes
+/// (quip-pgdata, quip-caddy-data, quip-caddy-config) — in place. Stop must not
+/// destroy containers; recreating from a clean slate is the Start path's job
+/// (`down` + name reap). `docker compose stop` acts on every running container
+/// in the project, including profiled ones, without needing the profile flag.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("stop-started", serde_json::json!({}));
 
     // Kill the log-streamer child first — same ordering as the old
     // stop_node_container sequence, so `docker compose logs -f` unblocks
-    // before we tear containers down.
+    // before we stop the containers.
     let log_state = app.state::<LogStreamState>();
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
 
-    log_cmd(&app, "docker compose down");
-    let result = run_compose_streaming(&app, vec!["down".into()]).await;
-
-    // Belt-and-suspenders: force-remove each container by the explicit
-    // name the compose file declares. Covers cases where `docker compose
-    // down` reports success but the project-label lookup misses — which
-    // has been observed with some compose/Docker version combos. Missing
-    // names exit non-zero (no such container); we ignore those.
-    force_remove_known_containers(&app).await;
-
-    // Sweep orphan containers that aren't part of the compose project but
-    // are running our node images. Catches stragglers from older builds
-    // that ran `docker run <node-image> --version` and ended up launching
-    // a full node under a random anonymous name.
-    sweep_orphan_node_containers(&app).await;
+    log_cmd(&app, "docker compose stop");
+    let result = run_compose_streaming(&app, vec!["stop".into()]).await;
 
     match &result {
         Ok(_) => {
             log_output(&app, "Compose stack stopped.");
-            let _ = app.emit(
-                "stop-complete",
-                serde_json::json!({ "success": true }),
-            );
+            let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
         }
         Err(e) => {
             log_err(&app, e);
@@ -567,16 +906,23 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     result
 }
 
-/// Container names declared in the upstream `docker-compose.yml`. These
-/// don't change with profile or run-mode — they're fixed by compose's
-/// `container_name:` directive — so we can always try to reap them.
+/// Container names we force-remove as a Start-time cleanup backstop. The first
+/// group is the fixed `container_name:` values from the current upstream
+/// `docker-compose.yml` (independent of profile/run-mode). The trailing group
+/// is legacy names the current compose file no longer declares, kept only so an
+/// upgrade still reaps them.
 const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-cpu",
     "quip-cuda",
-    "quip-qpu",
+    "quip-validator",
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
+    // Removed in v0.2 — the cpu/cuda miners self-bootstrap (faucet + miner +
+    // descriptor registration), so the one-shot bootstrap container is gone.
+    "quip-bootstrap",
+    // Legacy one-container TUI path.
+    "quip-node",
 ];
 
 /// Force-remove every container the compose file declares by name. Runs
@@ -587,17 +933,13 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
 async fn force_remove_known_containers(app: &AppHandle) {
     for &name in KNOWN_CONTAINER_NAMES {
         let out = tokio::task::spawn_blocking(move || {
-            crate::cmd::new("docker")
-                .args(["rm", "-f", name])
-                .output()
+            crate::cmd::new("docker").args(["rm", "-f", name]).output()
         })
         .await;
         let Ok(Ok(output)) = out else { continue };
         if output.status.success() {
             // Docker prints the removed container's name to stdout.
-            let removed = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string();
+            let removed = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !removed.is_empty() {
                 log_cmd(app, &format!("docker rm -f {name}"));
                 log_output(app, &format!("Removed {removed}"));
@@ -613,7 +955,7 @@ async fn force_remove_known_containers(app: &AppHandle) {
 /// since `docker ps --filter label!=…` isn't portable.
 async fn sweep_orphan_node_containers(app: &AppHandle) {
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
-        let image_ref = format!("{image}:latest");
+        let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
         let ps = tokio::task::spawn_blocking({
             let image_ref = image_ref.clone();
             move || {
@@ -647,9 +989,7 @@ async fn sweep_orphan_node_containers(app: &AppHandle) {
             );
             let id = id.to_string();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::cmd::new("docker")
-                    .args(["rm", "-f", &id])
-                    .output()
+                crate::cmd::new("docker").args(["rm", "-f", &id]).output()
             })
             .await;
         }
@@ -691,6 +1031,17 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     };
+
+    // A genuinely empty stack reports no objects (empty stdout or `[]`). But if
+    // compose printed something we couldn't parse, reporting an empty/Stopped
+    // stack would be a lie — it masks a running stack and re-enables the Start
+    // button. Surface the parse failure instead.
+    if objects.is_empty() && !text.is_empty() && text != "[]" {
+        return Err(format!(
+            "could not parse `docker compose ps` output: {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
 
     let mut services = Vec::new();
     for v in objects {
@@ -759,12 +1110,10 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
 /// Useful for debugging the merged configuration the daemon would receive.
 #[tauri::command]
 pub async fn get_stack_config() -> Result<String, String> {
-    let output = tokio::task::spawn_blocking(|| {
-        compose_cmd().args(["config"]).output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    let output = tokio::task::spawn_blocking(|| compose_cmd().args(["config"]).output())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -773,10 +1122,152 @@ pub async fn get_stack_config() -> Result<String, String> {
     }
 }
 
-// Silence unused-import warnings while the module sits alongside docker.rs
-// during step 4. stack_caddyfile is re-exported for callers that want the
-// patched Caddyfile path for diagnostics.
-#[allow(dead_code)]
-pub(crate) fn _caddyfile_path() -> PathBuf {
-    stack_caddyfile()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_profile_uses_only_v02_cpu_and_cuda_profiles() {
+        assert_eq!(compose_profile(ImageTag::Cpu), "cpu");
+        assert_eq!(compose_profile(ImageTag::Cuda), "cuda");
+    }
+
+    #[test]
+    fn compose_services_docker_uses_profile_defaults() {
+        assert!(compose_services(&RunMode::Docker).is_empty());
+    }
+
+    #[test]
+    fn compose_services_native_runs_only_support_services() {
+        let services = compose_services(&RunMode::Native);
+        assert_eq!(
+            services,
+            ["quip-validator", "dashboard", "postgres", "caddy"]
+        );
+        assert!(!services.contains(&"cpu"));
+        assert!(!services.contains(&"cuda"));
+        assert!(!services.contains(&"quip-bootstrap"));
+    }
+
+    #[test]
+    fn v02_cleanup_containers_do_not_include_qpu_service() {
+        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-validator"));
+        assert!(KNOWN_CONTAINER_NAMES.contains(&"quip-bootstrap"));
+        assert!(!KNOWN_CONTAINER_NAMES.contains(&"quip-faucet"));
+        assert!(!KNOWN_CONTAINER_NAMES.contains(&"quip-qpu"));
+    }
+
+    #[test]
+    fn miner_image_paths_use_v02_names() {
+        assert_eq!(
+            image_for_tag(ImageTag::Cpu),
+            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu"
+        );
+        assert_eq!(
+            image_for_tag(ImageTag::Cuda),
+            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda"
+        );
+        assert_eq!(
+            VALIDATOR_IMAGE,
+            "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node"
+        );
+        assert_eq!(
+            DASHBOARD_IMAGE,
+            "registry.gitlab.com/quip.network/dashboard.quip.network"
+        );
+        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
+    }
+
+    #[test]
+    fn env_lines_use_v02_dashboard_and_validator_keys() {
+        let mut settings = AppSettings {
+            hostname: String::new(),
+            cert_email: "ops@example.com".to_string(),
+            zerossl_api_key: "zero".to_string(),
+            run_mode: RunMode::Docker,
+            ..AppSettings::default()
+        };
+        settings.node_config.node_name = "validator-home".to_string();
+        settings.node_config.num_cpus = 4;
+
+        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret");
+        let env = lines.join("\n");
+
+        assert!(env.contains("PUID=501"));
+        assert!(env.contains("PGID=1000"));
+        assert!(env.contains("QUIP_HOSTNAME=:20049"));
+        assert!(env.contains("CERT_EMAIL=ops@example.com"));
+        assert!(env.contains("ZEROSSL_API_KEY=zero"));
+        assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
+        assert!(env.contains("QUIP_MINER_TAG=v0.2"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
+        assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
+        assert!(env.contains("VALIDATOR_NAME=validator-home"));
+        assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));
+        // QUIP_VALIDATOR_RPC_URLS is deferred to the compose default
+        // (ws://quip-caddy:8088/rpc), not written into .env.
+        assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
+        assert!(!env.contains("QUIP_NODE_URL"));
+        assert!(!env.contains("QUIP_NODE_TOKEN"));
+        assert!(!env.contains("QUIP_FAUCET_URL"));
+    }
+
+    #[test]
+    fn env_lines_use_public_host_for_caddy_when_it_is_dns() {
+        let mut settings = AppSettings::default();
+        settings.node_config.public_host = "node.example.com".to_string();
+        settings.hostname = "dashboard.example.com".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
+    }
+
+    #[test]
+    fn env_lines_fall_back_to_hostname_when_public_host_is_not_dns() {
+        let mut settings = AppSettings::default();
+        settings.node_config.public_host = "203.0.113.9".to_string();
+        settings.hostname = "dashboard.example.com".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
+    }
+
+    #[test]
+    fn env_lines_preserve_dwave_key() {
+        let mut settings = AppSettings::default();
+        settings.node_config.dwave_config = Some(crate::settings::DwaveConfig {
+            token: "dwave-token".to_string(),
+            ..crate::settings::DwaveConfig::default()
+        });
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        assert!(env.contains("DWAVE_API_KEY=dwave-token"));
+    }
+
+    #[test]
+    fn env_lines_native_omits_docker_miner_validator_env() {
+        let mut settings = AppSettings {
+            run_mode: RunMode::Native,
+            ..AppSettings::default()
+        };
+        settings.node_config.node_name = "physical-miner-validator".to_string();
+
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(!env.contains("QUIP_VALIDATORS="));
+        // Deferred to the compose default in both modes (see above).
+        assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
+    }
+
+    #[test]
+    fn env_lines_default_validator_name_and_single_cpu_cpuset() {
+        let settings = AppSettings::default();
+        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+
+        assert!(env.contains("VALIDATOR_NAME=quip-validator"));
+        assert!(env.contains("QUIP_MINER_CPUSET=0"));
+    }
 }

@@ -31,13 +31,39 @@ struct ReleaseLinks {
     self_url: String,
 }
 
-pub fn parse_semver(v: &str) -> (u64, u64, u64) {
+/// Parse a version like `v0.2.0`, `0.2.0`, or `0.2.0-rc1` into a comparable
+/// tuple `(major, minor, patch, prerelease)`.
+///
+/// A final release sorts ABOVE any pre-release of the same `major.minor.patch`
+/// (`0.2.0` > `0.2.0-rc2`), and pre-releases sort among themselves by their
+/// trailing number (`0.2.0-rc1` < `0.2.0-rc2`). Without pre-release ordering
+/// the in-app updater never offers an `rc` → `rc` bump, because the entire
+/// `-rcN` suffix parses to nothing and both versions collapse to the same
+/// `(major, minor, patch)`. Unparseable components default to 0.
+pub fn parse_semver(v: &str) -> (u64, u64, u64, u64) {
     let v = v.trim_start_matches('v');
-    let parts: Vec<&str> = v.split('.').collect();
-    let major = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (major, minor, patch)
+    let (core, prerelease) = match v.split_once('-') {
+        // A release has no pre-release suffix, so it outranks every `-rcN`.
+        None => (v, u64::MAX),
+        Some((core, pre)) => (core, parse_prerelease(pre)),
+    };
+    let mut parts = core.split('.');
+    let major = next_number(&mut parts);
+    let minor = next_number(&mut parts);
+    let patch = next_number(&mut parts);
+    (major, minor, patch, prerelease)
+}
+
+fn next_number<'a>(parts: &mut impl Iterator<Item = &'a str>) -> u64 {
+    parts.next().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// Extract the trailing integer from a pre-release identifier (`rc1` → 1,
+/// `rc.2` → 2). Used only to order pre-releases against each other; the
+/// identifier text itself is not significant.
+fn parse_prerelease(pre: &str) -> u64 {
+    let digits: String = pre.chars().filter(char::is_ascii_digit).collect();
+    digits.parse().unwrap_or(0)
 }
 
 #[tauri::command]
@@ -58,9 +84,7 @@ pub async fn get_node_version() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let settings = crate::settings::load_settings();
         match settings.run_mode {
-            crate::settings::RunMode::Native => {
-                crate::native::installed_binary_version()
-            }
+            crate::settings::RunMode::Native => crate::native::installed_binary_version(),
             crate::settings::RunMode::Docker => None,
         }
     })
@@ -108,71 +132,82 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
 /// background monitor to iterate over the whole stack, and by each
 /// Tauri-facing check wrapper to keep serialisation shapes unchanged.
 ///
-/// Postgres and Caddy are deliberately absent: they use pinned version
-/// tags (`postgres:16`, `caddy:2-alpine`), not `:latest`, so point
-/// releases come in via routine `docker compose pull` rather than
-/// silent digest drift.
+/// Postgres and Caddy are deliberately absent: they use Docker Hub version
+/// tags (`postgres:16`, `caddy:2-alpine`), so point releases come in via
+/// routine `docker compose pull` rather than GitLab registry checks.
 #[derive(Clone, Copy, Debug)]
 pub enum ImageRef {
-    Node(crate::settings::ImageTag),
+    Miner(crate::settings::ImageTag),
+    Validator,
     Dashboard,
 }
 
 impl ImageRef {
-    fn gitlab_path(&self) -> &'static str {
+    fn repository(&self) -> &'static str {
         match self {
-            ImageRef::Node(crate::settings::ImageTag::Cuda) => {
-                "quip.network/quip-protocol/quip-network-node-cuda"
+            ImageRef::Miner(image_tag) => crate::compose::image_for_tag(*image_tag),
+            ImageRef::Validator => crate::compose::VALIDATOR_IMAGE,
+            ImageRef::Dashboard => crate::compose::DASHBOARD_IMAGE,
+        }
+    }
+
+    fn gitlab_path(&self) -> &'static str {
+        self.repository()
+            .strip_prefix("registry.gitlab.com/")
+            .unwrap_or_else(|| self.repository())
+    }
+
+    fn tag(&self) -> &'static str {
+        match self {
+            ImageRef::Miner(_) | ImageRef::Validator | ImageRef::Dashboard => {
+                crate::compose::COMPOSE_IMAGE_TAG
             }
-            ImageRef::Node(crate::settings::ImageTag::Cpu) => {
-                "quip.network/quip-protocol/quip-network-node-cpu"
-            }
-            ImageRef::Dashboard => "quip.network/dashboard.quip.network",
         }
     }
 
     fn local_ref(&self) -> String {
-        format!("registry.gitlab.com/{}:latest", self.gitlab_path())
+        format!("{}:{}", self.repository(), self.tag())
     }
 
     /// Human label used by the UI for update toasts.
     pub fn display_name(&self) -> &'static str {
         match self {
-            ImageRef::Node(crate::settings::ImageTag::Cuda) => "Node (CUDA)",
-            ImageRef::Node(crate::settings::ImageTag::Cpu) => "Node (CPU)",
+            ImageRef::Miner(crate::settings::ImageTag::Cuda) => "Miner (CUDA)",
+            ImageRef::Miner(crate::settings::ImageTag::Cpu) => "Miner (CPU)",
+            ImageRef::Validator => "Validator",
             ImageRef::Dashboard => "Dashboard",
         }
     }
 }
 
-/// The images whose latest-tag digests are worth polling for the given
-/// settings + run_mode. Native mode drops the node image (it runs on the
-/// host); `dashboard_enabled == false` drops the dashboard image.
+/// The images whose configured-tag digests are worth polling for the given
+/// settings + run_mode. Native mode drops Docker miner/validator images (the
+/// miner binary runs on the host). Dashboard-disabled mode is unsupported in
+/// v0.2, so the dashboard image is always relevant.
 fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
     let mut v = Vec::new();
     if settings.run_mode == crate::settings::RunMode::Docker {
-        v.push(ImageRef::Node(settings.image_tag));
+        v.push(ImageRef::Miner(settings.image_tag));
+        v.push(ImageRef::Validator);
     }
-    if settings.dashboard_enabled {
-        v.push(ImageRef::Dashboard);
-    }
+    v.push(ImageRef::Dashboard);
     v
 }
 
-/// Core GitLab registry digest probe — HEAD the manifest, diff against the
-/// local `docker image inspect` digest. Gracefully degrades to `Ok(None)`
-/// when the registry requires auth or the image isn't present locally.
-async fn check_gitlab_image_update(
-    image: ImageRef,
-) -> Result<Option<ImageUpdateInfo>, String> {
+/// Core GitLab registry digest probe — HEAD the configured tag's manifest,
+/// diff against the local `docker image inspect` digest. Gracefully degrades
+/// to `Ok(None)` when the registry requires auth or the image isn't present
+/// locally.
+async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdateInfo>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| e.to_string())?;
 
     let manifest_url = format!(
-        "https://registry.gitlab.com/v2/{}/manifests/latest",
-        image.gitlab_path()
+        "https://registry.gitlab.com/v2/{}/manifests/{}",
+        image.gitlab_path(),
+        image.tag()
     );
 
     let resp = match client
@@ -212,16 +247,13 @@ async fn check_gitlab_image_update(
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default()
     })
     .await
     .unwrap_or_default();
 
-    let update_available =
-        !current_digest.is_empty() && !current_digest.contains(&digest);
+    let update_available = !current_digest.is_empty() && !current_digest.contains(&digest);
 
     Ok(Some(ImageUpdateInfo {
         current_digest,
@@ -234,13 +266,25 @@ async fn check_gitlab_image_update(
 pub async fn check_image_update(
     image_tag: crate::settings::ImageTag,
 ) -> Result<Option<ImageUpdateInfo>, String> {
-    check_gitlab_image_update(ImageRef::Node(image_tag)).await
+    check_gitlab_image_update(ImageRef::Miner(image_tag)).await
 }
 
 #[tauri::command]
-pub async fn check_dashboard_image_update(
-) -> Result<Option<ImageUpdateInfo>, String> {
+pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, String> {
     check_gitlab_image_update(ImageRef::Dashboard).await
+}
+
+pub async fn check_docker_core_image_update(
+    image_tag: crate::settings::ImageTag,
+) -> Result<Option<(ImageRef, ImageUpdateInfo)>, String> {
+    for image in [ImageRef::Miner(image_tag), ImageRef::Validator] {
+        if let Some(info) = check_gitlab_image_update(image).await? {
+            if info.update_available {
+                return Ok(Some((image, info)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Background task that checks for updates every 30 minutes.
@@ -248,8 +292,7 @@ pub async fn check_dashboard_image_update(
 /// - Native mode: checks for new binary release
 /// - Always: checks for new node-manager app release
 pub async fn background_update_monitor(app: tauri::AppHandle) {
-    let mut interval =
-        tokio::time::interval(Duration::from_secs(30 * 60));
+    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
     // Skip the first immediate tick
     interval.tick().await;
 
@@ -292,18 +335,25 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                 &app,
                 "[Auto-Update] New stack image detected, restarting...",
             );
-            let _ = crate::compose::stop_stack(app.clone()).await;
-            let _ = crate::compose::pull_compose_images(app.clone()).await;
-            let _ = crate::compose::start_stack(app.clone()).await;
-            emit_log(&app, "[Auto-Update] Restart complete.");
+            // Bail on the first failing step and report it — never claim
+            // "Restart complete." after a swallowed error, which would tell
+            // the user their node is up when stop succeeded but start didn't.
+            match auto_update_restart_stack(&app).await {
+                Ok(()) => emit_log(&app, "[Auto-Update] Restart complete."),
+                Err(e) => emit_error(
+                    &app,
+                    &format!(
+                        "[Auto-Update] Restart failed: {e}. Your node may be \
+                         stopped — open the app and start it manually."
+                    ),
+                ),
+            }
         }
 
         // Native binary: separate channel because the binary is not a
         // container image and lives on GitLab Releases, not the registry.
         if settings.run_mode == crate::settings::RunMode::Native {
-            if let Ok(Some(info)) =
-                crate::native::check_binary_update().await
-            {
+            if let Ok(Some(info)) = crate::native::check_binary_update().await {
                 let _ = app.emit("binary-update-available", &info);
 
                 if settings.auto_update_enabled {
@@ -314,24 +364,131 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             info.version
                         ),
                     );
-                    let _ = crate::native::download_native_binary(
-                        app.clone(),
-                    )
-                    .await;
-                    emit_log(&app, "[Auto-Update] Binary updated.");
+                    match crate::native::download_native_binary(app.clone()).await {
+                        Ok(_) => emit_log(&app, "[Auto-Update] Binary updated."),
+                        Err(e) => {
+                            emit_error(&app, &format!("[Auto-Update] Binary download failed: {e}"))
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+/// Stop → pull → start the compose stack, short-circuiting on the first error
+/// so a failed pull doesn't leave the stack torn down with a misleading
+/// success message.
+async fn auto_update_restart_stack(app: &tauri::AppHandle) -> Result<(), String> {
+    crate::compose::stop_stack(app.clone()).await?;
+    crate::compose::pull_compose_images(app.clone()).await?;
+    crate::compose::start_stack(app.clone()).await?;
+    Ok(())
+}
+
 fn emit_log(app: &tauri::AppHandle, msg: &str) {
+    emit_level(app, "INFO", msg);
+}
+
+fn emit_error(app: &tauri::AppHandle, msg: &str) {
+    emit_level(app, "ERROR", msg);
+}
+
+fn emit_level(app: &tauri::AppHandle, level: &str, msg: &str) {
     let _ = app.emit(
         "node-log",
         serde_json::json!({
             "timestamp": "",
-            "level": "INFO",
+            "level": level,
             "message": msg,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{AppSettings, ImageTag, RunMode};
+
+    #[test]
+    fn image_refs_use_v02_repositories() {
+        let refs = [
+            (
+                ImageRef::Miner(ImageTag::Cpu),
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2",
+                "quip.network/quip-protocol/quip-miner-cpu",
+                "Miner (CPU)",
+            ),
+            (
+                ImageRef::Miner(ImageTag::Cuda),
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
+                "quip.network/quip-protocol/quip-miner-cuda",
+                "Miner (CUDA)",
+            ),
+            (
+                ImageRef::Validator,
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
+                "quip.network/quip-protocol-rs/quip-network-node",
+                "Validator",
+            ),
+            (
+                ImageRef::Dashboard,
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
+                "quip.network/dashboard.quip.network",
+                "Dashboard",
+            ),
+        ];
+
+        for (image, local_ref, gitlab_path, display_name) in refs {
+            assert_eq!(image.local_ref(), local_ref);
+            assert_eq!(image.gitlab_path(), gitlab_path);
+            assert_eq!(image.tag(), "v0.2");
+            assert_eq!(image.display_name(), display_name);
+        }
+    }
+
+    #[test]
+    fn relevant_images_include_validator_only_for_docker_mode() {
+        let mut settings = AppSettings {
+            run_mode: RunMode::Docker,
+            image_tag: ImageTag::Cuda,
+            ..AppSettings::default()
+        };
+
+        let docker_images: Vec<String> = relevant_images(&settings)
+            .into_iter()
+            .map(|image| image.local_ref())
+            .collect();
+        assert_eq!(
+            docker_images,
+            vec![
+                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
+                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
+                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
+            ]
+        );
+
+        settings.run_mode = RunMode::Native;
+        let native_images: Vec<String> = relevant_images(&settings)
+            .into_iter()
+            .map(|image| image.local_ref())
+            .collect();
+        assert_eq!(
+            native_images,
+            vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
+        );
+    }
+
+    #[test]
+    fn parse_semver_orders_release_candidates() {
+        // Pre-releases order by their trailing number...
+        assert!(parse_semver("0.2.0-rc1") < parse_semver("0.2.0-rc2"));
+        // ...and a final release outranks any of its pre-releases.
+        assert!(parse_semver("0.2.0-rc2") < parse_semver("0.2.0"));
+        // The `v` prefix is ignored; normal precedence still holds.
+        assert!(parse_semver("v0.2.0") > parse_semver("v0.1.5"));
+        assert!(parse_semver("0.2.0-rc1") > parse_semver("0.1.9"));
+        // Identical versions compare equal — no spurious update offered.
+        assert_eq!(parse_semver("0.2.0-rc1"), parse_semver("v0.2.0-rc1"));
+    }
 }
