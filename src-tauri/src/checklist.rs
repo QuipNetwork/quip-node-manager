@@ -2,8 +2,8 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, Semaphore};
 
@@ -240,46 +240,6 @@ fn check_wsl() -> (bool, String) {
     )
 }
 
-/// `docker image inspect <ref>` — true iff the image is already present on
-/// the local daemon. Used by the stack-images aggregator.
-fn docker_image_present(image_ref: &str) -> bool {
-    crate::cmd::new("docker")
-        .args(["image", "inspect", image_ref])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Images the current profile + service list expects to find locally.
-/// In Native mode Docker miner/validator images are excluded because the miner
-/// binary runs on the host.
-fn required_stack_images(ctx: &CheckCtx) -> Vec<String> {
-    let mut images = Vec::new();
-    if ctx.run_mode == RunMode::Docker {
-        images.push(format!(
-            "{}:{}",
-            crate::compose::image_for_tag(ctx.image_tag),
-            crate::compose::COMPOSE_IMAGE_TAG
-        ));
-        images.push(format!(
-            "{}:{}",
-            crate::compose::VALIDATOR_IMAGE,
-            crate::compose::COMPOSE_IMAGE_TAG
-        ));
-    }
-    images.push(format!(
-        "{}:{}",
-        crate::compose::DASHBOARD_IMAGE,
-        crate::compose::COMPOSE_IMAGE_TAG
-    ));
-    images.push("postgres:16".into());
-    // Caddy belongs to the cpu/cuda compose profiles (and the Native service
-    // list), so it always starts regardless of tls_enabled. Pre-flight must
-    // verify its image is present, or `docker compose up` fails pulling it.
-    images.push("caddy:2-alpine".into());
-    images
-}
-
 fn check_secret_exists() -> bool {
     data_dir().join("node-secret.json").exists()
 }
@@ -412,7 +372,55 @@ fn is_connect_timeout(error: &str) -> bool {
 /// GUI-facing entry point. `ctx.app` is used to emit the full check.quip.network
 /// request URL, HTTP status, and response body into `node-log` so users can
 /// copy/paste the raw output when asking for support.
+/// How long a check.quip.network port-probe result stays fresh. The service
+/// rate-limits aggressively, so we reuse the last result for any re-run that
+/// isn't an explicit user Retry (mode/TLS toggles, auto-rechecks, reloads).
+const PORT_PROBE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Per-port cache of the last probe result + when it was taken. Process-global
+/// because probes run from per-recheck `CheckCtx` instances that don't persist.
+fn port_probe_cache() -> &'static Mutex<HashMap<u16, (PortProbeResult, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<u16, (PortProbeResult, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_port_probe(port: u16) -> Option<PortProbeResult> {
+    let cache = port_probe_cache().lock().ok()?;
+    let (result, taken_at) = cache.get(&port)?;
+    (taken_at.elapsed() < PORT_PROBE_TTL).then_some(*result)
+}
+
+fn store_port_probe(port: u16, result: PortProbeResult) {
+    if let Ok(mut cache) = port_probe_cache().lock() {
+        let _ = cache.insert(port, (result, Instant::now()));
+    }
+}
+
+/// Drop all cached probe results so the next probe hits check.quip.network.
+/// Called on a user-initiated Retry (not on auto/background rechecks).
+pub(crate) fn clear_port_probe_cache() {
+    if let Ok(mut cache) = port_probe_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// Cached front door for the port probe: serve a <5-minute-old result if we
+/// have one, otherwise probe and store. A user Retry clears the cache first
+/// (see `run_recheck`), so it always re-probes.
 async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeResult {
+    if let Some(cached) = cached_port_probe(port) {
+        ctx.log_probe(
+            "INFO",
+            format!("port {port} \u{2014} using cached check.quip.network result (<5m old)"),
+        );
+        return cached;
+    }
+    let result = probe_port_forwarding_uncached(ctx, port).await;
+    store_port_probe(port, result);
+    result
+}
+
+async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeResult {
     use tokio::net::TcpListener;
 
     match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
@@ -598,7 +606,6 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "docker",
     "docker-compose",
     "wsl",
-    "stack-images",
     "binary",
     "secret",
     "ip",
@@ -613,7 +620,10 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
     match id {
         // Docker daemon + compose itself — v0.2 always runs compose services
         // in both Docker and Native manager modes, so these are always shown.
-        "docker" | "docker-compose" | "stack-images" => true,
+        // Image availability isn't pre-checked: Start always runs
+        // `docker compose pull`, so a separate pre-flight image check (and its
+        // load-time pull) would be redundant.
+        "docker" | "docker-compose" => true,
         // Windows-only WSL probe. Docker mode only (Native is macOS-only).
         "wsl" => ctx.run_mode == RunMode::Docker && cfg!(target_os = "windows"),
         // Binary is native-mode only.
@@ -655,9 +665,8 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             Some(FixKind::InstallDocker),
         ),
         "wsl" => CheckItem::new(id, "WSL installed with distro", false, None),
-        // stack-images and binary are not separately "fixable": their Retry
-        // recheck downloads (pull / binary fetch) as part of running the check.
-        "stack-images" => CheckItem::new(id, "Stack images available", true, None),
+        // binary is not separately "fixable": its Retry recheck downloads the
+        // binary as part of running the check.
         "binary" => CheckItem::new(id, "Native miner binary available", true, None),
         "secret" => CheckItem::new(
             id,
@@ -744,65 +753,6 @@ async fn run_check_docker_compose(ctx: &CheckCtx) -> CheckItem {
     } else {
         base.with_state(CheckState::Fail)
             .with_detail("install Docker Desktop, which ships with the `docker compose` CLI plugin")
-    }
-}
-
-/// Return the subset of `images` not present in the local Docker image store.
-async fn missing_stack_images(images: Vec<String>) -> Vec<String> {
-    tokio::task::spawn_blocking(move || {
-        images
-            .into_iter()
-            .filter(|img| !docker_image_present(img))
-            .collect()
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Stack images: every run first attempts `docker compose pull` so a retry
-/// actively fetches any missing or updated images before reporting (compose
-/// only downloads layers that are absent or changed, and emits progress to the
-/// Logs tab). If the pull can't reach the registry we fall back to reporting on
-/// whatever is already cached locally rather than blocking on the network.
-async fn run_check_stack_images(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("stack-images", ctx);
-    let images = required_stack_images(ctx);
-    if images.is_empty() {
-        return base
-            .with_state(CheckState::Skip)
-            .with_detail("no compose images needed for this profile");
-    }
-
-    // Download first. Skipped when there's no app handle (e.g. unit tests).
-    // A pull failure is non-fatal — we still report on the local cache below.
-    let pull_err = match &ctx.app {
-        Some(app) => crate::compose::pull_compose_images(app.clone()).await.err(),
-        None => None,
-    };
-
-    let missing = missing_stack_images(images).await;
-    if !missing.is_empty() {
-        let detail = match &pull_err {
-            Some(e) => format!("missing: {} \u{2014} {}", missing.join(", "), e),
-            None => format!("missing: {}", missing.join(", ")),
-        };
-        return base
-            .with_state(CheckState::Fail)
-            .with_label("Stack images unavailable")
-            .with_detail(detail);
-    }
-
-    match pull_err {
-        // Present locally but the registry was unreachable, so we're running on
-        // possibly-stale images. Warn rather than claim up to date (a Warn
-        // never blocks start).
-        Some(e) => base
-            .with_state(CheckState::Warn)
-            .with_label("Stack images present (pull failed)")
-            .with_detail(e),
-        None => base
-            .with_state(CheckState::Pass)
-            .with_label("Miner + validator images up to date"),
     }
 }
 
@@ -990,7 +940,6 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
         "docker" => run_check_docker(ctx).await,
         "docker-compose" => run_check_docker_compose(ctx).await,
         "wsl" => run_check_wsl(ctx).await,
-        "stack-images" => run_check_stack_images(ctx).await,
         "binary" => run_check_binary(ctx).await,
         "secret" => run_check_secret(ctx).await,
         "ip" => run_check_ip(ctx).await,
@@ -1109,6 +1058,13 @@ async fn seed_cache(state: &ChecklistState, ctx: &CheckCtx) {
 async fn run_recheck(app: AppHandle, ids: Option<Vec<String>>, auto: bool) -> Result<(), String> {
     let state: tauri::State<'_, ChecklistState> = app.state();
     let ctx = Arc::new(CheckCtx::from_settings(Some(app.clone())));
+
+    // A user-initiated Retry forces fresh external probes; auto/background
+    // rechecks reuse the 5-minute cache so we don't trip check.quip.network's
+    // rate limit.
+    if !auto {
+        clear_port_probe_cache();
+    }
 
     let ids = match ids {
         Some(ids) if !ids.is_empty() => ids,
@@ -1243,15 +1199,16 @@ mod tests {
     }
 
     #[test]
-    fn version_check_is_merged_into_availability_checks() {
-        // The standalone "version" freshness check was folded into the
-        // availability checks — stack-images (Docker) and binary (Native) —
-        // so each artifact has one check covering presence + up-to-date-ness.
+    fn image_availability_is_not_pre_checked() {
+        // Start always runs `docker compose pull`, so there is no separate
+        // pre-flight image-availability check (the old "stack-images" check is
+        // gone, as is the standalone "version" freshness check). Native still
+        // verifies its host binary.
+        assert!(!ALL_CHECK_IDS.contains(&"version"));
         assert!(
-            !ALL_CHECK_IDS.contains(&"version"),
-            "version should be merged into stack-images / binary"
+            !ALL_CHECK_IDS.contains(&"stack-images"),
+            "stack-images pre-flight check should be removed (we pull on Start)"
         );
-        assert!(ALL_CHECK_IDS.contains(&"stack-images"));
         assert!(ALL_CHECK_IDS.contains(&"binary"));
     }
 
@@ -1325,24 +1282,5 @@ mod tests {
         let item = idle_item("port-validator", &ctx);
         assert!(!item.required);
         assert_eq!(item.fixable, None);
-    }
-
-    #[test]
-    fn required_stack_images_use_v02_refs() {
-        let mut ctx = test_ctx();
-        ctx.image_tag = ImageTag::Cuda;
-
-        // Caddy is always required (it's in the cpu/cuda profile), independent
-        // of any TLS setting.
-        assert_eq!(
-            required_stack_images(&ctx),
-            vec![
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
-                "postgres:16",
-                "caddy:2-alpine",
-            ]
-        );
     }
 }
