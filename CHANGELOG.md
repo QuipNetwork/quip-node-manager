@@ -7,13 +7,13 @@
 **macOS / Linux:**
 
 ```sh
-curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc4/scripts/install.sh | sh
+curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc5/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc4/scripts/install.ps1 | iex
+irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc5/scripts/install.ps1 | iex
 ```
 
 ## Manual Install
