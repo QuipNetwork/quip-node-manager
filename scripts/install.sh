@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Quip Node Manager installer for macOS and Linux.
-# Usage: curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc6/scripts/install.sh | sh
+# Usage: curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0-rc7/scripts/install.sh | sh
 set -eu
 
 REPO="quip.network%2Fquip-node-manager"
