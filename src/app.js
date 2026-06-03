@@ -223,25 +223,24 @@ const FIX_LABELS = {
 const FIX_FOLDED_INTO_RETRY = new Set(['secret']);
 
 // ─── Tab switching ──────────────────────────────────────────────────────────
+// Activate a tab by name (e.g. 'status', 'dashboard'). Used by the tab buttons
+// and by flows that need to navigate the user programmatically.
+function activateTab(tab) {
+  document
+    .querySelectorAll('.tab-btn')
+    .forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  document
+    .querySelectorAll('.tab-content')
+    .forEach((c) => c.classList.toggle('active', c.id === `tab-${tab}`));
+  if (state.settings) {
+    state.settings.active_tab = tab;
+    invoke('update_settings', { settings: state.settings }).catch(console.error);
+  }
+  if (tab === 'dashboard') refreshDashboardTab();
+}
+
 document.querySelectorAll('.tab-btn').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const tab = btn.dataset.tab;
-    document
-      .querySelectorAll('.tab-btn')
-      .forEach((b) => b.classList.remove('active'));
-    document
-      .querySelectorAll('.tab-content')
-      .forEach((c) => c.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById(`tab-${tab}`).classList.add('active');
-    if (state.settings) {
-      state.settings.active_tab = tab;
-      invoke('update_settings', { settings: state.settings }).catch(
-        console.error
-      );
-    }
-    if (tab === 'dashboard') refreshDashboardTab();
-  });
+  btn.addEventListener('click', () => activateTab(btn.dataset.tab));
 });
 
 // ─── Configuration section toggle ────────────────────────────────────────────
@@ -254,9 +253,11 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
 });
 
 // ─── Dashboard database reset ─────────────────────────────────────────────────
-// Shown only after a `dashboard-db-mismatch`: recreate the Postgres volume and
-// bring the stack back up. The button stays disabled while the (potentially
-// slow) down → rm → start sequence runs; progress streams to the Logs tab.
+// Offered whenever the dashboard isn't running (e.g. to clear a stale cached
+// identity or recover from a Postgres password mismatch). Data-only: it deletes
+// the Postgres volume + indexer data and does NOT start anything. A missing
+// volume is treated as success by the backend. On success we send the user back
+// to the Status Monitor tab; on failure we stay and show the error.
 document.getElementById('dashboard-reset-btn')?.addEventListener('click', async () => {
   const btn = document.getElementById('dashboard-reset-btn');
   const msg = document.getElementById('dashboard-empty-msg');
@@ -265,13 +266,14 @@ document.getElementById('dashboard-reset-btn')?.addEventListener('click', async 
   try {
     await invoke('reset_dashboard_database');
     state.dashboardDbError = null;
+    await pollStatus();
+    activateTab('status');
   } catch (e) {
     state.dashboardDbError = `Reset failed: ${e}`;
     appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
+    refreshDashboardTab();
   } finally {
     if (btn) btn.disabled = false;
-    refreshDashboardTab();
-    pollStatus();
   }
 });
 
