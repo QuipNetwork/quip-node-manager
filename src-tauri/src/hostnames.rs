@@ -61,16 +61,34 @@ pub(crate) fn caddy_hostname_from_public_host(public_host: &str) -> Option<Strin
 }
 
 pub(crate) fn resolved_caddy_hostname(public_host: &str, fallback_hostname: &str) -> String {
+    // A genuine public DNS host (in `public_host`, or pre-formatted in the
+    // hostname field) yields a named-host site so Caddy provisions a real cert
+    // on :443 + :20049. Everything else — empty, localhost, an IP, a bare or
+    // edited port like `localhost:20080` — must resolve to a PORT-ONLY site
+    // (`:20049`). Port-only is the only form that (a) serves plain HTTP rather
+    // than triggering Caddy's automatic HTTPS, and (b) matches any `Host`
+    // header, which is required because the host side of the port is remapped
+    // (e.g. 20052->20049) so the browser's Host never matches a named site.
+    // The listen port is always the container-internal 20049 regardless of the
+    // user's host-side port.
     if let Some(hostname) = caddy_hostname_from_public_host(public_host) {
         return hostname;
     }
-
-    let fallback = fallback_hostname.trim();
-    if fallback.is_empty() {
-        format!(":{CADDY_PUBLIC_API_PORT}")
-    } else {
-        fallback.to_string()
+    if fallback_has_public_dns_host(fallback_hostname) {
+        return fallback_hostname.trim().to_string();
     }
+    format!(":{CADDY_PUBLIC_API_PORT}")
+}
+
+/// True when the hostname field holds a real public DNS host — including the
+/// pre-formatted multi-address form `example.com, example.com:20049`. Used to
+/// decide whether to honor the field verbatim (DNS → real TLS) or normalize it
+/// to a port-only site (localhost / IP / bare port → plain HTTP any-host).
+fn fallback_has_public_dns_host(fallback: &str) -> bool {
+    let first = fallback.split(',').next().unwrap_or("").trim();
+    public_host_name(first)
+        .map(|h| is_public_dns_host(&h))
+        .unwrap_or(false)
 }
 
 fn is_public_dns_host(host: &str) -> bool {
@@ -129,6 +147,33 @@ mod tests {
         assert_eq!(
             resolved_caddy_hostname("", "dashboard.example.com, dashboard.example.com:20049"),
             "dashboard.example.com, dashboard.example.com:20049"
+        );
+    }
+
+    #[test]
+    fn caddy_hostname_normalizes_non_public_fallbacks_to_port_only() {
+        // localhost / IP / bare-or-edited port must NOT become a named site
+        // (which would trigger auto-HTTPS + host matching). They collapse to a
+        // port-only `:20049` so Caddy serves plain HTTP for any Host header.
+        for fallback in [
+            "",
+            "localhost",
+            "localhost:20080",
+            "127.0.0.1",
+            "127.0.0.1:20049",
+            ":20080",
+            "node.local",
+        ] {
+            assert_eq!(
+                resolved_caddy_hostname("", fallback),
+                ":20049",
+                "fallback {fallback:?} should normalize to port-only"
+            );
+        }
+        // A real DNS host in the field is still honored verbatim.
+        assert_eq!(
+            resolved_caddy_hostname("", "node.example.com"),
+            "node.example.com"
         );
     }
 }
