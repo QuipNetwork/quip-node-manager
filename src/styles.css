@@ -840,6 +840,11 @@ button.check-action:disabled {
 }
 
 .pp-bar-fill {
+  /* The fill is a <span> inside .pp-bar (which is itself a grid item, hence
+     blockified). The fill is NOT a grid item, so without an explicit block
+     display it stays inline and ignores width/height — leaving only the gray
+     track visible. display:block makes the width:<pct>% actually apply. */
+  display: block;
   height: 100%;
   background: var(--accent);
   border-radius: 4px;
