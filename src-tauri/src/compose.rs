@@ -192,6 +192,17 @@ fn render_env_lines(
         settings.node_config.node_name.trim()
     };
 
+    // GPU SM cap for NVIDIA MPS (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE on the cuda
+    // service). Use the first enabled GPU device's utilization; default to 100
+    // (no cap) when none is configured. Only the cuda service reads it.
+    let gpu_utilization = settings
+        .node_config
+        .gpu_device_configs
+        .iter()
+        .find(|d| d.enabled)
+        .map(|d| d.utilization)
+        .unwrap_or(100);
+
     let mut lines = vec![
         format!("PUID={puid}"),
         format!("PGID={pgid}"),
@@ -208,6 +219,7 @@ fn render_env_lines(
             cpu_set_for_config(&settings.node_config)
         ),
         format!("VALIDATOR_NAME={validator_name}"),
+        format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
     ];
 
     if settings.run_mode == RunMode::Docker {
@@ -483,6 +495,43 @@ async fn pull_compose_images_for_settings(
     result
 }
 
+/// Best-effort start of the per-user NVIDIA MPS control daemon so the cuda
+/// container (which runs `ipc: host` and mounts `/tmp/nvidia-mps`) can share
+/// the GPU's SMs in hardware, capped at the operator's configured utilization.
+///
+/// Linux + native NVIDIA only: MPS is unsupported under WSL2 / Docker Desktop,
+/// so this is compiled out on other platforms. Non-fatal — a missing
+/// `nvidia-cuda-mps-control` binary or an already-running daemon just leaves
+/// MPS inactive, and the miner falls back to software / NVML throttling.
+#[cfg(target_os = "linux")]
+async fn ensure_mps_daemon(app: &AppHandle) {
+    let out = tokio::task::spawn_blocking(|| {
+        crate::cmd::new("nvidia-cuda-mps-control")
+            .arg("-d")
+            .output()
+    })
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            log_cmd(app, "nvidia-cuda-mps-control -d");
+            log_output(app, "Started NVIDIA MPS control daemon for GPU SM sharing.");
+        }
+        // Non-success is almost always "an instance is already running" — fine.
+        // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
+        Ok(Ok(o)) => {
+            let detail = String::from_utf8_lossy(&o.stderr);
+            let detail = detail.trim();
+            if !detail.is_empty() {
+                log_output(
+                    app,
+                    &format!("NVIDIA MPS daemon already active or unavailable: {detail}"),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
 ///
@@ -562,6 +611,15 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
     pull_compose_images_for_settings(&app, &settings).await?;
+
+    // Start the host NVIDIA MPS daemon before the cuda container so it can
+    // attach (native Linux GPU hosts only; no-op everywhere else).
+    #[cfg(target_os = "linux")]
+    {
+        if settings.run_mode == RunMode::Docker && settings.image_tag == ImageTag::Cuda {
+            ensure_mps_daemon(&app).await;
+        }
+    }
 
     // (8) Up. There is no separate `down`: Stop only stops the containers, so a
     // normal restart reuses them and compose recreates just what changed.
