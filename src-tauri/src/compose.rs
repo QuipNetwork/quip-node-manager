@@ -14,8 +14,16 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Monotonic id stamped on every `pull-progress` / `pull-complete` event of a
+/// single pull. The frontend uses it to ignore stale events delivered out of
+/// order (a late layer event arriving after the pull's `pull-complete` must not
+/// resurrect the progress panel) and to treat `pull-complete` as the one
+/// authoritative "this pull is over" signal.
+static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // ── logging helpers (moved verbatim from docker.rs) ────────────────────────
 
@@ -249,10 +257,10 @@ enum StdoutMode {
     /// Emit each raw line to node-log (used by up/down).
     Log,
     /// Parse `docker compose --progress json` events (emitted on stderr) into
-    /// structured `pull-progress` events. Only image-level milestones and
-    /// unparseable lines reach node-log, so the console isn't flooded with
-    /// per-layer churn.
-    PullJson,
+    /// structured `pull-progress` events stamped with the given pull generation.
+    /// Only image-level milestones and unparseable lines reach node-log, so the
+    /// console isn't flooded with per-layer churn.
+    PullJson(u64),
 }
 
 /// Parse one `--progress json` line and emit a structured `pull-progress`
@@ -260,12 +268,12 @@ enum StdoutMode {
 /// caller can skip treating it as error output). Image-level milestones are
 /// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
 /// record without the per-layer noise.
-fn emit_pull_progress_json(app: &AppHandle, line: &str) -> bool {
+fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return false;
     };
     let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
@@ -282,6 +290,11 @@ fn emit_pull_progress_json(app: &AppHandle, line: &str) -> bool {
                 "message": format!("{} {}", text, id.trim_start_matches("Image ")),
             }),
         );
+    }
+    // Stamp the generation so the frontend can discard events from a pull it has
+    // already closed (see PULL_GENERATION).
+    if let Some(obj) = value.as_object_mut() {
+        let _ = obj.insert("gen".into(), serde_json::json!(gen));
     }
     let _ = app.emit("pull-progress", value);
     true
@@ -331,9 +344,10 @@ async fn run_compose_streaming_mode(
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if matches!(mode, StdoutMode::PullJson) && emit_pull_progress_json(&app_err, &line)
-                {
-                    continue;
+                if let StdoutMode::PullJson(gen) = mode {
+                    if emit_pull_progress_json(&app_err, gen, &line) {
+                        continue;
+                    }
                 }
                 let _ = app_err.emit(
                     "node-log",
@@ -477,17 +491,22 @@ async fn pull_compose_images_for_settings(
         args.push((*s).into());
     }
 
-    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson).await;
+    // Allocate this pull's generation up front so every progress event and the
+    // terminal pull-complete carry the same id.
+    let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // Tell the UI the pull is over so it can hide the progress panel. The panel
-    // also hides itself once every image reports "Pulled", but that per-image
-    // accounting has proven unreliable on some platforms (an image's terminal
-    // event can be missed), leaving the panel stuck. Process exit is the
-    // authoritative signal, so emit it unconditionally.
+    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
+    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson(gen)).await;
+
+    // Tell the UI the pull is over so it can hide the progress panel. Process
+    // exit is the authoritative "pull is done" signal: per-image "Pulled"
+    // accounting can miss an image's terminal event on some platforms, and a
+    // late progress event delivered after this one is discarded by the frontend
+    // because its generation is already closed.
     let _ = app.emit(
         "pull-complete",
         serde_json::json!({
+            "gen": gen,
             "success": result.is_ok(),
             "error": result.as_ref().err().cloned().unwrap_or_default(),
         }),

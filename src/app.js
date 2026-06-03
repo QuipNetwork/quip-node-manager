@@ -37,6 +37,10 @@ const state = {
   // dashboard's password; cleared once the dashboard comes up. Drives the
   // error message + Reset button in the dashboard placeholder.
   dashboardDbError: null,
+  // Highest pull generation that has received its `pull-complete`. Progress
+  // events at or below this are stale (a late layer event from a finished
+  // pull) and must not reopen the panel. See handlePullProgress.
+  pullCompletedGen: 0,
 };
 
 const DEFAULT_DASHBOARD_HOSTNAME = ':20049';
@@ -1049,8 +1053,21 @@ function friendlyImageName(id) {
 function handlePullProgress(ev) {
   // Legacy {line} events (non-pull compose commands) have no id — ignore them.
   if (!ev || typeof ev.id !== 'string') return;
-  if (!state.pull || !state.pull.active) {
-    state.pull = { active: true, title: 'Pulling stack images', images: new Map() };
+
+  // Generation gating. Each pull is stamped with a monotonic `gen` by the
+  // backend; `pull-complete` records it in pullCompletedGen. An event at or
+  // below that watermark is a late straggler from a pull we've already closed
+  // (event delivery across the backend's reader threads is not ordered), so
+  // dropping it is what keeps the panel from being resurrected after it hides.
+  const gen = Number(ev.gen) || 0;
+  if (gen <= state.pullCompletedGen) return;
+
+  // A higher generation (or no live session) starts a fresh panel; a lower one
+  // belongs to a superseded pull and is ignored.
+  if (!state.pull || !state.pull.active || gen > state.pull.gen) {
+    state.pull = { active: true, gen, title: 'Pulling stack images', images: new Map() };
+  } else if (gen < state.pull.gen) {
+    return;
   }
 
   const isImageLevel = !ev.parent_id && ev.id.startsWith('Image ');
@@ -1064,6 +1081,10 @@ function handlePullProgress(ev) {
   if (isImageLevel) {
     if (ev.status === 'Done' || ev.text === 'Pulled') img.done = true;
   } else {
+    // The presence of any layer event is what distinguishes an image that is
+    // actually downloading from one that was already up to date — the latter
+    // emits only image-level Working/Done events and no layers, so it never
+    // gets a row (see renderPullPanel).
     const layerDone = ev.text === 'Pull complete' || ev.text === 'Already exists';
     const prev = img.layers.get(ev.id) || { cur: 0, tot: 0 };
     const tot = Number(ev.total) || prev.tot;
@@ -1074,17 +1095,25 @@ function handlePullProgress(ev) {
   }
 
   renderPullPanel();
-
-  const images = [...state.pull.images.values()];
-  if (images.length > 0 && images.every((i) => i.done)) {
-    if (state._pullHideTimer) clearTimeout(state._pullHideTimer);
-    state._pullHideTimer = setTimeout(finishPullProgress, 1500);
-  }
+  // The panel is closed authoritatively by `pull-complete` (generation-keyed),
+  // not by counting per-image "Pulled" events — that accounting could miss an
+  // image's terminal event and, after closing, be reopened by a straggler.
 }
 
 function renderPullPanel() {
   const panel = document.getElementById('pull-progress-panel');
   if (!panel || !state.pull) return;
+
+  // Only images that produced layer events are actually being downloaded;
+  // already-up-to-date images emit only image-level Working/Done events and are
+  // omitted. If nothing is downloading, the panel stays hidden entirely rather
+  // than flashing a bare title.
+  const downloading = [...state.pull.images.values()].filter((img) => img.layers.size > 0);
+  if (downloading.length === 0) {
+    panel.style.display = 'none';
+    panel.replaceChildren();
+    return;
+  }
   panel.style.display = '';
 
   const title = document.createElement('div');
@@ -1092,7 +1121,7 @@ function renderPullPanel() {
   title.textContent = state.pull.title || 'Downloading';
   const rows = [title];
 
-  for (const img of state.pull.images.values()) {
+  for (const img of downloading) {
     const layers = [...img.layers.values()];
     const tot = layers.reduce((s, l) => s + l.tot, 0);
     const cur = layers.reduce((s, l) => s + l.cur, 0);
@@ -1140,14 +1169,17 @@ function finishPullProgress() {
     panel.style.display = 'none';
     panel.replaceChildren();
   }
-  state.pull = { active: false, images: new Map() };
+  state.pull = null;
 }
 
 // The native miner binary download reuses the same panel as a single bar.
 function handleBinaryDownloadProgress(ev) {
   const { downloaded, total, done } = ev || {};
   if (!state.pull || !state.pull.active) {
-    state.pull = { active: true, title: 'Downloading native miner', images: new Map() };
+    // gen: Infinity keeps a late docker `pull-complete` (always a finite
+    // generation) from closing this native-miner download, which shares the
+    // panel but isn't part of the docker pull generation sequence.
+    state.pull = { active: true, gen: Infinity, title: 'Downloading native miner', images: new Map() };
   }
   let img = state.pull.images.get('native-miner');
   if (!img) {
@@ -1362,11 +1394,17 @@ async function setupListeners() {
   // "Pulled" events, which can miss an image's terminal event on some
   // platforms and leave the panel stuck open.
   await listen('pull-complete', (event) => {
-    const { success, error } = event.payload || {};
+    const { gen, success, error } = event.payload || {};
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
-    finishPullProgress();
+    // Mark this generation closed so any straggler progress event can't reopen
+    // the panel, then hide it if the live session is this pull (or older).
+    const closed = Number(gen) || 0;
+    state.pullCompletedGen = Math.max(state.pullCompletedGen, closed);
+    if (!state.pull || state.pull.gen === undefined || state.pull.gen <= closed) {
+      finishPullProgress();
+    }
   });
 
   // Per-image pull bars (docker compose --progress json, aggregated per image).
