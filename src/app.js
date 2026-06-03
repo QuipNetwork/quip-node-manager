@@ -144,9 +144,18 @@ function refreshDashboardTab() {
   if (!frame || !empty) return; // tab markup not present on first load
 
   const url = dashboardUrl(state.settings);
-  const dashRunning = state.stack?.services?.some(
-    (s) => (s.service === 'dashboard' || s.service === 'dashboard-direct') && s.running,
+  // Only load the iframe once the dashboard is actually serving: running AND
+  // (healthy or no healthcheck). Loading it while the dashboard/Caddy are still
+  // starting lands the iframe on a connection-error page that never recovers —
+  // refreshDashboardTab won't re-set an unchanged `src`, so it stays stuck
+  // until a manual reload. The dashboard image ships a healthcheck, and Caddy
+  // starts after it, so "healthy" implies the front door is up.
+  const dashSvc = state.stack?.services?.find(
+    (s) => s.service === 'dashboard' || s.service === 'dashboard-direct',
   );
+  const dashRunning = !!dashSvc?.running
+    && dashSvc.health !== 'starting'
+    && dashSvc.health !== 'unhealthy';
 
   // Toggle via style.display rather than the `hidden` attribute — the
   // placeholder has `display: flex` in CSS (for its centered layout) which
@@ -1345,14 +1354,17 @@ async function setupListeners() {
     updateStartStopState();
   });
 
-  // Docker pull lifecycle — pull-complete always triggers a backend-side
-  // recheck of image+version, so the UI auto-updates without us doing
-  // anything here beyond logging terminal outcomes.
+  // Docker pull lifecycle. The backend emits this when the `docker compose
+  // pull` process exits — the authoritative "pull is over" signal. Hide the
+  // progress panel here rather than relying solely on counting per-image
+  // "Pulled" events, which can miss an image's terminal event on some
+  // platforms and leave the panel stuck open.
   await listen('pull-complete', (event) => {
     const { success, error } = event.payload || {};
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Pull failed: ${error || 'unknown error'}` });
     }
+    finishPullProgress();
   });
 
   // Per-image pull bars (docker compose --progress json, aggregated per image).
