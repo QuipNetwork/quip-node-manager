@@ -75,7 +75,16 @@ function dashboardHostnameForSettings(settings) {
   if (isPublicDnsHost(publicHost)) {
     return `${publicHost}, ${publicHost}:${CADDY_PUBLIC_API_PORT}`;
   }
-  return settings?.hostname || DEFAULT_DASHBOARD_HOSTNAME;
+  // Mirror resolved_caddy_hostname: only honor the hostname field when it holds
+  // a real public DNS host (incl. the `host, host:20049` form). localhost / an
+  // IP / a bare or edited port normalize to the port-only default so the iframe
+  // targets plain HTTP on the (remapped) API port instead of an auto-HTTPS host.
+  const fallback = (settings?.hostname || '').trim();
+  const fallbackHost = publicHostName(fallback.split(',')[0]);
+  if (isPublicDnsHost(fallbackHost)) {
+    return fallback;
+  }
+  return DEFAULT_DASHBOARD_HOSTNAME;
 }
 
 function dashboardHostForBrowser(settings) {
@@ -111,9 +120,6 @@ document.addEventListener('change', (e) => {
   if (!e.target) return;
   if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
-    // TLS adds caddy:2-alpine to the required stack images — recheck so
-    // stack-images reflects it without waiting for the next cycle.
-    invoke('recheck').catch(() => {});
   }
 });
 
@@ -179,7 +185,7 @@ function refreshDashboardTab() {
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
   'docker', 'docker-compose', 'wsl',
-  'stack-images', 'binary', 'secret',
+  'binary', 'secret',
   'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
