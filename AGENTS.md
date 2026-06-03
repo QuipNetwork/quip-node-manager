@@ -5,7 +5,7 @@ Instructions for AI coding agents (Claude Code, Codex, Cursor, etc.).
 ## Project Overview
 
 Quip Node Desktop Manager — a Tauri v2 desktop app that orchestrates and monitors the Quip node
-stack (miner + validator + bootstrap + dashboard + postgres + caddy). Runs the stack via Docker
+stack (miner + validator + dashboard + postgres + caddy). Runs the stack via Docker
 Compose, or in Native mode (default on macOS) where the miner binary runs on the host and the
 support services run in Docker. The same binary also exposes a headless TUI (`--cli`, or when no
 display is available — SSH/headless). Rust backend + vanilla HTML/CSS/JS frontend.
@@ -44,7 +44,7 @@ quip-node-manager/
         ├── cmd.rs                 # Command wrapper: PATH augmentation (login-shell
         │                          # $PATH + known tool dirs) + Windows no-console-flash
         ├── compose.rs             # docker compose orchestration: miner +
-        │                          # validator + bootstrap + dashboard + postgres + caddy
+        │                          # validator + dashboard + postgres + caddy
         ├── stack_assets.rs        # include_str! the compose.yml + Caddyfile + chain
         │                          # spec; patch ports + Native upstream at stage time
         ├── log_stream.rs          # docker compose logs -f → Tauri events
@@ -78,10 +78,12 @@ quip-node-manager/
   `docker-compose` (v1), not the Python bindings.
 - **Container names** (from compose `container_name`): `quip-cpu` or
   `quip-cuda` (miner, chosen by GPU presence), `quip-validator` (Substrate
-  block-producing validator), `quip-bootstrap` (one-shot keystore
-  registration), `quip-dashboard`, `quip-postgres`, `quip-caddy`. The
+  block-producing validator), `quip-dashboard`, `quip-postgres`, `quip-caddy`. The
   dashboard/Caddy reach the miner via the compose network alias `quip-miner`,
-  and the validator via `quip-validator`. D-Wave QPU mining activates on top of
+  and the validator via `quip-validator`. The miner self-bootstraps on first
+  start — it auto-funds via the testnet faucet and registers its keystore in
+  `QuantumPow.Miners`, so there is no separate one-shot bootstrap container.
+  D-Wave QPU mining activates on top of
   the CPU image via `config.toml [dwave]` (no separate qpu service). The
   upstream compose also defines an optional `quip-faucet` service behind a
   `faucet` profile, which the manager never starts.
@@ -114,7 +116,6 @@ tag live in `src-tauri/src/compose.rs` (`CPU_IMAGE`, `CUDA_IMAGE`,
 - Miner (CPU): `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2`
 - Miner (CUDA): `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2`
 - Validator: `registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2`
-- Bootstrap (one-shot keystore registration): reuses the CPU miner image `quip-miner-cpu:v0.2`
 - Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network:v0.2`
 - Postgres: `postgres:16` (Docker Hub)
 - Caddy: `caddy:2-alpine` (Docker Hub)
@@ -125,15 +126,15 @@ Selected by `AppSettings`:
 - `tls_enabled: bool` — controls whether Caddy provisions TLS (`:80`/`:443` are
   always published by the caddy service).
 
-The dashboard + postgres + caddy + validator + bootstrap services are always part
+The dashboard + postgres + caddy + validator services are always part
 of the `cpu`/`cuda` profile — there is no `dashboard_enabled` toggle.
 
 ## Run Modes
 
 | run_mode | node | compose services run |
 |----------|------|----------------------|
-| `Docker` | `quip-{cpu,cuda}` miner container via compose | every profile service: miner + `quip-bootstrap` + `quip-validator` + `dashboard` + `postgres` + `caddy` (empty positional list ⇒ compose starts the whole profile) |
-| `Native` (macOS only) | native miner binary on the host (`~/quip-data/bin/quip-miner-*`) | explicit list `quip-validator dashboard postgres caddy` — no miner/bootstrap container. The validator's JSON-RPC (9944) is published on `127.0.0.1:<validator_rpc_port>` so the host miner connects via `ws://127.0.0.1:<validator_rpc_port>`; the dashboard reaches the host miner's REST at `host.docker.internal:<rest_port>` |
+| `Docker` | `quip-{cpu,cuda}` miner container via compose | every profile service: miner + `quip-validator` + `dashboard` + `postgres` + `caddy` (empty positional list ⇒ compose starts the whole profile) |
+| `Native` (macOS only) | native miner binary on the host (`~/quip-data/bin/quip-miner-*`) | explicit list `quip-validator dashboard postgres caddy` — no miner container. The validator's JSON-RPC (9944) is published on `127.0.0.1:<validator_rpc_port>` so the host miner connects via `ws://127.0.0.1:<validator_rpc_port>`; the dashboard reaches the host miner's REST at `host.docker.internal:<rest_port>` |
 
 ## Compose Profiles
 
@@ -141,8 +142,8 @@ of the `cpu`/`cuda` profile — there is no `dashboard_enabled` toggle.
 
 | profile | services started |
 |---------|------------------|
-| `cpu` | `cpu` miner + `quip-bootstrap` + `quip-validator` + `dashboard` + `postgres` + `caddy` |
-| `cuda` | `cuda` miner + `quip-bootstrap` + `quip-validator` + `dashboard` + `postgres` + `caddy` |
+| `cpu` | `cpu` miner + `quip-validator` + `dashboard` + `postgres` + `caddy` |
+| `cuda` | `cuda` miner + `quip-validator` + `dashboard` + `postgres` + `caddy` |
 
 `compose_profile(image_tag)` returns the image's service name (`cpu` or `cuda`) —
 there is no `qpu` profile (D-Wave mining rides on the CPU image via
@@ -151,8 +152,8 @@ both profiles. The vendored compose file also defines an opt-in `faucet` profile
 (`quip-faucet`), which the manager never selects.
 
 In Native mode, `start_stack` passes an explicit positional service list
-(`quip-validator dashboard postgres caddy`) that omits the miner and bootstrap,
-so `--profile` gates eligibility while positional args restrict what actually
+(`quip-validator dashboard postgres caddy`) that omits the miner, so
+`--profile` gates eligibility while positional args restrict what actually
 starts.
 
 ## Data Files (all in `~/quip-data/`)

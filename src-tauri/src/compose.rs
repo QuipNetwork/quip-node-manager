@@ -77,7 +77,7 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
 
 /// Compose profile name for v0.2 — the same string as the image's service
 /// name. The standard upstream profiles always include dashboard, postgres,
-/// Caddy, the selected miner, bootstrap, and validator.
+/// Caddy, the selected miner, and validator.
 pub fn compose_profile(image_tag: ImageTag) -> &'static str {
     image_tag.service()
 }
@@ -87,9 +87,9 @@ pub fn compose_profile(image_tag: ImageTag) -> &'static str {
 /// - Docker mode: empty slice means "start every service the profile allows"
 ///   (compose default). We don't enumerate because the profile already gates
 ///   things down to the correct set.
-/// - Native mode: we skip the miner and bootstrap containers and hand compose
-///   an explicit list of support services. The profile is still set so these
-///   services are eligible, while positional args restrict startup to them.
+/// - Native mode: we skip the miner container and hand compose an explicit
+///   list of support services. The profile is still set so these services are
+///   eligible, while positional args restrict startup to them.
 pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     match run_mode {
         RunMode::Docker => &[],
@@ -557,6 +557,15 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         );
     }
 
+    // Belt-and-suspenders: `down` has been observed to silently no-op when the
+    // project label doesn't line up, and Stop now only stops containers
+    // (leaving them in place). Force-remove the known container names and sweep
+    // image orphans so `up` recreates from a clean slate — and so containers
+    // from older compose files the current one no longer declares (e.g. the
+    // removed quip-bootstrap) are reaped on upgrade.
+    force_remove_known_containers(&app).await;
+    sweep_orphan_node_containers(&app).await;
+
     let profile = compose_profile(settings.image_tag);
 
     // (8) Pull the configured v0.2 preview tags.
@@ -766,35 +775,25 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Stop the compose stack. Named volumes (quip_pgdata, quip_caddy-data,
-/// quip_caddy-config) are preserved by default — `down` removes containers
-/// and the project network only.
+/// Stop the compose stack. Uses `docker compose stop`, which halts the
+/// containers but leaves them — and the project network and named volumes
+/// (quip-pgdata, quip-caddy-data, quip-caddy-config) — in place. Stop must not
+/// destroy containers; recreating from a clean slate is the Start path's job
+/// (`down` + name reap). `docker compose stop` acts on every running container
+/// in the project, including profiled ones, without needing the profile flag.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("stop-started", serde_json::json!({}));
 
     // Kill the log-streamer child first — same ordering as the old
     // stop_node_container sequence, so `docker compose logs -f` unblocks
-    // before we tear containers down.
+    // before we stop the containers.
     let log_state = app.state::<LogStreamState>();
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
 
-    log_cmd(&app, "docker compose down");
-    let result = run_compose_streaming(&app, vec!["down".into()]).await;
-
-    // Belt-and-suspenders: force-remove each container by the explicit
-    // name the compose file declares. Covers cases where `docker compose
-    // down` reports success but the project-label lookup misses — which
-    // has been observed with some compose/Docker version combos. Missing
-    // names exit non-zero (no such container); we ignore those.
-    force_remove_known_containers(&app).await;
-
-    // Sweep orphan containers that aren't part of the compose project but
-    // are running our node images. Catches stragglers from older builds
-    // that ran `docker run <node-image> --version` and ended up launching
-    // a full node under a random anonymous name.
-    sweep_orphan_node_containers(&app).await;
+    log_cmd(&app, "docker compose stop");
+    let result = run_compose_streaming(&app, vec!["stop".into()]).await;
 
     match &result {
         Ok(_) => {
@@ -813,18 +812,22 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     result
 }
 
-/// Container names declared in the upstream `docker-compose.yml`. These
-/// don't change with profile or run-mode — they're fixed by compose's
-/// `container_name:` directive — so we can always try to reap them.
+/// Container names we force-remove as a Start-time cleanup backstop. The first
+/// group is the fixed `container_name:` values from the current upstream
+/// `docker-compose.yml` (independent of profile/run-mode). The trailing group
+/// is legacy names the current compose file no longer declares, kept only so an
+/// upgrade still reaps them.
 const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-cpu",
     "quip-cuda",
     "quip-validator",
-    "quip-bootstrap",
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
-    // Legacy one-container TUI path; kept as a cleanup-only backstop.
+    // Removed in v0.2 — the cpu/cuda miners self-bootstrap (faucet + miner +
+    // descriptor registration), so the one-shot bootstrap container is gone.
+    "quip-bootstrap",
+    // Legacy one-container TUI path.
     "quip-node",
 ];
 
