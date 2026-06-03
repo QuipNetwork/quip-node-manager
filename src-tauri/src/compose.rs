@@ -466,7 +466,21 @@ async fn pull_compose_images_for_settings(
     }
 
     log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    run_compose_streaming_mode(app, args, StdoutMode::PullJson).await
+    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson).await;
+
+    // Tell the UI the pull is over so it can hide the progress panel. The panel
+    // also hides itself once every image reports "Pulled", but that per-image
+    // accounting has proven unreliable on some platforms (an image's terminal
+    // event can be missed), leaving the panel stuck. Process exit is the
+    // authoritative signal, so emit it unconditionally.
+    let _ = app.emit(
+        "pull-complete",
+        serde_json::json!({
+            "success": result.is_ok(),
+            "error": result.as_ref().err().cloned().unwrap_or_default(),
+        }),
+    );
+    result
 }
 
 /// Start the compose stack (and, in Native mode, arrange for the native
@@ -544,51 +558,54 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     log_cmd(&app, "Writing config.toml");
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
-    // (7) Clean slate. `down` is cheap and idempotent; removes stale
-    // containers left behind when the user switches image_tag/profile.
-    log_cmd(&app, "docker compose down");
-    // Best-effort cleanup, but surface a failure: a wedged `down` (stuck
-    // container, dead daemon) turns the next `up` into a confusing
-    // name-conflict error whose root cause would otherwise be invisible.
-    if let Err(e) = run_compose_streaming(&app, vec!["down".into()]).await {
-        log_err(
-            &app,
-            &format!("Warning: pre-start cleanup (docker compose down) failed, continuing: {e}"),
-        );
-    }
-
-    // Belt-and-suspenders: `down` has been observed to silently no-op when the
-    // project label doesn't line up, and Stop now only stops containers
-    // (leaving them in place). Force-remove the known container names and sweep
-    // image orphans so `up` recreates from a clean slate — and so containers
-    // from older compose files the current one no longer declares (e.g. the
-    // removed quip-bootstrap) are reaped on upgrade.
-    force_remove_known_containers(&app).await;
-    sweep_orphan_node_containers(&app).await;
-
     let profile = compose_profile(settings.image_tag);
 
-    // (8) Pull the configured v0.2 preview tags.
+    // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
     pull_compose_images_for_settings(&app, &settings).await?;
 
-    // (9) Up.
-    let mut up_args: Vec<String> =
-        vec!["--profile".into(), profile.into(), "up".into(), "-d".into()];
+    // (8) Up. There is no separate `down`: Stop only stops the containers, so a
+    // normal restart reuses them and compose recreates just what changed.
+    // `--remove-orphans` reaps containers for services the current compose no
+    // longer declares (e.g. the removed quip-bootstrap) without destroying the
+    // rest.
+    let mut up_args: Vec<String> = vec![
+        "--profile".into(),
+        profile.into(),
+        "up".into(),
+        "-d".into(),
+        "--remove-orphans".into(),
+    ];
     for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
     log_cmd(
         &app,
         &format!(
-            "docker compose --profile {profile} up -d{}",
-            if up_args.len() > 4 {
-                format!(" {}", up_args[4..].join(" "))
+            "docker compose --profile {profile} up -d --remove-orphans{}",
+            if up_args.len() > 5 {
+                format!(" {}", up_args[5..].join(" "))
             } else {
                 String::new()
             }
         ),
     );
-    let up_result = run_compose_streaming(&app, up_args).await;
+    let mut up_result = run_compose_streaming(&app, up_args.clone()).await;
+
+    // `up` only fails like this when a leftover container is holding one of our
+    // fixed container_names and compose can't reconcile it — e.g. one created
+    // by an older version under a different project label, which surfaces as a
+    // name conflict rather than a container to recreate. Reap the known names
+    // (and image orphans) once, then retry. This runs ONLY on failure, so a
+    // normal start never force-removes anything.
+    if let Err(e) = &up_result {
+        log_err(
+            &app,
+            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
+        );
+        force_remove_known_containers(&app).await;
+        sweep_orphan_node_containers(&app).await;
+        up_result = run_compose_streaming(&app, up_args).await;
+    }
 
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
     // or foreign data volume keeps an old password and would otherwise leave
