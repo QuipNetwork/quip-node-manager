@@ -873,8 +873,15 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// containers but leaves them — and the project network and named volumes
 /// (quip-pgdata, quip-caddy-data, quip-caddy-config) — in place. Stop must not
 /// destroy containers; recreating from a clean slate is the Start path's job
-/// (`down` + name reap). `docker compose stop` acts on every running container
-/// in the project, including profiled ones, without needing the profile flag.
+/// (`down` + name reap).
+///
+/// Every service in the upstream compose file is gated behind the `cpu`/`cuda`
+/// profile, so `stop` MUST activate those profiles. Compose v2 reconciles
+/// `stop`/`down`/`restart` against the *active* profile set; without
+/// `--profile`, profile-gated services are absent from the model and `stop`
+/// silently halts nothing (exit 0, no output). We activate both `cpu` and
+/// `cuda` so Stop halts the whole stack regardless of the configured miner
+/// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("stop-started", serde_json::json!({}));
@@ -886,8 +893,15 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
 
-    log_cmd(&app, "docker compose stop");
-    let result = run_compose_streaming(&app, vec!["stop".into()]).await;
+    let stop_args: Vec<String> = vec![
+        "--profile".into(),
+        compose_profile(ImageTag::Cpu).into(),
+        "--profile".into(),
+        compose_profile(ImageTag::Cuda).into(),
+        "stop".into(),
+    ];
+    log_cmd(&app, "docker compose --profile cpu --profile cuda stop");
+    let result = run_compose_streaming(&app, stop_args).await;
 
     match &result {
         Ok(_) => {
