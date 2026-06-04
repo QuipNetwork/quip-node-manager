@@ -490,5 +490,8 @@ mod tests {
         assert!(parse_semver("0.2.0-rc1") > parse_semver("0.1.9"));
         // Identical versions compare equal — no spurious update offered.
         assert_eq!(parse_semver("0.2.0-rc1"), parse_semver("v0.2.0-rc1"));
+        // A higher patch outranks a lower final release even as a pre-release,
+        // so the binary updater never downgrades 0.2.1-rc2 to 0.2.0.
+        assert!(parse_semver("0.2.1-rc2") > parse_semver("0.2.0"));
     }
 }

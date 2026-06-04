@@ -89,7 +89,12 @@ fn binary_release_marker_path() -> std::path::PathBuf {
 }
 
 /// Fetch the quip-protocol releases list (GitLab returns them newest-first).
-async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json::Value> {
+/// Returns the URL it hit and the specific cause on failure so callers can show
+/// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
+/// than a generic "couldn't list releases".
+async fn fetch_protocol_releases(
+    client: &reqwest::Client,
+) -> Result<serde_json::Value, String> {
     let url = format!(
         "https://gitlab.com/api/v4/projects/{}/releases?per_page=20",
         PROTOCOL_PROJECT
@@ -99,11 +104,14 @@ async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json:
         .header("User-Agent", "quip-node-manager")
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("GET {url} returned HTTP {status}"));
     }
-    resp.json().await.ok()
+    resp.json()
+        .await
+        .map_err(|e| format!("GET {url} returned unparseable JSON: {e}"))
 }
 
 /// (tag, asset_url, description) for every release that ships `asset_name`,
@@ -530,9 +538,7 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| e.to_string())?;
-    let releases = fetch_protocol_releases(&meta_client)
-        .await
-        .ok_or_else(|| "Could not list quip-protocol releases".to_string())?;
+    let releases = fetch_protocol_releases(&meta_client).await?;
     let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name)
         .await
         .ok_or_else(|| {
@@ -639,16 +645,31 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     Ok(version)
 }
 
-/// Check if the configured v0.2 native miner release is installed.
-#[tauri::command]
-pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
-    let current = match tokio::task::spawn_blocking(installed_binary_version)
+/// Installed vs. latest-downloadable native miner versions, and whether an
+/// update is warranted. `latest` is `None` when the release feed couldn't be
+/// reached (so callers can distinguish "confirmed current" from "couldn't
+/// check"). `update` is `Some` only when `latest` is strictly newer.
+#[derive(Debug, Clone)]
+pub struct BinaryVersions {
+    pub installed: Option<String>,
+    pub latest: Option<String>,
+    pub update: Option<crate::update::UpdateInfo>,
+}
+
+/// Resolve installed and latest-online versions in one pass. Surfaces both
+/// numbers so the UI can show what it discovered, not just a yes/no verdict.
+pub async fn resolve_binary_versions() -> Result<BinaryVersions, String> {
+    let installed = tokio::task::spawn_blocking(installed_binary_version)
         .await
         .ok()
-        .flatten()
-    {
-        Some(v) => v,
-        None => return Ok(None),
+        .flatten();
+    // No installed binary → nothing to compare against; skip the network call.
+    let Some(current) = installed.clone() else {
+        return Ok(BinaryVersions {
+            installed: None,
+            latest: None,
+            update: None,
+        });
     };
 
     let client = reqwest::Client::builder()
@@ -656,35 +677,62 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         .build()
         .map_err(|e| e.to_string())?;
 
-    let Some(releases) = fetch_protocol_releases(&client).await else {
-        return Ok(None);
+    // Update check is best-effort: an unreachable feed leaves the installed
+    // binary running, so a fetch failure is non-fatal here (unlike the download
+    // path, which surfaces the cause to the user). Leave `latest` as None so the
+    // caller can say "couldn't check" rather than over-claiming "up to date".
+    let latest_release = match fetch_protocol_releases(&client).await {
+        Ok(releases) => {
+            // Only offer an update we can actually install — a just-tagged
+            // release whose artifact build hasn't finished is skipped until
+            // it's downloadable.
+            resolve_latest_downloadable_release(&client, &releases, binary_name())
+                .await
+                .filter(|(tag, _, _)| !tag.is_empty())
+        }
+        Err(_) => None,
     };
-    // Only offer an update we can actually install — a just-tagged release
-    // whose artifact build hasn't finished is skipped until it's downloadable.
-    let Some((tag, url, description)) =
-        resolve_latest_downloadable_release(&client, &releases, binary_name()).await
-    else {
-        return Ok(None);
+    let Some((tag, url, description)) = latest_release else {
+        return Ok(BinaryVersions {
+            installed: Some(normalize_release_version(&current)),
+            latest: None,
+            update: None,
+        });
     };
-    if tag.is_empty() {
-        return Ok(None);
-    }
 
-    let current_tag_matches = installed_binary_release_tag()
-        .map(|installed| installed == tag)
-        .unwrap_or(false);
-    let current_version_matches =
-        normalize_release_version(&current) == normalize_release_version(&tag);
-
-    if !current_tag_matches && !current_version_matches {
-        Ok(Some(crate::update::UpdateInfo {
-            version: normalize_release_version(&tag),
-            url,
-            notes: description,
-        }))
-    } else {
-        Ok(None)
+    // Only offer a strictly newer release — never a downgrade. A bare
+    // inequality check walks an installed `-rcN` back to the lower final
+    // release (e.g. local 0.2.1-rc2 → latest-downloadable 0.2.0) whenever
+    // the higher version's artifact is missing or sorts older by date.
+    // Compare semver against the higher of the binary's own `--version` and
+    // the recorded install tag, since either may lag the other.
+    let mut installed_sv = crate::update::parse_semver(current.trim_start_matches('v'));
+    if let Some(marker) = installed_binary_release_tag() {
+        installed_sv =
+            installed_sv.max(crate::update::parse_semver(marker.trim_start_matches('v')));
     }
+    let latest_sv = crate::update::parse_semver(tag.trim_start_matches('v'));
+    let latest_version = normalize_release_version(&tag);
+
+    let update = (latest_sv > installed_sv).then(|| crate::update::UpdateInfo {
+        version: latest_version.clone(),
+        url,
+        notes: description,
+    });
+
+    Ok(BinaryVersions {
+        installed: Some(normalize_release_version(&current)),
+        latest: Some(latest_version),
+        update,
+    })
+}
+
+/// Check if a newer v0.2 native miner release is available. Thin wrapper over
+/// [`resolve_binary_versions`] preserving the `Option<UpdateInfo>` contract the
+/// frontend update banner consumes.
+#[tauri::command]
+pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
+    Ok(resolve_binary_versions().await?.update)
 }
 
 #[tauri::command]

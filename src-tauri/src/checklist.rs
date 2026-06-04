@@ -791,28 +791,53 @@ async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
 
     // Missing → download before reporting. Skipped when there's no app handle.
     if !available {
+        // Capture the download error verbatim — download_native_binary already
+        // returns a precise, user-actionable reason (release feed unreachable,
+        // artifact not built yet, HTTP status, write error). Replacing it with a
+        // generic "check your connection" hid the real cause.
+        let mut download_err: Option<String> = None;
         if let Some(app) = &ctx.app {
-            let _ = crate::native::download_native_binary(app.clone()).await;
+            if let Err(e) = crate::native::download_native_binary(app.clone()).await {
+                download_err = Some(e);
+            }
             available = tokio::task::spawn_blocking(crate::native::is_binary_available)
                 .await
                 .unwrap_or(false);
         }
         if !available {
+            let detail = download_err.unwrap_or_else(|| {
+                "no app handle available to start the download".to_string()
+            });
             return base
                 .with_state(CheckState::Fail)
-                .with_label("Native miner binary not installed")
-                .with_detail("download failed \u{2014} check your connection and retry");
+                .with_label("Native miner binary download failed")
+                .with_detail(detail);
         }
     }
 
-    match crate::native::check_binary_update().await {
-        Ok(Some(info)) => fetch_binary_update(ctx, base, &info.version).await,
-        Ok(None) => base
-            .with_state(CheckState::Pass)
-            .with_label("Native miner binary up to date"),
-        // Binary is installed, but we couldn't reach the release feed to
-        // confirm it's current. Green would over-claim, so warn (the binary
-        // still runs — a Warn never blocks start).
+    match crate::native::resolve_binary_versions().await {
+        Ok(v) => {
+            let installed = v.installed.as_deref().unwrap_or("unknown");
+            match (v.update, v.latest) {
+                // A newer release exists → fetch it before reporting.
+                (Some(info), _) => fetch_binary_update(ctx, base, &info.version).await,
+                // Confirmed current: show both numbers so the user can see what
+                // was discovered, not just a green check.
+                (None, Some(latest)) => base.with_state(CheckState::Pass).with_label(format!(
+                    "Native miner binary up to date (installed v{installed}, latest v{latest})"
+                )),
+                // Installed, but the release feed was unreachable — we can't
+                // confirm it's current. Green would over-claim, so warn (the
+                // binary still runs — a Warn never blocks start).
+                (None, None) => base
+                    .with_state(CheckState::Warn)
+                    .with_label(format!(
+                        "Native miner binary installed (v{installed}); couldn't reach release feed"
+                    ))
+                    .with_detail("update check skipped — could not list quip-protocol releases"),
+            }
+        }
+        // Rare: HTTP client couldn't even be built. Binary still runs.
         Err(e) => base
             .with_state(CheckState::Warn)
             .with_label("Native miner binary installed (update check failed)")
