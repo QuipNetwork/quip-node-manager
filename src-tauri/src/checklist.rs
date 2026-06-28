@@ -334,34 +334,20 @@ impl PortProbeResult {
 /// the host at all" from "host responded, just not as expected" and from
 /// service-side errors we shouldn't blame the user for.
 enum ProbeOutcome {
-    /// Service returned success-key=true OR success-key=false with an
-    /// error indicating the host *did* respond (protocol-level mismatch,
-    /// RST, handshake succeeded but status response missing, etc.). From
-    /// the router-forwarding perspective these are all passing cases.
+    /// `/checkport` reported `reachable:true`: the external TCP connect got a
+    /// SYN-ACK, so the router forward works and something is listening. The
+    /// only passing case.
     HostResponded,
-    /// Service returned success-key=false AND the error indicates no
-    /// response at the UDP/TCP layer (timeout, unreachable, no route).
-    Timeout,
+    /// `/checkport` reported `reachable:false`: the external TCP connect could
+    /// not be established — the SYN timed out, or the host/router replied with
+    /// a RST ("connection refused"). Either way the port is not reachable.
+    Unreachable,
     /// HTTP 429 with `retry_after_seconds`. We can't verify right now, so
     /// we surface a warning but preserve the retry time for the UX.
     RateLimited(u64),
     /// Any other failure — HTTP 5xx, non-JSON body, client-side network
     /// error. Treated as lenient-pass (not the user's fault).
     ServiceError,
-}
-
-/// Classify an `error` string from check.quip.network as a pure
-/// connect-level timeout (no response from the host) vs any other kind
-/// of failure (host responded, just not with a full protocol success).
-///
-/// Conservative heuristic — when in doubt, treat as responded. That
-/// matches the "only failure to connect is a fail" rule.
-fn is_connect_timeout(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("unreachable")
-        || lower.contains("no route")
 }
 
 /// TCP forwarding check. One `/checkport` probe runs:
@@ -434,7 +420,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
             );
             match probe_external_tcp(ctx, port).await {
                 ProbeOutcome::HostResponded => PortProbeResult::Verified,
-                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
+                ProbeOutcome::Unreachable => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
                     retry_after_secs: retry,
                     endpoint: "checkport",
@@ -464,7 +450,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
             accept_task.abort();
             match outcome {
                 ProbeOutcome::HostResponded => PortProbeResult::ForwardReady,
-                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
+                ProbeOutcome::Unreachable => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
                     retry_after_secs: retry,
                     endpoint: "checkport",
@@ -563,22 +549,26 @@ async fn fetch_probe_json(
     let Ok(json) = serde_json::from_str::<Value>(&body) else {
         return ProbeOutcome::ServiceError;
     };
-    let success = json
+    let reachable = json
         .get(success_key)
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if success {
-        return ProbeOutcome::HostResponded;
-    }
-    // success-key is false — classify by the error string. A pure connect
-    // timeout means the host didn't respond at all. Anything else (ALPN
-    // mismatch, RST, TLS error, banner timeout, etc.) means the host IS
-    // reachable at the transport layer, so the router forward is working.
-    let error_str = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
-    if is_connect_timeout(error_str) {
-        ProbeOutcome::Timeout
-    } else {
+    classify_checkport(reachable)
+}
+
+/// Classify a parsed `/checkport` `reachable` flag into a `ProbeOutcome`.
+///
+/// `/checkport` performs a single plain-TCP connect from check.quip.network to
+/// the caller's public IP, so the result is binary: `reachable:true` is a
+/// SYN-ACK (forward works *and* something is listening); `reachable:false` is
+/// either a timeout (SYN dropped) or a RST/"connection refused" — in every
+/// `false` case the prober could not open a TCP connection, so the port is not
+/// externally reachable.
+fn classify_checkport(reachable: bool) -> ProbeOutcome {
+    if reachable {
         ProbeOutcome::HostResponded
+    } else {
+        ProbeOutcome::Unreachable
     }
 }
 
@@ -1265,6 +1255,30 @@ mod tests {
             label.contains("couldn't externally verify"),
             "label was: {label}"
         );
+    }
+
+    #[test]
+    fn connection_refused_is_not_reachable() {
+        // From the field: GET /checkport?port=30333 → HTTP 200
+        // {"reachable":false,"error":"dial tcp 96.233.112.201:30333: connect:
+        // connection refused"}. A plain-TCP RST means the prober never reached
+        // our listener, so the port is NOT externally reachable — this must map
+        // to the not-reachable outcome (Warn/orange), never a pass.
+        let outcome = classify_checkport(false);
+        assert!(
+            matches!(outcome, ProbeOutcome::Unreachable),
+            "connection refused should classify as not-reachable"
+        );
+    }
+
+    #[test]
+    fn reachable_true_is_the_only_passing_outcome() {
+        // Guards the success path so the binary classifier can't regress into
+        // failing a genuinely reachable port.
+        assert!(matches!(
+            classify_checkport(true),
+            ProbeOutcome::HostResponded
+        ));
     }
 
     #[test]
