@@ -328,17 +328,19 @@ so non-Tauri callers (the TUI) probe silently.
 The frontend uses `window.__TAURI__.core.invoke` (`withGlobalTauri: true`).
 
 Events emitted by backend (complete set): `node-log`, `checklist-update`,
-`pull-progress`, `stop-started`, `stop-complete`, `image-update-available`,
-`binary-update-available`, `binary-download-progress`, `app-update-available`.
-(The frontend also registers listeners for `node-status`, `stack-status`, and
-`pull-complete`, none of which the backend emits — dead listeners.)
+`pull-progress`, `pull-complete`, `stop-started`, `stop-complete`,
+`dashboard-db-mismatch`, `image-update-available`, `binary-update-available`,
+`binary-download-progress`, `app-update-available`.
 
 - `node-log` → `{ timestamp, level, message }`
 - `checklist-update` → `CheckItem { id, state, label, detail, required,
   fixable, updated_at_ms }`
 - `pull-progress` → `{ line }` (one `docker compose pull` output line) or a
   `--progress json` layer event forwarded verbatim
+- `pull-complete` → `{ gen, success, error }` (emitted when the pull process
+  exits — the authoritative "pull is over" signal)
 - `stop-started`, `stop-complete` — stop lifecycle
+- `dashboard-db-mismatch` → `{ message }` (Postgres volume password mismatch)
 - `image-update-available` → `{ image, info }` (emitted per image whose digest
   changed, gated on `info.update_available`)
 - `binary-update-available` → native-binary UpdateInfo
