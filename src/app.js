@@ -154,9 +154,7 @@ function refreshDashboardTab() {
   // refreshDashboardTab won't re-set an unchanged `src`, so it stays stuck
   // until a manual reload. The dashboard image ships a healthcheck, and Caddy
   // starts after it, so "healthy" implies the front door is up.
-  const dashSvc = state.stack?.services?.find(
-    (s) => s.service === 'dashboard' || s.service === 'dashboard-direct',
-  );
+  const dashSvc = state.stack?.services?.find((s) => s.service === 'dashboard');
   const dashRunning = !!dashSvc?.running
     && dashSvc.health !== 'starting'
     && dashSvc.health !== 'unhealthy';
@@ -755,7 +753,7 @@ function setStatus(stateStr) {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
-    sub.textContent = 'Running but some checks failing';
+    sub.textContent = 'Running, but some stack services are down or unhealthy';
   } else {
     dot.classList.add('status-stopped');
     text.classList.add('status-stopped');
@@ -786,7 +784,6 @@ function visibleInMode(id, runMode) {
   switch (id) {
     case 'docker':
     case 'docker-compose':
-    case 'stack-images':
       return composeWillRun;
     case 'wsl':
       return isDocker && state.hardwareSurvey?.os === 'windows';
@@ -867,7 +864,6 @@ function defaultLabel(id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
     case 'wsl':               return 'WSL installed with distro';
-    case 'stack-images':      return 'Stack images available';
     case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
@@ -926,12 +922,11 @@ function mergeCheckUpdate(item) {
   state.checks.set(item.id, item);
   renderChecklist();
 
-  // The stack-images (Docker) and binary (Native) checks now cover node
-  // freshness too. When either reaches a terminal state the node version may
-  // have changed (a pull/download update fix ran), so refresh the header's
-  // "v<app> (node <node>)" label.
+  // The binary (Native) check covers miner freshness too. When it reaches a
+  // terminal state the node version may have changed (a download update fix
+  // ran), so refresh the header's "v<app> (node <node>)" label.
   if (
-    (item.id === 'stack-images' || item.id === 'binary') &&
+    item.id === 'binary' &&
     item.state !== 'idle' &&
     item.state !== 'running'
   ) {
@@ -1333,32 +1328,47 @@ function stackRunningInMode() {
   if (isDockerMode()) {
     // Node container must be one of the running services in Docker mode.
     const nodeRunning = s.services?.some(
-      (x) => ['cpu', 'cuda', 'qpu'].includes(x.service) && x.running,
+      (x) => ['cpu', 'cuda'].includes(x.service) && x.running,
     );
     return !!nodeRunning;
   }
   return s.services?.some((x) => x.running);
 }
 
+// Map the stack roll-up + miner state to the status pill. The miner (container
+// or native process) decides RUNNING vs STOPPED; support-service health
+// decides RUNNING vs DEGRADED. In Native mode a null stack means the support
+// containers aren't reachable at all — the miner alone is degraded, not fine.
+function statusFromStack(minerRunning) {
+  if (!minerRunning) return 'stopped';
+  // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
+  // while the transition is still in flight.
+  if (state.starting || state.stopping) return 'running';
+  const overall = state.stack?.overall ?? 'stopped';
+  return overall === 'running' ? 'running' : 'degraded';
+}
+
 async function pollStatus() {
   try {
-    // Stack status is valid in both Docker and Native modes (Native runs a
-    // subset — dashboard+postgres[+caddy]).
+    // Stack status is valid in both Docker and Native modes (Native still
+    // runs the validator/dashboard/postgres/caddy support services).
     try {
       state.stack = await invoke('get_stack_status');
     } catch {
-      state.stack = null;
+      // Keep the last known stack. The backend errors deliberately when
+      // `compose ps` output is unparseable, precisely so a running stack
+      // isn't reported as stopped (which would re-enable Start).
     }
 
     if (isDockerMode()) {
       state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
-      setStatus(state.containerRunning ? 'running' : 'stopped');
+      setStatus(statusFromStack(state.containerRunning));
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
       state.containerRunning = false;
-      setStatus(status.running ? 'running' : 'stopped');
+      setStatus(statusFromStack(status.running));
     }
   } catch {
     state.containerRunning = false;
@@ -1378,14 +1388,6 @@ async function setupListeners() {
   // Single CheckItem per event — merged into state.checks by id.
   await listen('checklist-update', (event) => {
     mergeCheckUpdate(event.payload);
-  });
-
-  await listen('node-status', (event) => {
-    const { state: s } = event.payload;
-    const stateStr = s?.toLowerCase() || 'stopped';
-    state.containerRunning = stateStr === 'running';
-    setStatus(stateStr);
-    updateStartStopState();
   });
 
   // Docker pull lifecycle. The backend emits this when the `docker compose
@@ -1412,20 +1414,13 @@ async function setupListeners() {
     handlePullProgress(event.payload);
   });
 
-  // Stop lifecycle — update the status pill immediately; backend also
-  // emits container-status so we don't have to wait for the next poll.
+  // Stop lifecycle — surface stop failures in the log drawer; the 10s poll
+  // refreshes the status pill.
   await listen('stop-complete', (event) => {
     const { success, error } = event.payload || {};
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${error || 'unknown error'}` });
     }
-  });
-
-  await listen('stack-status', (event) => {
-    // Backend may emit lifecycle events in future; for now we just re-poll
-    // to refresh state.stack and the dashboard iframe visibility.
-    void event;
-    pollStatus();
   });
 
   // Postgres rejected the dashboard's password — surface the actionable error

@@ -768,11 +768,10 @@ async fn fetch_binary_update(ctx: &CheckCtx, base: CheckItem, version: &str) -> 
     }
 }
 
-/// Native miner binary. Mirrors the stack-images check: a retry actively
-/// fetches the binary before reporting — a missing binary is downloaded and an
-/// outdated one is updated. A current binary is left untouched (the PyInstaller
-/// binary is large, so the full download is gated on need rather than re-run
-/// every retry; Docker images differ only because compose pulls layer deltas).
+/// Native miner binary. A retry actively fetches the binary before reporting —
+/// a missing binary is downloaded and an outdated one is updated. A current
+/// binary is left untouched (the PyInstaller binary is large, so the full
+/// download is gated on need rather than re-run every retry).
 async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("binary", ctx);
     let mut available = tokio::task::spawn_blocking(crate::native::is_binary_available)

@@ -105,6 +105,24 @@ pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     }
 }
 
+/// Services whose state feeds the stack-health roll-up for the given mode.
+/// `docker compose ps --all` lists every container in the project — including
+/// Exited miners left behind by an image-type or run-mode switch (Stop never
+/// removes containers) — so health must only consider the services the
+/// current configuration actually starts.
+pub fn expected_services(run_mode: &RunMode, image_tag: ImageTag) -> Vec<&'static str> {
+    match run_mode {
+        RunMode::Docker => vec![
+            image_tag.service(),
+            "quip-validator",
+            "dashboard",
+            "postgres",
+            "caddy",
+        ],
+        RunMode::Native => compose_services(&RunMode::Native).to_vec(),
+    }
+}
+
 // ── compose command builder ────────────────────────────────────────────────
 
 fn to_forward_slash(p: PathBuf) -> String {
@@ -1096,28 +1114,44 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
         });
     }
 
-    let overall = if services.is_empty() {
-        StackHealth::Stopped
-    } else if services
+    let settings = crate::settings::load_settings();
+    let expected = expected_services(&settings.run_mode, settings.image_tag);
+    let overall = roll_up_health(&services, &expected);
+
+    Ok(StackStatus { services, overall })
+}
+
+/// Roll per-service states up into a `StackHealth`, considering only the
+/// `expected` services. Containers outside `expected` (stale miners from
+/// another profile or run mode) are ignored; an expected service with no
+/// container at all counts as not running.
+fn roll_up_health(services: &[ServiceStatus], expected: &[&str]) -> StackHealth {
+    let relevant: Vec<&ServiceStatus> = services
+        .iter()
+        .filter(|s| expected.contains(&s.service.as_str()))
+        .collect();
+    let running = relevant.iter().filter(|s| s.running).count();
+    if running == 0 {
+        return StackHealth::Stopped;
+    }
+    if relevant
         .iter()
         .any(|s| s.health.as_deref() == Some("unhealthy"))
     {
-        StackHealth::Unhealthy
-    } else if services.iter().all(|s| {
+        return StackHealth::Unhealthy;
+    }
+    let all_ok = relevant.iter().all(|s| {
         s.running
             && s.health
                 .as_deref()
                 .map(|h| h == "healthy" || h == "starting")
                 .unwrap_or(true)
-    }) {
+    });
+    if all_ok && running == expected.len() {
         StackHealth::Running
-    } else if services.iter().any(|s| s.running) {
-        StackHealth::Degraded
     } else {
-        StackHealth::Stopped
-    };
-
-    Ok(StackStatus { services, overall })
+        StackHealth::Degraded
+    }
 }
 
 /// `docker compose config` output — replaces the old `get_container_config`.
@@ -1139,6 +1173,68 @@ pub async fn get_stack_config() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn svc(service: &str, running: bool, health: Option<&str>) -> ServiceStatus {
+        ServiceStatus {
+            name: format!("quip-{service}"),
+            service: service.to_string(),
+            running,
+            health: health.map(str::to_string),
+            status_text: String::new(),
+            image: String::new(),
+        }
+    }
+
+    #[test]
+    fn stale_exited_miner_does_not_degrade_health() {
+        // A leftover Exited quip-cpu from before a cpu→cuda switch (or a
+        // Docker→Native switch) must not drag the roll-up to Degraded.
+        let services = vec![
+            svc("cpu", false, None),
+            svc("cuda", true, None),
+            svc("quip-validator", true, None),
+            svc("dashboard", true, Some("healthy")),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cuda);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Running);
+
+        // Native mode ignores every miner container.
+        let expected = expected_services(&RunMode::Native, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Running);
+    }
+
+    #[test]
+    fn missing_expected_service_is_degraded() {
+        // Dashboard container never created — the stack is not fully Running.
+        let services = vec![
+            svc("cpu", true, None),
+            svc("quip-validator", true, None),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Degraded);
+    }
+
+    #[test]
+    fn roll_up_health_terminal_states() {
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&[], &expected), StackHealth::Stopped);
+
+        let stopped = vec![svc("cpu", false, None), svc("caddy", false, None)];
+        assert_eq!(roll_up_health(&stopped, &expected), StackHealth::Stopped);
+
+        let unhealthy = vec![
+            svc("cpu", true, None),
+            svc("quip-validator", true, None),
+            svc("dashboard", true, Some("unhealthy")),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        assert_eq!(roll_up_health(&unhealthy, &expected), StackHealth::Unhealthy);
+    }
 
     #[test]
     fn compose_profile_uses_only_v02_cpu_and_cuda_profiles() {

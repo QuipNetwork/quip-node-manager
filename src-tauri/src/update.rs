@@ -274,19 +274,6 @@ pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, S
     check_gitlab_image_update(ImageRef::Dashboard).await
 }
 
-pub async fn check_docker_core_image_update(
-    image_tag: crate::settings::ImageTag,
-) -> Result<Option<(ImageRef, ImageUpdateInfo)>, String> {
-    for image in [ImageRef::Miner(image_tag), ImageRef::Validator] {
-        if let Some(info) = check_gitlab_image_update(image).await? {
-            if info.update_available {
-                return Ok(Some((image, info)));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Background task that checks for updates every 30 minutes.
 /// - Docker mode: checks for new image digest
 /// - Native mode: checks for new binary release

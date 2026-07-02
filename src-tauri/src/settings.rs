@@ -411,8 +411,8 @@ pub struct ServiceStatus {
     pub image: String,
 }
 
-/// Aggregate roll-up of the compose stack, exposed to the frontend as a
-/// single `stack-status` event / `get_stack_status` response.
+/// Aggregate roll-up of the compose stack, exposed to the frontend as the
+/// `get_stack_status` response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StackStatus {
     pub services: Vec<ServiceStatus>,
