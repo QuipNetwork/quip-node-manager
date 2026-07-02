@@ -996,11 +996,28 @@ document.getElementById('btn-recheck-all').addEventListener('click', () => {
 });
 
 // ─── Log panel ────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+// Append `text` to `el`, turning http(s) URLs into clickable anchors (opened
+// via the external-link handler at the bottom of this file). Built from DOM
+// nodes, never innerHTML — log text streams from node output and must not be
+// interpreted as markup.
+function appendTextWithLinks(el, text) {
+  const urlRe = /https?:\/\/\S+/g;
+  let last = 0;
+  for (const match of text.matchAll(urlRe)) {
+    // Trailing punctuation is sentence structure, not part of the URL.
+    const url = match[0].replace(/[.,;:!?)\]'"]+$/, '');
+    if (match.index > last) {
+      el.appendChild(document.createTextNode(text.slice(last, match.index)));
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.textContent = url;
+    el.appendChild(a);
+    last = match.index + url.length;
+  }
+  if (last < text.length) {
+    el.appendChild(document.createTextNode(text.slice(last)));
+  }
 }
 
 function appendLog(entry) {
@@ -1012,7 +1029,7 @@ function appendLog(entry) {
   const line = document.createElement('p');
   line.className = `log-line log-${(entry.level || 'info').toLowerCase()}`;
   const ts = entry.timestamp ? `[${entry.timestamp}] ` : '';
-  line.textContent = `${ts}${entry.message}`;
+  appendTextWithLinks(line, `${ts}${entry.message}`);
   output.appendChild(line);
   if (output.scrollHeight - output.scrollTop - output.clientHeight < 60) {
     output.scrollTop = output.scrollHeight;
@@ -1488,13 +1505,28 @@ function showUpdateBadge(version, url) {
   versionEl.classList.add('has-update');
 
   versionEl.onclick = (e) => {
+    // stopPropagation keeps the toggle click from reaching the document-level
+    // hide listener — but it also keeps anchor clicks from reaching the
+    // external-link handler below, so the Download link must be handled here.
     e.stopPropagation();
+    const anchor = e.target.closest('a[href]');
+    if (anchor && anchor.getAttribute('href').startsWith('http')) {
+      e.preventDefault();
+      openUrl(anchor.getAttribute('href'));
+      tooltip.style.display = 'none';
+      return;
+    }
     tooltip.style.display = tooltip.style.display === 'none' ? 'flex' : 'none';
   };
-  document.addEventListener('click', () => {
-    tooltip.style.display = 'none';
-  }, { once: false });
 }
+
+// Hide the update tooltip on any click outside the version badge (badge
+// clicks never bubble here — see showUpdateBadge). Registered once at module
+// level; showUpdateBadge re-runs on every 30-min update check.
+document.addEventListener('click', () => {
+  const tooltip = document.getElementById('update-tooltip');
+  if (tooltip) tooltip.style.display = 'none';
+});
 
 // ─── First-boot prompt ────────────────────────────────────────────────────────
 async function checkFirstBoot() {

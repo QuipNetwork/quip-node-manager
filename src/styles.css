@@ -756,6 +756,13 @@ button.check-action:disabled {
   color: var(--text-faint);
 }
 
+/* URLs in log lines are clickable (opened in the system browser); inherit
+   the line's level color so links don't break the log's color coding. */
+.log-line a {
+  color: inherit;
+  text-decoration: underline;
+}
+
 /* ─── Dashboard Placeholder ──────────────────────────────────────────────── */
 .dashboard-placeholder {
   display: flex;
