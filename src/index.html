@@ -50,6 +50,9 @@
           <div>
             <div id="status-text" class="status-text status-stopped">STOPPED</div>
             <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Node not running</div>
+            <span id="update-badge" title="A node update is available — Restart to Update"
+              style="display:none;margin-left:8px;padding:2px 8px;border-radius:10px;
+              background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Update</span>
           </div>
           <div style="margin-left:auto;display:flex;gap:8px;">
             <button id="btn-start" class="btn btn-primary" disabled>Start Node</button>
@@ -183,11 +186,6 @@
                   </div>
                 </div>
 
-                <!-- Auto-update toggle -->
-                <div style="margin-top:16px;display:flex;align-items:center;gap:10px;">
-                  <input type="checkbox" id="auto-update-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                  <label for="auto-update-enabled" style="margin:0;cursor:pointer;">Auto-restart when new image available <span style="color:var(--text-faint);font-weight:400;">(Docker only)</span></label>
-                </div>
               </div>
             </div>
           </div>

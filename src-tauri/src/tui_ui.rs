@@ -360,15 +360,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             ),
         ));
 
-        // Auto-update
-        let au_check = if app.form.auto_update { "[x]" } else { "[ ]" };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Auto-update", au_check),
-                focus_style(app, &FocusId::AutoUpdate),
-            ),
-        ]));
     }
 
     // CPU Cores
