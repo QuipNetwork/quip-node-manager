@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
@@ -274,6 +276,23 @@ pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, S
     check_gitlab_image_update(ImageRef::Dashboard).await
 }
 
+/// True when `current` contains an update id not present in `last` — i.e. a
+/// genuinely new update appeared since the last notification. Shrinking or
+/// clearing the set never notifies (an already-notified or applied update must
+/// not re-nag).
+fn has_new_update(current: &HashSet<String>, last: &HashSet<String>) -> bool {
+    current.difference(last).next().is_some()
+}
+
+fn notify_update_available(app: &tauri::AppHandle) {
+    let _ = app
+        .notification()
+        .builder()
+        .title("Quip node update available")
+        .body("Restart to Update to apply the latest node update.")
+        .show();
+}
+
 /// Background task that checks for updates every 30 minutes.
 /// - Docker mode: checks for new image digest
 /// - Native mode: checks for new binary release
@@ -283,12 +302,14 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
     // Skip the first immediate tick
     interval.tick().await;
 
+    let mut last_notified: HashSet<String> = HashSet::new();
+
     loop {
         interval.tick().await;
 
         let settings = crate::settings::load_settings();
 
-        // Check for node-manager app updates
+        // Check for node-manager app updates (out of scope for dedup notification)
         if let Ok(Some(info)) = check_app_update().await {
             let _ = app.emit("app-update-available", &info);
             crate::set_tray_update(
@@ -297,6 +318,8 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                 &format!("Quip Node Manager — v{} available", info.version),
             );
         }
+
+        let mut current: HashSet<String> = HashSet::new();
 
         // Compose-image checks — applies in Docker mode, and in Native mode
         // whenever the dashboard service is running (dashboard + postgres
@@ -311,6 +334,7 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             "info": info,
                         }),
                     );
+                    current.insert(format!("{}:{}", image.display_name(), info.latest_digest));
                 }
             }
         }
@@ -320,8 +344,14 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         if settings.run_mode == crate::settings::RunMode::Native {
             if let Ok(Some(info)) = crate::native::check_binary_update().await {
                 let _ = app.emit("binary-update-available", &info);
+                current.insert(format!("binary:{}", info.version));
             }
         }
+
+        if has_new_update(&current, &last_notified) {
+            notify_update_available(&app);
+        }
+        last_notified = current;
     }
 }
 
@@ -397,6 +427,20 @@ mod tests {
             native_images,
             vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
         );
+    }
+
+    #[test]
+    fn notifies_only_on_a_newly_appeared_update() {
+        use std::collections::HashSet;
+        let none: HashSet<String> = HashSet::new();
+        let a: HashSet<String> = ["miner:sha_a".into()].into();
+        let ab: HashSet<String> = ["miner:sha_a".into(), "binary:0.2.1".into()].into();
+
+        assert!(has_new_update(&a, &none), "first detection notifies");
+        assert!(!has_new_update(&a, &a), "same set: no re-nag");
+        assert!(has_new_update(&ab, &a), "a newly added id notifies");
+        assert!(!has_new_update(&a, &ab), "shrinking set does not notify");
+        assert!(!has_new_update(&none, &a), "cleared set does not notify");
     }
 
     #[test]
