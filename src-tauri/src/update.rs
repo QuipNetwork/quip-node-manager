@@ -19,14 +19,23 @@ pub enum UpdateStep {
 
 /// The ordered stop → apply → start plan for a user-initiated update restart.
 /// Docker stops/starts only the compose stack; Native also stops/starts the
-/// host miner and refreshes its binary. Each step is idempotent from a stopped
-/// state, so the same plan works whether or not the node is currently running.
-fn update_restart_steps(mode: &crate::settings::RunMode) -> Vec<UpdateStep> {
+/// host miner and optionally refreshes its binary.
+///
+/// `binary_update_pending` gates the `DownloadBinary` step: pass `true` only
+/// when `native::check_binary_update()` returned `Ok(Some(_))`. For Docker
+/// the flag is irrelevant — the plan never includes `DownloadBinary`.
+fn update_restart_steps(
+    mode: &crate::settings::RunMode,
+    binary_update_pending: bool,
+) -> Vec<UpdateStep> {
     use UpdateStep::*;
     match mode {
         crate::settings::RunMode::Docker => vec![StopStack, PullImages, StartStack],
-        crate::settings::RunMode::Native => {
+        crate::settings::RunMode::Native if binary_update_pending => {
             vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        }
+        crate::settings::RunMode::Native => {
+            vec![StopNative, StopStack, PullImages, StartStack, StartNative]
         }
     }
 }
@@ -55,10 +64,20 @@ async fn run_update_step(app: &tauri::AppHandle, step: UpdateStep) -> Result<(),
 /// User-initiated: stop → apply the pending update → start, mode-aware. Bails
 /// on the first failing step (leaving the node stopped) rather than claiming a
 /// false success — the caller keeps the update flagged and re-enables the button.
+///
+/// For Native mode the `DownloadBinary` step is included only when
+/// `native::check_binary_update()` confirms a binary update is pending. A
+/// check error (network hiccup, GitLab outage) is treated as "not pending"
+/// so that a Docker-image-only update still completes successfully; the binary
+/// check will be re-run on the next monitor poll.
 #[tauri::command]
 pub async fn restart_to_update(app: tauri::AppHandle) -> Result<(), String> {
     let mode = crate::settings::load_settings().run_mode;
-    for step in update_restart_steps(&mode) {
+    let binary_update_pending = matches!(
+        crate::native::check_binary_update().await,
+        Ok(Some(_))
+    );
+    for step in update_restart_steps(&mode, binary_update_pending) {
         run_update_step(&app, step).await?;
     }
     Ok(())
@@ -505,18 +524,32 @@ mod tests {
     #[test]
     fn docker_restart_plan_is_stop_pull_start() {
         use UpdateStep::*;
+        // Docker ignores the binary_update_pending flag entirely.
         assert_eq!(
-            update_restart_steps(&RunMode::Docker),
+            update_restart_steps(&RunMode::Docker, false),
+            vec![StopStack, PullImages, StartStack]
+        );
+        assert_eq!(
+            update_restart_steps(&RunMode::Docker, true),
             vec![StopStack, PullImages, StartStack]
         );
     }
 
     #[test]
-    fn native_restart_plan_stops_both_downloads_and_starts_both() {
+    fn native_restart_plan_with_binary_update_includes_download() {
         use UpdateStep::*;
         assert_eq!(
-            update_restart_steps(&RunMode::Native),
+            update_restart_steps(&RunMode::Native, true),
             vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        );
+    }
+
+    #[test]
+    fn native_restart_plan_without_binary_update_skips_download() {
+        use UpdateStep::*;
+        assert_eq!(
+            update_restart_steps(&RunMode::Native, false),
+            vec![StopNative, StopStack, PullImages, StartStack, StartNative]
         );
     }
 

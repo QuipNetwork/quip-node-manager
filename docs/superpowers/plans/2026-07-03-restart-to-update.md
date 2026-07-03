@@ -25,7 +25,7 @@
 - `native::check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String>` (`native.rs:712`); `UpdateInfo { version, url, notes }` (`update.rs:7`).
 - Apply functions (all `async`, take `AppHandle` unless noted):
   - `compose::stop_stack(AppHandle)`, `compose::pull_compose_images(AppHandle)`, `compose::start_stack(AppHandle)` (`compose.rs:904,475,586`).
-  - `native::stop_native_node(AppHandle, State<NativeProcessState>)`, `native::start_native_node(AppHandle, State<NativeProcessState>) -> Result<String,String>` (`native.rs:927,717`), `native::download_native_binary(AppHandle) -> Result<String,String>` (`native.rs:499`, self-guards: only downloads if strictly newer).
+  - `native::stop_native_node(AppHandle, State<NativeProcessState>)`, `native::start_native_node(AppHandle, State<NativeProcessState>) -> Result<String,String>` (`native.rs:927,717`), `native::download_native_binary(AppHandle) -> Result<String,String>` (`native.rs:499`; does NOT self-guard — it unconditionally re-downloads the latest release; the strictly-newer guard lives in `check_binary_update`, and `DownloadBinary` is now gated by the `binary_update_pending` flag in `update_restart_steps`).
 - `crate::native::NativeProcessState` (managed; obtained in a command via a `State<'_, NativeProcessState>` param, as `get_native_node_status` does).
 - `settings.rs:383-384` `auto_update_enabled` field + default `399`.
 - `lib.rs:71` `generate_handler!` list; `update::background_update_monitor` spawned at `lib.rs:233`.
