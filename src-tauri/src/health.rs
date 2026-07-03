@@ -168,7 +168,8 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
     let infra = check_infra(stack, miner_up);
 
     // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
-    let rpc = crate::validator_rpc::ValidatorRpc::new(&crate::native::native_miner_validator_url(cfg));
+    let validator_url = crate::native::native_miner_validator_url(cfg);
+    let rpc = crate::validator_rpc::ValidatorRpc::new(&validator_url);
     let (chain, participation) = probe_chain_and_participation(&rpc, st).await;
 
     let candidate = roll_up(infra, chain, participation);
