@@ -105,7 +105,10 @@ struct MetalToml {
 #[derive(Serialize)]
 struct ConfigToml {
     miner: MinerToml,
-    cpu: CpuToml,
+    // None when CPU mining is disabled — the miner treats [cpu] presence as
+    // the backend switch, so the section must vanish entirely, not zero out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<CpuToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gpu: Option<GpuToml>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -238,9 +241,9 @@ impl ConfigToml {
 
         ConfigToml {
             miner,
-            cpu: CpuToml {
+            cpu: config.cpu_enabled.then_some(CpuToml {
                 num_cpus: config.num_cpus,
-            },
+            }),
             gpu,
             cuda,
             metal,
@@ -495,6 +498,37 @@ mod tests {
         let toml = render_config_toml(&cfg, &RunMode::Native);
         assert!(!toml.contains("[gpu]"));
         assert!(toml.contains("[metal]"));
+    }
+
+    #[test]
+    fn cpu_enabled_renders_configured_core_count() {
+        let cfg = NodeConfig {
+            num_cpus: 8,
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
+        assert!(toml.contains("[cpu]\n"));
+        assert!(toml.contains("num_cpus = 8"));
+    }
+
+    #[test]
+    fn cpu_disabled_omits_cpu_section_in_both_modes() {
+        let cfg = NodeConfig {
+            cpu_enabled: false,
+            num_cpus: 8,
+            ..NodeConfig::default()
+        };
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let toml = render_config_toml(&cfg, &mode);
+            assert!(
+                !toml.contains("[cpu]"),
+                "{mode:?}: [cpu] rendered while disabled"
+            );
+            assert!(
+                !toml.contains("num_cpus"),
+                "{mode:?}: num_cpus rendered while disabled"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::log_stream::LogEntry;
-use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
+use crate::settings::{data_dir, NodeConfig, RunMode};
 use serde::Serialize;
 use std::path::Path;
 use std::process::Child;
@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
-const PUBLIC_TESTNET_FAUCET_URL: &str = "https://faucet.testnet.quip.network";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -233,34 +232,13 @@ fn validator_rpc_http_probe_url(validator_url: &str) -> String {
         .unwrap_or_else(|| validator_url.to_string())
 }
 
-pub(crate) fn native_miner_subcommand(config: &NodeConfig) -> &'static str {
-    if config.dwave_config.is_some() {
-        return "qpu";
-    }
-
-    if matches!(config.gpu_backend, GpuBackend::Mps | GpuBackend::Modal)
-        || config
-            .gpu_device_configs
-            .iter()
-            .any(|device| device.enabled)
-    {
-        return "gpu";
-    }
-
-    "cpu"
-}
-
-pub(crate) fn native_miner_args(config: &NodeConfig, config_path: &Path) -> Vec<String> {
-    let subcommand = native_miner_subcommand(config);
-    let signer_key = native_signer_key_path().to_string_lossy().to_string();
+// The miner picks its own backends (cpu/gpu/qpu) from the config.toml
+// sections — the manager passes no subcommand and no per-key CLI overrides
+// (signer_key lives in [miner]; the faucet default is built into the miner).
+pub(crate) fn native_miner_args(config_path: &Path) -> Vec<String> {
     vec![
-        subcommand.to_string(),
         "--config".to_string(),
         config_path.to_string_lossy().to_string(),
-        "--signer-key".to_string(),
-        signer_key,
-        "--faucet-url".to_string(),
-        PUBLIC_TESTNET_FAUCET_URL.to_string(),
     ]
 }
 
@@ -844,7 +822,7 @@ pub async fn start_native_node(
     let validator_url = native_miner_validator_url(&config);
     wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
 
-    let miner_args = native_miner_args(&config, &config_path);
+    let miner_args = native_miner_args(&config_path);
     let mut cmd = crate::cmd::new(&bin);
     cmd.args(&miner_args)
         .current_dir(&work_dir)
@@ -1151,23 +1129,12 @@ mod tests {
     }
 
     #[test]
-    fn native_miner_args_pass_config_signer_and_public_faucet() {
-        let cfg = NodeConfig::default();
-        let args = native_miner_args(&cfg, Path::new("/tmp/config.toml"));
-        let signer_key = native_signer_key_path().to_string_lossy().to_string();
+    fn native_miner_args_pass_only_the_config_path() {
+        // No backend subcommand and no per-key CLI overrides: the miner
+        // decides cpu/gpu/qpu from the config.toml sections alone.
+        let args = native_miner_args(Path::new("/tmp/config.toml"));
 
-        assert_eq!(
-            args,
-            vec![
-                "cpu".to_string(),
-                "--config".to_string(),
-                "/tmp/config.toml".to_string(),
-                "--signer-key".to_string(),
-                signer_key,
-                "--faucet-url".to_string(),
-                PUBLIC_TESTNET_FAUCET_URL.to_string()
-            ]
-        );
+        assert_eq!(args, vec!["--config".to_string(), "/tmp/config.toml".to_string()]);
     }
 
     #[test]
@@ -1178,27 +1145,6 @@ mod tests {
             args,
             vec!["keygen", "--out", "/tmp/quip-data/keystore.json"]
         );
-    }
-
-    #[test]
-    fn native_miner_subcommand_prefers_qpu_over_gpu() {
-        let cfg = NodeConfig {
-            dwave_config: Some(crate::settings::DwaveConfig::default()),
-            gpu_backend: GpuBackend::Mps,
-            ..NodeConfig::default()
-        };
-
-        assert_eq!(native_miner_subcommand(&cfg), "qpu");
-    }
-
-    #[test]
-    fn native_miner_subcommand_uses_gpu_for_mps() {
-        let cfg = NodeConfig {
-            gpu_backend: GpuBackend::Mps,
-            ..NodeConfig::default()
-        };
-
-        assert_eq!(native_miner_subcommand(&cfg), "gpu");
     }
 
     #[test]

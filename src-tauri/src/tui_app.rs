@@ -605,7 +605,7 @@ impl TuiApp {
         }
 
         match run_mode {
-            RunMode::Native => self.start_node_native(&config),
+            RunMode::Native => self.start_node_native(),
             RunMode::Docker => self.start_node_docker(&config),
         }
         self.config_expanded = false;
@@ -677,7 +677,7 @@ impl TuiApp {
         }
     }
 
-    fn start_node_native(&mut self, config: &crate::settings::NodeConfig) {
+    fn start_node_native(&mut self) {
         if !crate::native::is_binary_available() {
             self.set_status("No native binary found. Download it first.");
             return;
@@ -690,7 +690,7 @@ impl TuiApp {
             let config_path = data_dir.join("config.toml");
             let log_path = data_dir.join("node-output.log");
             let _ = crate::native::ensure_native_signer_key(&bin)?;
-            let miner_args = crate::native::native_miner_args(config, &config_path);
+            let miner_args = crate::native::native_miner_args(&config_path);
             let log_file = std::fs::File::create(&log_path)
                 .map_err(|e| format!("Cannot create log file: {}", e))?;
             let log_err = log_file

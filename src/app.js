@@ -120,10 +120,23 @@ function updateStackUiVisibility() {
   subs.style.display = tlsEl.checked ? '' : 'none';
 }
 
+// Show CPU subsettings (core count) only while CPU mining is enabled; the
+// toggle itself governs whether config.toml gets a [cpu] section.
+function updateCpuUiVisibility() {
+  const cpuEl = document.getElementById('cpu-enabled');
+  const subs = document.getElementById('cpu-subsettings');
+  if (!cpuEl || !subs) return;
+
+  subs.style.display = cpuEl.checked ? '' : 'none';
+}
+
 document.addEventListener('change', (e) => {
   if (!e.target) return;
   if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
+  }
+  if (e.target.id === 'cpu-enabled') {
+    updateCpuUiVisibility();
   }
 });
 
@@ -605,6 +618,7 @@ function collectConfig() {
     log_level: document.getElementById('log-level')?.value || 'info',
     node_log: document.getElementById('node-log')?.value?.trim() ?? '',
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
+    cpu_enabled: document.getElementById('cpu-enabled')?.checked ?? true,
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
@@ -688,7 +702,9 @@ function populateForm(settings) {
   }
 
   // CPU Miner
+  document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  updateCpuUiVisibility();
 
   // GPU Miner — for Metal, utilization/yielding come from metal_config;
   // for CUDA, from the first enabled device (or defaults).

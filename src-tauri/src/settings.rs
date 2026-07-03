@@ -159,6 +159,9 @@ fn default_listen() -> String {
 fn default_num_cpus() -> u32 {
     1
 }
+fn default_cpu_enabled() -> bool {
+    true
+}
 fn default_timeout() -> u32 {
     3
 }
@@ -266,7 +269,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub http_log: String,
 
-    // CPU mining
+    // CPU mining. cpu_enabled controls whether config.toml gets a [cpu]
+    // section at all; defaults true so pre-toggle settings keep CPU mining.
+    #[serde(default = "default_cpu_enabled")]
+    pub cpu_enabled: bool,
     #[serde(default = "default_num_cpus")]
     pub num_cpus: u32,
 
@@ -320,6 +326,7 @@ impl Default for NodeConfig {
             log_level: "info".to_string(),
             node_log: String::new(),
             http_log: String::new(),
+            cpu_enabled: true,
             num_cpus: 1,
             gpu_backend: GpuBackend::Local,
             gpu_device_configs: vec![],
@@ -592,6 +599,14 @@ mod tests {
 
         assert_eq!(config.port, 20049);
         assert_eq!(config.validator_port, 30333);
+    }
+
+    #[test]
+    fn node_config_missing_cpu_enabled_defaults_to_true() {
+        // Pre-toggle app-settings.json files have no cpu_enabled key; they
+        // must load as enabled, not silently stop CPU mining on upgrade.
+        let config: NodeConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(config.cpu_enabled);
     }
 
     #[test]

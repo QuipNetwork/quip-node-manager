@@ -205,9 +205,15 @@
           <!-- CPU Miner Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">CPU Miner Configuration</div>
-            <div class="form-group" style="max-width:160px;margin-bottom:0;">
-              <label for="num-cpus">CPU Cores</label>
-              <input type="number" id="num-cpus" min="1" max="64" value="1" />
+            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+              <input type="checkbox" id="cpu-enabled" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
+              <label for="cpu-enabled" style="margin:0;cursor:pointer;">Enable CPU mining</label>
+            </div>
+            <div id="cpu-subsettings" style="margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
+              <div class="form-group" style="max-width:160px;margin-bottom:0;">
+                <label for="num-cpus">CPU Cores</label>
+                <input type="number" id="num-cpus" min="1" max="64" value="1" />
+              </div>
             </div>
           </div>
 
