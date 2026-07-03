@@ -43,6 +43,97 @@ pub fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(head))
 }
 
+// ── Task 3: read-only JSON-RPC client ────────────────────────────────────────
+
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemHealth {
+    pub peers: u64,
+    #[serde(rename = "isSyncing")]
+    pub is_syncing: bool,
+}
+
+pub fn parse_block_number(hex_str: &str) -> Result<u64, String> {
+    let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    u64::from_str_radix(s, 16).map_err(|e| format!("bad block number {hex_str}: {e}"))
+}
+
+pub fn parse_system_health(v: &serde_json::Value) -> Result<SystemHealth, String> {
+    serde_json::from_value(v.clone()).map_err(|e| format!("bad system_health: {e}"))
+}
+
+/// Convert a `ws(s)://host:port[/path]` validator URL to an `http(s)://` JSON-RPC base.
+fn rpc_base_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+pub struct ValidatorRpc {
+    base: String,
+}
+
+impl ValidatorRpc {
+    pub fn new(url: &str) -> Self {
+        ValidatorRpc { base: rpc_base_url(url) }
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let body = serde_json::json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let resp = reqwest::Client::new()
+            .post(&self.base)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("{method} request failed: {e}"))?;
+        let v: serde_json::Value =
+            resp.json().await.map_err(|e| format!("{method} bad json: {e}"))?;
+        v.get("result").cloned().ok_or_else(|| format!("{method}: no result field"))
+    }
+
+    pub async fn current_block(&self) -> Result<u64, String> {
+        let r = self.call("chain_getHeader", serde_json::json!([])).await?;
+        let num = r
+            .get("number")
+            .and_then(|n| n.as_str())
+            .ok_or("header has no number")?;
+        parse_block_number(num)
+    }
+
+    pub async fn system_health(&self) -> Result<SystemHealth, String> {
+        let r = self.call("system_health", serde_json::json!([])).await?;
+        parse_system_health(&r)
+    }
+
+    pub async fn storage_u64(&self, key: &[u8]) -> Result<Option<u64>, String> {
+        let hex_key = format!("0x{}", hex::encode(key));
+        let r = self.call("state_getStorage", serde_json::json!([hex_key])).await?;
+        match r.as_str() {
+            None => Ok(None),
+            Some(s) => {
+                let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))
+                    .map_err(|e| format!("bad storage hex: {e}"))?;
+                Ok(decode_u64_le(&bytes))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +181,20 @@ b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
     #[test]
     fn decode_u64_le_rejects_short_input() {
         assert_eq!(decode_u64_le(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn parses_hex_block_number() {
+        // 0x81b5b = 8*65536 + 4096 + 11*256 + 80 + 11 = 531291
+        assert_eq!(parse_block_number("0x81b5b").unwrap(), 531291);
+    }
+
+    #[test]
+    fn parses_system_health() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"peers":8,"isSyncing":false,"shouldHavePeers":true}"#).unwrap();
+        let h = parse_system_health(&v).unwrap();
+        assert_eq!(h.peers, 8);
+        assert!(!h.is_syncing);
     }
 }
