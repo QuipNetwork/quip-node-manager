@@ -127,9 +127,6 @@ pub fn persist_promoted_settings(promoted: &PromotedMinerConfig) -> Result<(), S
 }
 
 pub fn emit_report(app: &AppHandle, report: &MigrationReport) {
-    if report.changed {
-        emit_log(app, "INFO", "Migrated v0.1 node data to the v0.2 layout");
-    }
     for warning in &report.warnings {
         emit_log(app, "WARN", warning);
     }
@@ -288,9 +285,6 @@ fn migrate_env_file(path: &Path) -> Result<MigrationReport, String> {
     let mut warnings = Vec::new();
     if has_legacy {
         warnings.push("removed v0.1 QUIP_NODE_URL/QUIP_NODE_TOKEN env keys".to_string());
-    }
-    if !has_validator_rpc {
-        warnings.push("added QUIP_VALIDATOR_RPC_URLS placeholder to migrated .env".to_string());
     }
 
     Ok(MigrationReport {
