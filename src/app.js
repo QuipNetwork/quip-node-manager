@@ -22,6 +22,9 @@ const state = {
   // Full StackStatus returned by get_stack_status:
   // { services: [{name, service, running, health, status_text, image}], overall }
   stack: null,
+  // HealthReport returned by get_health / health-changed event:
+  // { overall, infra:{state,detail}, chain:{state,detail}, participation:{state,detail} }
+  health: null,
   checksPassed: false,
   starting: false,
   stopping: false,
@@ -770,6 +773,11 @@ function setStatus(stateStr) {
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
     sub.textContent = 'Running, but some stack services are down or unhealthy';
+  } else if (stateStr === 'unhealthy') {
+    dot.classList.add('status-degraded', 'active');
+    text.classList.add('status-degraded');
+    text.textContent = 'UNHEALTHY';
+    sub.textContent = 'Node health checks failing';
   } else {
     dot.classList.add('status-stopped');
     text.classList.add('status-stopped');
@@ -1377,8 +1385,19 @@ function statusFromStack(minerRunning) {
   // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
   // while the transition is still in flight.
   if (state.starting || state.stopping) return 'running';
+  // When the health monitor has reported, use its verdict directly so the
+  // pill reflects the three-dimensional check (infra + chain + participation).
+  if (state.health?.overall) return state.health.overall;
   const overall = state.stack?.overall ?? 'stopped';
   return overall === 'running' ? 'running' : 'degraded';
+}
+
+// Re-paint the status pill from current state without a full poll round-trip.
+// Called by renderHealth() so an inbound health-changed event immediately
+// updates the pill without waiting for the next 10 s pollStatus tick.
+function refreshStatusPill() {
+  const minerRunning = state.containerRunning || state.nativeRunning;
+  setStatus(statusFromStack(minerRunning));
 }
 
 async function pollStatus() {
@@ -1410,6 +1429,32 @@ async function pollStatus() {
   }
   updateStartStopState();
   refreshDashboardTab();
+}
+
+// ─── Node Health panel ────────────────────────────────────────────────────────
+// Color map for [data-state] values: ok → green, warn → yellow,
+// fail → red, unknown → faint; matches the existing CSS variable palette.
+const HEALTH_STATE_COLOR = {
+  ok: 'var(--success)',
+  warn: 'var(--warning)',
+  fail: 'var(--error)',
+  unknown: 'var(--text-faint)',
+};
+
+function renderHealth(report) {
+  if (!report) return;
+  state.health = report;
+  const paint = (id, dim) => {
+    const el = document.getElementById(id);
+    if (!el || !dim) return;
+    el.textContent = dim.state + (dim.detail ? ' — ' + dim.detail : '');
+    el.dataset.state = dim.state;
+    el.style.color = HEALTH_STATE_COLOR[dim.state] ?? 'var(--text-faint)';
+  };
+  paint('health-infra', report.infra);
+  paint('health-chain', report.chain);
+  paint('health-participation', report.participation);
+  refreshStatusPill();
 }
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
@@ -1493,6 +1538,11 @@ async function setupListeners() {
       const pct = Math.round((downloaded / total) * 100);
       if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
     }
+  });
+
+  // Health monitor \u2014 event-driven updates from the backend health loop.
+  await listen('health-changed', (event) => {
+    renderHealth(event.payload);
   });
 }
 
@@ -1679,6 +1729,12 @@ async function init() {
   });
 
   state.pollInterval = setInterval(pollStatus, 10_000);
+
+  // Fallback health poll — the health-changed event is the primary path;
+  // this catches any missed events (e.g. listener registered after first emit).
+  setInterval(async () => {
+    try { renderHealth(await invoke('get_health')); } catch (_) { /* transient — backend may not have sampled yet */ }
+  }, 15_000);
 }
 
 init().catch(console.error);
