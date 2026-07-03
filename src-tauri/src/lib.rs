@@ -112,6 +112,7 @@ pub fn run() {
             update::check_app_update,
             update::check_image_update,
             update::check_dashboard_image_update,
+            update::restart_to_update,
             // Log streaming
             log_stream::start_log_stream,
             log_stream::stop_log_stream,

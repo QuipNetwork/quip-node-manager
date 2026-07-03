@@ -1,7 +1,87 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::native::NativeProcessState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
+use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateStep {
+    StopNative,
+    StopStack,
+    DownloadBinary,
+    PullImages,
+    StartStack,
+    StartNative,
+}
+
+/// The ordered stop → apply → start plan for a user-initiated update restart.
+/// Docker stops/starts only the compose stack; Native also stops/starts the
+/// host miner and optionally refreshes its binary.
+///
+/// `binary_update_pending` gates the `DownloadBinary` step: pass `true` only
+/// when `native::check_binary_update()` returned `Ok(Some(_))`. For Docker
+/// the flag is irrelevant — the plan never includes `DownloadBinary`.
+fn update_restart_steps(
+    mode: &crate::settings::RunMode,
+    binary_update_pending: bool,
+) -> Vec<UpdateStep> {
+    use UpdateStep::*;
+    match mode {
+        crate::settings::RunMode::Docker => vec![StopStack, PullImages, StartStack],
+        crate::settings::RunMode::Native if binary_update_pending => {
+            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        }
+        crate::settings::RunMode::Native => {
+            vec![StopNative, StopStack, PullImages, StartStack, StartNative]
+        }
+    }
+}
+
+async fn run_update_step(app: &tauri::AppHandle, step: UpdateStep) -> Result<(), String> {
+    // Native steps fetch the managed process state from `app` (same idiom as
+    // health.rs), so the command needs no State parameter.
+    match step {
+        UpdateStep::StopNative => {
+            let state = app.state::<NativeProcessState>();
+            crate::native::stop_native_node(app.clone(), state).await
+        }
+        UpdateStep::StopStack => crate::compose::stop_stack(app.clone()).await,
+        UpdateStep::DownloadBinary => {
+            crate::native::download_native_binary(app.clone()).await.map(|_| ())
+        }
+        UpdateStep::PullImages => crate::compose::pull_compose_images(app.clone()).await,
+        UpdateStep::StartStack => crate::compose::start_stack(app.clone()).await,
+        UpdateStep::StartNative => {
+            let state = app.state::<NativeProcessState>();
+            crate::native::start_native_node(app.clone(), state).await.map(|_| ())
+        }
+    }
+}
+
+/// User-initiated: stop → apply the pending update → start, mode-aware. Bails
+/// on the first failing step (leaving the node stopped) rather than claiming a
+/// false success — the caller keeps the update flagged and re-enables the button.
+///
+/// For Native mode the `DownloadBinary` step is included only when
+/// `native::check_binary_update()` confirms a binary update is pending. A
+/// check error (network hiccup, GitLab outage) is treated as "not pending"
+/// so that a Docker-image-only update still completes successfully; the binary
+/// check will be re-run on the next monitor poll.
+#[tauri::command]
+pub async fn restart_to_update(app: tauri::AppHandle) -> Result<(), String> {
+    let mode = crate::settings::load_settings().run_mode;
+    let binary_update_pending = matches!(
+        crate::native::check_binary_update().await,
+        Ok(Some(_))
+    );
+    for step in update_restart_steps(&mode, binary_update_pending) {
+        run_update_step(&app, step).await?;
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
@@ -274,6 +354,23 @@ pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, S
     check_gitlab_image_update(ImageRef::Dashboard).await
 }
 
+/// True when `current` contains an update id not present in `last` — i.e. a
+/// genuinely new update appeared since the last notification. Shrinking or
+/// clearing the set never notifies (an already-notified or applied update must
+/// not re-nag).
+fn has_new_update(current: &HashSet<String>, last: &HashSet<String>) -> bool {
+    current.difference(last).next().is_some()
+}
+
+fn notify_update_available(app: &tauri::AppHandle) {
+    let _ = app
+        .notification()
+        .builder()
+        .title("Quip node update available")
+        .body("Restart to Update to apply the latest node update.")
+        .show();
+}
+
 /// Background task that checks for updates every 30 minutes.
 /// - Docker mode: checks for new image digest
 /// - Native mode: checks for new binary release
@@ -283,12 +380,14 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
     // Skip the first immediate tick
     interval.tick().await;
 
+    let mut last_notified: HashSet<String> = HashSet::new();
+
     loop {
         interval.tick().await;
 
         let settings = crate::settings::load_settings();
 
-        // Check for node-manager app updates
+        // Check for node-manager app updates (out of scope for dedup notification)
         if let Ok(Some(info)) = check_app_update().await {
             let _ = app.emit("app-update-available", &info);
             crate::set_tray_update(
@@ -298,10 +397,11 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
             );
         }
 
+        let mut current: HashSet<String> = HashSet::new();
+
         // Compose-image checks — applies in Docker mode, and in Native mode
         // whenever the dashboard service is running (dashboard + postgres
         // + maybe caddy). `relevant_images` filters the set correctly.
-        let mut any_compose_update = false;
         for image in relevant_images(&settings) {
             if let Ok(Some(info)) = check_gitlab_image_update(image).await {
                 if info.update_available {
@@ -312,28 +412,8 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             "info": info,
                         }),
                     );
-                    any_compose_update = true;
+                    current.insert(format!("{}:{}", image.display_name(), info.latest_digest));
                 }
-            }
-        }
-
-        if any_compose_update && settings.auto_update_enabled {
-            emit_log(
-                &app,
-                "[Auto-Update] New stack image detected, restarting...",
-            );
-            // Bail on the first failing step and report it — never claim
-            // "Restart complete." after a swallowed error, which would tell
-            // the user their node is up when stop succeeded but start didn't.
-            match auto_update_restart_stack(&app).await {
-                Ok(()) => emit_log(&app, "[Auto-Update] Restart complete."),
-                Err(e) => emit_error(
-                    &app,
-                    &format!(
-                        "[Auto-Update] Restart failed: {e}. Your node may be \
-                         stopped — open the app and start it manually."
-                    ),
-                ),
             }
         }
 
@@ -342,54 +422,15 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         if settings.run_mode == crate::settings::RunMode::Native {
             if let Ok(Some(info)) = crate::native::check_binary_update().await {
                 let _ = app.emit("binary-update-available", &info);
-
-                if settings.auto_update_enabled {
-                    emit_log(
-                        &app,
-                        &format!(
-                            "[Auto-Update] New binary v{} available, downloading...",
-                            info.version
-                        ),
-                    );
-                    match crate::native::download_native_binary(app.clone()).await {
-                        Ok(_) => emit_log(&app, "[Auto-Update] Binary updated."),
-                        Err(e) => {
-                            emit_error(&app, &format!("[Auto-Update] Binary download failed: {e}"))
-                        }
-                    }
-                }
+                current.insert(format!("binary:{}", info.version));
             }
         }
+
+        if has_new_update(&current, &last_notified) {
+            notify_update_available(&app);
+        }
+        last_notified = current;
     }
-}
-
-/// Stop → pull → start the compose stack, short-circuiting on the first error
-/// so a failed pull doesn't leave the stack torn down with a misleading
-/// success message.
-async fn auto_update_restart_stack(app: &tauri::AppHandle) -> Result<(), String> {
-    crate::compose::stop_stack(app.clone()).await?;
-    crate::compose::pull_compose_images(app.clone()).await?;
-    crate::compose::start_stack(app.clone()).await?;
-    Ok(())
-}
-
-fn emit_log(app: &tauri::AppHandle, msg: &str) {
-    emit_level(app, "INFO", msg);
-}
-
-fn emit_error(app: &tauri::AppHandle, msg: &str) {
-    emit_level(app, "ERROR", msg);
-}
-
-fn emit_level(app: &tauri::AppHandle, level: &str, msg: &str) {
-    let _ = app.emit(
-        "node-log",
-        serde_json::json!({
-            "timestamp": "",
-            "level": level,
-            "message": msg,
-        }),
-    );
 }
 
 #[cfg(test)]
@@ -463,6 +504,52 @@ mod tests {
         assert_eq!(
             native_images,
             vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
+        );
+    }
+
+    #[test]
+    fn notifies_only_on_a_newly_appeared_update() {
+        use std::collections::HashSet;
+        let none: HashSet<String> = HashSet::new();
+        let a: HashSet<String> = ["miner:sha_a".into()].into();
+        let ab: HashSet<String> = ["miner:sha_a".into(), "binary:0.2.1".into()].into();
+
+        assert!(has_new_update(&a, &none), "first detection notifies");
+        assert!(!has_new_update(&a, &a), "same set: no re-nag");
+        assert!(has_new_update(&ab, &a), "a newly added id notifies");
+        assert!(!has_new_update(&a, &ab), "shrinking set does not notify");
+        assert!(!has_new_update(&none, &a), "cleared set does not notify");
+    }
+
+    #[test]
+    fn docker_restart_plan_is_stop_pull_start() {
+        use UpdateStep::*;
+        // Docker ignores the binary_update_pending flag entirely.
+        assert_eq!(
+            update_restart_steps(&RunMode::Docker, false),
+            vec![StopStack, PullImages, StartStack]
+        );
+        assert_eq!(
+            update_restart_steps(&RunMode::Docker, true),
+            vec![StopStack, PullImages, StartStack]
+        );
+    }
+
+    #[test]
+    fn native_restart_plan_with_binary_update_includes_download() {
+        use UpdateStep::*;
+        assert_eq!(
+            update_restart_steps(&RunMode::Native, true),
+            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        );
+    }
+
+    #[test]
+    fn native_restart_plan_without_binary_update_skips_download() {
+        use UpdateStep::*;
+        assert_eq!(
+            update_restart_steps(&RunMode::Native, false),
+            vec![StopNative, StopStack, PullImages, StartStack, StartNative]
         );
     }
 
