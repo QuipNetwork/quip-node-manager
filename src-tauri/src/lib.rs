@@ -17,6 +17,7 @@ pub mod tui_app;
 pub mod tui_input;
 pub mod tui_ui;
 pub mod update;
+pub mod validator_rpc;
 
 use checklist::ChecklistState;
 use log_stream::LogStreamState;
