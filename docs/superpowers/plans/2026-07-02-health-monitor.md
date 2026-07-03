@@ -264,7 +264,7 @@ Append to the `tests` module:
 ```rust
     #[test]
     fn parses_hex_block_number() {
-        assert_eq!(parse_block_number("0x81b5b").unwrap(), 531803);
+        assert_eq!(parse_block_number("0x81b5b").unwrap(), 531291);
     }
 
     #[test]
