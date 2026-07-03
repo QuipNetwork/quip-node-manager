@@ -85,6 +85,20 @@ pub fn check_infra(stack: StackHealth, miner_up: bool) -> DimensionStatus {
     }
 }
 
+/// Map a `LatestParticipation` storage read to a participation verdict. A
+/// transport/decode error is `Unknown` (→ Degraded), never a hard Fail; a
+/// genuine `Ok(None)` (key absent) still flows through `check_participation`.
+pub fn participation_from_read(
+    read: Result<Option<u64>, String>,
+    qblock_count: u64,
+    warming_up: bool,
+) -> DimensionStatus {
+    match read {
+        Err(e) => status(DimensionState::Unknown, e),
+        Ok(latest) => check_participation(qblock_count, latest, warming_up),
+    }
+}
+
 /// Combined verdict from all three health dimensions.
 #[derive(Serialize, Clone)]
 pub struct HealthReport {
@@ -109,6 +123,17 @@ pub fn roll_up(
         StackHealth::Running
     };
     HealthReport { overall, infra, chain, participation }
+}
+
+/// Verdict for a node that is not running: overall `Stopped` (never notifies),
+/// with chain/participation `Unknown` since the validator is not probed.
+fn stopped_report(infra_detail: &str) -> HealthReport {
+    HealthReport {
+        overall: StackHealth::Stopped,
+        infra: status(DimensionState::Unknown, infra_detail),
+        chain: status(DimensionState::Unknown, "node stopped"),
+        participation: status(DimensionState::Unknown, "node stopped"),
+    }
 }
 
 /// Suppress a single-poll Unhealthy blip as Degraded; only report Unhealthy
@@ -140,6 +165,8 @@ struct MonitorState {
     consecutive_fails: u32,
     prev_overall: Option<StackHealth>,
     first_poll_epoch: Option<u64>,
+    /// Latest report computed by the poll loop; served by `get_health`.
+    last_report: Option<HealthReport>,
 }
 
 /// One measurement of all three dimensions, rolled up and debounced.
@@ -165,6 +192,16 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
         }
         RunMode::Docker => !matches!(stack, StackHealth::Stopped),
     };
+
+    // Node not running: report Stopped without probing the validator RPC, and
+    // reset the debounce/baseline so a later restart starts clean.
+    if !miner_up {
+        let mut guard = st.lock().unwrap();
+        guard.consecutive_fails = 0;
+        guard.prev_block = None;
+        guard.prev_overall = Some(StackHealth::Stopped);
+        return stopped_report("miner not running");
+    }
     let infra = check_infra(stack, miner_up);
 
     // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
@@ -229,10 +266,10 @@ async fn probe_participation(
         Ok(None) => return status(DimensionState::Unknown, "no qblock count on chain"),
         Err(e) => return status(DimensionState::Unknown, e),
     };
-    let latest = rpc.storage_u64(&lp_key).await.ok().flatten();
+    let latest = rpc.storage_u64(&lp_key).await;
     // Warming up = still within the startup grace window (~2 min = one head interval).
     let warming_up = within_startup_grace(st);
-    check_participation(qblock_count, latest, warming_up)
+    participation_from_read(latest, qblock_count, warming_up)
 }
 
 /// True until STARTUP_GRACE_SECS have elapsed since the first poll.
@@ -247,11 +284,13 @@ fn within_startup_grace(st: &Mutex<MonitorState>) -> bool {
     now.saturating_sub(start) < STARTUP_GRACE_SECS
 }
 
+/// Return the latest report computed by the poll loop. This does NOT sample or
+/// mutate state — the background loop is the only thing that probes the RPC.
 #[tauri::command]
 pub async fn get_health(app: AppHandle) -> HealthReport {
     let st = app.state::<Mutex<MonitorState>>();
-    let inner = st.inner();
-    sample(&app, inner).await
+    let cached = { st.inner().lock().unwrap().last_report.clone() };
+    cached.unwrap_or_else(|| stopped_report("warming up"))
 }
 
 /// Spawn the 15 s poll loop; emit `health-changed` and notify on transitions.
@@ -267,6 +306,10 @@ pub fn spawn_health_monitor(app: AppHandle) {
                 let inner = st.inner();
                 sample(&app, inner).await
             };
+            {
+                let st = app.state::<Mutex<MonitorState>>();
+                st.inner().lock().unwrap().last_report = Some(report.clone());
+            }
             let flipped_to_unhealthy = matches!(report.overall, StackHealth::Unhealthy)
                 && !matches!(last_overall, Some(StackHealth::Unhealthy));
             if flipped_to_unhealthy {
@@ -415,5 +458,44 @@ mod tests {
     #[test]
     fn infra_fails_when_miner_down() {
         assert_eq!(check_infra(StackHealth::Running, false).state, DimensionState::Fail);
+    }
+
+    #[test]
+    fn stopped_report_is_stopped_with_unknown_chain_and_participation() {
+        let r = stopped_report("miner not running");
+        assert!(matches!(r.overall, StackHealth::Stopped));
+        assert_eq!(r.chain.state, DimensionState::Unknown);
+        assert_eq!(r.participation.state, DimensionState::Unknown);
+    }
+
+    #[test]
+    fn participation_from_read_err_is_unknown() {
+        let s = participation_from_read(Err("rpc down".into()), 3865, false);
+        assert_eq!(s.state, DimensionState::Unknown);
+        assert_eq!(s.detail, "rpc down");
+    }
+
+    #[test]
+    fn participation_from_read_absent_after_warmup_fails() {
+        assert_eq!(
+            participation_from_read(Ok(None), 3865, false).state,
+            DimensionState::Fail
+        );
+    }
+
+    #[test]
+    fn participation_from_read_absent_while_warming_warns() {
+        assert_eq!(
+            participation_from_read(Ok(None), 3865, true).state,
+            DimensionState::Warn
+        );
+    }
+
+    #[test]
+    fn participation_from_read_present_is_ok() {
+        assert_eq!(
+            participation_from_read(Ok(Some(3865)), 3865, false).state,
+            DimensionState::Ok
+        );
     }
 }
