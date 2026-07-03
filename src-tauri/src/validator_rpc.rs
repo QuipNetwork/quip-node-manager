@@ -37,6 +37,12 @@ pub fn storage_map_key(pallet: &str, item: &str, key: &[u8]) -> Vec<u8> {
     k
 }
 
+/// Decode the leading SCALE `u64` (little-endian) from a storage value.
+pub fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
+    let head: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +72,23 @@ mod tests {
 c3d972b93e95d78499f6ca768214647b\
 b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
         );
+    }
+
+    #[test]
+    fn decodes_qblock_count_value() {
+        let raw = hex::decode("190f000000000000").unwrap();
+        assert_eq!(decode_u64_le(&raw), Some(3865));
+    }
+
+    #[test]
+    fn decodes_leading_u64_of_latest_participation() {
+        // Value carries qblock:u64 followed by trailing fields we ignore.
+        let raw = hex::decode("1a0f00000000000001007e1c0800").unwrap();
+        assert_eq!(decode_u64_le(&raw), Some(3866));
+    }
+
+    #[test]
+    fn decode_u64_le_rejects_short_input() {
+        assert_eq!(decode_u64_le(&[0u8; 4]), None);
     }
 }
