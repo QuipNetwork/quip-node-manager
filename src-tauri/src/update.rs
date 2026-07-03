@@ -1,9 +1,68 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use crate::native::NativeProcessState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 use tauri::Emitter;
+use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateStep {
+    StopNative,
+    StopStack,
+    DownloadBinary,
+    PullImages,
+    StartStack,
+    StartNative,
+}
+
+/// The ordered stop → apply → start plan for a user-initiated update restart.
+/// Docker stops/starts only the compose stack; Native also stops/starts the
+/// host miner and refreshes its binary. Each step is idempotent from a stopped
+/// state, so the same plan works whether or not the node is currently running.
+fn update_restart_steps(mode: &crate::settings::RunMode) -> Vec<UpdateStep> {
+    use UpdateStep::*;
+    match mode {
+        crate::settings::RunMode::Docker => vec![StopStack, PullImages, StartStack],
+        crate::settings::RunMode::Native => {
+            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        }
+    }
+}
+
+async fn run_update_step(app: &tauri::AppHandle, step: UpdateStep) -> Result<(), String> {
+    // Native steps fetch the managed process state from `app` (same idiom as
+    // health.rs), so the command needs no State parameter.
+    match step {
+        UpdateStep::StopNative => {
+            let state = app.state::<NativeProcessState>();
+            crate::native::stop_native_node(app.clone(), state).await
+        }
+        UpdateStep::StopStack => crate::compose::stop_stack(app.clone()).await,
+        UpdateStep::DownloadBinary => {
+            crate::native::download_native_binary(app.clone()).await.map(|_| ())
+        }
+        UpdateStep::PullImages => crate::compose::pull_compose_images(app.clone()).await,
+        UpdateStep::StartStack => crate::compose::start_stack(app.clone()).await,
+        UpdateStep::StartNative => {
+            let state = app.state::<NativeProcessState>();
+            crate::native::start_native_node(app.clone(), state).await.map(|_| ())
+        }
+    }
+}
+
+/// User-initiated: stop → apply the pending update → start, mode-aware. Bails
+/// on the first failing step (leaving the node stopped) rather than claiming a
+/// false success — the caller keeps the update flagged and re-enables the button.
+#[tauri::command]
+pub async fn restart_to_update(app: tauri::AppHandle) -> Result<(), String> {
+    let mode = crate::settings::load_settings().run_mode;
+    for step in update_restart_steps(&mode) {
+        run_update_step(&app, step).await?;
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
@@ -441,6 +500,24 @@ mod tests {
         assert!(has_new_update(&ab, &a), "a newly added id notifies");
         assert!(!has_new_update(&a, &ab), "shrinking set does not notify");
         assert!(!has_new_update(&none, &a), "cleared set does not notify");
+    }
+
+    #[test]
+    fn docker_restart_plan_is_stop_pull_start() {
+        use UpdateStep::*;
+        assert_eq!(
+            update_restart_steps(&RunMode::Docker),
+            vec![StopStack, PullImages, StartStack]
+        );
+    }
+
+    #[test]
+    fn native_restart_plan_stops_both_downloads_and_starts_both() {
+        use UpdateStep::*;
+        assert_eq!(
+            update_restart_steps(&RunMode::Native),
+            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+        );
     }
 
     #[test]
