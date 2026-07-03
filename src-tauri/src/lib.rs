@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod compose;
 pub mod config;
 pub mod hardware;
+pub mod health;
 pub mod hostnames;
 pub mod log_stream;
 pub mod migration_v2;
