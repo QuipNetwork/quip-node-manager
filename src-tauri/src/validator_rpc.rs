@@ -134,6 +134,24 @@ impl ValidatorRpc {
     }
 }
 
+// ── Task 4: Account id from keystore ─────────────────────────────────────────
+
+pub fn parse_account_id_hex(keystore_json: &str) -> Result<[u8; 32], String> {
+    let v: serde_json::Value =
+        serde_json::from_str(keystore_json).map_err(|e| format!("keystore not json: {e}"))?;
+    let s = v.get("account_id_hex").and_then(|x| x.as_str())
+        .ok_or("keystore missing account_id_hex")?;
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))
+        .map_err(|e| format!("bad account_id_hex: {e}"))?;
+    bytes.try_into().map_err(|_| "account_id_hex is not 32 bytes".to_string())
+}
+
+pub fn read_account_id(keystore_path: &std::path::Path) -> Result<[u8; 32], String> {
+    let text = std::fs::read_to_string(keystore_path)
+        .map_err(|e| format!("cannot read keystore {}: {e}", keystore_path.display()))?;
+    parse_account_id_hex(&text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +214,21 @@ b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
         let h = parse_system_health(&v).unwrap();
         assert_eq!(h.peers, 8);
         assert!(!h.is_syncing);
+    }
+
+    #[test]
+    fn parses_account_id_from_keystore_json() {
+        let json = r#"{"version":1,"scheme":"hybrid","encrypted":false,
+            "account_id_hex":"0xb4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"}"#;
+        let id = parse_account_id_hex(json).unwrap();
+        assert_eq!(
+            hex::encode(id),
+            "b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
+        );
+    }
+
+    #[test]
+    fn account_id_missing_field_errs() {
+        assert!(parse_account_id_hex(r#"{"version":1}"#).is_err());
     }
 }
