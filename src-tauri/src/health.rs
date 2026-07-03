@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Node health monitor: infra + chain-liveness + participation.
 
-use crate::settings::StackHealth;
+use crate::settings::{RunMode, StackHealth};
 use crate::validator_rpc::SystemHealth;
 use serde::Serialize;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Serialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -67,6 +70,21 @@ pub fn check_participation(
     }
 }
 
+/// Infrastructure is OK when the Docker stack rolls up Running AND the miner is
+/// up (native process alive, or — in Docker mode — its container is part of the
+/// already-Running stack, in which case `miner_up` is passed as true).
+pub fn check_infra(stack: StackHealth, miner_up: bool) -> DimensionStatus {
+    if !miner_up {
+        return status(DimensionState::Fail, "miner not running");
+    }
+    match stack {
+        StackHealth::Running => status(DimensionState::Ok, "all services up"),
+        StackHealth::Degraded => status(DimensionState::Warn, "stack degraded"),
+        StackHealth::Unhealthy => status(DimensionState::Fail, "stack unhealthy"),
+        StackHealth::Stopped => status(DimensionState::Fail, "stack stopped"),
+    }
+}
+
 /// Combined verdict from all three health dimensions.
 #[derive(Serialize, Clone)]
 pub struct HealthReport {
@@ -114,6 +132,163 @@ pub fn debounce(
             other
         }
     }
+}
+
+#[derive(Default)]
+struct MonitorState {
+    prev_block: Option<u64>,
+    consecutive_fails: u32,
+    prev_overall: Option<StackHealth>,
+    first_poll_epoch: Option<u64>,
+}
+
+/// One measurement of all three dimensions, rolled up and debounced.
+async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
+    let settings = crate::settings::load_settings();
+    let run_mode = settings.run_mode.clone();
+    let cfg = &settings.node_config;
+
+    // Dimension A: infra. (get_stack_status / load_settings / data_dir take no app arg.)
+    let stack = crate::compose::get_stack_status()
+        .await
+        .map(|s| s.overall)
+        .unwrap_or(StackHealth::Unhealthy);
+    let miner_up = match run_mode {
+        RunMode::Native => {
+            // get_native_node_status is an async #[tauri::command] over managed
+            // NativeProcessState; fetch that state and call it directly.
+            let native_state = app.state::<crate::native::NativeProcessState>();
+            crate::native::get_native_node_status(native_state)
+                .await
+                .map(|s| s.running)
+                .unwrap_or(false)
+        }
+        RunMode::Docker => !matches!(stack, StackHealth::Stopped),
+    };
+    let infra = check_infra(stack, miner_up);
+
+    // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
+    let rpc = crate::validator_rpc::ValidatorRpc::new(&crate::native::native_miner_validator_url(cfg));
+    let (chain, participation) = probe_chain_and_participation(&rpc, st).await;
+
+    let candidate = roll_up(infra, chain, participation);
+    let mut guard = st.lock().unwrap();
+    let prev = guard.prev_overall.unwrap_or(StackHealth::Stopped);
+    let debounced = debounce(&prev, candidate.overall, &mut guard.consecutive_fails);
+    guard.prev_overall = Some(debounced);
+    HealthReport { overall: debounced, ..candidate }
+}
+
+async fn probe_chain_and_participation(
+    rpc: &crate::validator_rpc::ValidatorRpc,
+    st: &Mutex<MonitorState>,
+) -> (DimensionStatus, DimensionStatus) {
+    let now_block = match rpc.current_block().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                status(DimensionState::Unknown, e),
+                status(DimensionState::Unknown, "rpc unreachable"),
+            );
+        }
+    };
+    let health = match rpc.system_health().await {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                status(DimensionState::Unknown, e),
+                status(DimensionState::Unknown, "rpc unreachable"),
+            );
+        }
+    };
+    let prev_block = { st.lock().unwrap().prev_block };
+    let chain = check_chain(prev_block, now_block, &health);
+    {
+        st.lock().unwrap().prev_block = Some(now_block);
+    }
+
+    let participation = probe_participation(rpc, st).await;
+    (chain, participation)
+}
+
+async fn probe_participation(
+    rpc: &crate::validator_rpc::ValidatorRpc,
+    st: &Mutex<MonitorState>,
+) -> DimensionStatus {
+    let keystore = crate::settings::data_dir().join("keystore.json");
+    let account = match crate::validator_rpc::read_account_id(&keystore) {
+        Ok(a) => a,
+        Err(e) => return status(DimensionState::Unknown, e),
+    };
+    let qc_key = crate::validator_rpc::storage_value_key("QuantumPow", "QBlockCount");
+    let lp_key =
+        crate::validator_rpc::storage_map_key("MinerRegistry", "LatestParticipation", &account);
+    let qblock_count = match rpc.storage_u64(&qc_key).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return status(DimensionState::Unknown, "no qblock count on chain"),
+        Err(e) => return status(DimensionState::Unknown, e),
+    };
+    let latest = rpc.storage_u64(&lp_key).await.ok().flatten();
+    // Warming up = still within the startup grace window (~2 min = one head interval).
+    let warming_up = within_startup_grace(st);
+    check_participation(qblock_count, latest, warming_up)
+}
+
+/// True until STARTUP_GRACE_SECS have elapsed since the first poll.
+fn within_startup_grace(st: &Mutex<MonitorState>) -> bool {
+    const STARTUP_GRACE_SECS: u64 = 120;
+    let mut guard = st.lock().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let start = *guard.first_poll_epoch.get_or_insert(now);
+    now.saturating_sub(start) < STARTUP_GRACE_SECS
+}
+
+#[tauri::command]
+pub async fn get_health(app: AppHandle) -> HealthReport {
+    let st = app.state::<Mutex<MonitorState>>();
+    let inner = st.inner();
+    sample(&app, inner).await
+}
+
+/// Spawn the 15 s poll loop; emit `health-changed` and notify on transitions.
+pub fn spawn_health_monitor(app: AppHandle) {
+    app.manage(Mutex::new(MonitorState::default()));
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut last_overall: Option<StackHealth> = None;
+        loop {
+            ticker.tick().await;
+            let report = {
+                let st = app.state::<Mutex<MonitorState>>();
+                let inner = st.inner();
+                sample(&app, inner).await
+            };
+            let flipped_to_unhealthy = matches!(report.overall, StackHealth::Unhealthy)
+                && !matches!(last_overall, Some(StackHealth::Unhealthy));
+            if flipped_to_unhealthy {
+                notify_unhealthy(&app, &report);
+            }
+            last_overall = Some(report.overall);
+            let _ = app.emit("health-changed", &report);
+        }
+    });
+}
+
+fn notify_unhealthy(app: &AppHandle, report: &HealthReport) {
+    let reason = [&report.infra, &report.chain, &report.participation]
+        .iter()
+        .find(|d| d.state == DimensionState::Fail)
+        .map(|d| d.detail.clone())
+        .unwrap_or_else(|| "node unhealthy".to_string());
+    let _ = app
+        .notification()
+        .builder()
+        .title("Quip node unhealthy")
+        .body(&reason)
+        .show();
 }
 
 #[cfg(test)]
@@ -224,5 +399,20 @@ mod tests {
     #[test]
     fn participation_fails_when_never_participated_after_warmup() {
         assert_eq!(check_participation(3865, None, false).state, DimensionState::Fail);
+    }
+
+    #[test]
+    fn infra_ok_when_stack_running_and_miner_up() {
+        assert_eq!(check_infra(StackHealth::Running, true).state, DimensionState::Ok);
+    }
+
+    #[test]
+    fn infra_fails_when_stack_unhealthy() {
+        assert_eq!(check_infra(StackHealth::Unhealthy, true).state, DimensionState::Fail);
+    }
+
+    #[test]
+    fn infra_fails_when_miner_down() {
+        assert_eq!(check_infra(StackHealth::Running, false).state, DimensionState::Fail);
     }
 }

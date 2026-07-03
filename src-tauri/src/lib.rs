@@ -61,6 +61,7 @@ pub fn set_tray_update(app: &tauri::AppHandle, has_update: bool, tooltip: &str) 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(LogStreamState::new())
         .manage(NativeProcessState::new())
         .manage(ChecklistState::new())
@@ -88,6 +89,7 @@ pub fn run() {
             compose::reset_dashboard_database,
             compose::get_stack_status,
             compose::get_stack_config,
+            health::get_health,
             // Hardware
             hardware::detect_gpu_backend,
             hardware::list_gpu_devices,
@@ -229,6 +231,9 @@ pub fn run() {
             // ── Background update monitor ────────────────────────
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(update::background_update_monitor(handle));
+
+            // ── Node health monitor (15 s poll loop) ─────────────
+            crate::health::spawn_health_monitor(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())
