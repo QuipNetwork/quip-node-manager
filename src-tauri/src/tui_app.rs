@@ -569,9 +569,6 @@ impl TuiApp {
                     self.set_status(format!("Migration settings error: {}", e));
                     return;
                 }
-                if report.changed {
-                    self.set_status("Migrated v0.1 node data to v0.2 layout");
-                }
             }
             Err(e) => {
                 self.set_status(format!("Migration error: {}", e));

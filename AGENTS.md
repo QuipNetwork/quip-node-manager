@@ -53,7 +53,8 @@ quip-node-manager/
         ├── network.rs             # Public IP detection only
         ├── update.rs              # Multi-image + app update monitor
         ├── migration_v2.rs        # v0.1 → v0.2 config/.env migration; backs up
-        │                          # old files and promotes hand-edited host/port
+        │                          # old files and promotes hand-edited host/port.
+        │                          # REMOVE in v0.3 (drop v0.1 → v0.2 upgrades)
         ├── hostnames.rs           # public_host parsing → Caddy hostname +
         │                          # validator libp2p --public-addr multiaddr
         ├── checklist.rs           # Pre-flight checks → checklist-update events;
