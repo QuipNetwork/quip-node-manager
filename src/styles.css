@@ -214,6 +214,10 @@ body {
   background-color: var(--error);
 }
 
+.status-dot.status-unhealthy {
+  background-color: var(--error);
+}
+
 .status-dot.status-running.active {
   animation: pulse-green 2s infinite;
 }
@@ -223,6 +227,10 @@ body {
 }
 
 .status-dot.status-stopped.active {
+  animation: pulse-red 2s infinite;
+}
+
+.status-dot.status-unhealthy.active {
   animation: pulse-red 2s infinite;
 }
 
@@ -286,6 +294,10 @@ body {
 }
 
 .status-text.status-stopped {
+  color: var(--error);
+}
+
+.status-text.status-unhealthy {
   color: var(--error);
 }
 

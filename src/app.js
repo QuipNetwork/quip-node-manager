@@ -774,8 +774,8 @@ function setStatus(stateStr) {
     text.textContent = 'DEGRADED';
     sub.textContent = 'Running, but some stack services are down or unhealthy';
   } else if (stateStr === 'unhealthy') {
-    dot.classList.add('status-degraded', 'active');
-    text.classList.add('status-degraded');
+    dot.classList.add('status-unhealthy', 'active');
+    text.classList.add('status-unhealthy');
     text.textContent = 'UNHEALTHY';
     sub.textContent = 'Node health checks failing';
   } else {
@@ -1301,6 +1301,7 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     await stopNode();
     state.containerRunning = false;
     state.nativeRunning = false;
+    state.health = null;
     setStatus('stopped');
     updateStartStopState();
     expandConfig();
