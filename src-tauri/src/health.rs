@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Node health monitor: infra + chain-liveness + participation.
 
+use crate::settings::StackHealth;
 use crate::validator_rpc::SystemHealth;
 use serde::Serialize;
 
@@ -66,12 +67,111 @@ pub fn check_participation(
     }
 }
 
+/// Combined verdict from all three health dimensions.
+#[derive(Serialize, Clone)]
+pub struct HealthReport {
+    pub overall: StackHealth,
+    pub infra: DimensionStatus,
+    pub chain: DimensionStatus,
+    pub participation: DimensionStatus,
+}
+
+/// Worst-wins: any Fail → Unhealthy; else any Warn/Unknown → Degraded; else Running.
+pub fn roll_up(
+    infra: DimensionStatus,
+    chain: DimensionStatus,
+    participation: DimensionStatus,
+) -> HealthReport {
+    let states = [&infra.state, &chain.state, &participation.state];
+    let overall = if states.iter().any(|s| **s == DimensionState::Fail) {
+        StackHealth::Unhealthy
+    } else if states.iter().any(|s| matches!(s, DimensionState::Warn | DimensionState::Unknown)) {
+        StackHealth::Degraded
+    } else {
+        StackHealth::Running
+    };
+    HealthReport { overall, infra, chain, participation }
+}
+
+/// Suppress a single-poll Unhealthy blip as Degraded; only report Unhealthy
+/// once it persists for two consecutive polls. Recovery resets the counter.
+pub fn debounce(
+    _prev_overall: &StackHealth,
+    candidate: StackHealth,
+    consecutive_fails: &mut u32,
+) -> StackHealth {
+    match candidate {
+        StackHealth::Unhealthy => {
+            *consecutive_fails += 1;
+            if *consecutive_fails >= 2 {
+                StackHealth::Unhealthy
+            } else {
+                StackHealth::Degraded
+            }
+        }
+        other => {
+            *consecutive_fails = 0;
+            other
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn health(peers: u64, syncing: bool) -> SystemHealth {
         SystemHealth { peers, is_syncing: syncing }
+    }
+
+    use crate::settings::StackHealth;
+
+    fn ok() -> DimensionStatus { status(DimensionState::Ok, "") }
+    fn fail() -> DimensionStatus { status(DimensionState::Fail, "") }
+    fn warn() -> DimensionStatus { status(DimensionState::Warn, "") }
+
+    #[test]
+    fn rollup_all_ok_is_running() {
+        assert!(matches!(roll_up(ok(), ok(), ok()).overall, StackHealth::Running));
+    }
+
+    #[test]
+    fn rollup_infra_fail_is_unhealthy() {
+        assert!(matches!(roll_up(fail(), ok(), ok()).overall, StackHealth::Unhealthy));
+    }
+
+    #[test]
+    fn rollup_chain_fail_is_unhealthy() {
+        assert!(matches!(roll_up(ok(), fail(), ok()).overall, StackHealth::Unhealthy));
+    }
+
+    #[test]
+    fn rollup_warn_is_degraded_not_unhealthy() {
+        assert!(matches!(roll_up(ok(), warn(), ok()).overall, StackHealth::Degraded));
+    }
+
+    #[test]
+    fn debounce_holds_first_fail_at_degraded() {
+        let mut n = 0;
+        let out = debounce(&StackHealth::Running, StackHealth::Unhealthy, &mut n);
+        assert!(matches!(out, StackHealth::Degraded));
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn debounce_reports_unhealthy_on_second_consecutive_fail() {
+        let mut n = 1;
+        let out = debounce(&StackHealth::Degraded, StackHealth::Unhealthy, &mut n);
+        assert!(matches!(out, StackHealth::Unhealthy));
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn debounce_resets_on_recovery() {
+        let mut n = 2;
+        let out = debounce(&StackHealth::Unhealthy, StackHealth::Running, &mut n);
+        assert!(matches!(out, StackHealth::Running));
+        assert_eq!(n, 0);
     }
 
     #[test]
