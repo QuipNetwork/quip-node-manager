@@ -6,7 +6,7 @@
 
 **Architecture:** A host-side `HealthMonitor` polls three independent dimensions every 15 s. Infrastructure reuses the existing `compose::get_stack_status` roll-up + native PID check. Chain-liveness and participation come from **read-only substrate JSON-RPC** over the existing `reqwest` client: `chain_getHeader` / `system_health`, plus two pallet storage reads (`QuantumPow.QBlockCount` and `MinerRegistry.LatestParticipation[account]`), decoded by hand (both are plain `u64` little-endian). The log stream stays as the diagnostic layer only.
 
-**Tech Stack:** Rust (Tauri v2 backend), `reqwest` (already present), new crates `parity-scale-codec`, `twox-hash`, `blake2` for storage-key hashing/decoding; vanilla JS/HTML frontend.
+**Tech Stack:** Rust (Tauri v2 backend), `reqwest` (already present), new crates `twox-hash` + `blake2` for storage-key hashing (the two u64 values decode with stdlib `from_le_bytes`); vanilla JS/HTML frontend.
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - ≤100 lines/function, cyclomatic complexity ≤8, ≤5 positional params, 100-char lines, absolute imports (`crate::…`), no relative module paths.
 - Zero-warnings: `cargo clippy` must pass clean. Run from `src-tauri/`.
 - No new `:latest` image tags, no config schema changes to `config.toml`.
-- Dependency versions (looked up 2026-07-02): `parity-scale-codec = "3.7"`, `twox-hash = "2.1"`, `blake2 = "0.10"`.
+- Dependency versions (looked up 2026-07-02): `twox-hash = "2.1"`, `blake2 = "0.10"`. (No `parity-scale-codec`: both storage values are plain `u64` LE, decoded with stdlib `from_le_bytes`.)
 - Health verdict enum reuses the existing `crate::settings::StackHealth` variants: `Running`, `Degraded`, `Unhealthy`, `Stopped`.
 - Validator RPC is reached from the host at `http://127.0.0.1:<validator_rpc_port>` (default 9944) in **both** run modes (Task 8 makes Docker publish it).
 
@@ -68,9 +68,9 @@ Known-answer test vectors and fixtures used throughout the plan:
 In `src-tauri/Cargo.toml` under `[dependencies]`, after `hex = "0.4"`:
 
 ```toml
-# Read-only substrate storage access for the health monitor: storage-key
-# hashing (twox128 / blake2_128_concat) + SCALE u64 decode. No signing.
-parity-scale-codec = "3.7"
+# Read-only substrate storage-key hashing for the health monitor
+# (twox128 / blake2_128_concat). The two u64 values decode with stdlib
+# from_le_bytes, so no SCALE-codec crate is needed. No signing.
 twox-hash = "2.1"
 blake2 = "0.10"
 ```
