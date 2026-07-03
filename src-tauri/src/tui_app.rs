@@ -49,7 +49,6 @@ pub enum FocusId {
     QpuApiKey,
     QpuDailyBudget,
     ApplyRestart,
-    AutoUpdate,
     // Advanced (inside Custom Settings)
     LogLevel,
     NodeLog,
@@ -113,7 +112,6 @@ pub struct FormState {
     pub telemetry_dir: String,
     pub node_log: String,
     pub http_log: String,
-    pub auto_update: bool,
     // Image selector
     pub image_tag: crate::settings::ImageTag,
     /// Temporary buffer used while editing a text field.
@@ -166,7 +164,6 @@ impl FormState {
             telemetry_dir: nc.telemetry_dir.clone(),
             node_log: nc.node_log.clone(),
             http_log: nc.http_log.clone(),
-            auto_update: s.auto_update_enabled,
             image_tag: s.image_tag,
             edit_buf: String::new(),
         }
@@ -748,7 +745,6 @@ impl TuiApp {
         self.settings.node_config = config;
         self.settings.image_tag = self.form.image_tag;
         self.settings.run_mode = self.form.run_mode();
-        self.settings.auto_update_enabled = self.form.auto_update;
         if let Err(e) = crate::settings::save_settings(&self.settings) {
             self.set_status(format!("Save error: {}", e));
             return;
@@ -823,7 +819,6 @@ impl TuiApp {
                 list.push(FocusId::LogLevel);
                 list.push(FocusId::NodeLog);
                 list.push(FocusId::HttpLog);
-                list.push(FocusId::AutoUpdate);
             }
             list.push(FocusId::CpuCores);
             list.push(FocusId::GpuEnable);

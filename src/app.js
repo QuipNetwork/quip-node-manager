@@ -638,8 +638,6 @@ function collectConfig() {
 function applyFormToSettings() {
   if (!state.settings) return;
   state.settings.node_config = collectConfig();
-  state.settings.auto_update_enabled =
-    document.getElementById('auto-update-enabled')?.checked ?? false;
 
   // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
   // enabled, CPU otherwise. D-Wave mining is a config.toml [dwave] concern,
@@ -1653,8 +1651,6 @@ async function init() {
     populateForm(settings);
     // The Metal toggle (rendered once the hardware survey lands) reflects
     // run_mode; there is no separate run-mode control to seed here.
-    document.getElementById('auto-update-enabled').checked =
-      settings.auto_update_enabled ?? false;
     if (settings.active_tab && settings.active_tab !== 'status') {
       document
         .querySelector(`[data-tab="${settings.active_tab}"]`)

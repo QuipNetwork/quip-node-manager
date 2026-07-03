@@ -141,12 +141,6 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
-        FocusId::AutoUpdate => {
-            app.form.auto_update = !app.form.auto_update;
-            app.dirty = true;
-            Action::None
-        }
-
         // GPU Utilization — increase by 10 (wraps at 100)
         FocusId::GpuUtilization => {
             app.form.gpu_utilization = if app.form.gpu_utilization >= 100 {
@@ -192,7 +186,6 @@ fn toggle_or_activate(app: &mut TuiApp) -> Action {
     match app.focus {
         FocusId::PublicHostEnable
         | FocusId::GpuYielding
-        | FocusId::AutoUpdate
         | FocusId::RunMode
         | FocusId::GpuEnable => activate(app),
         _ => activate(app),

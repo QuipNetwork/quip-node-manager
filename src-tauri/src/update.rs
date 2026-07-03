@@ -301,7 +301,6 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         // Compose-image checks — applies in Docker mode, and in Native mode
         // whenever the dashboard service is running (dashboard + postgres
         // + maybe caddy). `relevant_images` filters the set correctly.
-        let mut any_compose_update = false;
         for image in relevant_images(&settings) {
             if let Ok(Some(info)) = check_gitlab_image_update(image).await {
                 if info.update_available {
@@ -312,28 +311,7 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
                             "info": info,
                         }),
                     );
-                    any_compose_update = true;
                 }
-            }
-        }
-
-        if any_compose_update && settings.auto_update_enabled {
-            emit_log(
-                &app,
-                "[Auto-Update] New stack image detected, restarting...",
-            );
-            // Bail on the first failing step and report it — never claim
-            // "Restart complete." after a swallowed error, which would tell
-            // the user their node is up when stop succeeded but start didn't.
-            match auto_update_restart_stack(&app).await {
-                Ok(()) => emit_log(&app, "[Auto-Update] Restart complete."),
-                Err(e) => emit_error(
-                    &app,
-                    &format!(
-                        "[Auto-Update] Restart failed: {e}. Your node may be \
-                         stopped — open the app and start it manually."
-                    ),
-                ),
             }
         }
 
@@ -342,54 +320,9 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
         if settings.run_mode == crate::settings::RunMode::Native {
             if let Ok(Some(info)) = crate::native::check_binary_update().await {
                 let _ = app.emit("binary-update-available", &info);
-
-                if settings.auto_update_enabled {
-                    emit_log(
-                        &app,
-                        &format!(
-                            "[Auto-Update] New binary v{} available, downloading...",
-                            info.version
-                        ),
-                    );
-                    match crate::native::download_native_binary(app.clone()).await {
-                        Ok(_) => emit_log(&app, "[Auto-Update] Binary updated."),
-                        Err(e) => {
-                            emit_error(&app, &format!("[Auto-Update] Binary download failed: {e}"))
-                        }
-                    }
-                }
             }
         }
     }
-}
-
-/// Stop → pull → start the compose stack, short-circuiting on the first error
-/// so a failed pull doesn't leave the stack torn down with a misleading
-/// success message.
-async fn auto_update_restart_stack(app: &tauri::AppHandle) -> Result<(), String> {
-    crate::compose::stop_stack(app.clone()).await?;
-    crate::compose::pull_compose_images(app.clone()).await?;
-    crate::compose::start_stack(app.clone()).await?;
-    Ok(())
-}
-
-fn emit_log(app: &tauri::AppHandle, msg: &str) {
-    emit_level(app, "INFO", msg);
-}
-
-fn emit_error(app: &tauri::AppHandle, msg: &str) {
-    emit_level(app, "ERROR", msg);
-}
-
-fn emit_level(app: &tauri::AppHandle, level: &str, msg: &str) {
-    let _ = app.emit(
-        "node-log",
-        serde_json::json!({
-            "timestamp": "",
-            "level": level,
-            "message": msg,
-        }),
-    );
 }
 
 #[cfg(test)]

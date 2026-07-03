@@ -380,8 +380,6 @@ pub struct AppSettings {
     pub zerossl_api_key: String,
     #[serde(default)]
     pub run_mode: RunMode,
-    #[serde(default)]
-    pub auto_update_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -396,7 +394,6 @@ impl Default for AppSettings {
             cert_email: String::new(),
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
-            auto_update_enabled: false,
         }
     }
 }
