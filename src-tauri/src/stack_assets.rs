@@ -21,9 +21,9 @@
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:80` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
-//!   - compose.yml (Native mode only): the validator's JSON-RPC port is
-//!     published on the host loopback (127.0.0.1:9944) so the host-side
-//!     miner can connect to `ws://127.0.0.1:9944` directly.
+//!   - compose.yml (both modes): the validator's JSON-RPC port is published
+//!     on the host loopback (127.0.0.1:9944) so the host health monitor and
+//!     the host-side miner (Native) can reach `ws://127.0.0.1:9944` directly.
 
 use crate::settings::{data_dir, RunMode};
 use std::fs;
@@ -100,7 +100,6 @@ pub fn sync_stack_assets(
     }
 
     let compose_out = patch_compose_file(
-        run_mode,
         COMPOSE_YML,
         public_api_port,
         validator_port,
@@ -119,7 +118,6 @@ pub fn sync_stack_assets(
 }
 
 fn patch_compose_file(
-    run_mode: &RunMode,
     src: &str,
     public_api_port: u16,
     validator_port: u16,
@@ -127,8 +125,7 @@ fn patch_compose_file(
     validator_rpc_port: u16,
 ) -> String {
     let patched = patch_compose_ports(src, public_api_port, validator_port);
-    let patched =
-        expose_native_validator_rpc(run_mode, &patched, validator_port, validator_rpc_port);
+    let patched = expose_validator_rpc(&patched, validator_port, validator_rpc_port);
     let patched = patch_validator_public_addr(&patched, public_host, validator_port);
     strip_volume_names(&patched)
 }
@@ -148,19 +145,11 @@ fn strip_volume_names(src: &str) -> String {
         .replace("\n    name: quip-caddy-config", "")
 }
 
-/// In Native mode, publish the validator's JSON-RPC port on the host loopback
-/// (`127.0.0.1:<validator_rpc_port>`) so the host-side miner can reach it. In
-/// Docker mode the miner is a container and reaches `quip-validator:9944` over
-/// the compose network, so no host publish is needed.
-fn expose_native_validator_rpc(
-    run_mode: &RunMode,
-    src: &str,
-    validator_port: u16,
-    validator_rpc_port: u16,
-) -> String {
-    if !matches!(run_mode, RunMode::Native) {
-        return src.to_string();
-    }
+/// Publish the validator's JSON-RPC port on the host loopback
+/// (`127.0.0.1:<validator_rpc_port>`) in both run modes so the host health
+/// monitor can reach `ws://127.0.0.1:<validator_rpc_port>` directly.
+/// In Native mode the host-side miner also uses this binding.
+fn expose_validator_rpc(src: &str, validator_port: u16, validator_rpc_port: u16) -> String {
     // Anchor on the (already port-patched) validator UDP mapping so the RPC
     // mapping lands inside the quip-validator service's `ports:` list.
     let udp_line = format!("      - \"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\"\n");
@@ -288,7 +277,6 @@ mod tests {
     #[test]
     fn patch_compose_file_adds_public_addr_from_dns_public_host() {
         let patched = patch_compose_file(
-            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
@@ -300,18 +288,11 @@ mod tests {
 
     #[test]
     fn patch_compose_file_adds_public_addr_from_ip_public_host() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "1.2.3.4",
-            9944,
-        );
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "1.2.3.4", 9944);
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
         let patched = patch_compose_file(
-            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
@@ -323,55 +304,33 @@ mod tests {
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
-        );
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(!patched.contains("--public-addr"));
     }
 
     #[test]
-    fn native_mode_publishes_validator_rpc_on_configured_host_port() {
-        let patched = patch_compose_file(
-            &RunMode::Native,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
-        );
+    fn both_modes_publish_validator_rpc_on_configured_host_port() {
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
         // Inserted right after the validator's UDP mapping, inside its ports.
         assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
 
         // The host side honours the configured port; the container side is
         // always the validator's fixed 9944.
-        let custom = patch_compose_file(
-            &RunMode::Native,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9955,
-        );
+        let custom =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9955);
         assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
     }
 
     #[test]
-    fn docker_mode_does_not_publish_validator_rpc() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
+    fn docker_mode_also_publishes_validator_rpc_to_host() {
+        let out = expose_validator_rpc(COMPOSE_YML, 30333, 9944);
+        assert!(
+            out.contains("127.0.0.1:9944:9944"),
+            "Docker mode must publish validator RPC to host loopback for the health monitor"
         );
-        assert!(!patched.contains("9944:9944"));
     }
 
     #[test]
