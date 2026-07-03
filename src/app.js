@@ -28,6 +28,8 @@ const state = {
   checksPassed: false,
   starting: false,
   stopping: false,
+  updateAvailable: null,   // null | { kind: 'image' | 'binary' }
+  updating: false,
   detectedGpus: [], // { index, name }
   logLines: [],
   MAX_LOG_LINES: 500,
@@ -744,12 +746,25 @@ function updateStartStopState() {
   const running = state.containerRunning || state.nativeRunning;
   const startBtn = document.getElementById('btn-start');
   const stopBtn = document.getElementById('btn-stop');
-  startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
-  startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
-  stopBtn.disabled = !running || state.starting || state.stopping;
+  const pendingUpdate = !!state.updateAvailable;
+
+  if (state.updating) {
+    startBtn.textContent = 'Updating…';
+    startBtn.disabled = true;
+  } else if (pendingUpdate && running) {
+    // Node running + update pending: btn-start becomes the apply action.
+    startBtn.textContent = 'Restart to Update';
+    startBtn.disabled = !state.checksPassed;
+  } else {
+    // Stopped (with or without update) or running with no update: normal Start.
+    startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+    startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
+  }
+
   stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  stopBtn.disabled = !running || state.starting || state.stopping || state.updating;
   document.getElementById('btn-apply').disabled =
-    !state.checksPassed || state.starting || state.stopping;
+    !state.checksPassed || state.starting || state.stopping || state.updating;
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -1244,6 +1259,29 @@ function expandConfig() {
   document.getElementById('config-section').style.display = '';
 }
 
+async function runRestartToUpdate() {
+  const applyStatus = document.getElementById('apply-status');
+  state.updating = true;
+  updateStartStopState();
+  applyStatus.textContent = 'Updating…';
+  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting node to apply update…' });
+  try {
+    if (state.settings) { applyFormToSettings(); await invoke('update_settings', { settings: state.settings }); }
+    await invoke('restart_to_update');
+    state.updateAvailable = null;
+    document.getElementById('update-badge').style.display = 'none';
+    applyStatus.textContent = 'Node updated and started.';
+    await pollStatus();
+  } catch (e) {
+    // Keep the update flagged so the button stays actionable.
+    applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Update failed: ${e}` });
+  } finally {
+    state.updating = false;
+    updateStartStopState();
+  }
+}
+
 async function startNode() {
   if (isDockerMode()) {
     await invoke('start_stack');
@@ -1269,6 +1307,10 @@ async function stopNode() {
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 document.getElementById('btn-start').addEventListener('click', async () => {
+  if (state.updateAvailable) {
+    await runRestartToUpdate();
+    return;
+  }
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
   updateStartStopState();
@@ -1512,12 +1554,18 @@ async function setupListeners() {
   // Update notifications
   await listen('image-update-available', () => {
     appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+    state.updateAvailable = { kind: 'image' };
+    document.getElementById('update-badge').style.display = '';
+    updateStartStopState();
     refreshNodeVersion();
   });
 
   await listen('binary-update-available', (event) => {
     const info = event.payload;
-    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Download to update.` });
+    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Restart to update.` });
+    state.updateAvailable = { kind: 'binary' };
+    document.getElementById('update-badge').style.display = '';
+    updateStartStopState();
     refreshNodeVersion();
   });
 
