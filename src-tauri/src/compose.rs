@@ -6,6 +6,7 @@
 //! validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
+use crate::progress::{ProgressSink, TauriSink};
 use crate::settings::{
     AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
@@ -15,6 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -284,7 +286,7 @@ enum StdoutMode {
 /// caller can skip treating it as error output). Image-level milestones are
 /// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
 /// record without the per-layer noise.
-fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
+fn emit_pull_progress_json(sink: &dyn ProgressSink, gen: u64, line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
@@ -298,34 +300,29 @@ fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
     // Image-level events have no parent layer; mirror them to the log.
     if value.get("parent_id").is_none() && id.starts_with("Image ") {
         let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let _ = app.emit(
-            "node-log",
-            serde_json::json!({
-                "timestamp": "",
-                "level": "INFO",
-                "message": format!("{} {}", text, id.trim_start_matches("Image ")),
-            }),
-        );
+        sink.log("INFO", &format!("{} {}", text, id.trim_start_matches("Image ")));
     }
     // Stamp the generation so the frontend can discard events from a pull it has
     // already closed (see PULL_GENERATION).
     if let Some(obj) = value.as_object_mut() {
         let _ = obj.insert("gen".into(), serde_json::json!(gen));
     }
-    let _ = app.emit("pull-progress", value);
+    sink.pull_progress(value);
     true
 }
 
-async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
-    run_compose_streaming_mode(app, args, StdoutMode::Log).await
+async fn run_compose_streaming(
+    sink: Arc<dyn ProgressSink>,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_compose_streaming_mode(sink, args, StdoutMode::Log).await
 }
 
 async fn run_compose_streaming_mode(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     args: Vec<String>,
     mode: StdoutMode,
 ) -> Result<(), String> {
-    let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let mut child = compose_cmd()
             .args(&args)
@@ -337,42 +334,28 @@ async fn run_compose_streaming_mode(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let app_out = app.clone();
+        let sink_out = Arc::clone(&sink);
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if matches!(mode, StdoutMode::Log) {
-                    let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                    sink_out.pull_progress(serde_json::json!({ "line": &line }));
                 }
-                let _ = app_out.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_out.log("INFO", &line);
             }
         });
 
         // docker compose writes `--progress json` events to stderr, so the
         // PullJson parsing lives here. Non-progress lines stay error output.
-        let app_err = app.clone();
+        let sink_err = Arc::clone(&sink);
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let StdoutMode::PullJson(gen) = mode {
-                    if emit_pull_progress_json(&app_err, gen, &line) {
+                    if emit_pull_progress_json(&*sink_err, gen, &line) {
                         continue;
                     }
                 }
-                let _ = app_err.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_err.log("INFO", &line);
                 last = line;
             }
             last
@@ -471,6 +454,18 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 /// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
+    pull_compose_images_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Pull every compose stack image, reporting per-image progress through `sink`.
+///
+/// Loads the current app settings, stages the compose assets and `.env` file
+/// (so compose sees the configured v0.2 image tags), then runs
+/// `docker compose --profile <p> pull [services...]`. The `pull-complete`
+/// notification is delivered via `sink.pull_complete` when the command exits.
+pub(crate) async fn pull_compose_images_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<(), String> {
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
@@ -487,11 +482,11 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     // start sequence) would silently fetch the wrong tag.
     write_env_file(&settings)?;
 
-    pull_compose_images_for_settings(&app, &settings).await
+    pull_compose_images_for_settings(sink, &settings).await
 }
 
 async fn pull_compose_images_for_settings(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     settings: &AppSettings,
 ) -> Result<(), String> {
     let profile = compose_profile(settings.image_tag);
@@ -511,21 +506,18 @@ async fn pull_compose_images_for_settings(
     // terminal pull-complete carry the same id.
     let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson(gen)).await;
+    sink.log("INFO", &format!("$ docker compose --profile {profile} pull ..."));
+    let result = run_compose_streaming_mode(Arc::clone(&sink), args, StdoutMode::PullJson(gen)).await;
 
     // Tell the UI the pull is over so it can hide the progress panel. Process
     // exit is the authoritative "pull is done" signal: per-image "Pulled"
     // accounting can miss an image's terminal event on some platforms, and a
     // late progress event delivered after this one is discarded by the frontend
     // because its generation is already closed.
-    let _ = app.emit(
-        "pull-complete",
-        serde_json::json!({
-            "gen": gen,
-            "success": result.is_ok(),
-            "error": result.as_ref().err().cloned().unwrap_or_default(),
-        }),
+    sink.pull_complete(
+        gen,
+        result.is_ok(),
+        &result.as_ref().err().cloned().unwrap_or_default(),
     );
     result
 }
@@ -645,7 +637,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     let profile = compose_profile(settings.image_tag);
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
-    pull_compose_images_for_settings(&app, &settings).await?;
+    pull_compose_images_for_settings(Arc::new(TauriSink::new(app.clone())), &settings).await?;
 
     // Start the host NVIDIA MPS daemon before the cuda container so it can
     // attach (native Linux GPU hosts only; no-op everywhere else).
@@ -682,7 +674,8 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
             }
         ),
     );
-    let mut up_result = run_compose_streaming(&app, up_args.clone()).await;
+    let mut up_result =
+        run_compose_streaming(Arc::new(TauriSink::new(app.clone())), up_args.clone()).await;
 
     // `up` only fails like this when a leftover container is holding one of our
     // fixed container_names and compose can't reconcile it — e.g. one created
@@ -697,7 +690,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         );
         force_remove_known_containers(&app).await;
         sweep_orphan_node_containers(&app).await;
-        up_result = run_compose_streaming(&app, up_args).await;
+        up_result = run_compose_streaming(Arc::new(TauriSink::new(app.clone())), up_args).await;
     }
 
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
@@ -917,7 +910,7 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
         "stop".into(),
     ];
     log_cmd(&app, "docker compose --profile cpu --profile cuda stop");
-    let result = run_compose_streaming(&app, stop_args).await;
+    let result = run_compose_streaming(Arc::new(TauriSink::new(app.clone())), stop_args).await;
 
     match &result {
         Ok(_) => {

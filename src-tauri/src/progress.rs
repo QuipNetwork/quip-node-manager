@@ -12,6 +12,9 @@ pub trait ProgressSink: Send + Sync {
     fn log(&self, level: &str, message: &str);
     /// A raw `docker compose --progress json` event (the `pull-progress` event).
     fn pull_progress(&self, event: serde_json::Value);
+    /// The pull sequence finished (`pull-complete`). `gen` identifies the pull
+    /// generation so the frontend can discard stale events.
+    fn pull_complete(&self, gen: u64, success: bool, error: &str);
     /// Stop sequence began (`stop-started`).
     fn stop_started(&self);
     /// Stop sequence finished (`stop-complete`).
@@ -41,6 +44,12 @@ impl ProgressSink for TauriSink {
     fn pull_progress(&self, event: serde_json::Value) {
         let _ = self.app.emit("pull-progress", event);
     }
+    fn pull_complete(&self, gen: u64, success: bool, error: &str) {
+        let _ = self.app.emit(
+            "pull-complete",
+            serde_json::json!({ "gen": gen, "success": success, "error": error }),
+        );
+    }
     fn stop_started(&self) {
         let _ = self.app.emit("stop-started", serde_json::json!({}));
     }
@@ -63,6 +72,7 @@ pub struct NullSink;
 impl ProgressSink for NullSink {
     fn log(&self, _level: &str, _message: &str) {}
     fn pull_progress(&self, _event: serde_json::Value) {}
+    fn pull_complete(&self, _gen: u64, _success: bool, _error: &str) {}
     fn stop_started(&self) {}
     fn stop_complete(&self, _success: bool, _error: Option<&str>) {}
     fn binary_download_progress(&self, _downloaded: u64, _total: Option<u64>, _done: bool) {}
@@ -78,9 +88,10 @@ mod tests {
         // object-safe (we pass &dyn ProgressSink everywhere).
         let sink: &dyn ProgressSink = &NullSink;
         sink.log("INFO", "hello");
+        sink.pull_progress(serde_json::json!({"id": "x"}));
+        sink.pull_complete(1, true, "");
         sink.stop_started();
         sink.stop_complete(true, None);
         sink.binary_download_progress(0, Some(10), false);
-        sink.pull_progress(serde_json::json!({"id": "x"}));
     }
 }
