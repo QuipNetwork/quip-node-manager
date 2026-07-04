@@ -11,6 +11,7 @@ pub mod log_stream;
 pub mod migration_v2;
 pub mod native;
 pub mod network;
+pub mod progress;
 pub mod secret;
 pub mod settings;
 pub mod stack_assets;
