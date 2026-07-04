@@ -492,6 +492,16 @@ pub fn installed_binary_version() -> Option<String> {
     }
 }
 
+/// Serializes `download_native_binary` so concurrent callers coalesce instead
+/// of racing: the loser waits on the lock, then finds the binary already
+/// current and skips its own download. Belt-and-suspenders against duplicate
+/// fetches from any pair of callers (checklist Retry, Start provisioning, the
+/// update-restart `DownloadBinary` step) writing the same fixed temp path.
+fn download_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Download the latest native miner binary from GitLab releases. Tracks the
 /// most recent release that ships this platform's asset, so release-candidate
 /// tags (e.g. `v0.2.0rc1`) are picked up automatically.
@@ -510,6 +520,10 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         let _ = app.emit("node-log", entry);
     };
 
+    // Serialize downloads so concurrent callers coalesce instead of racing the
+    // shared temp path (see `download_guard`). Held across the whole download.
+    let _guard = download_guard().lock().await;
+
     // Resolve the latest release that actually ships this binary (rc-aware).
     let meta_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -525,6 +539,16 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
                  isn't available yet — the build may still be running. Try again shortly."
             )
         })?;
+
+    // If a concurrent caller installed this version while we waited on the
+    // lock, skip the redundant re-download.
+    let latest_version = normalize_release_version(&tag);
+    if installed_binary_version().as_deref() == Some(latest_version.as_str()) {
+        log(format!(
+            "{name} already up to date (v{latest_version}); skipping download"
+        ));
+        return Ok(latest_version);
+    }
 
     log(format!("Downloading {name} ({tag})"));
     log(format!("From {url}"));

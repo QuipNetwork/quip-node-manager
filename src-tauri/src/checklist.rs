@@ -768,11 +768,24 @@ async fn fetch_binary_update(ctx: &CheckCtx, base: CheckItem, version: &str) -> 
     }
 }
 
-/// Native miner binary. A retry actively fetches the binary before reporting —
-/// a missing binary is downloaded and an outdated one is updated. A current
-/// binary is left untouched (the PyInstaller binary is large, so the full
-/// download is gated on need rather than re-run every retry).
-async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
+/// Report an available binary update without downloading it. Used by automatic
+/// rechecks (a Warn never blocks Start); the user remediates via the
+/// Restart-to-Update flow or an explicit checklist Retry.
+fn binary_update_available_item(base: CheckItem, installed: &str, version: &str) -> CheckItem {
+    base.with_state(CheckState::Warn).with_label(format!(
+        "Native miner update available \u{2014} v{version} (installed v{installed})"
+    ))
+}
+
+/// Native miner binary. A missing binary is always downloaded (the required
+/// check can't otherwise pass). An *available update* is downloaded only on a
+/// user-initiated Retry (`auto == false`); an automatic recheck — e.g. the one
+/// fired after a stop — reports it as a Warn without downloading. That matters
+/// during Restart-to-Update: its plan already has a dedicated DownloadBinary
+/// step, so an auto recheck that also downloaded would race it, re-fetching the
+/// whole binary into the same fixed temp path. A current binary is left
+/// untouched (the PyInstaller binary is large, so downloads are gated on need).
+async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
     let base = idle_item("binary", ctx);
     let mut available = tokio::task::spawn_blocking(crate::native::is_binary_available)
         .await
@@ -808,8 +821,13 @@ async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
         Ok(v) => {
             let installed = v.installed.as_deref().unwrap_or("unknown");
             match (v.update, v.latest) {
-                // A newer release exists → fetch it before reporting.
-                (Some(info), _) => fetch_binary_update(ctx, base, &info.version).await,
+                // A newer release exists. A user Retry fetches it now; an
+                // automatic recheck reports it without downloading so it can't
+                // race the Restart-to-Update flow's own DownloadBinary step.
+                (Some(info), _) if !auto => {
+                    fetch_binary_update(ctx, base, &info.version).await
+                }
+                (Some(info), _) => binary_update_available_item(base, installed, &info.version),
                 // Confirmed current: show both numbers so the user can see what
                 // was discovered, not just a green check.
                 (None, Some(latest)) => base.with_state(CheckState::Pass).with_label(format!(
@@ -948,13 +966,15 @@ async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
-/// Dispatch by id. Unknown ids return a Skip item.
-async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
+/// Dispatch by id. Unknown ids return a Skip item. `auto` distinguishes a
+/// system-triggered recheck from a user Retry; only the binary check reads it
+/// (to gate the update download).
+async fn run_check_by_id(id: &str, ctx: &CheckCtx, auto: bool) -> CheckItem {
     match id {
         "docker" => run_check_docker(ctx).await,
         "docker-compose" => run_check_docker_compose(ctx).await,
         "wsl" => run_check_wsl(ctx).await,
-        "binary" => run_check_binary(ctx).await,
+        "binary" => run_check_binary(ctx, auto).await,
         "secret" => run_check_secret(ctx).await,
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
@@ -1046,7 +1066,7 @@ async fn recheck_one(
     );
 
     // Run the check.
-    let final_item = run_check_by_id(id, ctx).await;
+    let final_item = run_check_by_id(id, ctx, auto).await;
 
     {
         let mut cache = state.cache.lock().await;
@@ -1168,7 +1188,9 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     };
     let mut results = Vec::new();
     for id in visible_ids(&ctx) {
-        results.push(run_check_by_id(&id, &ctx).await);
+        // TUI "run everything" is user-initiated (auto = false). It never has an
+        // app handle, so no download happens regardless.
+        results.push(run_check_by_id(&id, &ctx, false).await);
     }
     results
 }
@@ -1210,6 +1232,20 @@ mod tests {
             idle_item("port-validator", &ctx).label,
             "Validator P2P port 30333 reachable"
         );
+    }
+
+    #[test]
+    fn auto_recheck_reports_binary_update_without_downloading() {
+        // Regression guard for the double-download race: the post-stop auto
+        // recheck must report an available update, not fetch it (the
+        // Restart-to-Update flow's DownloadBinary step owns the download). The
+        // item is a Warn (never blocks Start) showing both versions.
+        let base = idle_item("binary", &test_ctx());
+        let item = binary_update_available_item(base, "0.2.1-rc4", "0.2.1-rc39");
+        assert_eq!(item.state, CheckState::Warn);
+        assert!(item.label.contains("update available"));
+        assert!(item.label.contains("v0.2.1-rc39"));
+        assert!(item.label.contains("installed v0.2.1-rc4"));
     }
 
     #[test]
