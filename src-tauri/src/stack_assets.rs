@@ -19,7 +19,7 @@
 //!   - Caddyfile: the optional local faucet route is stripped; the manager
 //!     uses the public testnet faucet exposed by the upstream miner bootstrap.
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
-//!     from `quip-miner:80` (compose network alias, absent when the miner
+//!     from `quip-miner:8086` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
 //!   - compose.yml (both modes): the validator's JSON-RPC port is published
 //!     on the host loopback (127.0.0.1:9944) so the host health monitor and
@@ -41,6 +41,18 @@ const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Cadd
 /// Canonical Quip testnet chain spec referenced by the v0.2 compose file.
 const CHAIN_SPEC: &str =
     include_str!("../../vendor/nodes.quip.network/chain-specs/quip-testnet.json");
+
+/// First-run miner config seed templates. The compose cpu/cuda services
+/// bind-mount `./config/quip-miner.{cpu,cuda}.toml` over the container's
+/// `/app/quip-miner.docker.toml`; the entrypoint copies it to
+/// `/data/config.toml` only when that file is absent. The manager writes its
+/// own `data/config.toml` first, so the seed never fires — but the bind-mount
+/// source must exist on disk or Docker fabricates an empty directory. We stage
+/// the upstream templates verbatim to satisfy the mount.
+const MINER_CONFIG_CPU: &str =
+    include_str!("../../vendor/nodes.quip.network/config/quip-miner.cpu.toml");
+const MINER_CONFIG_CUDA: &str =
+    include_str!("../../vendor/nodes.quip.network/config/quip-miner.cuda.toml");
 
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
@@ -69,6 +81,12 @@ pub fn stack_chain_spec_file() -> PathBuf {
     data_dir().join("chain-specs").join("quip-testnet.json")
 }
 
+/// `<data_dir>/config/quip-miner.{cpu,cuda}.toml` — staged seed templates
+/// bind-mounted by the compose cpu/cuda services.
+pub fn stack_miner_config_file(backend: &str) -> PathBuf {
+    data_dir().join("config").join(format!("quip-miner.{backend}.toml"))
+}
+
 /// `--project-directory` for every `docker compose` invocation.
 pub fn stack_project_dir() -> PathBuf {
     data_dir()
@@ -85,7 +103,7 @@ pub fn stack_project_dir() -> PathBuf {
 /// using `validator_port`.
 ///
 /// In Native mode the Caddyfile's upstream for `/api/v1/*` is also
-/// rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>`.
+/// rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>`.
 pub fn sync_stack_assets(
     run_mode: &RunMode,
     public_api_port: u16,
@@ -95,7 +113,7 @@ pub fn sync_stack_assets(
     validator_rpc_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
-    for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
+    for sub in ["data", "dashboard-data", "caddy", "chain-specs", "config"] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
@@ -113,6 +131,11 @@ pub fn sync_stack_assets(
     fs::write(stack_caddyfile(), caddy_out).map_err(|e| format!("write Caddyfile: {e}"))?;
 
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
+
+    fs::write(stack_miner_config_file("cpu"), MINER_CONFIG_CPU)
+        .map_err(|e| format!("write quip-miner.cpu.toml: {e}"))?;
+    fs::write(stack_miner_config_file("cuda"), MINER_CONFIG_CUDA)
+        .map_err(|e| format!("write quip-miner.cuda.toml: {e}"))?;
 
     Ok(())
 }
@@ -191,7 +214,7 @@ fn patch_caddyfile(run_mode: &RunMode, src: &str, native_rest_port: u16) -> Stri
     let src = strip_local_faucet_route(src);
     match run_mode {
         RunMode::Native => src.replace(
-            "quip-miner:80",
+            "quip-miner:8086",
             &format!("host.docker.internal:{native_rest_port}"),
         ),
         RunMode::Docker => src,
@@ -340,11 +363,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_miner_config_templates_match_the_caddy_rest_port() {
+        // The seed templates and the Caddyfile's `quip-miner:8086` upstream (and
+        // our DOCKER_MINER_REST_PORT) must agree on the container REST port.
+        for template in [MINER_CONFIG_CPU, MINER_CONFIG_CUDA] {
+            assert!(template.contains("[miner]"));
+            assert!(template.contains("rest_port = 8086"));
+        }
+        assert!(MINER_CONFIG_CPU.contains("[cpu]"));
+        assert!(MINER_CONFIG_CUDA.contains("[cuda.0]"));
+    }
+
+    #[test]
     fn docker_caddyfile_keeps_v02_routes_and_miner_upstream() {
         let patched = patch_caddyfile(&RunMode::Docker, CADDYFILE, 20100);
         assert!(patched.contains("handle /rpc"));
         assert!(patched.contains("handle /api/v1/*"));
-        assert!(patched.contains("reverse_proxy quip-miner:80"));
+        assert!(patched.contains("reverse_proxy quip-miner:8086"));
         assert!(!patched.contains("/api/faucet"));
         assert!(!patched.contains("quip-faucet"));
         assert!(!patched.contains("host.docker.internal:20100"));
@@ -356,7 +391,7 @@ mod tests {
         assert!(patched.contains("handle /rpc"));
         assert!(patched.contains("handle /api/v1/*"));
         assert!(patched.contains("reverse_proxy host.docker.internal:20100"));
-        assert!(!patched.contains("reverse_proxy quip-miner:80"));
+        assert!(!patched.contains("reverse_proxy quip-miner:8086"));
         assert!(!patched.contains("/api/faucet"));
         assert!(!patched.contains("quip-faucet"));
     }

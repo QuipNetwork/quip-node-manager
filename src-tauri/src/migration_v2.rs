@@ -545,7 +545,7 @@ solver = "Advantage2_System1.13"
             .content
             .contains("signer_key = \"/data/keystore.json\""));
         assert!(migration.content.contains("rest_host = \"0.0.0.0\""));
-        assert!(migration.content.contains("rest_port = 80"));
+        assert!(migration.content.contains("rest_port = 8086"));
         assert!(migration.content.contains("node_name = \"cpu-home\""));
         assert!(migration
             .content

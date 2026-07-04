@@ -229,7 +229,7 @@ fn render_env_lines(
         .map(|d| d.utilization)
         .unwrap_or(100);
 
-    let mut lines = vec![
+    let lines = vec![
         format!("PUID={puid}"),
         format!("PGID={pgid}"),
         format!("QUIP_HOSTNAME={hostname}"),
@@ -248,12 +248,10 @@ fn render_env_lines(
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
     ];
 
-    if settings.run_mode == RunMode::Docker {
-        lines.push(format!(
-            "QUIP_VALIDATORS={}",
-            crate::config::DOCKER_VALIDATOR_RPC
-        ));
-    }
+    // The miner is config-driven as of upstream nodes.quip.network's explicit
+    // env contract: the compose cpu/cuda services no longer read QUIP_VALIDATORS
+    // (it lives in config.toml's [miner].validators), so we don't write it.
+    //
     // QUIP_VALIDATOR_RPC_URLS is intentionally NOT set here. The dashboard uses
     // it for both the chain RPC and (by stripping /rpc) the local miner REST,
     // so it must resolve both from one host — Caddy's internal :8088 listener.
@@ -1314,7 +1312,9 @@ mod tests {
         assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
-        assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));
+        // QUIP_VALIDATORS is no longer written — the miner is config-driven and
+        // the upstream compose dropped it from the cpu/cuda env contract.
+        assert!(!env.contains("QUIP_VALIDATORS"));
         // QUIP_VALIDATOR_RPC_URLS is deferred to the compose default
         // (ws://quip-caddy:8088/rpc), not written into .env.
         assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));

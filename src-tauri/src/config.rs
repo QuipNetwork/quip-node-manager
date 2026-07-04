@@ -10,7 +10,10 @@ use std::fs;
 pub(crate) const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
 pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 pub(crate) const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
-pub(crate) const DOCKER_MINER_REST_PORT: u16 = 80;
+// Container-internal miner REST port. Must match the upstream Caddyfile's
+// `reverse_proxy quip-miner:8086` and the seeded `quip-miner.{cpu,cuda}.toml`
+// `rest_port` (see stack_assets); the miner publishes no host port.
+pub(crate) const DOCKER_MINER_REST_PORT: u16 = 8086;
 pub(crate) const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
 
 /// Native miner → local validator: the validator container publishes its raw
@@ -325,7 +328,7 @@ mod tests {
         assert!(toml.contains("validators = [\"ws://quip-validator:9944\"]"));
         assert!(toml.contains("signer_key = \"/data/keystore.json\""));
         assert!(toml.contains("rest_host = \"0.0.0.0\""));
-        assert!(toml.contains("rest_port = 80"));
+        assert!(toml.contains("rest_port = 8086"));
         assert!(toml.contains("[cpu]\n"));
 
         for legacy_key in [

@@ -163,9 +163,10 @@ starts.
 |------|------------------------|---------|
 | `app-settings.json` | settings.rs (user preferences) | UI toggles + NodeConfig |
 | `config.toml` | config.rs on every Start | Node config (bind-mounted into the node container in Docker mode; read directly by the binary in Native mode) |
-| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_VALIDATORS (Docker only); mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
+| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
+| `config/quip-miner.{cpu,cuda}.toml` | stack_assets.rs (embedded copy) | First-run miner config seed templates bind-mounted by the compose cpu/cuda services. Inert for the manager (our `data/config.toml` always exists first, so the entrypoint never seeds), but the mount source must exist on disk. |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
-| `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>` |
+| `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
 | `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
 | `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
@@ -219,9 +220,9 @@ It stages the embedded compose.yml, Caddyfile, and chain spec
 4. **Caddyfile faucet strip** (always): the optional local faucet route block is
    removed (the manager relies on the public testnet faucet).
 
-5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:80` becomes
+5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:8086` becomes
    `host.docker.internal:<native_rest_port>` so the dashboard container reaches
-   the host miner. Docker mode keeps `quip-miner:80`.
+   the host miner. Docker mode keeps `quip-miner:8086`.
 
 Why embedded + patched at stage time (instead of compose's `${VAR}` env
 substitution): the Caddyfile upstream rewrite and the validator `--public-addr`
@@ -243,7 +244,8 @@ validator/API ports:
 For the miner's own `config.toml`: `config.rs` emits `public_port` verbatim from
 `config.public_port` (`Option<u16>`, skipped when `None`) in both modes — there
 is no Docker-side hardcoded `port = 20049` in the miner config. The Docker miner
-config carries `rest_port = 80` (container-internal REST) and Native carries
+config carries `rest_port = 8086` (container-internal REST, matching the
+Caddyfile's `quip-miner:8086` upstream) and Native carries
 `rest_port = <native_rest_port>` (default 20100, loopback-only).
 
 ## Pre-flight Port Reachability Check
