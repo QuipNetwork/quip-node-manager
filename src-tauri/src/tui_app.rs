@@ -559,114 +559,75 @@ impl TuiApp {
     // ─── Actions ──────────────────────────────────────────────────────────────
 
     fn start_node(&mut self) {
-        let run_mode = self.form.run_mode();
-        let mut config = self.form.to_node_config(&self.settings.node_config);
-
-        match crate::migration_v2::migrate_for_run_mode(&run_mode) {
-            Ok(report) => {
-                report.promoted.apply_to_node_config(&mut config);
-                if let Err(e) = crate::migration_v2::persist_promoted_settings(&report.promoted) {
-                    self.set_status(format!("Migration settings error: {}", e));
+        match self.form.run_mode() {
+            RunMode::Docker => {
+                // Persist form values so start_stack_core's load_settings() sees them.
+                let mut settings = self.settings.clone();
+                settings.node_config = self.form.to_node_config(&self.settings.node_config);
+                settings.image_tag = self.form.image_tag;
+                settings.run_mode = RunMode::Docker;
+                if let Err(e) = crate::settings::save_settings(&settings) {
+                    self.set_status(format!("Save error: {e}"));
                     return;
                 }
+                // start_stack_core handles migration, IP detect, asset sync, env
+                // file, config.toml, pull, and `up -d` — no duplication needed here.
+                let tx = self.log_tx.clone();
+                std::thread::spawn(move || {
+                    let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                        std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                    let _ = rt.block_on(crate::compose::start_stack_core(sink));
+                });
+                self.set_status("Starting compose stack…");
+                self.config_expanded = false;
             }
-            Err(e) => {
-                self.set_status(format!("Migration error: {}", e));
-                return;
-            }
-        }
+            RunMode::Native => {
+                let run_mode = RunMode::Native;
+                let mut config = self.form.to_node_config(&self.settings.node_config);
 
-        // Auto-detect public IP when no public_host is configured
-        if config.public_host.is_empty() {
-            if let Ok(rt) = tokio::runtime::Runtime::new() {
-                match rt.block_on(crate::network::detect_public_ip()) {
-                    Ok(ip) => {
-                        self.set_status(format!("Auto-detected IP: {}", ip));
-                        config.public_host = ip;
+                match crate::migration_v2::migrate_for_run_mode(&run_mode) {
+                    Ok(report) => {
+                        report.promoted.apply_to_node_config(&mut config);
+                        if let Err(e) =
+                            crate::migration_v2::persist_promoted_settings(&report.promoted)
+                        {
+                            self.set_status(format!("Migration settings error: {}", e));
+                            return;
+                        }
                     }
-                    Err(e) => self.set_status(format!(
-                        "Could not auto-detect public IP ({e}); node won't advertise a public address"
-                    )),
+                    Err(e) => {
+                        self.set_status(format!("Migration error: {}", e));
+                        return;
+                    }
                 }
-            }
-        }
 
-        // The config renderer forces the native miner's REST host to loopback
-        // (reached via host.docker.internal), so no rest_host override here.
-        if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
-            self.set_status(format!("Config error: {}", e));
-            return;
-        }
-
-        match run_mode {
-            RunMode::Native => self.start_node_native(),
-            RunMode::Docker => self.start_node_docker(&config),
-        }
-        self.config_expanded = false;
-    }
-
-    fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        // Remove the legacy single-container TUI path if it was used before
-        // the manager moved to the v0.2 compose stack.
-        let _ = crate::cmd::new("docker")
-            .args(["rm", "-f", "quip-node"])
-            .output();
-
-        let mut settings = self.settings.clone();
-        settings.node_config = config.clone();
-        settings.image_tag = self.form.image_tag;
-        settings.run_mode = RunMode::Docker;
-
-        if let Err(e) = crate::stack_assets::sync_stack_assets(
-            &RunMode::Docker,
-            config.port,
-            config.validator_port,
-            &config.public_host,
-            crate::config::native_rest_port(config),
-            config.validator_rpc_port,
-        ) {
-            self.set_status(format!("Stack asset error: {}", e));
-            return;
-        }
-        if let Err(e) = crate::compose::write_env_file(&settings) {
-            self.set_status(format!("Env error: {}", e));
-            return;
-        }
-
-        let profile = crate::compose::compose_profile(settings.image_tag);
-
-        self.set_status("Stopping existing compose stack...");
-        let _ = crate::compose::compose_cmd().args(["down"]).output();
-
-        self.set_status("Pulling compose images...");
-        if !self.run_compose_step(&["--profile", profile, "pull"], "Pull failed") {
-            return;
-        }
-
-        self.set_status("Starting compose stack...");
-        if self.run_compose_step(&["--profile", profile, "up", "-d"], "Start failed") {
-            self.set_status("Stack started (Docker)");
-            self.refresh_status();
-        }
-    }
-
-    fn run_compose_step(&mut self, args: &[&str], label: &str) -> bool {
-        match crate::compose::compose_cmd().args(args).output() {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let detail = stderr.trim();
-                if detail.is_empty() {
-                    self.set_status(format!("{}: {}", label, stdout.trim()));
-                } else {
-                    self.set_status(format!("{}: {}", label, detail));
+                // Auto-detect public IP when no public_host is configured.
+                if config.public_host.is_empty() {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        match rt.block_on(crate::network::detect_public_ip()) {
+                            Ok(ip) => {
+                                self.set_status(format!("Auto-detected IP: {}", ip));
+                                config.public_host = ip;
+                            }
+                            Err(e) => self.set_status(format!(
+                                "Could not auto-detect public IP ({e}); \
+                                 node won't advertise a public address"
+                            )),
+                        }
+                    }
                 }
-                false
-            }
-            Err(e) => {
-                self.set_status(format!("{}: {}", label, e));
-                false
+
+                // The config renderer forces the native miner's REST host to
+                // loopback (reached via host.docker.internal), so no rest_host
+                // override here.
+                if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
+                    self.set_status(format!("Config error: {}", e));
+                    return;
+                }
+
+                self.start_node_native();
+                self.config_expanded = false;
             }
         }
     }
@@ -711,7 +672,15 @@ impl TuiApp {
     fn stop_node(&mut self) {
         match self.form.run_mode() {
             RunMode::Docker => {
-                let _ = crate::compose::compose_cmd().args(["down"]).output();
+                // stop_stack_core runs `docker compose stop` (keeps containers),
+                // fixing the old bug where the TUI called `compose down` (destroys them).
+                let tx = self.log_tx.clone();
+                std::thread::spawn(move || {
+                    let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                        std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+                    let _ = rt.block_on(crate::compose::stop_stack_core(sink));
+                });
             }
             RunMode::Native => {
                 let pid_path = crate::settings::data_dir().join("node.pid");
@@ -732,7 +701,7 @@ impl TuiApp {
                 }
             }
         }
-        self.set_status("Node stopped");
+        self.set_status("Stopping…");
         self.config_expanded = true;
         self.refresh_status();
     }

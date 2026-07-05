@@ -5,15 +5,15 @@
 use crate::log_stream::LogEntry;
 use crate::progress::ProgressSink;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 pub struct TuiSink {
-    tx: Sender<LogEntry>,
+    tx: SyncSender<LogEntry>,
     last_pct: AtomicU64,
 }
 
 impl TuiSink {
-    pub fn new(tx: Sender<LogEntry>) -> Self {
+    pub fn new(tx: SyncSender<LogEntry>) -> Self {
         Self {
             tx,
             last_pct: AtomicU64::new(u64::MAX),
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn tui_sink_forwards_log_lines() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(64);
         let sink = TuiSink::new(tx);
         sink.log("WARN", "disk low");
         let entry = rx.recv().unwrap();
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn tui_sink_deduplicates_binary_download_progress() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(64);
         let sink = TuiSink::new(tx);
 
         // Simulate download at 1000 total bytes: 1, 2, 3 all truncate to 0%
