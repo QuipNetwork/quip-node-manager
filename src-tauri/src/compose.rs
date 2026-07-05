@@ -531,7 +531,7 @@ async fn pull_compose_images_for_settings(
 /// `nvidia-cuda-mps-control` binary or an already-running daemon just leaves
 /// MPS inactive, and the miner falls back to software / NVML throttling.
 #[cfg(target_os = "linux")]
-async fn ensure_mps_daemon(app: &AppHandle) {
+async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
     let out = tokio::task::spawn_blocking(|| {
         crate::cmd::new("nvidia-cuda-mps-control")
             .arg("-d")
@@ -540,8 +540,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
     .await;
     match out {
         Ok(Ok(o)) if o.status.success() => {
-            log_cmd(app, "nvidia-cuda-mps-control -d");
-            log_output(app, "Started NVIDIA MPS control daemon for GPU SM sharing.");
+            sink.log("INFO", "$ nvidia-cuda-mps-control -d");
+            sink.log("INFO", "Started NVIDIA MPS control daemon for GPU SM sharing.");
         }
         // Non-success is almost always "an instance is already running" — fine.
         // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
@@ -549,8 +549,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
             let detail = String::from_utf8_lossy(&o.stderr);
             let detail = detail.trim();
             if !detail.is_empty() {
-                log_output(
-                    app,
+                sink.log(
+                    "INFO",
                     &format!("NVIDIA MPS daemon already active or unavailable: {detail}"),
                 );
             }
@@ -561,6 +561,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
+///
+/// Thin Tauri command wrapper — see [`start_stack_core`] for the full sequence.
 ///
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
@@ -574,6 +576,23 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 ///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
+    start_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stage assets, pull, and `up -d` the compose stack, reporting via `sink`.
+///
+/// Sequence:
+///   1. migrate existing v0.1 config/env, if present
+///   2. auto-detect public_host in Docker mode
+///   3. force native miner REST settings when Native mode is used
+///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   5. write .env
+///   6. write_config_toml
+///   7. docker compose --profile <p> pull
+///   8. docker compose --profile <p> up -d [services...]
+pub(crate) async fn start_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
 
     // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
@@ -584,20 +603,24 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         .promoted
         .apply_to_node_config(&mut settings.node_config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
-    crate::migration_v2::emit_report(&app, &migration);
+    for warning in &migration.warnings {
+        for line in warning.lines() {
+            sink.log("WARN", line);
+        }
+    }
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => {
-                log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+                sink.log("INFO", &format!("$ Auto-detected public IP: {}", ip));
                 settings.node_config.public_host = ip;
             }
             // Don't fail the start, but don't hide it either: without a
             // public_host the validator advertises no public address.
-            Err(e) => log_err(
-                &app,
+            Err(e) => sink.log(
+                "ERROR",
                 &format!(
                     "Warning: could not auto-detect public IP ({e}); the node will not \
                      advertise a public address. Set a public host in Settings."
@@ -631,20 +654,20 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
-    log_cmd(&app, "Writing config.toml");
+    sink.log("INFO", "$ Writing config.toml");
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
-    pull_compose_images_for_settings(Arc::new(TauriSink::new(app.clone())), &settings).await?;
+    pull_compose_images_for_settings(Arc::clone(&sink), &settings).await?;
 
     // Start the host NVIDIA MPS daemon before the cuda container so it can
     // attach (native Linux GPU hosts only; no-op everywhere else).
     #[cfg(target_os = "linux")]
     {
         if settings.run_mode == RunMode::Docker && settings.image_tag == ImageTag::Cuda {
-            ensure_mps_daemon(&app).await;
+            ensure_mps_daemon(Arc::clone(&sink)).await;
         }
     }
 
@@ -663,10 +686,10 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
-    log_cmd(
-        &app,
+    sink.log(
+        "INFO",
         &format!(
-            "docker compose --profile {profile} up -d --remove-orphans{}",
+            "$ docker compose --profile {profile} up -d --remove-orphans{}",
             if up_args.len() > 5 {
                 format!(" {}", up_args[5..].join(" "))
             } else {
@@ -674,8 +697,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
             }
         ),
     );
-    let mut up_result =
-        run_compose_streaming(Arc::new(TauriSink::new(app.clone())), up_args.clone()).await;
+    let mut up_result = run_compose_streaming(Arc::clone(&sink), up_args.clone()).await;
 
     // `up` only fails like this when a leftover container is holding one of our
     // fixed container_names and compose can't reconcile it — e.g. one created
@@ -684,20 +706,22 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (and image orphans) once, then retry. This runs ONLY on failure, so a
     // normal start never force-removes anything.
     if let Err(e) = &up_result {
-        log_err(
-            &app,
-            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
+        sink.log(
+            "ERROR",
+            &format!(
+                "docker compose up failed ({e}); reaping leftover containers and retrying"
+            ),
         );
-        force_remove_known_containers(&app).await;
-        sweep_orphan_node_containers(&app).await;
-        up_result = run_compose_streaming(Arc::new(TauriSink::new(app.clone())), up_args).await;
+        force_remove_known_containers(Arc::clone(&sink)).await;
+        sweep_orphan_node_containers(Arc::clone(&sink)).await;
+        up_result = run_compose_streaming(Arc::clone(&sink), up_args).await;
     }
 
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
     // or foreign data volume keeps an old password and would otherwise leave
     // the dashboard crash-looping behind a silent 502.
     if up_result.is_ok() {
-        verify_dashboard_db(&app).await;
+        verify_dashboard_db(Arc::clone(&sink)).await;
     }
     up_result
 }
@@ -723,7 +747,7 @@ enum PgAuthProbe {
 /// the user only sees as a 502 behind Caddy. Surface it explicitly via the
 /// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
 /// are unaffected, so we don't abort the whole start.
-async fn verify_dashboard_db(app: &AppHandle) {
+async fn verify_dashboard_db(sink: Arc<dyn ProgressSink>) {
     let password = crate::settings::postgres_password();
     let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
         .await
@@ -737,11 +761,8 @@ async fn verify_dashboard_db(app: &AppHandle) {
                  dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
                  Dashboard tab to recreate it."
             );
-            log_err(app, &msg);
-            let _ = app.emit(
-                "dashboard-db-mismatch",
-                serde_json::json!({ "message": msg }),
-            );
+            sink.log("ERROR", &msg);
+            sink.dashboard_db_mismatch(&msg);
         }
     }
 }
@@ -953,7 +974,7 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
 /// silently no-op-ing when the project label doesn't line up with what
 /// we pass. `docker rm -f` on a missing name returns non-zero which we
 /// ignore; we only surface output when something is actually removed.
-async fn force_remove_known_containers(app: &AppHandle) {
+async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
     for &name in KNOWN_CONTAINER_NAMES {
         let out = tokio::task::spawn_blocking(move || {
             crate::cmd::new("docker").args(["rm", "-f", name]).output()
@@ -964,8 +985,8 @@ async fn force_remove_known_containers(app: &AppHandle) {
             // Docker prints the removed container's name to stdout.
             let removed = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !removed.is_empty() {
-                log_cmd(app, &format!("docker rm -f {name}"));
-                log_output(app, &format!("Removed {removed}"));
+                sink.log("INFO", &format!("$ docker rm -f {name}"));
+                sink.log("INFO", &format!("Removed {removed}"));
             }
         }
     }
@@ -976,7 +997,7 @@ async fn force_remove_known_containers(app: &AppHandle) {
 /// individual failures are logged but don't fail the stop. The name prefix
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
-async fn sweep_orphan_node_containers(app: &AppHandle) {
+async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
         let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
         let ps = tokio::task::spawn_blocking({
@@ -1006,9 +1027,9 @@ async fn sweep_orphan_node_containers(app: &AppHandle) {
             if name.starts_with("quip-") {
                 continue; // Managed by compose — leave for `down` to reap.
             }
-            log_cmd(
-                app,
-                &format!("docker rm -f {id}  # orphan {name} from {image_ref}"),
+            sink.log(
+                "INFO",
+                &format!("$ docker rm -f {id}  # orphan {name} from {image_ref}"),
             );
             let id = id.to_string();
             let _ = tokio::task::spawn_blocking(move || {
