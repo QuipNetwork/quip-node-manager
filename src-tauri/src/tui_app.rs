@@ -284,7 +284,9 @@ impl Default for TuiApp {
 
 impl TuiApp {
     pub fn new() -> Self {
-        let settings = crate::settings::load_settings();
+        let mut settings = crate::settings::load_settings();
+        let survey = crate::hardware::run_survey();
+        merge_surveyed_gpus(&mut settings.node_config, &survey);
         let form = FormState::from_settings(&settings);
         let qpu_expanded = !form.qpu_api_key.is_empty();
         let (tx, rx) = mpsc::sync_channel(512);
@@ -751,4 +753,62 @@ fn load_secret_sync() -> String {
         return String::new();
     };
     v["secret"].as_str().unwrap_or("").to_string()
+}
+
+/// Add a GpuDeviceConfig for each surveyed device missing from `node_config`,
+/// preserving any saved enabled/utilization/yielding for existing indices.
+fn merge_surveyed_gpus(
+    node_config: &mut crate::settings::NodeConfig,
+    survey: &crate::hardware::HardwareSurvey,
+) {
+    for dev in &survey.gpu_devices {
+        if !node_config.gpu_device_configs.iter().any(|c| c.index == dev.index) {
+            node_config.gpu_device_configs.push(crate::settings::GpuDeviceConfig {
+                index: dev.index,
+                enabled: false,
+                utilization: 80,
+                yielding: false,
+            });
+        }
+    }
+    node_config.gpu_device_configs.sort_by_key(|c| c.index);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_surveyed_gpus_adds_detected_and_preserves_saved() {
+        use crate::hardware::{GpuDevice, HardwareSurvey};
+        let mut nc = crate::settings::NodeConfig {
+            gpu_device_configs: vec![crate::settings::GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 55,
+                yielding: true,
+            }],
+            ..Default::default()
+        };
+        let survey = HardwareSurvey {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpu_count: 8,
+            gpu_backend: "cuda".into(),
+            gpu_devices: vec![
+                GpuDevice { index: 0, name: "RTX 3060".into(), memory_mb: Some(12288) },
+                GpuDevice { index: 1, name: "RTX 3060".into(), memory_mb: Some(12288) },
+            ],
+            docker_available: true,
+            docker_version: None,
+            python_available: false,
+            python_version: None,
+            recommended_mode: crate::settings::RunMode::Docker,
+        };
+        merge_surveyed_gpus(&mut nc, &survey);
+        assert_eq!(nc.gpu_device_configs.len(), 2);
+        assert!(nc.gpu_device_configs[0].enabled); // preserved
+        assert_eq!(nc.gpu_device_configs[0].utilization, 55); // preserved
+        assert!(!nc.gpu_device_configs[1].enabled); // new device defaults off
+    }
 }
