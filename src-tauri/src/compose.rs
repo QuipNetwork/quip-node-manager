@@ -914,14 +914,33 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("stop-started", serde_json::json!({}));
-
     // Kill the log-streamer child first — same ordering as the old
     // stop_node_container sequence, so `docker compose logs -f` unblocks
     // before we stop the containers.
     let log_state = app.state::<LogStreamState>();
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
+
+    stop_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stop the compose stack, reporting via `sink`.
+///
+/// Emits `stop-started`, runs `docker compose --profile cpu --profile cuda stop`
+/// (v0.2 semantics: stops containers but does not remove them), then emits
+/// `stop-complete`. Both cpu and cuda profiles are activated so the whole stack
+/// is halted regardless of the configured miner type or containers left over
+/// from a profile switch.
+///
+/// Args:
+///     sink: Receives `stop-started`, `node-log`, and `stop-complete` events.
+///
+/// Returns:
+///     `Ok(())` on success, `Err(message)` if the compose command fails.
+pub(crate) async fn stop_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
+    sink.stop_started();
 
     let stop_args: Vec<String> = vec![
         "--profile".into(),
@@ -930,20 +949,19 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
         compose_profile(ImageTag::Cuda).into(),
         "stop".into(),
     ];
-    log_cmd(&app, "docker compose --profile cpu --profile cuda stop");
-    let result = run_compose_streaming(Arc::new(TauriSink::new(app.clone())), stop_args).await;
+    sink.log("INFO", "$ docker compose --profile cpu --profile cuda stop");
+    let result = run_compose_streaming(Arc::clone(&sink), stop_args).await;
 
     match &result {
         Ok(_) => {
-            log_output(&app, "Compose stack stopped.");
-            let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
+            sink.log("INFO", "Compose stack stopped.");
+            sink.stop_complete(true, None);
         }
         Err(e) => {
-            log_err(&app, e);
-            let _ = app.emit(
-                "stop-complete",
-                serde_json::json!({ "success": false, "error": e }),
-            );
+            for line in e.lines() {
+                sink.log("ERROR", line);
+            }
+            sink.stop_complete(false, Some(e));
         }
     }
 
