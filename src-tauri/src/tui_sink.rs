@@ -4,15 +4,20 @@
 
 use crate::log_stream::LogEntry;
 use crate::progress::ProgressSink;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 pub struct TuiSink {
     tx: Sender<LogEntry>,
+    last_pct: AtomicU64,
 }
 
 impl TuiSink {
     pub fn new(tx: Sender<LogEntry>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            last_pct: AtomicU64::new(u64::MAX),
+        }
     }
 
     fn push(&self, level: &str, message: String) {
@@ -65,12 +70,14 @@ impl ProgressSink for TuiSink {
         if done {
             self.push("INFO", "Binary download complete".to_string());
         } else if let Some(total) = total {
-            let pct = if total > 0 {
-                downloaded * 100 / total
-            } else {
-                0
-            };
-            self.push("INFO", format!("Downloading binary… {pct}%"));
+            if total > 0 {
+                let pct = downloaded * 100 / total;
+                let prev_pct = self.last_pct.load(Ordering::Relaxed);
+                if pct != prev_pct {
+                    self.last_pct.store(pct, Ordering::Relaxed);
+                    self.push("INFO", format!("Downloading binary… {pct}%"));
+                }
+            }
         }
     }
 
@@ -92,5 +99,34 @@ mod tests {
         let entry = rx.recv().unwrap();
         assert_eq!(entry.level, "WARN");
         assert_eq!(entry.message, "disk low");
+    }
+
+    #[test]
+    fn tui_sink_deduplicates_binary_download_progress() {
+        let (tx, rx) = mpsc::channel();
+        let sink = TuiSink::new(tx);
+
+        // Simulate download at 1000 total bytes: 1, 2, 3 all truncate to 0%
+        sink.binary_download_progress(1, Some(1000), false);
+        sink.binary_download_progress(2, Some(1000), false);
+        sink.binary_download_progress(3, Some(1000), false);
+
+        // Now 25% (250 / 1000 = 25) — should emit
+        sink.binary_download_progress(250, Some(1000), false);
+
+        // Complete
+        sink.binary_download_progress(1000, Some(1000), true);
+
+        // Collect received messages
+        let mut messages = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            messages.push(entry.message);
+        }
+
+        // Should be 3 messages: 0%, 25%, complete
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0], "Downloading binary… 0%");
+        assert_eq!(messages[1], "Downloading binary… 25%");
+        assert_eq!(messages[2], "Binary download complete");
     }
 }
