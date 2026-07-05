@@ -272,6 +272,8 @@ pub struct TuiApp {
     pub scroll_offset: u16,
     pub content_height: u16,
     last_status_check: Instant,
+    /// Shared native-process state; mirrors what the GUI holds in `tauri::State`.
+    native_state: std::sync::Arc<crate::native::NativeProcessState>,
 }
 
 impl Default for TuiApp {
@@ -282,7 +284,9 @@ impl Default for TuiApp {
 
 impl TuiApp {
     pub fn new() -> Self {
-        let settings = crate::settings::load_settings();
+        let mut settings = crate::settings::load_settings();
+        let survey = crate::hardware::run_survey();
+        merge_surveyed_gpus(&mut settings.node_config, &survey);
         let form = FormState::from_settings(&settings);
         let qpu_expanded = !form.qpu_api_key.is_empty();
         let (tx, rx) = mpsc::sync_channel(512);
@@ -327,6 +331,7 @@ impl TuiApp {
             content_height: 0,
             last_status_check: Instant::now() - Duration::from_secs(10),
             settings,
+            native_state: std::sync::Arc::new(crate::native::NativeProcessState::new()),
         }
     }
 
@@ -558,181 +563,66 @@ impl TuiApp {
 
     // ─── Actions ──────────────────────────────────────────────────────────────
 
+    /// Start the node stack for the currently selected run mode.
+    ///
+    /// In Docker mode: `start_stack_core` brings up the full compose stack.
+    /// In Native mode: `start_stack_core` starts support services first
+    /// (validator, dashboard, postgres, caddy), then `start_native_node_core`
+    /// starts the host miner (which waits for the validator RPC).
     fn start_node(&mut self) {
-        let run_mode = self.form.run_mode();
-        let mut config = self.form.to_node_config(&self.settings.node_config);
-
-        match crate::migration_v2::migrate_for_run_mode(&run_mode) {
-            Ok(report) => {
-                report.promoted.apply_to_node_config(&mut config);
-                if let Err(e) = crate::migration_v2::persist_promoted_settings(&report.promoted) {
-                    self.set_status(format!("Migration settings error: {}", e));
-                    return;
-                }
-            }
-            Err(e) => {
-                self.set_status(format!("Migration error: {}", e));
-                return;
-            }
-        }
-
-        // Auto-detect public IP when no public_host is configured
-        if config.public_host.is_empty() {
-            if let Ok(rt) = tokio::runtime::Runtime::new() {
-                match rt.block_on(crate::network::detect_public_ip()) {
-                    Ok(ip) => {
-                        self.set_status(format!("Auto-detected IP: {}", ip));
-                        config.public_host = ip;
-                    }
-                    Err(e) => self.set_status(format!(
-                        "Could not auto-detect public IP ({e}); node won't advertise a public address"
-                    )),
-                }
-            }
-        }
-
-        // The config renderer forces the native miner's REST host to loopback
-        // (reached via host.docker.internal), so no rest_host override here.
-        if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
-            self.set_status(format!("Config error: {}", e));
+        let mut settings = self.settings.clone();
+        settings.node_config = self.form.to_node_config(&self.settings.node_config);
+        settings.image_tag = self.form.image_tag;
+        settings.run_mode = self.form.run_mode();
+        if let Err(e) = crate::settings::save_settings(&settings) {
+            self.set_status(format!("Save error: {e}"));
             return;
         }
-
-        match run_mode {
-            RunMode::Native => self.start_node_native(),
-            RunMode::Docker => self.start_node_docker(&config),
-        }
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = settings.run_mode.clone();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                crate::compose::start_stack_core(std::sync::Arc::clone(&sink)).await?;
+                if run_mode == crate::settings::RunMode::Native {
+                    crate::native::start_native_node_core(sink, &state).await?;
+                }
+                Ok::<(), String>(())
+            });
+        });
+        self.set_status("Starting…");
         self.config_expanded = false;
     }
 
-    fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        // Remove the legacy single-container TUI path if it was used before
-        // the manager moved to the v0.2 compose stack.
-        let _ = crate::cmd::new("docker")
-            .args(["rm", "-f", "quip-node"])
-            .output();
-
-        let mut settings = self.settings.clone();
-        settings.node_config = config.clone();
-        settings.image_tag = self.form.image_tag;
-        settings.run_mode = RunMode::Docker;
-
-        if let Err(e) = crate::stack_assets::sync_stack_assets(
-            &RunMode::Docker,
-            config.port,
-            config.validator_port,
-            &config.public_host,
-            crate::config::native_rest_port(config),
-            config.validator_rpc_port,
-        ) {
-            self.set_status(format!("Stack asset error: {}", e));
-            return;
-        }
-        if let Err(e) = crate::compose::write_env_file(&settings) {
-            self.set_status(format!("Env error: {}", e));
-            return;
-        }
-
-        let profile = crate::compose::compose_profile(settings.image_tag);
-
-        self.set_status("Stopping existing compose stack...");
-        let _ = crate::compose::compose_cmd().args(["down"]).output();
-
-        self.set_status("Pulling compose images...");
-        if !self.run_compose_step(&["--profile", profile, "pull"], "Pull failed") {
-            return;
-        }
-
-        self.set_status("Starting compose stack...");
-        if self.run_compose_step(&["--profile", profile, "up", "-d"], "Start failed") {
-            self.set_status("Stack started (Docker)");
-            self.refresh_status();
-        }
-    }
-
-    fn run_compose_step(&mut self, args: &[&str], label: &str) -> bool {
-        match crate::compose::compose_cmd().args(args).output() {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let detail = stderr.trim();
-                if detail.is_empty() {
-                    self.set_status(format!("{}: {}", label, stdout.trim()));
-                } else {
-                    self.set_status(format!("{}: {}", label, detail));
-                }
-                false
-            }
-            Err(e) => {
-                self.set_status(format!("{}: {}", label, e));
-                false
-            }
-        }
-    }
-
-    fn start_node_native(&mut self) {
-        if !crate::native::is_binary_available() {
-            self.set_status("No native binary found. Download it first.");
-            return;
-        }
-        // Use the async start via a blocking runtime
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(async {
-            let data_dir = crate::settings::data_dir();
-            let bin = data_dir.join("bin").join(crate::native::binary_name());
-            let config_path = data_dir.join("config.toml");
-            let log_path = data_dir.join("node-output.log");
-            let _ = crate::native::ensure_native_signer_key(&bin)?;
-            let miner_args = crate::native::native_miner_args(&config_path);
-            let log_file = std::fs::File::create(&log_path)
-                .map_err(|e| format!("Cannot create log file: {}", e))?;
-            let log_err = log_file
-                .try_clone()
-                .map_err(|e| format!("Cannot clone log file: {}", e))?;
-            let child = crate::cmd::new(&bin)
-                .args(&miner_args)
-                .stdout(log_file)
-                .stderr(log_err)
-                .spawn()
-                .map_err(|e| format!("Spawn failed: {}", e))?;
-            let pid_path = data_dir.join("node.pid");
-            let _ = std::fs::write(&pid_path, child.id().to_string());
-            Ok::<(), String>(())
-        }) {
-            Ok(()) => {
-                self.set_status("Node started (Native)");
-                self.refresh_status();
-            }
-            Err(e) => self.set_status(format!("Start failed: {}", e)),
-        }
-    }
-
+    /// Stop the node stack for the currently selected run mode.
+    ///
+    /// In Native mode: host miner is stopped first, then compose support
+    /// services. In Docker mode: compose stack is stopped directly.
     fn stop_node(&mut self) {
-        match self.form.run_mode() {
-            RunMode::Docker => {
-                let _ = crate::compose::compose_cmd().args(["down"]).output();
-            }
-            RunMode::Native => {
-                let pid_path = crate::settings::data_dir().join("node.pid");
-                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::kill(-pid, libc::SIGTERM);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = crate::cmd::new("taskkill")
-                                .args(["/F", "/PID", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                    let _ = std::fs::remove_file(&pid_path);
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = self.form.run_mode();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                if run_mode == crate::settings::RunMode::Native {
+                    // Best-effort: stop miner before tearing down support stack.
+                    let _ = crate::native::stop_native_node_core(
+                        std::sync::Arc::clone(&sink),
+                        &state,
+                    )
+                    .await;
                 }
-            }
-        }
-        self.set_status("Node stopped");
+                crate::compose::stop_stack_core(sink).await?;
+                Ok::<(), String>(())
+            });
+        });
+        self.set_status("Stopping…");
         self.config_expanded = true;
         self.refresh_status();
     }
@@ -863,4 +753,62 @@ fn load_secret_sync() -> String {
         return String::new();
     };
     v["secret"].as_str().unwrap_or("").to_string()
+}
+
+/// Add a GpuDeviceConfig for each surveyed device missing from `node_config`,
+/// preserving any saved enabled/utilization/yielding for existing indices.
+fn merge_surveyed_gpus(
+    node_config: &mut crate::settings::NodeConfig,
+    survey: &crate::hardware::HardwareSurvey,
+) {
+    for dev in &survey.gpu_devices {
+        if !node_config.gpu_device_configs.iter().any(|c| c.index == dev.index) {
+            node_config.gpu_device_configs.push(crate::settings::GpuDeviceConfig {
+                index: dev.index,
+                enabled: false,
+                utilization: 80,
+                yielding: false,
+            });
+        }
+    }
+    node_config.gpu_device_configs.sort_by_key(|c| c.index);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_surveyed_gpus_adds_detected_and_preserves_saved() {
+        use crate::hardware::{GpuDevice, HardwareSurvey};
+        let mut nc = crate::settings::NodeConfig {
+            gpu_device_configs: vec![crate::settings::GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 55,
+                yielding: true,
+            }],
+            ..Default::default()
+        };
+        let survey = HardwareSurvey {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpu_count: 8,
+            gpu_backend: "cuda".into(),
+            gpu_devices: vec![
+                GpuDevice { index: 0, name: "RTX 3060".into(), memory_mb: Some(12288) },
+                GpuDevice { index: 1, name: "RTX 3060".into(), memory_mb: Some(12288) },
+            ],
+            docker_available: true,
+            docker_version: None,
+            python_available: false,
+            python_version: None,
+            recommended_mode: crate::settings::RunMode::Docker,
+        };
+        merge_surveyed_gpus(&mut nc, &survey);
+        assert_eq!(nc.gpu_device_configs.len(), 2);
+        assert!(nc.gpu_device_configs[0].enabled); // preserved
+        assert_eq!(nc.gpu_device_configs[0].utilization, 55); // preserved
+        assert!(!nc.gpu_device_configs[1].enabled); // new device defaults off
+    }
 }

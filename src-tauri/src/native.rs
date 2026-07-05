@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::log_stream::LogEntry;
+use crate::progress::ProgressSink;
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use serde::Serialize;
 use std::path::Path;
@@ -292,20 +292,13 @@ pub(crate) fn ensure_native_signer_key(bin: &Path) -> Result<bool, String> {
 }
 
 async fn wait_for_native_miner_validator_rpc(
-    app: &tauri::AppHandle,
+    sink: &dyn ProgressSink,
     validator_url: &str,
 ) -> Result<(), String> {
     // TODO: Revisit this readiness gate; it likely needs another pass to make
     // the flow and diagnostics more eloquent.
     let probe_url = validator_rpc_http_probe_url(validator_url);
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: format!("Waiting for validator RPC at {validator_url}"),
-        },
-    );
+    sink.log("INFO", &format!("Waiting for validator RPC at {validator_url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -332,13 +325,9 @@ async fn wait_for_native_miner_validator_rpc(
                             })
                             .unwrap_or(false)
                         {
-                            let _ = app.emit(
-                                "node-log",
-                                &LogEntry {
-                                    timestamp: String::new(),
-                                    level: "INFO".to_string(),
-                                    message: format!("Validator RPC is ready at {validator_url}"),
-                                },
+                            sink.log(
+                                "INFO",
+                                &format!("Validator RPC is ready at {validator_url}"),
                             );
                             return Ok(());
                         }
@@ -507,18 +496,26 @@ fn download_guard() -> &'static tokio::sync::Mutex<()> {
 /// tags (e.g. `v0.2.0rc1`) are picked up automatically.
 #[tauri::command]
 pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
+    download_native_binary_core(Arc::new(crate::progress::TauriSink::new(app))).await
+}
+
+/// Core binary-download logic decoupled from Tauri. Resolves the latest
+/// downloadable release for this platform, coalesces concurrent callers via the
+/// download guard, streams the binary with per-chunk progress events, and writes
+/// a release marker for subsequent update checks.
+///
+/// Args:
+///     sink: Progress/log sink for `node-log` and `binary-download-progress`
+///         events. GUI callers pass a `TauriSink`; TUI callers pass a `TuiSink`.
+///
+/// Returns:
+///     The normalized version string of the installed binary (e.g. `"0.2.1"`).
+pub(crate) async fn download_native_binary_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
-
-    let log = |msg: String| {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "INFO",
-            "message": msg,
-        });
-        let _ = app.emit("node-log", entry);
-    };
 
     // Serialize downloads so concurrent callers coalesce instead of racing the
     // shared temp path (see `download_guard`). Held across the whole download.
@@ -544,14 +541,15 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     // lock, skip the redundant re-download.
     let latest_version = normalize_release_version(&tag);
     if installed_binary_version().as_deref() == Some(latest_version.as_str()) {
-        log(format!(
-            "{name} already up to date (v{latest_version}); skipping download"
-        ));
+        sink.log(
+            "INFO",
+            &format!("{name} already up to date (v{latest_version}); skipping download"),
+        );
         return Ok(latest_version);
     }
 
-    log(format!("Downloading {name} ({tag})"));
-    log(format!("From {url}"));
+    sink.log("INFO", &format!("Downloading {name} ({tag})"));
+    sink.log("INFO", &format!("From {url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -594,15 +592,7 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         file.write_all(&chunk)
             .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
-
-        let _ = app.emit(
-            "binary-download-progress",
-            BinaryDownloadProgress {
-                downloaded,
-                total,
-                done: false,
-            },
-        );
+        sink.binary_download_progress(downloaded, total, false);
     }
     drop(file);
 
@@ -623,26 +613,22 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     // affects update detection, so warn instead of failing the download — but
     // don't swallow it silently, or stale-marker bugs become invisible.
     if let Err(e) = write_binary_release_marker(&tag) {
-        log(format!(
-            "Warning: could not record release marker ({e}); \
-             update checks may keep re-offering this version"
-        ));
+        sink.log(
+            "INFO",
+            &format!(
+                "Warning: could not record release marker ({e}); \
+                 update checks may keep re-offering this version"
+            ),
+        );
     }
 
-    let _ = app.emit(
-        "binary-download-progress",
-        BinaryDownloadProgress {
-            downloaded,
-            total,
-            done: true,
-        },
-    );
+    sink.binary_download_progress(downloaded, total, true);
 
     let version = installed_binary_version().unwrap_or_else(|| normalize_release_version(&tag));
-    log(format!(
-        "Installed {} from {} (binary version: {})",
-        name, tag, version
-    ));
+    sink.log(
+        "INFO",
+        &format!("Installed {} from {} (binary version: {})", name, tag, version),
+    );
 
     Ok(version)
 }
@@ -742,6 +728,30 @@ pub async fn start_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<String, String> {
+    let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
+    let msg = start_native_node_core(Arc::clone(&sink), &state).await?;
+    // Log tail uses AppHandle directly (continuous streaming; TUI provides its
+    // own path). Start it after core succeeds so the log file exists.
+    start_log_tail(app, Arc::clone(&state.stop_flag));
+    Ok(msg)
+}
+
+/// Core native-node start logic decoupled from Tauri. Runs pre-flight checks,
+/// migrates config, auto-provisions the miner binary, waits for the validator
+/// RPC, and spawns the miner process. The caller is responsible for starting
+/// log streaming after this returns (GUI via `start_log_tail`; TUI via its own
+/// path).
+///
+/// Args:
+///     sink: Progress/log sink for `node-log` events.
+///     state: Shared native-process state (child handle, stop flag, PID).
+///
+/// Returns:
+///     A human-readable start confirmation (e.g. `"Native miner started (PID 42)"`).
+pub(crate) async fn start_native_node_core(
+    sink: Arc<dyn ProgressSink>,
+    state: &NativeProcessState,
+) -> Result<String, String> {
     // Check for already-running process (in-memory or orphan from PID file)
     if let Some(child) = state.child.lock().unwrap().as_ref() {
         let pid = child.id();
@@ -760,7 +770,12 @@ pub async fn start_native_node(
     let migration = crate::migration_v2::migrate_for_run_mode(&RunMode::Native)?;
     migration.promoted.apply_to_node_config(&mut config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
-    crate::migration_v2::emit_report(&app, &migration);
+    // emit_report emits node-log WARN lines for each migration warning.
+    for warning in &migration.warnings {
+        for line in warning.lines() {
+            sink.log("WARN", line);
+        }
+    }
 
     // Auto-detect public IP when no public_host is configured. A detection
     // failure must not be silent: without a public_host the validator
@@ -770,16 +785,12 @@ pub async fn start_native_node(
         match crate::network::detect_public_ip().await {
             Ok(ip) => config.public_host = ip,
             Err(e) => {
-                let _ = app.emit(
-                    "node-log",
-                    &LogEntry {
-                        timestamp: String::new(),
-                        level: "WARN".to_string(),
-                        message: format!(
-                            "Could not auto-detect public IP ({e}); the node will not \
-                             advertise a public address. Set a public host in Settings."
-                        ),
-                    },
+                sink.log(
+                    "WARN",
+                    &format!(
+                        "Could not auto-detect public IP ({e}); the node will not \
+                         advertise a public address. Set a public host in Settings."
+                    ),
                 );
             }
         }
@@ -795,18 +806,14 @@ pub async fn start_native_node(
     // dead-end here.
     let bin = binary_path();
     if !bin.exists() {
-        let _ = app.emit(
-            "node-log",
-            &LogEntry {
-                timestamp: String::new(),
-                level: "INFO".to_string(),
-                message: format!(
-                    "Native miner binary not found at {} — downloading…",
-                    bin.display()
-                ),
-            },
+        sink.log(
+            "INFO",
+            &format!(
+                "Native miner binary not found at {} — downloading…",
+                bin.display()
+            ),
         );
-        download_native_binary(app.clone()).await?;
+        download_native_binary_core(Arc::clone(&sink)).await?;
     }
     if !bin.exists() {
         return Err(format!(
@@ -830,21 +837,17 @@ pub async fn start_native_node(
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
 
     if ensure_native_signer_key(&bin)? {
-        let _ = app.emit(
-            "node-log",
-            &LogEntry {
-                timestamp: String::new(),
-                level: "INFO".to_string(),
-                message: format!(
-                    "Generated native miner keystore at {}",
-                    native_signer_key_path().display()
-                ),
-            },
+        sink.log(
+            "INFO",
+            &format!(
+                "Generated native miner keystore at {}",
+                native_signer_key_path().display()
+            ),
         );
     }
 
     let validator_url = native_miner_validator_url(&config);
-    wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
+    wait_for_native_miner_validator_rpc(sink.as_ref(), &validator_url).await?;
 
     let miner_args = native_miner_args(&config_path);
     let mut cmd = crate::cmd::new(&bin);
@@ -867,30 +870,13 @@ pub async fn start_native_node(
 
     let pid = child.id();
 
-    // Log the command
-    let cmd_msg = format!("$ {} {}", bin.display(), miner_args.join(" "));
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: cmd_msg,
-        },
-    );
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: format!("Native miner started (PID {})", pid),
-        },
-    );
+    // Log the command and PID.
+    sink.log("INFO", &format!("$ {} {}", bin.display(), miner_args.join(" ")));
+    sink.log("INFO", &format!("Native miner started (PID {})", pid));
 
-    // Start tailing node.log (the protocol's own log, not stdout)
-    let stop_flag = Arc::clone(&state.stop_flag);
-    *stop_flag.lock().unwrap() = false;
-    start_log_tail(app.clone(), Arc::clone(&stop_flag));
-
+    // Arm the stop flag before storing the child so stop_native_node_core can
+    // observe the flag immediately if called in quick succession.
+    *state.stop_flag.lock().unwrap() = false;
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
@@ -952,7 +938,33 @@ pub async fn stop_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
-    let _ = app.emit("stop-started", serde_json::json!({}));
+    let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
+    stop_native_node_core(sink, &state).await?;
+    // trigger_recheck_auto requires an AppHandle; runs only in the GUI wrapper.
+    // The TUI has its own recheck path.
+    let rc_app = app.clone();
+    tokio::spawn(async move {
+        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
+    });
+    Ok(())
+}
+
+/// Core native-node stop logic decoupled from Tauri. Signals `stop-started`,
+/// kills the managed child and any orphan PID, verifies the processes are gone
+/// within `NATIVE_STOP_DEADLINE`, then signals `stop-complete`.
+///
+/// Args:
+///     sink: Progress/log sink for `stop-started` and `stop-complete` events.
+///     state: Shared native-process state (child handle, stop flag, PID file).
+///
+/// Returns:
+///     `Ok(())` when the node has stopped; `Err` with a human-readable cause
+///     when the deadline fires or the process survives SIGKILL.
+pub(crate) async fn stop_native_node_core(
+    sink: Arc<dyn ProgressSink>,
+    state: &NativeProcessState,
+) -> Result<(), String> {
+    sink.stop_started();
     *state.stop_flag.lock().unwrap() = true;
 
     // Snapshot PIDs we need to kill. Drops the guards before awaiting.
@@ -996,21 +1008,11 @@ pub async fn stop_native_node(
         } else {
             "native process still alive after SIGKILL — manual kill required"
         };
-        let _ = app.emit(
-            "stop-complete",
-            serde_json::json!({ "success": false, "error": msg }),
-        );
+        sink.stop_complete(false, Some(msg));
         return Err(msg.to_string());
     }
 
-    let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
-
-    let rc_app = app.clone();
-    tokio::spawn(async move {
-        // The binary check now covers both presence and freshness.
-        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
-    });
-
+    sink.stop_complete(true, None);
     Ok(())
 }
 

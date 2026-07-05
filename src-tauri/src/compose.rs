@@ -6,6 +6,7 @@
 //! validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
+use crate::progress::{ProgressSink, TauriSink};
 use crate::settings::{
     AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
@@ -15,6 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -284,7 +286,7 @@ enum StdoutMode {
 /// caller can skip treating it as error output). Image-level milestones are
 /// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
 /// record without the per-layer noise.
-fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
+fn emit_pull_progress_json(sink: &dyn ProgressSink, gen: u64, line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
@@ -298,34 +300,29 @@ fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
     // Image-level events have no parent layer; mirror them to the log.
     if value.get("parent_id").is_none() && id.starts_with("Image ") {
         let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let _ = app.emit(
-            "node-log",
-            serde_json::json!({
-                "timestamp": "",
-                "level": "INFO",
-                "message": format!("{} {}", text, id.trim_start_matches("Image ")),
-            }),
-        );
+        sink.log("INFO", &format!("{} {}", text, id.trim_start_matches("Image ")));
     }
     // Stamp the generation so the frontend can discard events from a pull it has
     // already closed (see PULL_GENERATION).
     if let Some(obj) = value.as_object_mut() {
         let _ = obj.insert("gen".into(), serde_json::json!(gen));
     }
-    let _ = app.emit("pull-progress", value);
+    sink.pull_progress(value);
     true
 }
 
-async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
-    run_compose_streaming_mode(app, args, StdoutMode::Log).await
+async fn run_compose_streaming(
+    sink: Arc<dyn ProgressSink>,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_compose_streaming_mode(sink, args, StdoutMode::Log).await
 }
 
 async fn run_compose_streaming_mode(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     args: Vec<String>,
     mode: StdoutMode,
 ) -> Result<(), String> {
-    let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let mut child = compose_cmd()
             .args(&args)
@@ -337,42 +334,28 @@ async fn run_compose_streaming_mode(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let app_out = app.clone();
+        let sink_out = Arc::clone(&sink);
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if matches!(mode, StdoutMode::Log) {
-                    let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                    sink_out.pull_progress(serde_json::json!({ "line": &line }));
                 }
-                let _ = app_out.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_out.log("INFO", &line);
             }
         });
 
         // docker compose writes `--progress json` events to stderr, so the
         // PullJson parsing lives here. Non-progress lines stay error output.
-        let app_err = app.clone();
+        let sink_err = Arc::clone(&sink);
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let StdoutMode::PullJson(gen) = mode {
-                    if emit_pull_progress_json(&app_err, gen, &line) {
+                    if emit_pull_progress_json(&*sink_err, gen, &line) {
                         continue;
                     }
                 }
-                let _ = app_err.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_err.log("INFO", &line);
                 last = line;
             }
             last
@@ -471,6 +454,18 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 /// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
+    pull_compose_images_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Pull every compose stack image, reporting per-image progress through `sink`.
+///
+/// Loads the current app settings, stages the compose assets and `.env` file
+/// (so compose sees the configured v0.2 image tags), then runs
+/// `docker compose --profile <p> pull [services...]`. The `pull-complete`
+/// notification is delivered via `sink.pull_complete` when the command exits.
+pub(crate) async fn pull_compose_images_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<(), String> {
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
@@ -487,11 +482,11 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     // start sequence) would silently fetch the wrong tag.
     write_env_file(&settings)?;
 
-    pull_compose_images_for_settings(&app, &settings).await
+    pull_compose_images_for_settings(sink, &settings).await
 }
 
 async fn pull_compose_images_for_settings(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     settings: &AppSettings,
 ) -> Result<(), String> {
     let profile = compose_profile(settings.image_tag);
@@ -511,21 +506,18 @@ async fn pull_compose_images_for_settings(
     // terminal pull-complete carry the same id.
     let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson(gen)).await;
+    sink.log("INFO", &format!("$ docker compose --profile {profile} pull ..."));
+    let result = run_compose_streaming_mode(Arc::clone(&sink), args, StdoutMode::PullJson(gen)).await;
 
     // Tell the UI the pull is over so it can hide the progress panel. Process
     // exit is the authoritative "pull is done" signal: per-image "Pulled"
     // accounting can miss an image's terminal event on some platforms, and a
     // late progress event delivered after this one is discarded by the frontend
     // because its generation is already closed.
-    let _ = app.emit(
-        "pull-complete",
-        serde_json::json!({
-            "gen": gen,
-            "success": result.is_ok(),
-            "error": result.as_ref().err().cloned().unwrap_or_default(),
-        }),
+    sink.pull_complete(
+        gen,
+        result.is_ok(),
+        &result.as_ref().err().cloned().unwrap_or_default(),
     );
     result
 }
@@ -539,7 +531,7 @@ async fn pull_compose_images_for_settings(
 /// `nvidia-cuda-mps-control` binary or an already-running daemon just leaves
 /// MPS inactive, and the miner falls back to software / NVML throttling.
 #[cfg(target_os = "linux")]
-async fn ensure_mps_daemon(app: &AppHandle) {
+async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
     let out = tokio::task::spawn_blocking(|| {
         crate::cmd::new("nvidia-cuda-mps-control")
             .arg("-d")
@@ -548,8 +540,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
     .await;
     match out {
         Ok(Ok(o)) if o.status.success() => {
-            log_cmd(app, "nvidia-cuda-mps-control -d");
-            log_output(app, "Started NVIDIA MPS control daemon for GPU SM sharing.");
+            sink.log("INFO", "$ nvidia-cuda-mps-control -d");
+            sink.log("INFO", "Started NVIDIA MPS control daemon for GPU SM sharing.");
         }
         // Non-success is almost always "an instance is already running" — fine.
         // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
@@ -557,8 +549,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
             let detail = String::from_utf8_lossy(&o.stderr);
             let detail = detail.trim();
             if !detail.is_empty() {
-                log_output(
-                    app,
+                sink.log(
+                    "INFO",
                     &format!("NVIDIA MPS daemon already active or unavailable: {detail}"),
                 );
             }
@@ -569,6 +561,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
+///
+/// Thin Tauri command wrapper — see [`start_stack_core`] for the full sequence.
 ///
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
@@ -582,6 +576,23 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 ///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
+    start_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stage assets, pull, and `up -d` the compose stack, reporting via `sink`.
+///
+/// Sequence:
+///   1. migrate existing v0.1 config/env, if present
+///   2. auto-detect public_host in Docker mode
+///   3. force native miner REST settings when Native mode is used
+///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   5. write .env
+///   6. write_config_toml
+///   7. docker compose --profile <p> pull
+///   8. docker compose --profile <p> up -d [services...]
+pub(crate) async fn start_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
 
     // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
@@ -592,20 +603,24 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         .promoted
         .apply_to_node_config(&mut settings.node_config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
-    crate::migration_v2::emit_report(&app, &migration);
+    for warning in &migration.warnings {
+        for line in warning.lines() {
+            sink.log("WARN", line);
+        }
+    }
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => {
-                log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+                sink.log("INFO", &format!("$ Auto-detected public IP: {}", ip));
                 settings.node_config.public_host = ip;
             }
             // Don't fail the start, but don't hide it either: without a
             // public_host the validator advertises no public address.
-            Err(e) => log_err(
-                &app,
+            Err(e) => sink.log(
+                "ERROR",
                 &format!(
                     "Warning: could not auto-detect public IP ({e}); the node will not \
                      advertise a public address. Set a public host in Settings."
@@ -639,20 +654,20 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
-    log_cmd(&app, "Writing config.toml");
+    sink.log("INFO", "$ Writing config.toml");
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
-    pull_compose_images_for_settings(&app, &settings).await?;
+    pull_compose_images_for_settings(Arc::clone(&sink), &settings).await?;
 
     // Start the host NVIDIA MPS daemon before the cuda container so it can
     // attach (native Linux GPU hosts only; no-op everywhere else).
     #[cfg(target_os = "linux")]
     {
         if settings.run_mode == RunMode::Docker && settings.image_tag == ImageTag::Cuda {
-            ensure_mps_daemon(&app).await;
+            ensure_mps_daemon(Arc::clone(&sink)).await;
         }
     }
 
@@ -671,10 +686,10 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
-    log_cmd(
-        &app,
+    sink.log(
+        "INFO",
         &format!(
-            "docker compose --profile {profile} up -d --remove-orphans{}",
+            "$ docker compose --profile {profile} up -d --remove-orphans{}",
             if up_args.len() > 5 {
                 format!(" {}", up_args[5..].join(" "))
             } else {
@@ -682,7 +697,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
             }
         ),
     );
-    let mut up_result = run_compose_streaming(&app, up_args.clone()).await;
+    let mut up_result = run_compose_streaming(Arc::clone(&sink), up_args.clone()).await;
 
     // `up` only fails like this when a leftover container is holding one of our
     // fixed container_names and compose can't reconcile it — e.g. one created
@@ -691,20 +706,22 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (and image orphans) once, then retry. This runs ONLY on failure, so a
     // normal start never force-removes anything.
     if let Err(e) = &up_result {
-        log_err(
-            &app,
-            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
+        sink.log(
+            "ERROR",
+            &format!(
+                "docker compose up failed ({e}); reaping leftover containers and retrying"
+            ),
         );
-        force_remove_known_containers(&app).await;
-        sweep_orphan_node_containers(&app).await;
-        up_result = run_compose_streaming(&app, up_args).await;
+        force_remove_known_containers(Arc::clone(&sink)).await;
+        sweep_orphan_node_containers(Arc::clone(&sink)).await;
+        up_result = run_compose_streaming(Arc::clone(&sink), up_args).await;
     }
 
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
     // or foreign data volume keeps an old password and would otherwise leave
     // the dashboard crash-looping behind a silent 502.
     if up_result.is_ok() {
-        verify_dashboard_db(&app).await;
+        verify_dashboard_db(Arc::clone(&sink)).await;
     }
     up_result
 }
@@ -730,7 +747,7 @@ enum PgAuthProbe {
 /// the user only sees as a 502 behind Caddy. Surface it explicitly via the
 /// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
 /// are unaffected, so we don't abort the whole start.
-async fn verify_dashboard_db(app: &AppHandle) {
+async fn verify_dashboard_db(sink: Arc<dyn ProgressSink>) {
     let password = crate::settings::postgres_password();
     let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
         .await
@@ -744,11 +761,8 @@ async fn verify_dashboard_db(app: &AppHandle) {
                  dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
                  Dashboard tab to recreate it."
             );
-            log_err(app, &msg);
-            let _ = app.emit(
-                "dashboard-db-mismatch",
-                serde_json::json!({ "message": msg }),
-            );
+            sink.log("ERROR", &msg);
+            sink.dashboard_db_mismatch(&msg);
         }
     }
 }
@@ -900,14 +914,33 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("stop-started", serde_json::json!({}));
-
     // Kill the log-streamer child first — same ordering as the old
     // stop_node_container sequence, so `docker compose logs -f` unblocks
     // before we stop the containers.
     let log_state = app.state::<LogStreamState>();
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
+
+    stop_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stop the compose stack, reporting via `sink`.
+///
+/// Emits `stop-started`, runs `docker compose --profile cpu --profile cuda stop`
+/// (v0.2 semantics: stops containers but does not remove them), then emits
+/// `stop-complete`. Both cpu and cuda profiles are activated so the whole stack
+/// is halted regardless of the configured miner type or containers left over
+/// from a profile switch.
+///
+/// Args:
+///     sink: Receives `stop-started`, `node-log`, and `stop-complete` events.
+///
+/// Returns:
+///     `Ok(())` on success, `Err(message)` if the compose command fails.
+pub(crate) async fn stop_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
+    sink.stop_started();
 
     let stop_args: Vec<String> = vec![
         "--profile".into(),
@@ -916,20 +949,19 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
         compose_profile(ImageTag::Cuda).into(),
         "stop".into(),
     ];
-    log_cmd(&app, "docker compose --profile cpu --profile cuda stop");
-    let result = run_compose_streaming(&app, stop_args).await;
+    sink.log("INFO", "$ docker compose --profile cpu --profile cuda stop");
+    let result = run_compose_streaming(Arc::clone(&sink), stop_args).await;
 
     match &result {
         Ok(_) => {
-            log_output(&app, "Compose stack stopped.");
-            let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
+            sink.log("INFO", "Compose stack stopped.");
+            sink.stop_complete(true, None);
         }
         Err(e) => {
-            log_err(&app, e);
-            let _ = app.emit(
-                "stop-complete",
-                serde_json::json!({ "success": false, "error": e }),
-            );
+            for line in e.lines() {
+                sink.log("ERROR", line);
+            }
+            sink.stop_complete(false, Some(e));
         }
     }
 
@@ -960,7 +992,7 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
 /// silently no-op-ing when the project label doesn't line up with what
 /// we pass. `docker rm -f` on a missing name returns non-zero which we
 /// ignore; we only surface output when something is actually removed.
-async fn force_remove_known_containers(app: &AppHandle) {
+async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
     for &name in KNOWN_CONTAINER_NAMES {
         let out = tokio::task::spawn_blocking(move || {
             crate::cmd::new("docker").args(["rm", "-f", name]).output()
@@ -971,8 +1003,8 @@ async fn force_remove_known_containers(app: &AppHandle) {
             // Docker prints the removed container's name to stdout.
             let removed = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !removed.is_empty() {
-                log_cmd(app, &format!("docker rm -f {name}"));
-                log_output(app, &format!("Removed {removed}"));
+                sink.log("INFO", &format!("$ docker rm -f {name}"));
+                sink.log("INFO", &format!("Removed {removed}"));
             }
         }
     }
@@ -983,7 +1015,7 @@ async fn force_remove_known_containers(app: &AppHandle) {
 /// individual failures are logged but don't fail the stop. The name prefix
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
-async fn sweep_orphan_node_containers(app: &AppHandle) {
+async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
         let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
         let ps = tokio::task::spawn_blocking({
@@ -1013,9 +1045,9 @@ async fn sweep_orphan_node_containers(app: &AppHandle) {
             if name.starts_with("quip-") {
                 continue; // Managed by compose — leave for `down` to reap.
             }
-            log_cmd(
-                app,
-                &format!("docker rm -f {id}  # orphan {name} from {image_ref}"),
+            sink.log(
+                "INFO",
+                &format!("$ docker rm -f {id}  # orphan {name} from {image_ref}"),
             );
             let id = id.to_string();
             let _ = tokio::task::spawn_blocking(move || {
