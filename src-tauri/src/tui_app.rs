@@ -272,6 +272,8 @@ pub struct TuiApp {
     pub scroll_offset: u16,
     pub content_height: u16,
     last_status_check: Instant,
+    /// Shared native-process state; mirrors what the GUI holds in `tauri::State`.
+    native_state: std::sync::Arc<crate::native::NativeProcessState>,
 }
 
 impl Default for TuiApp {
@@ -327,6 +329,7 @@ impl TuiApp {
             content_height: 0,
             last_status_check: Instant::now() - Duration::from_secs(10),
             settings,
+            native_state: std::sync::Arc::new(crate::native::NativeProcessState::new()),
         }
     }
 
@@ -558,149 +561,65 @@ impl TuiApp {
 
     // ─── Actions ──────────────────────────────────────────────────────────────
 
+    /// Start the node stack for the currently selected run mode.
+    ///
+    /// In Docker mode: `start_stack_core` brings up the full compose stack.
+    /// In Native mode: `start_stack_core` starts support services first
+    /// (validator, dashboard, postgres, caddy), then `start_native_node_core`
+    /// starts the host miner (which waits for the validator RPC).
     fn start_node(&mut self) {
-        match self.form.run_mode() {
-            RunMode::Docker => {
-                // Persist form values so start_stack_core's load_settings() sees them.
-                let mut settings = self.settings.clone();
-                settings.node_config = self.form.to_node_config(&self.settings.node_config);
-                settings.image_tag = self.form.image_tag;
-                settings.run_mode = RunMode::Docker;
-                if let Err(e) = crate::settings::save_settings(&settings) {
-                    self.set_status(format!("Save error: {e}"));
-                    return;
-                }
-                // start_stack_core handles migration, IP detect, asset sync, env
-                // file, config.toml, pull, and `up -d` — no duplication needed here.
-                let tx = self.log_tx.clone();
-                std::thread::spawn(move || {
-                    let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
-                        std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
-                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-                    let _ = rt.block_on(crate::compose::start_stack_core(sink));
-                });
-                self.set_status("Starting compose stack…");
-                self.config_expanded = false;
-            }
-            RunMode::Native => {
-                let run_mode = RunMode::Native;
-                let mut config = self.form.to_node_config(&self.settings.node_config);
-
-                match crate::migration_v2::migrate_for_run_mode(&run_mode) {
-                    Ok(report) => {
-                        report.promoted.apply_to_node_config(&mut config);
-                        if let Err(e) =
-                            crate::migration_v2::persist_promoted_settings(&report.promoted)
-                        {
-                            self.set_status(format!("Migration settings error: {}", e));
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        self.set_status(format!("Migration error: {}", e));
-                        return;
-                    }
-                }
-
-                // Auto-detect public IP when no public_host is configured.
-                if config.public_host.is_empty() {
-                    if let Ok(rt) = tokio::runtime::Runtime::new() {
-                        match rt.block_on(crate::network::detect_public_ip()) {
-                            Ok(ip) => {
-                                self.set_status(format!("Auto-detected IP: {}", ip));
-                                config.public_host = ip;
-                            }
-                            Err(e) => self.set_status(format!(
-                                "Could not auto-detect public IP ({e}); \
-                                 node won't advertise a public address"
-                            )),
-                        }
-                    }
-                }
-
-                // The config renderer forces the native miner's REST host to
-                // loopback (reached via host.docker.internal), so no rest_host
-                // override here.
-                if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
-                    self.set_status(format!("Config error: {}", e));
-                    return;
-                }
-
-                self.start_node_native();
-                self.config_expanded = false;
-            }
-        }
-    }
-
-    fn start_node_native(&mut self) {
-        if !crate::native::is_binary_available() {
-            self.set_status("No native binary found. Download it first.");
+        let mut settings = self.settings.clone();
+        settings.node_config = self.form.to_node_config(&self.settings.node_config);
+        settings.image_tag = self.form.image_tag;
+        settings.run_mode = self.form.run_mode();
+        if let Err(e) = crate::settings::save_settings(&settings) {
+            self.set_status(format!("Save error: {e}"));
             return;
         }
-        // Use the async start via a blocking runtime
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(async {
-            let data_dir = crate::settings::data_dir();
-            let bin = data_dir.join("bin").join(crate::native::binary_name());
-            let config_path = data_dir.join("config.toml");
-            let log_path = data_dir.join("node-output.log");
-            let _ = crate::native::ensure_native_signer_key(&bin)?;
-            let miner_args = crate::native::native_miner_args(&config_path);
-            let log_file = std::fs::File::create(&log_path)
-                .map_err(|e| format!("Cannot create log file: {}", e))?;
-            let log_err = log_file
-                .try_clone()
-                .map_err(|e| format!("Cannot clone log file: {}", e))?;
-            let child = crate::cmd::new(&bin)
-                .args(&miner_args)
-                .stdout(log_file)
-                .stderr(log_err)
-                .spawn()
-                .map_err(|e| format!("Spawn failed: {}", e))?;
-            let pid_path = data_dir.join("node.pid");
-            let _ = std::fs::write(&pid_path, child.id().to_string());
-            Ok::<(), String>(())
-        }) {
-            Ok(()) => {
-                self.set_status("Node started (Native)");
-                self.refresh_status();
-            }
-            Err(e) => self.set_status(format!("Start failed: {}", e)),
-        }
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = settings.run_mode.clone();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                crate::compose::start_stack_core(std::sync::Arc::clone(&sink)).await?;
+                if run_mode == crate::settings::RunMode::Native {
+                    crate::native::start_native_node_core(sink, &state).await?;
+                }
+                Ok::<(), String>(())
+            });
+        });
+        self.set_status("Starting…");
+        self.config_expanded = false;
     }
 
+    /// Stop the node stack for the currently selected run mode.
+    ///
+    /// In Native mode: host miner is stopped first, then compose support
+    /// services. In Docker mode: compose stack is stopped directly.
     fn stop_node(&mut self) {
-        match self.form.run_mode() {
-            RunMode::Docker => {
-                // stop_stack_core runs `docker compose stop` (keeps containers),
-                // fixing the old bug where the TUI called `compose down` (destroys them).
-                let tx = self.log_tx.clone();
-                std::thread::spawn(move || {
-                    let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
-                        std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
-                    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-                    let _ = rt.block_on(crate::compose::stop_stack_core(sink));
-                });
-            }
-            RunMode::Native => {
-                let pid_path = crate::settings::data_dir().join("node.pid");
-                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::kill(-pid, libc::SIGTERM);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = crate::cmd::new("taskkill")
-                                .args(["/F", "/PID", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                    let _ = std::fs::remove_file(&pid_path);
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = self.form.run_mode();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                if run_mode == crate::settings::RunMode::Native {
+                    // Best-effort: stop miner before tearing down support stack.
+                    let _ = crate::native::stop_native_node_core(
+                        std::sync::Arc::clone(&sink),
+                        &state,
+                    )
+                    .await;
                 }
-            }
-        }
+                crate::compose::stop_stack_core(sink).await?;
+                Ok::<(), String>(())
+            });
+        });
         self.set_status("Stopping…");
         self.config_expanded = true;
         self.refresh_status();
