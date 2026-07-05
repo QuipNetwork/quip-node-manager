@@ -17,6 +17,7 @@ pub mod settings;
 pub mod stack_assets;
 pub mod tui_app;
 pub mod tui_input;
+pub mod tui_sink;
 pub mod tui_ui;
 pub mod update;
 pub mod validator_rpc;
