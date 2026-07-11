@@ -9,6 +9,12 @@ use std::fs;
 // they live in one place.
 pub(crate) const DOCKER_VALIDATOR_RPC: &str = "ws://quip-validator:9944";
 pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
+// Faucet bot for wallet auto-topup at startup. The miner has NO built-in
+// default: absent `faucet_url` → underfunded wallet fails fast with
+// `wallet-underfunded`. The manager writes its own config.toml, bypassing the
+// upstream seed template, so it must render this key itself. Both run modes
+// target the public testnet.
+pub(crate) const FAUCET_URL: &str = "https://faucet.testnet.quip.network";
 pub(crate) const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
 // Container-internal miner REST port. Must match the upstream Caddyfile's
 // `reverse_proxy quip-miner:8086` and the seeded `quip-miner.{cpu,cuda}.toml`
@@ -47,6 +53,7 @@ fn native_signer_key() -> String {
 struct MinerToml {
     validators: Vec<String>,
     signer_key: String,
+    faucet_url: String,
     rest_host: String,
     rest_port: u16,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -140,6 +147,7 @@ impl ConfigToml {
             } else {
                 native_signer_key()
             },
+            faucet_url: FAUCET_URL.to_string(),
             // Native miner REST is loopback-only by design — the dashboard
             // container reaches it via host.docker.internal. Forcing it here
             // (rather than at each start path) keeps the invariant in one
@@ -530,6 +538,22 @@ mod tests {
             assert!(
                 !toml.contains("num_cpus"),
                 "{mode:?}: num_cpus rendered while disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn faucet_url_renders_in_both_modes() {
+        // The miner has no built-in faucet default: without faucet_url a fresh
+        // wallet fails fast with `wallet-underfunded`. Because the manager
+        // writes its own config.toml (bypassing the upstream seed template),
+        // both run modes must render the public testnet faucet.
+        let cfg = NodeConfig::default();
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let toml = render_config_toml(&cfg, &mode);
+            assert!(
+                toml.contains("faucet_url = \"https://faucet.testnet.quip.network\""),
+                "{mode:?}: faucet_url missing from [miner]"
             );
         }
     }

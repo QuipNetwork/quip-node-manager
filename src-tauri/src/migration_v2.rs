@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::config::{
     DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_HOST, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY,
-    DOCKER_VALIDATOR_RPC,
+    DOCKER_VALIDATOR_RPC, FAUCET_URL,
 };
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
@@ -346,6 +346,12 @@ fn convert_v01_config(root: &mut Table, run_mode: &RunMode) -> Result<ConfigMigr
         "signer_key".to_string(),
         Value::String(default_signer_key(run_mode)),
     );
+    // The miner has no built-in faucet default; without it a migrated wallet
+    // fails fast with `wallet-underfunded` (matches fresh config rendering).
+    miner.insert(
+        "faucet_url".to_string(),
+        Value::String(FAUCET_URL.to_string()),
+    );
     miner.insert(
         "rest_host".to_string(),
         Value::String(default_rest_host(run_mode, &global)),
@@ -544,6 +550,9 @@ solver = "Advantage2_System1.13"
         assert!(migration
             .content
             .contains("signer_key = \"/data/keystore.json\""));
+        assert!(migration
+            .content
+            .contains("faucet_url = \"https://faucet.testnet.quip.network\""));
         assert!(migration.content.contains("rest_host = \"0.0.0.0\""));
         assert!(migration.content.contains("rest_port = 8086"));
         assert!(migration.content.contains("node_name = \"cpu-home\""));

@@ -17,7 +17,8 @@
 //!   - compose.yml: when `public_host` is set, the validator command gets
 //!     a matching `--public-addr=<multiaddr>` using the public validator port.
 //!   - Caddyfile: the optional local faucet route is stripped; the manager
-//!     uses the public testnet faucet exposed by the upstream miner bootstrap.
+//!     points the miner at the public testnet faucet directly via
+//!     `config::FAUCET_URL` in the rendered config.toml.
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:8086` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.

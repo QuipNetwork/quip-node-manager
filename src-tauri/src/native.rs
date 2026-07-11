@@ -234,7 +234,8 @@ fn validator_rpc_http_probe_url(validator_url: &str) -> String {
 
 // The miner picks its own backends (cpu/gpu/qpu) from the config.toml
 // sections — the manager passes no subcommand and no per-key CLI overrides
-// (signer_key lives in [miner]; the faucet default is built into the miner).
+// (signer_key and faucet_url both live in [miner]; see config::FAUCET_URL —
+// the miner has no built-in faucet default, so the rendered config supplies it).
 pub(crate) fn native_miner_args(config_path: &Path) -> Vec<String> {
     vec![
         "--config".to_string(),
