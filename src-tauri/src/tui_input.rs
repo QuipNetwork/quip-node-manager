@@ -123,6 +123,18 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
 
+        // Update Channel — cycle Release/Beta. When no stable release exists
+        // Release isn't selectable, so lock to Beta (mirrors the web gray-out).
+        FocusId::UpdateChannel => {
+            app.form.update_channel_idx = if app.release_channel_available() {
+                (app.form.update_channel_idx + 1) % 2
+            } else {
+                1 // Beta
+            };
+            app.dirty = true;
+            Action::None
+        }
+
         // Checkboxes — toggle on Enter too
         FocusId::PublicHostEnable => {
             app.form.public_host_enabled = !app.form.public_host_enabled;

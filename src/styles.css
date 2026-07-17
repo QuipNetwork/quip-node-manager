@@ -937,3 +937,30 @@ button.check-action:disabled {
   align-items: center;
   gap: 8px;
 }
+
+/* ─── Segmented control (Release / Beta channel) ─────────────────────────── */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-input);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented-btn {
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  border: none;
+  padding: 6px 18px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.segmented-btn + .segmented-btn {
+  border-left: 1px solid var(--border-input);
+}
+.segmented-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+.segmented-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

@@ -91,7 +91,7 @@ fn binary_release_marker_path() -> std::path::PathBuf {
 /// Returns the URL it hit and the specific cause on failure so callers can show
 /// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
 /// than a generic "couldn't list releases".
-async fn fetch_protocol_releases(
+pub(crate) async fn fetch_protocol_releases(
     client: &reqwest::Client,
 ) -> Result<serde_json::Value, String> {
     let url = format!(
@@ -113,13 +113,16 @@ async fn fetch_protocol_releases(
         .map_err(|e| format!("GET {url} returned unparseable JSON: {e}"))
 }
 
-/// (tag, asset_url, description) for every release that ships `asset_name`,
-/// newest-first (GitLab returns releases newest-first). This tracks whatever
-/// the latest releases are tagged (`v0.2`, `v0.2.0rc1`, …) and skips older
-/// releases that only carry the legacy asset name.
+/// (tag, asset_url, description) for every release that ships `asset_name` on
+/// the given channel, newest-first (GitLab returns releases newest-first). This
+/// tracks whatever the latest releases are tagged (`v0.2.1`, `v0.2.1-rc9`, …)
+/// and skips older releases that only carry the legacy asset name. On the
+/// `Release` channel, `-rc` prereleases are filtered out so only stable tags
+/// remain.
 fn binary_release_candidates(
     releases: &serde_json::Value,
     asset_name: &str,
+    channel: crate::settings::UpdateChannel,
 ) -> Vec<(String, String, String)> {
     releases
         .as_array()
@@ -127,6 +130,9 @@ fn binary_release_candidates(
         .flatten()
         .filter_map(|rel| {
             let tag = rel["tag_name"].as_str()?.to_string();
+            if !crate::update::tag_matches_channel(&tag, channel) {
+                return None;
+            }
             let url = release_asset_url(rel, asset_name)?;
             let desc = rel["description"].as_str().unwrap_or("").to_string();
             Some((tag, url, desc))
@@ -157,8 +163,9 @@ async fn resolve_latest_downloadable_release(
     client: &reqwest::Client,
     releases: &serde_json::Value,
     asset_name: &str,
+    channel: crate::settings::UpdateChannel,
 ) -> Option<(String, String, String)> {
-    for candidate in binary_release_candidates(releases, asset_name) {
+    for candidate in binary_release_candidates(releases, asset_name, channel) {
         if asset_is_downloadable(client, &candidate.1).await {
             return Some(candidate);
         }
@@ -528,13 +535,15 @@ pub(crate) async fn download_native_binary_core(
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| e.to_string())?;
+    let channel = crate::settings::load_settings().update_channel;
     let releases = fetch_protocol_releases(&meta_client).await?;
-    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name)
+    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name, channel)
         .await
         .ok_or_else(|| {
             format!(
-                "The latest quip-protocol release ships {name}, but its artifact \
-                 isn't available yet — the build may still be running. Try again shortly."
+                "No downloadable quip-protocol release ships {name} on the {channel:?} \
+                 channel yet — the build may still be running, or the channel has no \
+                 published builds. Try again shortly."
             )
         })?;
 
@@ -670,12 +679,13 @@ pub async fn resolve_binary_versions() -> Result<BinaryVersions, String> {
     // binary running, so a fetch failure is non-fatal here (unlike the download
     // path, which surfaces the cause to the user). Leave `latest` as None so the
     // caller can say "couldn't check" rather than over-claiming "up to date".
+    let channel = crate::settings::load_settings().update_channel;
     let latest_release = match fetch_protocol_releases(&client).await {
         Ok(releases) => {
             // Only offer an update we can actually install — a just-tagged
             // release whose artifact build hasn't finished is skipped until
             // it's downloadable.
-            resolve_latest_downloadable_release(&client, &releases, binary_name())
+            resolve_latest_downloadable_release(&client, &releases, binary_name(), channel)
                 .await
                 .filter(|(tag, _, _)| !tag.is_empty())
         }
@@ -1117,7 +1127,11 @@ mod tests {
             }
         ]);
 
-        let candidates = binary_release_candidates(&releases, binary_name());
+        let candidates = binary_release_candidates(
+            &releases,
+            binary_name(),
+            crate::settings::UpdateChannel::Beta,
+        );
         let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
         assert_eq!(tags, vec!["v0.2.0rc2", "v0.2.0rc1"]);
         assert_eq!(
@@ -1128,12 +1142,40 @@ mod tests {
     }
 
     #[test]
+    fn release_channel_excludes_rc_binary_candidates() {
+        use crate::settings::UpdateChannel;
+        // A stable above the v0.2.0 Release floor, plus a newer rc.
+        let releases = serde_json::json!([
+            { "tag_name": "v0.2.2-rc1", "assets": { "links": [
+                { "name": binary_name(), "direct_asset_url": "https://example/rc" } ]}},
+            { "tag_name": "v0.2.1", "assets": { "links": [
+                { "name": binary_name(), "direct_asset_url": "https://example/stable" } ]}},
+        ]);
+
+        let tags = |ch| -> Vec<String> {
+            binary_release_candidates(&releases, binary_name(), ch)
+                .into_iter()
+                .map(|(t, _, _)| t)
+                .collect()
+        };
+
+        // Beta keeps every candidate; Release drops the -rc tag.
+        assert_eq!(tags(UpdateChannel::Beta), vec!["v0.2.2-rc1", "v0.2.1"]);
+        assert_eq!(tags(UpdateChannel::Release), vec!["v0.2.1"]);
+    }
+
+    #[test]
     fn no_release_shipping_the_binary_yields_no_candidates() {
         let releases = serde_json::json!([
             { "tag_name": "v0.1.20",
               "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] } }
         ]);
-        assert!(binary_release_candidates(&releases, binary_name()).is_empty());
+        assert!(binary_release_candidates(
+            &releases,
+            binary_name(),
+            crate::settings::UpdateChannel::Beta,
+        )
+        .is_empty());
     }
 
     #[test]

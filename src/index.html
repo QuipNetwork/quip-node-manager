@@ -193,6 +193,14 @@
           <!-- Stack Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">Stack Configuration</div>
+            <div class="form-group">
+              <label style="display:block;margin-bottom:6px;">Update Channel</label>
+              <div class="segmented" id="update-channel-toggle" role="group" aria-label="Update channel">
+                <button type="button" class="segmented-btn" id="channel-release" data-channel="release">Release</button>
+                <button type="button" class="segmented-btn" id="channel-beta" data-channel="beta">Beta</button>
+              </div>
+              <div id="channel-caption" style="font-size:11px;color:var(--text-faint);margin-top:4px;">&nbsp;</div>
+            </div>
             <div class="form-group" style="display:flex;align-items:center;gap:10px;">
               <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
               <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>

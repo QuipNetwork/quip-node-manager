@@ -145,6 +145,72 @@ document.addEventListener('change', (e) => {
   }
 });
 
+// Segmented Release/Beta channel control (buttons, not form inputs).
+document.addEventListener('click', (e) => {
+  const btn = e.target?.closest?.('.segmented-btn[data-channel]');
+  if (btn && !btn.disabled) {
+    setUpdateChannel(btn.dataset.channel);
+  }
+});
+
+// ─── Update channel (Release / Beta) ──────────────────────────────────────
+//
+// The channel selects which published tag each image + the native binary
+// tracks. Every image resolves its own tag independently from its own registry
+// (see src-tauri registry.rs): Release = its latest stable (no -rc); Beta = its
+// latest incl. rc. Release is grayed out and forced to Beta unless every image
+// has a stable tag to run.
+
+function updateChannelButtons() {
+  const ch = state.settings?.update_channel ?? 'release';
+  document.getElementById('channel-release')?.classList.toggle('active', ch === 'release');
+  document.getElementById('channel-beta')?.classList.toggle('active', ch === 'beta');
+}
+
+async function setUpdateChannel(channel) {
+  if (!state.settings || state.settings.update_channel === channel) return;
+  state.settings.update_channel = channel;
+  updateChannelButtons();
+  await invoke('update_settings', { settings: state.settings }).catch(console.error);
+  await refreshChannelInfo();
+}
+
+async function refreshChannelInfo() {
+  if (!state.settings) return;
+  const caption = document.getElementById('channel-caption');
+  const releaseBtn = document.getElementById('channel-release');
+  let info;
+  try {
+    info = await invoke('resolve_channel_info', {
+      channel: state.settings.update_channel,
+    });
+  } catch (e) {
+    if (caption) caption.textContent = 'Could not reach the release feed.';
+    return;
+  }
+  // Gray out Release until a stable (non-rc) release exists; force Beta.
+  if (releaseBtn) {
+    releaseBtn.disabled = !info.stable_available;
+    releaseBtn.title = info.stable_available
+      ? ''
+      : 'No stable release published yet — Beta only';
+  }
+  if (!info.stable_available && state.settings.update_channel === 'release') {
+    await setUpdateChannel('beta');
+    return;
+  }
+  updateChannelButtons();
+  if (caption) {
+    // Each image resolves its own tag from its own registry — they can differ.
+    const parts = (info.images || []).map(
+      ([name, tag]) => `${name} ${tag ?? '—'}`,
+    );
+    caption.textContent = parts.length
+      ? parts.join('  ·  ')
+      : 'No published builds on this channel yet.';
+  }
+}
+
 // ─── Dashboard tab iframe wiring ────────────────────────────────────────────
 
 function dashboardUrl(settings) {
@@ -684,6 +750,9 @@ function populateForm(settings) {
   document.getElementById('http-log').value = c.http_log ?? '';
 
   // Stack Configuration (image_tag is auto-derived, no UI control)
+  settings.update_channel = settings.update_channel ?? 'release';
+  updateChannelButtons();
+  refreshChannelInfo();
   document.getElementById('tls-enabled').checked =
     settings.tls_enabled ?? false;
   document.getElementById('hostname').value =

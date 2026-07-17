@@ -32,6 +32,7 @@ pub enum FocusId {
     CheckPort,
     ConfigToggle,
     RunMode,
+    UpdateChannel,
     Port,
     ValidatorPort,
     SecretShow,
@@ -86,7 +87,8 @@ pub struct FormState {
     pub validator_port: String,
     pub node_name: String,
     pub auto_mine: bool,
-    pub run_mode_idx: usize, // 0=Docker, 1=Native
+    pub run_mode_idx: usize,        // 0=Docker, 1=Native
+    pub update_channel_idx: usize,  // 0=Release, 1=Beta
     pub public_host_enabled: bool,
     pub public_host: String,
     pub public_port: String,
@@ -134,12 +136,17 @@ impl FormState {
             RunMode::Docker => 0,
             RunMode::Native => 1,
         };
+        let update_channel_idx = match s.update_channel {
+            crate::settings::UpdateChannel::Release => 0,
+            crate::settings::UpdateChannel::Beta => 1,
+        };
         FormState {
             port: nc.port.to_string(),
             validator_port: nc.validator_port.to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
+            update_channel_idx,
             public_host_enabled: !nc.public_host.is_empty() || nc.public_port.is_some(),
             public_host: nc.public_host.clone(),
             public_port: nc.public_port.map(|p| p.to_string()).unwrap_or_default(),
@@ -174,6 +181,14 @@ impl FormState {
             RunMode::Native
         } else {
             RunMode::Docker
+        }
+    }
+
+    pub fn update_channel(&self) -> crate::settings::UpdateChannel {
+        if self.update_channel_idx == 1 {
+            crate::settings::UpdateChannel::Beta
+        } else {
+            crate::settings::UpdateChannel::Release
         }
     }
 
@@ -274,6 +289,10 @@ pub struct TuiApp {
     last_status_check: Instant,
     /// Shared native-process state; mirrors what the GUI holds in `tauri::State`.
     native_state: std::sync::Arc<crate::native::NativeProcessState>,
+    /// Whether a stable (non-rc) release exists, fetched once in the background.
+    /// `None` until the check returns; `Some(false)` grays out the Release
+    /// channel and forces Beta (mirrors the web UI gating).
+    channel_stable: Arc<Mutex<Option<bool>>>,
 }
 
 impl Default for TuiApp {
@@ -297,6 +316,22 @@ impl TuiApp {
             let stream_tx = tx.clone();
             let stream_stop = Arc::clone(&log_stop);
             crate::log_stream::start_log_stream_core(stream_tx, stream_stop);
+        }
+        // Fetch stable-release availability in the background; drives the
+        // Release-channel gray-out without blocking startup.
+        let channel_stable: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        {
+            let slot = Arc::clone(&channel_stable);
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let info = rt.block_on(crate::update::resolve_channel_info(
+                        crate::settings::UpdateChannel::Beta,
+                    ));
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(info.stable_available);
+                    }
+                }
+            });
         }
         TuiApp {
             focus: FocusId::StartNode,
@@ -332,6 +367,28 @@ impl TuiApp {
             last_status_check: Instant::now() - Duration::from_secs(10),
             settings,
             native_state: std::sync::Arc::new(crate::native::NativeProcessState::new()),
+            channel_stable,
+        }
+    }
+
+    /// Whether the Release channel is selectable. Unknown (check still running)
+    /// counts as available so the default Release choice stays usable; only a
+    /// confirmed `Some(false)` grays it out and forces Beta.
+    pub fn release_channel_available(&self) -> bool {
+        self.channel_stable
+            .lock()
+            .map(|g| g.unwrap_or(true))
+            .unwrap_or(true)
+    }
+
+    /// The channel to persist: the form's selection, coerced to Beta when the
+    /// Release channel has no stable build to point at.
+    fn effective_update_channel(&self) -> crate::settings::UpdateChannel {
+        match self.form.update_channel() {
+            crate::settings::UpdateChannel::Release if !self.release_channel_available() => {
+                crate::settings::UpdateChannel::Beta
+            }
+            other => other,
         }
     }
 
@@ -574,6 +631,7 @@ impl TuiApp {
         settings.node_config = self.form.to_node_config(&self.settings.node_config);
         settings.image_tag = self.form.image_tag;
         settings.run_mode = self.form.run_mode();
+        settings.update_channel = self.effective_update_channel();
         if let Err(e) = crate::settings::save_settings(&settings) {
             self.set_status(format!("Save error: {e}"));
             return;
@@ -632,6 +690,7 @@ impl TuiApp {
         self.settings.node_config = config;
         self.settings.image_tag = self.form.image_tag;
         self.settings.run_mode = self.form.run_mode();
+        self.settings.update_channel = self.effective_update_channel();
         if let Err(e) = crate::settings::save_settings(&self.settings) {
             self.set_status(format!("Save error: {}", e));
             return;
@@ -691,6 +750,7 @@ impl TuiApp {
         list.push(FocusId::ConfigToggle);
         if self.config_expanded {
             list.push(FocusId::RunMode);
+            list.push(FocusId::UpdateChannel);
             list.push(FocusId::Port);
             list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
