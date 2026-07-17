@@ -70,8 +70,7 @@ impl ProgressSink for TuiSink {
         if done {
             self.push("INFO", "Binary download complete".to_string());
         } else if let Some(total) = total {
-            if total > 0 {
-                let pct = downloaded * 100 / total;
+            if let Some(pct) = (downloaded * 100).checked_div(total) {
                 let prev_pct = self.last_pct.load(Ordering::Relaxed);
                 if pct != prev_pct {
                     self.last_pct.store(pct, Ordering::Relaxed);

@@ -22,6 +22,24 @@ impl Default for RunMode {
     }
 }
 
+// ─── Update channel ─────────────────────────────────────────────────────────
+
+/// Which published tag line the stack tracks. Each image resolves its own tag
+/// independently from its own GitLab container registry by semver (see
+/// `crate::registry`):
+/// - `Release` → the highest tag with no `-rc` suffix (latest stable).
+/// - `Beta` → the highest tag overall, including `-rc` (bleeding edge).
+///
+/// Defaults to `Release`; the UI grays it out and forces `Beta` unless every
+/// image has a stable tag to run.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Release,
+    Beta,
+}
+
 // ─── GPU types ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -380,6 +398,8 @@ pub struct AppSettings {
     pub zerossl_api_key: String,
     #[serde(default)]
     pub run_mode: RunMode,
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
 }
 
 impl Default for AppSettings {
@@ -394,6 +414,7 @@ impl Default for AppSettings {
             cert_email: String::new(),
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
+            update_channel: UpdateChannel::default(),
         }
     }
 }

@@ -12,6 +12,7 @@ pub mod migration_v2;
 pub mod native;
 pub mod network;
 pub mod progress;
+pub mod registry;
 pub mod secret;
 pub mod settings;
 pub mod stack_assets;
@@ -112,8 +113,7 @@ pub fn run() {
             update::get_app_version,
             update::get_node_version,
             update::check_app_update,
-            update::check_image_update,
-            update::check_dashboard_image_update,
+            update::resolve_channel_info,
             update::restart_to_update,
             // Log streaming
             log_stream::start_log_stream,
