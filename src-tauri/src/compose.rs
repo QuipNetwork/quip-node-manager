@@ -170,12 +170,54 @@ pub const PGDATA_VOLUME: &str = "quip_pgdata";
 
 // ── .env generation ────────────────────────────────────────────────────────
 
+/// The channel-resolved tag for each stack image, decided **independently per
+/// repository** (miner / validator / dashboard advance on their own cadence).
+pub(crate) struct ResolvedImageTags {
+    pub miner: String,
+    pub validator: String,
+    pub dashboard: String,
+}
+
+/// Resolve each image's tag from its own GitLab container registry for the
+/// settings' update channel (see `crate::registry`). Every image falls back
+/// independently to `COMPOSE_IMAGE_TAG` — the compose `:-v0.2` default — when
+/// its registry is unreachable or carries no canonical tag on the channel, so
+/// starting the stack never hard-fails on a network hiccup and one image's
+/// gap never blocks the others.
+pub(crate) async fn resolve_channel_image_tags(settings: &AppSettings) -> ResolvedImageTags {
+    let ch = settings.update_channel;
+    let (miner, validator, dashboard) = tokio::join!(
+        crate::registry::resolve_image_channel_tag(image_for_tag(settings.image_tag), ch),
+        crate::registry::resolve_image_channel_tag(VALIDATOR_IMAGE, ch),
+        crate::registry::resolve_image_channel_tag(DASHBOARD_IMAGE, ch),
+    );
+    let fallback = || COMPOSE_IMAGE_TAG.to_string();
+    ResolvedImageTags {
+        miner: miner.unwrap_or_else(fallback),
+        validator: validator.unwrap_or_else(fallback),
+        dashboard: dashboard.unwrap_or_else(fallback),
+    }
+}
+
+/// Value of `key` (e.g. `QUIP_MINER_TAG`) currently pinned in `<data_dir>/.env`,
+/// or `None` when `.env` hasn't been written yet or the key is absent.
+pub(crate) fn current_pinned_tag(key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    let contents = fs::read_to_string(stack_project_dir().join(".env")).ok()?;
+    contents
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
-/// there is no merge with an existing file.
-pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
+/// there is no merge with an existing file. `tags` holds the channel-resolved
+/// per-image tags (see `resolve_channel_image_tags`).
+pub(crate) fn write_env_file(settings: &AppSettings, tags: &ResolvedImageTags) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
     let pg_password = crate::settings::postgres_password();
-    let lines = render_env_lines(settings, puid, pgid, &pg_password);
+    let lines = render_env_lines(settings, puid, pgid, &pg_password, tags);
 
     let path = stack_project_dir().join(".env");
     fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
@@ -203,6 +245,7 @@ fn render_env_lines(
     puid: u32,
     pgid: u32,
     pg_password: &str,
+    tags: &ResolvedImageTags,
 ) -> Vec<String> {
     let dwave_key = settings
         .node_config
@@ -239,9 +282,9 @@ fn render_env_lines(
         format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
         format!("DWAVE_API_KEY={dwave_key}"),
         format!("POSTGRES_PASSWORD={pg_password}"),
-        format!("QUIP_MINER_TAG={COMPOSE_IMAGE_TAG}"),
-        format!("QUIP_DASHBOARD_TAG={COMPOSE_IMAGE_TAG}"),
-        format!("QUIP_VALIDATOR_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_MINER_TAG={}", tags.miner),
+        format!("QUIP_DASHBOARD_TAG={}", tags.dashboard),
+        format!("QUIP_VALIDATOR_TAG={}", tags.validator),
         format!(
             "QUIP_MINER_CPUSET={}",
             cpu_set_for_config(&settings.node_config)
@@ -480,7 +523,8 @@ pub(crate) async fn pull_compose_images_core(
     // Write .env too: without it compose substitutes the compose.yml
     // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
     // start sequence) would silently fetch the wrong tag.
-    write_env_file(&settings)?;
+    let tags = resolve_channel_image_tags(&settings).await;
+    write_env_file(&settings, &tags)?;
 
     pull_compose_images_for_settings(sink, &settings).await
 }
@@ -649,8 +693,9 @@ pub(crate) async fn start_stack_core(
         settings.node_config.validator_rpc_port,
     )?;
 
-    // (5) .env
-    write_env_file(&settings)?;
+    // (5) .env — pin each QUIP_*_TAG to its image's channel-resolved tag.
+    let tags = resolve_channel_image_tags(&settings).await;
+    write_env_file(&settings, &tags)?;
 
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
@@ -1016,8 +1061,11 @@ async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
 async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
+    // Match the tag the miner actually runs (channel-resolved, pinned in .env),
+    // falling back to the compose default when .env hasn't been written yet.
+    let tag = current_pinned_tag("QUIP_MINER_TAG").unwrap_or_else(|| COMPOSE_IMAGE_TAG.to_string());
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
-        let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
+        let image_ref = format!("{image}:{tag}");
         let ps = tokio::task::spawn_blocking({
             let image_ref = image_ref.clone();
             move || {
@@ -1204,6 +1252,16 @@ pub async fn get_stack_config() -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// Same tag for all three images — most env tests don't exercise per-image
+    /// differences.
+    fn uniform_tags(tag: &str) -> ResolvedImageTags {
+        ResolvedImageTags {
+            miner: tag.to_string(),
+            validator: tag.to_string(),
+            dashboard: tag.to_string(),
+        }
+    }
+
     fn svc(service: &str, running: bool, health: Option<&str>) -> ServiceStatus {
         ServiceStatus {
             name: format!("quip-{service}"),
@@ -1330,7 +1388,7 @@ mod tests {
         settings.node_config.node_name = "validator-home".to_string();
         settings.node_config.num_cpus = 4;
 
-        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret");
+        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret", &uniform_tags("v0.2"));
         let env = lines.join("\n");
 
         assert!(env.contains("PUID=501"));
@@ -1356,12 +1414,31 @@ mod tests {
     }
 
     #[test]
+    fn env_lines_pin_all_image_tags_to_resolved_channel_tag() {
+        let settings = AppSettings {
+            run_mode: RunMode::Docker,
+            ..AppSettings::default()
+        };
+        // Each image pins to its OWN channel-resolved tag — repos advance
+        // independently, so the three QUIP_*_TAG lines can differ.
+        let tags = ResolvedImageTags {
+            miner: "v0.2.1-rc49".to_string(),
+            validator: "v0.2.1-rc13".to_string(),
+            dashboard: "v0.2.1-rc15".to_string(),
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &tags).join("\n");
+        assert!(env.contains("QUIP_MINER_TAG=v0.2.1-rc49"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2.1-rc13"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2.1-rc15"));
+    }
+
+    #[test]
     fn env_lines_use_public_host_for_caddy_when_it_is_dns() {
         let mut settings = AppSettings::default();
         settings.node_config.public_host = "node.example.com".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
     }
@@ -1372,7 +1449,7 @@ mod tests {
         settings.node_config.public_host = "203.0.113.9".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
     }
@@ -1385,7 +1462,7 @@ mod tests {
             ..crate::settings::DwaveConfig::default()
         });
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
         assert!(env.contains("DWAVE_API_KEY=dwave-token"));
     }
 
@@ -1397,7 +1474,7 @@ mod tests {
         };
         settings.node_config.node_name = "physical-miner-validator".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(!env.contains("QUIP_VALIDATORS="));
         // Deferred to the compose default in both modes (see above).
@@ -1407,7 +1484,7 @@ mod tests {
     #[test]
     fn env_lines_default_validator_name_and_single_cpu_cpuset() {
         let settings = AppSettings::default();
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));

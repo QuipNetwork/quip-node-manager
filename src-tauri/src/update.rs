@@ -90,13 +90,6 @@ pub struct UpdateInfo {
     pub notes: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ImageUpdateInfo {
-    pub current_digest: String,
-    pub latest_digest: String,
-    pub update_available: bool,
-}
-
 #[derive(Deserialize)]
 struct GitLabRelease {
     name: String,
@@ -146,6 +139,119 @@ fn parse_prerelease(pre: &str) -> u64 {
     digits.parse().unwrap_or(0)
 }
 
+// ── Update channel resolution ──────────────────────────────────────────────
+
+use crate::settings::UpdateChannel;
+
+/// Whether `tag` belongs on `channel`. Beta accepts every tag; Release accepts
+/// only stable tags (no `-rc` / prerelease suffix). Relies on `parse_semver`'s
+/// prerelease slot, which is `u64::MAX` for a final release and a smaller number
+/// for `-rcN` pre-releases.
+/// Stable tags at or below this version are NOT offered on the Release channel:
+/// `v0.2.0` predates the stable-release process, so Release stays gated (grayed
+/// out, forced to Beta) until a strictly newer stable (`v0.2.1`+) ships. Beta is
+/// unaffected. As a `parse_semver` tuple, a stable `v0.2.0` = `(0,2,0,u64::MAX)`.
+pub const RELEASE_STABLE_FLOOR: (u64, u64, u64, u64) = (0, 2, 0, u64::MAX);
+
+pub fn tag_matches_channel(tag: &str, channel: UpdateChannel) -> bool {
+    match channel {
+        UpdateChannel::Beta => true,
+        // Stable (no `-rc`) AND strictly newer than the floor.
+        UpdateChannel::Release => {
+            let sv = parse_semver(tag);
+            sv.3 == u64::MAX && sv > RELEASE_STABLE_FLOOR
+        }
+    }
+}
+
+/// Highest item on `channel` by semver, where `version_of` extracts each item's
+/// version string. On Release, `-rc` prereleases (and anything at/below the
+/// v0.2.0 floor) are filtered out; on Beta everything is eligible. Used to pick
+/// the app's own self-update release so the updater tracks the same channel as
+/// the stack — new rc's nag on Beta, only new stables nag on Release.
+fn pick_release_for_channel<T>(
+    items: Vec<T>,
+    channel: UpdateChannel,
+    version_of: impl Fn(&T) -> &str,
+) -> Option<T> {
+    items
+        .into_iter()
+        .filter(|it| tag_matches_channel(version_of(it), channel))
+        .max_by_key(|it| parse_semver(version_of(it)))
+}
+
+/// Per-image channel resolution for the settings UI. Each stack image resolves
+/// its own tag from its own registry (they advance independently), so the UI
+/// can show what each will pin to and whether Release is runnable.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChannelInfo {
+    /// Tag each image resolves to on the channel (`None` = registry unreachable
+    /// or no canonical tag), keyed by display name (Miner/Validator/Dashboard).
+    pub images: Vec<(String, Option<String>)>,
+    /// Whether every image has a stable (non-rc) tag — Release is selectable
+    /// only when true.
+    pub stable_available: bool,
+}
+
+/// The (display name, image reference) list the UI + monitor resolve, honoring
+/// the active miner flavour (cpu vs cuda).
+fn stack_images(settings: &crate::settings::AppSettings) -> [(&'static str, &'static str); 3] {
+    [
+        ("Miner", crate::compose::image_for_tag(settings.image_tag)),
+        ("Validator", crate::compose::VALIDATOR_IMAGE),
+        ("Dashboard", crate::compose::DASHBOARD_IMAGE),
+    ]
+}
+
+/// Fetch one repo's tags once and derive both its channel tag and whether it
+/// has any stable tag — avoids a second registry round-trip for the gray-out.
+async fn resolve_repo_channel(
+    client: &reqwest::Client,
+    image: &str,
+    channel: UpdateChannel,
+) -> (Option<String>, bool) {
+    match crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image)).await {
+        Ok(tags) => (
+            crate::registry::pick_channel_tag(&tags, channel),
+            crate::registry::pick_channel_tag(&tags, UpdateChannel::Release).is_some(),
+        ),
+        Err(_) => (None, false),
+    }
+}
+
+/// Resolve what a channel points at for every image right now, for the settings
+/// UI. Best-effort: an unreachable registry yields `None` for that image (and
+/// no stable), so the UI degrades gracefully instead of erroring.
+#[tauri::command]
+pub async fn resolve_channel_info(channel: UpdateChannel) -> ChannelInfo {
+    let settings = crate::settings::load_settings();
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    else {
+        return ChannelInfo {
+            images: Vec::new(),
+            stable_available: false,
+        };
+    };
+
+    let images = stack_images(&settings);
+    let (a, b, c) = tokio::join!(
+        resolve_repo_channel(&client, images[0].1, channel),
+        resolve_repo_channel(&client, images[1].1, channel),
+        resolve_repo_channel(&client, images[2].1, channel),
+    );
+    let results = [a, b, c];
+    ChannelInfo {
+        images: images
+            .iter()
+            .zip(&results)
+            .map(|((name, _), (tag, _))| (name.to_string(), tag.clone()))
+            .collect(),
+        stable_available: results.iter().all(|(_, has_stable)| *has_stable),
+    }
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -176,6 +282,7 @@ pub async fn get_node_version() -> Option<String> {
 #[tauri::command]
 pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
     let current = env!("CARGO_PKG_VERSION");
+    let channel = crate::settings::load_settings().update_channel;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -192,7 +299,12 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
         Err(_) => return Ok(None),
     };
 
-    let Some(latest) = releases.into_iter().next() else {
+    // Track the channel: Release only offers new stable app releases, Beta also
+    // offers newer rc's. Picks the highest matching release, not just the newest
+    // listed, so a stray older entry can't shadow the real latest.
+    let Some(latest) =
+        pick_release_for_channel(releases, channel, |r| r.name.trim_start_matches('v'))
+    else {
         return Ok(None);
     };
 
@@ -208,150 +320,30 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
     }
 }
 
-/// Which compose image a digest check is running against. Used by the
-/// background monitor to iterate over the whole stack, and by each
-/// Tauri-facing check wrapper to keep serialisation shapes unchanged.
-///
-/// Postgres and Caddy are deliberately absent: they use Docker Hub version
-/// tags (`postgres:16`, `caddy:2-alpine`), so point releases come in via
-/// routine `docker compose pull` rather than GitLab registry checks.
-#[derive(Clone, Copy, Debug)]
-pub enum ImageRef {
-    Miner(crate::settings::ImageTag),
-    Validator,
-    Dashboard,
-}
-
-impl ImageRef {
-    fn repository(&self) -> &'static str {
-        match self {
-            ImageRef::Miner(image_tag) => crate::compose::image_for_tag(*image_tag),
-            ImageRef::Validator => crate::compose::VALIDATOR_IMAGE,
-            ImageRef::Dashboard => crate::compose::DASHBOARD_IMAGE,
-        }
-    }
-
-    fn gitlab_path(&self) -> &'static str {
-        self.repository()
-            .strip_prefix("registry.gitlab.com/")
-            .unwrap_or_else(|| self.repository())
-    }
-
-    fn tag(&self) -> &'static str {
-        match self {
-            ImageRef::Miner(_) | ImageRef::Validator | ImageRef::Dashboard => {
-                crate::compose::COMPOSE_IMAGE_TAG
+/// Per-image `(display name, newer tag)` for every stack image whose registry
+/// now carries a higher channel tag than the one pinned in `.env`. Each image
+/// is checked against its OWN registry and its OWN pinned tag — they advance
+/// independently. Images with no `.env` pin (stack never started) or an
+/// unreachable registry are skipped. Postgres and Caddy use Docker Hub version
+/// tags and come in via routine `docker compose pull`.
+async fn check_stack_image_updates(
+    settings: &crate::settings::AppSettings,
+) -> Vec<(&'static str, String)> {
+    let env_keys = ["QUIP_MINER_TAG", "QUIP_VALIDATOR_TAG", "QUIP_DASHBOARD_TAG"];
+    let mut out = Vec::new();
+    for ((name, image), key) in stack_images(settings).iter().zip(env_keys) {
+        let Some(current) = crate::compose::current_pinned_tag(key) else {
+            continue;
+        };
+        if let Some(target) =
+            crate::registry::resolve_image_channel_tag(image, settings.update_channel).await
+        {
+            if parse_semver(&target) > parse_semver(&current) {
+                out.push((*name, target));
             }
         }
     }
-
-    fn local_ref(&self) -> String {
-        format!("{}:{}", self.repository(), self.tag())
-    }
-
-    /// Human label used by the UI for update toasts.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            ImageRef::Miner(crate::settings::ImageTag::Cuda) => "Miner (CUDA)",
-            ImageRef::Miner(crate::settings::ImageTag::Cpu) => "Miner (CPU)",
-            ImageRef::Validator => "Validator",
-            ImageRef::Dashboard => "Dashboard",
-        }
-    }
-}
-
-/// The images whose configured-tag digests are worth polling for the given
-/// settings + run_mode. Native mode drops Docker miner/validator images (the
-/// miner binary runs on the host). Dashboard-disabled mode is unsupported in
-/// v0.2, so the dashboard image is always relevant.
-fn relevant_images(settings: &crate::settings::AppSettings) -> Vec<ImageRef> {
-    let mut v = Vec::new();
-    if settings.run_mode == crate::settings::RunMode::Docker {
-        v.push(ImageRef::Miner(settings.image_tag));
-        v.push(ImageRef::Validator);
-    }
-    v.push(ImageRef::Dashboard);
-    v
-}
-
-/// Core GitLab registry digest probe — HEAD the configured tag's manifest,
-/// diff against the local `docker image inspect` digest. Gracefully degrades
-/// to `Ok(None)` when the registry requires auth or the image isn't present
-/// locally.
-async fn check_gitlab_image_update(image: ImageRef) -> Result<Option<ImageUpdateInfo>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let manifest_url = format!(
-        "https://registry.gitlab.com/v2/{}/manifests/{}",
-        image.gitlab_path(),
-        image.tag()
-    );
-
-    let resp = match client
-        .head(&manifest_url)
-        .header(
-            "Accept",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        )
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-
-    let digest = resp
-        .headers()
-        .get("docker-content-digest")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    if digest.is_empty() {
-        return Ok(None);
-    }
-
-    let inspect_image = image.local_ref();
-    let current_digest = tokio::task::spawn_blocking(move || {
-        crate::cmd::new("docker")
-            .args([
-                "image",
-                "inspect",
-                "--format",
-                "{{index .RepoDigests 0}}",
-                &inspect_image,
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-
-    let update_available = !current_digest.is_empty() && !current_digest.contains(&digest);
-
-    Ok(Some(ImageUpdateInfo {
-        current_digest,
-        latest_digest: digest,
-        update_available,
-    }))
-}
-
-#[tauri::command]
-pub async fn check_image_update(
-    image_tag: crate::settings::ImageTag,
-) -> Result<Option<ImageUpdateInfo>, String> {
-    check_gitlab_image_update(ImageRef::Miner(image_tag)).await
-}
-
-#[tauri::command]
-pub async fn check_dashboard_image_update() -> Result<Option<ImageUpdateInfo>, String> {
-    check_gitlab_image_update(ImageRef::Dashboard).await
+    out
 }
 
 /// True when `current` contains an update id not present in `last` — i.e. a
@@ -399,22 +391,15 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
 
         let mut current: HashSet<String> = HashSet::new();
 
-        // Compose-image checks — applies in Docker mode, and in Native mode
-        // whenever the dashboard service is running (dashboard + postgres
-        // + maybe caddy). `relevant_images` filters the set correctly.
-        for image in relevant_images(&settings) {
-            if let Ok(Some(info)) = check_gitlab_image_update(image).await {
-                if info.update_available {
-                    let _ = app.emit(
-                        "image-update-available",
-                        serde_json::json!({
-                            "image": image.display_name(),
-                            "info": info,
-                        }),
-                    );
-                    current.insert(format!("{}:{}", image.display_name(), info.latest_digest));
-                }
-            }
+        // Compose-image check — each image compared against its OWN registry
+        // and OWN pinned tag on the selected channel. Applies in both modes:
+        // the dashboard + supporting images run even in Native mode.
+        for (name, target) in check_stack_image_updates(&settings).await {
+            let _ = app.emit(
+                "image-update-available",
+                serde_json::json!({ "image": name, "version": target }),
+            );
+            current.insert(format!("image:{name}:{target}"));
         }
 
         // Native binary: separate channel because the binary is not a
@@ -436,75 +421,40 @@ pub async fn background_update_monitor(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{AppSettings, ImageTag, RunMode};
+    use crate::settings::RunMode;
 
     #[test]
-    fn image_refs_use_v02_repositories() {
-        let refs = [
-            (
-                ImageRef::Miner(ImageTag::Cpu),
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2",
-                "quip.network/quip-protocol/quip-miner-cpu",
-                "Miner (CPU)",
-            ),
-            (
-                ImageRef::Miner(ImageTag::Cuda),
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
-                "quip.network/quip-protocol/quip-miner-cuda",
-                "Miner (CUDA)",
-            ),
-            (
-                ImageRef::Validator,
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
-                "quip.network/quip-protocol-rs/quip-network-node",
-                "Validator",
-            ),
-            (
-                ImageRef::Dashboard,
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
-                "quip.network/dashboard.quip.network",
-                "Dashboard",
-            ),
-        ];
+    fn app_update_selection_tracks_channel() {
+        let pick = |rels: Vec<&'static str>, ch| {
+            pick_release_for_channel(rels, ch, |v| v.trim_start_matches('v'))
+        };
 
-        for (image, local_ref, gitlab_path, display_name) in refs {
-            assert_eq!(image.local_ref(), local_ref);
-            assert_eq!(image.gitlab_path(), gitlab_path);
-            assert_eq!(image.tag(), "v0.2");
-            assert_eq!(image.display_name(), display_name);
-        }
+        // Only rc's newer than the running build: Beta nags (newest rc),
+        // Release stays quiet (no stable to offer).
+        let rc_only = vec!["v0.2.1-rc11", "v0.2.1-rc12"];
+        assert_eq!(pick(rc_only.clone(), UpdateChannel::Beta), Some("v0.2.1-rc12"));
+        assert_eq!(pick(rc_only, UpdateChannel::Release), None);
+
+        // A stable release above the floor exists: both channels see it, and
+        // Release ignores the newer rc line.
+        let mixed = vec!["v0.2.2-rc1", "v0.2.1", "v0.2.0"];
+        assert_eq!(pick(mixed.clone(), UpdateChannel::Beta), Some("v0.2.2-rc1"));
+        assert_eq!(pick(mixed, UpdateChannel::Release), Some("v0.2.1"));
     }
 
     #[test]
-    fn relevant_images_include_validator_only_for_docker_mode() {
-        let mut settings = AppSettings {
-            run_mode: RunMode::Docker,
-            image_tag: ImageTag::Cuda,
-            ..AppSettings::default()
-        };
-
-        let docker_images: Vec<String> = relevant_images(&settings)
-            .into_iter()
-            .map(|image| image.local_ref())
-            .collect();
-        assert_eq!(
-            docker_images,
-            vec![
-                "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
-                "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
-            ]
-        );
-
-        settings.run_mode = RunMode::Native;
-        let native_images: Vec<String> = relevant_images(&settings)
-            .into_iter()
-            .map(|image| image.local_ref())
-            .collect();
-        assert_eq!(
-            native_images,
-            vec!["registry.gitlab.com/quip.network/dashboard.quip.network:v0.2"]
-        );
+    fn tag_matches_channel_gates_rc_and_floor_on_release() {
+        // Beta accepts anything.
+        assert!(tag_matches_channel("v0.2.0-rc1", UpdateChannel::Beta));
+        assert!(tag_matches_channel("v0.2.0", UpdateChannel::Beta));
+        // Release rejects rc.
+        assert!(!tag_matches_channel("v0.2.1-rc1", UpdateChannel::Release));
+        // Release rejects stable at/below the v0.2.0 floor...
+        assert!(!tag_matches_channel("v0.2.0", UpdateChannel::Release));
+        assert!(!tag_matches_channel("v0.1.9", UpdateChannel::Release));
+        // ...but accepts a stable strictly newer than the floor.
+        assert!(tag_matches_channel("v0.2.1", UpdateChannel::Release));
+        assert!(tag_matches_channel("v0.3.0", UpdateChannel::Release));
     }
 
     #[test]
