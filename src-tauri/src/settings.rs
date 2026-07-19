@@ -400,6 +400,13 @@ pub struct AppSettings {
     pub run_mode: RunMode,
     #[serde(default)]
     pub update_channel: UpdateChannel,
+    /// Memory ceiling for the miner container, in GiB. `None` defers to the
+    /// compose default (`QUIP_MINER_MEM_LIMIT:-16g`).
+    ///
+    /// Needs to live here rather than in `.env`: `write_env_file` regenerates
+    /// `.env` on every Start, so a hand-edited value there never survives.
+    #[serde(default)]
+    pub miner_mem_limit_gb: Option<u32>,
 }
 
 impl Default for AppSettings {
@@ -415,6 +422,7 @@ impl Default for AppSettings {
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
             update_channel: UpdateChannel::default(),
+            miner_mem_limit_gb: None,
         }
     }
 }
