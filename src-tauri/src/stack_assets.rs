@@ -71,6 +71,20 @@ pub fn stack_compose_file() -> PathBuf {
     data_dir().join("docker-compose.yml")
 }
 
+/// `<data_dir>/docker-compose.override.yml` — operator-owned, never written or
+/// read by this app beyond checking that it exists.
+///
+/// `sync_stack_assets` rewrites `docker-compose.yml` from the embedded bytes on
+/// every Start and Apply, so edits to the staged file do not survive. This is
+/// the supported place to change the bundled stack: compose merges it over the
+/// base file, and staging never touches it.
+///
+/// Compose auto-discovers this filename only when invoked with no `-f`. Every
+/// invocation here passes `-f`, so `compose_cmd` must add it explicitly.
+pub fn stack_override_file() -> PathBuf {
+    data_dir().join("docker-compose.override.yml")
+}
+
 /// `<data_dir>/caddy/Caddyfile` — staged from the embedded bytes, possibly
 /// patched for Native mode.
 pub fn stack_caddyfile() -> PathBuf {

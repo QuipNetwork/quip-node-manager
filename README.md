@@ -119,6 +119,26 @@ quip-node-manager --cli
 
 > **Native mode note (macOS):** the node's REST API binds to `127.0.0.1:20100`. Docker Desktop's vpnkit forwards container traffic from `host.docker.internal` through to the host's loopback, so the REST port is not exposed to the LAN.
 
+### Overriding the bundled stack
+
+Node Manager rewrites `~/quip-data/docker-compose.yml` from its embedded copy on every Start and Apply, discarding whatever you edited there. Put changes in `~/quip-data/docker-compose.override.yml` instead. Staging never touches that file, and compose merges it over the base.
+
+```yaml
+services:
+  quip-validator:
+    environment:
+      RUST_LOG: debug
+```
+
+Compose loads an override file automatically only when it discovers the compose file itself. Node Manager always passes `-f`, so it adds the override explicitly when the file exists, after the base file so the override wins.
+
+Two things to watch:
+
+- `command:` replaces the whole list rather than merging it. To change one validator flag, copy the entire `command:` block and edit the line you want.
+- Copy that block from the staged `~/quip-data/docker-compose.yml`, not from `vendor/nodes.quip.network/`. Staging adds flags the vendored file doesn't contain, such as `--public-addr`.
+
+> **Validator pruning isn't recommended.** The validator runs `--state-pruning=archive --blocks-pruning=archive`, keeping every state trie and block body from genesis. Size the disk for that. Pruning reclaims disk, but it breaks the dashboard: the descriptor worker scans from genesis and fails with `State already discarded` once it reads past the pruning window. Pruning also likely reduces your point awards on the SNAG platform. Only prune if you accept losing the dashboard.
+
 See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 
 ## License

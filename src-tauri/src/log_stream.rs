@@ -281,28 +281,11 @@ fn stream_with_fallback<F>(
                 // Compose file / project-directory live in <data_dir>.
                 // `--no-log-prefix` strips compose's `cpu  |` column so the
                 // existing parse_log_line regex still works.
-                let compose_file = crate::stack_assets::stack_compose_file()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let project_dir = crate::stack_assets::stack_project_dir()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let mut child = match crate::cmd::new("docker")
-                    .args([
-                        "compose",
-                        "-f",
-                        &compose_file,
-                        "--project-directory",
-                        &project_dir,
-                        "--project-name",
-                        "quip",
-                        "logs",
-                        "-f",
-                        "--no-log-prefix",
-                        "--tail",
-                        "100",
-                        &service,
-                    ])
+                // Reuse the shared builder so log streaming sees the same
+                // compose model as the rest of the app, including any
+                // operator docker-compose.override.yml.
+                let mut child = match crate::compose::compose_cmd()
+                    .args(["logs", "-f", "--no-log-prefix", "--tail", "100", &service])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()

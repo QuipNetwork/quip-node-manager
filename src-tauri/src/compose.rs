@@ -133,23 +133,49 @@ fn to_forward_slash(p: PathBuf) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// `docker compose -f <data_dir>/docker-compose.yml --project-directory
-/// <data_dir> --project-name quip` — the common prefix for every compose
-/// invocation.
+/// `docker compose -f <data_dir>/docker-compose.yml [-f
+/// <data_dir>/docker-compose.override.yml] --project-directory <data_dir>
+/// --project-name quip` — the common prefix for every compose invocation.
+///
+/// The override file is added only when it exists, and always after the base
+/// file so its values win. Compose auto-loads `docker-compose.override.yml`
+/// only when discovering files itself; passing `-f` disables that, so without
+/// this the operator override documented upstream would be silently ignored.
 pub(crate) fn compose_cmd() -> Command {
-    let compose_file = to_forward_slash(stack_compose_file());
-    let project_dir = to_forward_slash(stack_project_dir());
+    let override_file = crate::stack_assets::stack_override_file();
+    let args = compose_prefix_args(
+        &to_forward_slash(stack_compose_file()),
+        override_file.is_file().then(|| to_forward_slash(override_file)).as_deref(),
+        &to_forward_slash(stack_project_dir()),
+    );
     let mut c = crate::cmd::new("docker");
-    c.args([
-        "compose",
-        "-f",
-        &compose_file,
-        "--project-directory",
-        &project_dir,
-        "--project-name",
-        "quip",
-    ]);
+    c.args(&args);
     c
+}
+
+/// Argument prefix shared by every compose invocation, split out so the
+/// `-f` ordering contract is testable without touching the filesystem.
+///
+/// The override must come after the base file: compose merges left to right,
+/// so a later file wins. Reversing them would silently reinstate the bundled
+/// defaults over the operator's changes.
+fn compose_prefix_args(
+    compose_file: &str,
+    override_file: Option<&str>,
+    project_dir: &str,
+) -> Vec<String> {
+    let mut args = vec!["compose".to_string(), "-f".to_string(), compose_file.to_string()];
+    if let Some(o) = override_file {
+        args.push("-f".to_string());
+        args.push(o.to_string());
+    }
+    args.extend([
+        "--project-directory".to_string(),
+        project_dir.to_string(),
+        "--project-name".to_string(),
+        "quip".to_string(),
+    ]);
+    args
 }
 
 // ── postgres identity ──────────────────────────────────────────────────────
@@ -1251,6 +1277,42 @@ pub async fn get_stack_config() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_prefix_omits_override_when_absent() {
+        let args = compose_prefix_args("/d/docker-compose.yml", None, "/d");
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "/d/docker-compose.yml",
+                "--project-directory",
+                "/d",
+                "--project-name",
+                "quip"
+            ]
+        );
+    }
+
+    /// The override must follow the base file. Compose merges left to right, so
+    /// reversing these silently reinstates the bundled defaults over the
+    /// operator's changes.
+    #[test]
+    fn compose_prefix_puts_override_after_base_file() {
+        let args = compose_prefix_args(
+            "/d/docker-compose.yml",
+            Some("/d/docker-compose.override.yml"),
+            "/d",
+        );
+        let base = args.iter().position(|a| a == "/d/docker-compose.yml").unwrap();
+        let over = args
+            .iter()
+            .position(|a| a == "/d/docker-compose.override.yml")
+            .unwrap();
+        assert!(base < over, "override must win: {args:?}");
+        assert_eq!(args.iter().filter(|a| *a == "-f").count(), 2);
+    }
 
     /// Same tag for all three images — most env tests don't exercise per-image
     /// differences.
