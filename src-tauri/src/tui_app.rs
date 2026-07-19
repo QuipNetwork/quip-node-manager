@@ -10,7 +10,7 @@ use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, DwaveConfig, RunMode, StackHealth};
+use crate::settings::{AppSettings, DwaveConfig, ImageTag, RunMode, StackHealth};
 
 // Compact status used by the TUI. The GUI exposes the full StackStatus shape.
 #[derive(Clone, Debug)]
@@ -114,8 +114,8 @@ pub struct FormState {
     pub telemetry_dir: String,
     pub node_log: String,
     pub http_log: String,
-    // Image selector
-    pub image_tag: crate::settings::ImageTag,
+    // NOTE: no `image_tag` field. It is derived from the GPU config by
+    // `TuiApp::derive_image_tag` — storing it here let it go stale (QUI-895).
     /// Temporary buffer used while editing a text field.
     pub edit_buf: String,
 }
@@ -171,7 +171,6 @@ impl FormState {
             telemetry_dir: nc.telemetry_dir.clone(),
             node_log: nc.node_log.clone(),
             http_log: nc.http_log.clone(),
-            image_tag: s.image_tag,
             edit_buf: String::new(),
         }
     }
@@ -293,6 +292,11 @@ pub struct TuiApp {
     /// `None` until the check returns; `Some(false)` grays out the Release
     /// channel and forces Beta (mirrors the web UI gating).
     channel_stable: Arc<Mutex<Option<bool>>>,
+    /// GPU backend reported by the hardware survey ("cuda", "metal", "none", …).
+    /// Retained because `GpuDeviceConfig` records only index/enabled and carries
+    /// no vendor, so an enabled device alone cannot distinguish an NVIDIA card
+    /// from an Apple Metal GPU. `derive_image_tag` needs both signals.
+    gpu_backend: String,
 }
 
 impl Default for TuiApp {
@@ -368,6 +372,7 @@ impl TuiApp {
             settings,
             native_state: std::sync::Arc::new(crate::native::NativeProcessState::new()),
             channel_stable,
+            gpu_backend: survey.gpu_backend.clone(),
         }
     }
 
@@ -586,7 +591,10 @@ impl TuiApp {
             };
         };
 
-        let selected_service = self.form.image_tag.service();
+        let selected_service = self
+            .derive_image_tag(&self.settings.node_config)
+            .0
+            .service();
         let selected = stack
             .services
             .iter()
@@ -629,7 +637,11 @@ impl TuiApp {
     fn start_node(&mut self) {
         let mut settings = self.settings.clone();
         settings.node_config = self.form.to_node_config(&self.settings.node_config);
-        settings.image_tag = self.form.image_tag;
+        let (image_tag, warning) = self.derive_image_tag(&settings.node_config);
+        settings.image_tag = image_tag;
+        if let Some(w) = warning {
+            self.set_status(w);
+        }
         settings.run_mode = self.form.run_mode();
         settings.update_channel = self.effective_update_channel();
         if let Err(e) = crate::settings::save_settings(&settings) {
@@ -685,10 +697,43 @@ impl TuiApp {
         self.refresh_status();
     }
 
+    /// Which miner image the compose stack should run, derived from the GPU
+    /// configuration the user just edited.
+    ///
+    /// This MUST be derived rather than stored. `FormState.image_tag` used to
+    /// hold it, but nothing ever wrote that field after `from_settings`, so
+    /// toggling GPU-enable wrote `[gpu]`/`[cuda.0]` into config.toml while the
+    /// compose profile stayed `cpu` — the miner ran the CPU image against a
+    /// CUDA config (QUI-895).
+    ///
+    /// Inputs:
+    /// - `config.gpu_device_configs[].enabled` — per-device toggle. Carries NO
+    ///   vendor info; an enabled device may be NVIDIA or Apple Metal.
+    /// - `self.gpu_backend` — survey string: "cuda", "metal", "none", …
+    ///
+    /// The GUI's equivalent lives at `src/app.js:713-715` and reads:
+    ///     image_tag = (any device enabled && gpu_backend === 'cuda')
+    ///                   ? 'cuda' : 'cpu'
+    /// Note D-Wave/QPU is NOT a separate image — it activates via the
+    /// config.toml `[dwave]` section (see `settings.rs:56-59`).
+    /// Returns the tag plus an optional operator-facing warning. The warning is
+    /// what keeps the CPU fallback from being silent: a user who ticked GPU and
+    /// got a CPU miner must be told, since that mismatch is invisible in the
+    /// config.toml they just wrote. Suppressed in Native mode, where no miner
+    /// container runs at all and `image_tag` is therefore unused
+    /// (`compose::compose_services` excludes cpu/cuda for `RunMode::Native`).
+    fn derive_image_tag(&self, config: &crate::settings::NodeConfig) -> (ImageTag, Option<String>) {
+        derive_image_tag(config, &self.gpu_backend, self.form.run_mode())
+    }
+
     fn apply_and_restart(&mut self) {
         let config = self.form.to_node_config(&self.settings.node_config);
         self.settings.node_config = config;
-        self.settings.image_tag = self.form.image_tag;
+        let (image_tag, warning) = self.derive_image_tag(&self.settings.node_config);
+        self.settings.image_tag = image_tag;
+        if let Some(w) = warning {
+            self.set_status(w);
+        }
         self.settings.run_mode = self.form.run_mode();
         self.settings.update_channel = self.effective_update_channel();
         if let Err(e) = crate::settings::save_settings(&self.settings) {
@@ -815,6 +860,37 @@ fn load_secret_sync() -> String {
     v["secret"].as_str().unwrap_or("").to_string()
 }
 
+/// Pure form of `TuiApp::derive_image_tag`, split out so the decision table can
+/// be tested without standing up a whole `TuiApp` (which spawns threads and
+/// reads settings from disk). See the method for the full rationale.
+fn derive_image_tag(
+    config: &crate::settings::NodeConfig,
+    gpu_backend: &str,
+    run_mode: RunMode,
+) -> (ImageTag, Option<String>) {
+    if !config.gpu_device_configs.iter().any(|d| d.enabled) {
+        return (ImageTag::Cpu, None);
+    }
+    if gpu_backend == "cuda" {
+        return (ImageTag::Cuda, None);
+    }
+    if run_mode == RunMode::Native {
+        return (ImageTag::Cpu, None);
+    }
+    (
+        ImageTag::Cpu,
+        Some(format!(
+            "GPU enabled but no CUDA backend detected (gpu_backend={}) \
+             — starting the CPU image; config.toml still declares [cuda.*]",
+            if gpu_backend.is_empty() {
+                "unknown"
+            } else {
+                gpu_backend
+            }
+        )),
+    )
+}
+
 /// Add a GpuDeviceConfig for each surveyed device missing from `node_config`,
 /// preserving any saved enabled/utilization/yielding for existing indices.
 fn merge_surveyed_gpus(
@@ -837,6 +913,73 @@ fn merge_surveyed_gpus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NodeConfig with `n` GPU devices, all set to `enabled`.
+    fn nc_with_gpus(n: u32, enabled: bool) -> crate::settings::NodeConfig {
+        crate::settings::NodeConfig {
+            gpu_device_configs: (0..n)
+                .map(|index| crate::settings::GpuDeviceConfig {
+                    index,
+                    enabled,
+                    utilization: 80,
+                    yielding: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// QUI-895: the reported failure. Enabling a GPU on a CUDA host must select
+    /// the cuda image — previously `image_tag` stayed at its startup value, so
+    /// config.toml got [cuda.0] while compose ran `--profile cpu`.
+    #[test]
+    fn enabled_gpu_on_cuda_host_selects_cuda_image() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cuda);
+        assert!(warn.is_none(), "no warning expected on the happy path");
+    }
+
+    #[test]
+    fn no_enabled_gpu_selects_cpu_image_without_warning() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(2, false), "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cpu);
+        assert!(warn.is_none(), "plain CPU mining is not a fallback");
+    }
+
+    /// Silent fallback is not acceptable: a user who ticked GPU and gets the CPU
+    /// image must be told, because config.toml still declares [cuda.*] and the
+    /// mismatch is otherwise invisible.
+    #[test]
+    fn enabled_gpu_without_cuda_backend_falls_back_loudly() {
+        for backend in ["", "none", "metal"] {
+            let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), backend, RunMode::Docker);
+            assert_eq!(tag, ImageTag::Cpu, "backend={backend}");
+            let warn = warn.unwrap_or_else(|| panic!("expected a warning for backend={backend}"));
+            assert!(warn.contains("CPU image"), "backend={backend}: {warn}");
+        }
+        // The empty survey string is rendered as "unknown", not as a blank.
+        let (_, warn) = derive_image_tag(&nc_with_gpus(1, true), "", RunMode::Docker);
+        assert!(warn.unwrap().contains("gpu_backend=unknown"));
+    }
+
+    /// Native mode runs no miner container at all, so `image_tag` is unused and
+    /// a macOS/Metal operator must not be nagged about a CPU fallback.
+    #[test]
+    fn native_mode_metal_falls_back_quietly() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), "metal", RunMode::Native);
+        assert_eq!(tag, ImageTag::Cpu);
+        assert!(warn.is_none(), "Native mode starts no cpu/cuda container");
+    }
+
+    /// Mirrors the GUI at src/app.js:713-715 — only devices that are actually
+    /// enabled count, not merely present.
+    #[test]
+    fn one_enabled_device_among_several_is_enough() {
+        let mut nc = nc_with_gpus(3, false);
+        nc.gpu_device_configs[2].enabled = true;
+        let (tag, _) = derive_image_tag(&nc, "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cuda);
+    }
 
     #[test]
     fn merge_surveyed_gpus_adds_detected_and_preserves_saved() {
