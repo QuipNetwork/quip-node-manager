@@ -300,7 +300,7 @@ fn render_env_lines(
         .map(|d| d.utilization)
         .unwrap_or(100);
 
-    let lines = vec![
+    let mut lines = vec![
         format!("PUID={puid}"),
         format!("PGID={pgid}"),
         format!("QUIP_HOSTNAME={hostname}"),
@@ -318,6 +318,13 @@ fn render_env_lines(
         format!("VALIDATOR_NAME={validator_name}"),
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
     ];
+
+    // Miner memory ceiling. Omitted when unset so compose's own `:-16g`
+    // default stays the single source of truth — writing an explicit value
+    // here would fork the default across two files.
+    if let Some(gb) = settings.miner_mem_limit_gb {
+        lines.push(format!("QUIP_MINER_MEM_LIMIT={gb}g"));
+    }
 
     // The miner is config-driven as of upstream nodes.quip.network's explicit
     // env contract: the compose cpu/cuda services no longer read QUIP_VALIDATORS
@@ -1436,6 +1443,29 @@ mod tests {
             "registry.gitlab.com/quip.network/dashboard.quip.network"
         );
         assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
+    }
+
+    /// Unset must stay unset. Writing an explicit default here would fork the
+    /// 16g default across .env and the compose file, so bumping one would
+    /// silently leave the other behind.
+    #[test]
+    fn env_omits_miner_mem_limit_when_unset() {
+        let settings = AppSettings {
+            miner_mem_limit_gb: None,
+            ..AppSettings::default()
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        assert!(!env.contains("QUIP_MINER_MEM_LIMIT"), "{env}");
+    }
+
+    #[test]
+    fn env_writes_miner_mem_limit_in_gibibytes_when_set() {
+        let settings = AppSettings {
+            miner_mem_limit_gb: Some(48),
+            ..AppSettings::default()
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        assert!(env.contains("QUIP_MINER_MEM_LIMIT=48g"), "{env}");
     }
 
     #[test]

@@ -137,6 +137,14 @@ Two things to watch:
 - `command:` replaces the whole list rather than merging it. To change one validator flag, copy the entire `command:` block and edit the line you want.
 - Copy that block from the staged `~/quip-data/docker-compose.yml`, not from `vendor/nodes.quip.network/`. Staging adds flags the vendored file doesn't contain, such as `--public-addr`.
 
+The compose file caps the miner container at 16 GiB, which stops a runaway round from triggering a host-wide out-of-memory kill. On a dedicated miner with more RAM, raise it by setting `miner_mem_limit_gb` in `~/quip-data/app-settings.json`:
+
+```json
+{ "miner_mem_limit_gb": 48 }
+```
+
+Set it there rather than in `.env`, which Node Manager regenerates on every Start. There's no UI control for this yet.
+
 > **Validator pruning isn't recommended.** The validator runs `--state-pruning=archive --blocks-pruning=archive`, keeping every state trie and block body from genesis. Size the disk for that. Pruning reclaims disk, but it breaks the dashboard: the descriptor worker scans from genesis and fails with `State already discarded` once it reads past the pruning window. Pruning also likely reduces your point awards on the SNAG platform. Only prune if you accept losing the dashboard.
 
 See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
