@@ -123,6 +123,18 @@ fn activate(app: &mut TuiApp) -> Action {
             Action::None
         }
 
+        // Update Channel — cycle Release/Beta. When no stable release exists
+        // Release isn't selectable, so lock to Beta (mirrors the web gray-out).
+        FocusId::UpdateChannel => {
+            app.form.update_channel_idx = if app.release_channel_available() {
+                (app.form.update_channel_idx + 1) % 2
+            } else {
+                1 // Beta
+            };
+            app.dirty = true;
+            Action::None
+        }
+
         // Checkboxes — toggle on Enter too
         FocusId::PublicHostEnable => {
             app.form.public_host_enabled = !app.form.public_host_enabled;
@@ -141,12 +153,6 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
-        FocusId::AutoUpdate => {
-            app.form.auto_update = !app.form.auto_update;
-            app.dirty = true;
-            Action::None
-        }
-
         // GPU Utilization — increase by 10 (wraps at 100)
         FocusId::GpuUtilization => {
             app.form.gpu_utilization = if app.form.gpu_utilization >= 100 {
@@ -192,7 +198,6 @@ fn toggle_or_activate(app: &mut TuiApp) -> Action {
     match app.focus {
         FocusId::PublicHostEnable
         | FocusId::GpuYielding
-        | FocusId::AutoUpdate
         | FocusId::RunMode
         | FocusId::GpuEnable => activate(app),
         _ => activate(app),

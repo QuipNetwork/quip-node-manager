@@ -236,6 +236,23 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
     ]));
 
+    // Update channel (Release grays out until a stable release exists)
+    let channels = ["Release", "Beta"];
+    let channel_display = channels[app.form.update_channel_idx.min(1)];
+    let channel_note = if app.release_channel_available() {
+        String::new()
+    } else {
+        "  (no stable release yet — Beta only)".to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{:<16} {}", "Update Channel", channel_display),
+            focus_style(app, &FocusId::UpdateChannel),
+        ),
+        Span::styled(channel_note, Style::default().fg(DIM)),
+    ]));
+
     // Public API port
     lines.push(field_line(
         app,
@@ -360,15 +377,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             ),
         ));
 
-        // Auto-update
-        let au_check = if app.form.auto_update { "[x]" } else { "[ ]" };
-        lines.push(Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("{} Auto-update", au_check),
-                focus_style(app, &FocusId::AutoUpdate),
-            ),
-        ]));
     }
 
     // CPU Cores

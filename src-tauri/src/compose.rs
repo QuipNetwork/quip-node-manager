@@ -6,6 +6,7 @@
 //! validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
+use crate::progress::{ProgressSink, TauriSink};
 use crate::settings::{
     AppSettings, ImageTag, NodeConfig, RunMode, ServiceStatus, StackHealth, StackStatus,
 };
@@ -15,6 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -105,6 +107,24 @@ pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     }
 }
 
+/// Services whose state feeds the stack-health roll-up for the given mode.
+/// `docker compose ps --all` lists every container in the project — including
+/// Exited miners left behind by an image-type or run-mode switch (Stop never
+/// removes containers) — so health must only consider the services the
+/// current configuration actually starts.
+pub fn expected_services(run_mode: &RunMode, image_tag: ImageTag) -> Vec<&'static str> {
+    match run_mode {
+        RunMode::Docker => vec![
+            image_tag.service(),
+            "quip-validator",
+            "dashboard",
+            "postgres",
+            "caddy",
+        ],
+        RunMode::Native => compose_services(&RunMode::Native).to_vec(),
+    }
+}
+
 // ── compose command builder ────────────────────────────────────────────────
 
 fn to_forward_slash(p: PathBuf) -> String {
@@ -113,23 +133,49 @@ fn to_forward_slash(p: PathBuf) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// `docker compose -f <data_dir>/docker-compose.yml --project-directory
-/// <data_dir> --project-name quip` — the common prefix for every compose
-/// invocation.
+/// `docker compose -f <data_dir>/docker-compose.yml [-f
+/// <data_dir>/docker-compose.override.yml] --project-directory <data_dir>
+/// --project-name quip` — the common prefix for every compose invocation.
+///
+/// The override file is added only when it exists, and always after the base
+/// file so its values win. Compose auto-loads `docker-compose.override.yml`
+/// only when discovering files itself; passing `-f` disables that, so without
+/// this the operator override documented upstream would be silently ignored.
 pub(crate) fn compose_cmd() -> Command {
-    let compose_file = to_forward_slash(stack_compose_file());
-    let project_dir = to_forward_slash(stack_project_dir());
+    let override_file = crate::stack_assets::stack_override_file();
+    let args = compose_prefix_args(
+        &to_forward_slash(stack_compose_file()),
+        override_file.is_file().then(|| to_forward_slash(override_file)).as_deref(),
+        &to_forward_slash(stack_project_dir()),
+    );
     let mut c = crate::cmd::new("docker");
-    c.args([
-        "compose",
-        "-f",
-        &compose_file,
-        "--project-directory",
-        &project_dir,
-        "--project-name",
-        "quip",
-    ]);
+    c.args(&args);
     c
+}
+
+/// Argument prefix shared by every compose invocation, split out so the
+/// `-f` ordering contract is testable without touching the filesystem.
+///
+/// The override must come after the base file: compose merges left to right,
+/// so a later file wins. Reversing them would silently reinstate the bundled
+/// defaults over the operator's changes.
+fn compose_prefix_args(
+    compose_file: &str,
+    override_file: Option<&str>,
+    project_dir: &str,
+) -> Vec<String> {
+    let mut args = vec!["compose".to_string(), "-f".to_string(), compose_file.to_string()];
+    if let Some(o) = override_file {
+        args.push("-f".to_string());
+        args.push(o.to_string());
+    }
+    args.extend([
+        "--project-directory".to_string(),
+        project_dir.to_string(),
+        "--project-name".to_string(),
+        "quip".to_string(),
+    ]);
+    args
 }
 
 // ── postgres identity ──────────────────────────────────────────────────────
@@ -150,12 +196,54 @@ pub const PGDATA_VOLUME: &str = "quip_pgdata";
 
 // ── .env generation ────────────────────────────────────────────────────────
 
+/// The channel-resolved tag for each stack image, decided **independently per
+/// repository** (miner / validator / dashboard advance on their own cadence).
+pub(crate) struct ResolvedImageTags {
+    pub miner: String,
+    pub validator: String,
+    pub dashboard: String,
+}
+
+/// Resolve each image's tag from its own GitLab container registry for the
+/// settings' update channel (see `crate::registry`). Every image falls back
+/// independently to `COMPOSE_IMAGE_TAG` — the compose `:-v0.2` default — when
+/// its registry is unreachable or carries no canonical tag on the channel, so
+/// starting the stack never hard-fails on a network hiccup and one image's
+/// gap never blocks the others.
+pub(crate) async fn resolve_channel_image_tags(settings: &AppSettings) -> ResolvedImageTags {
+    let ch = settings.update_channel;
+    let (miner, validator, dashboard) = tokio::join!(
+        crate::registry::resolve_image_channel_tag(image_for_tag(settings.image_tag), ch),
+        crate::registry::resolve_image_channel_tag(VALIDATOR_IMAGE, ch),
+        crate::registry::resolve_image_channel_tag(DASHBOARD_IMAGE, ch),
+    );
+    let fallback = || COMPOSE_IMAGE_TAG.to_string();
+    ResolvedImageTags {
+        miner: miner.unwrap_or_else(fallback),
+        validator: validator.unwrap_or_else(fallback),
+        dashboard: dashboard.unwrap_or_else(fallback),
+    }
+}
+
+/// Value of `key` (e.g. `QUIP_MINER_TAG`) currently pinned in `<data_dir>/.env`,
+/// or `None` when `.env` hasn't been written yet or the key is absent.
+pub(crate) fn current_pinned_tag(key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    let contents = fs::read_to_string(stack_project_dir().join(".env")).ok()?;
+    contents
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
-/// there is no merge with an existing file.
-pub(crate) fn write_env_file(settings: &AppSettings) -> Result<(), String> {
+/// there is no merge with an existing file. `tags` holds the channel-resolved
+/// per-image tags (see `resolve_channel_image_tags`).
+pub(crate) fn write_env_file(settings: &AppSettings, tags: &ResolvedImageTags) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
     let pg_password = crate::settings::postgres_password();
-    let lines = render_env_lines(settings, puid, pgid, &pg_password);
+    let lines = render_env_lines(settings, puid, pgid, &pg_password, tags);
 
     let path = stack_project_dir().join(".env");
     fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
@@ -183,6 +271,7 @@ fn render_env_lines(
     puid: u32,
     pgid: u32,
     pg_password: &str,
+    tags: &ResolvedImageTags,
 ) -> Vec<String> {
     let dwave_key = settings
         .node_config
@@ -219,9 +308,9 @@ fn render_env_lines(
         format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
         format!("DWAVE_API_KEY={dwave_key}"),
         format!("POSTGRES_PASSWORD={pg_password}"),
-        format!("QUIP_MINER_TAG={COMPOSE_IMAGE_TAG}"),
-        format!("QUIP_DASHBOARD_TAG={COMPOSE_IMAGE_TAG}"),
-        format!("QUIP_VALIDATOR_TAG={COMPOSE_IMAGE_TAG}"),
+        format!("QUIP_MINER_TAG={}", tags.miner),
+        format!("QUIP_DASHBOARD_TAG={}", tags.dashboard),
+        format!("QUIP_VALIDATOR_TAG={}", tags.validator),
         format!(
             "QUIP_MINER_CPUSET={}",
             cpu_set_for_config(&settings.node_config)
@@ -230,12 +319,17 @@ fn render_env_lines(
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
     ];
 
-    if settings.run_mode == RunMode::Docker {
-        lines.push(format!(
-            "QUIP_VALIDATORS={}",
-            crate::config::DOCKER_VALIDATOR_RPC
-        ));
+    // Miner memory ceiling. Omitted when unset so compose's own `:-16g`
+    // default stays the single source of truth — writing an explicit value
+    // here would fork the default across two files.
+    if let Some(gb) = settings.miner_mem_limit_gb {
+        lines.push(format!("QUIP_MINER_MEM_LIMIT={gb}g"));
     }
+
+    // The miner is config-driven as of upstream nodes.quip.network's explicit
+    // env contract: the compose cpu/cuda services no longer read QUIP_VALIDATORS
+    // (it lives in config.toml's [miner].validators), so we don't write it.
+    //
     // QUIP_VALIDATOR_RPC_URLS is intentionally NOT set here. The dashboard uses
     // it for both the chain RPC and (by stripping /rpc) the local miner REST,
     // so it must resolve both from one host — Caddy's internal :8088 listener.
@@ -268,7 +362,7 @@ enum StdoutMode {
 /// caller can skip treating it as error output). Image-level milestones are
 /// also mirrored to node-log so the console keeps a "Pulling/Pulled <image>"
 /// record without the per-layer noise.
-fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
+fn emit_pull_progress_json(sink: &dyn ProgressSink, gen: u64, line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
@@ -282,34 +376,29 @@ fn emit_pull_progress_json(app: &AppHandle, gen: u64, line: &str) -> bool {
     // Image-level events have no parent layer; mirror them to the log.
     if value.get("parent_id").is_none() && id.starts_with("Image ") {
         let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let _ = app.emit(
-            "node-log",
-            serde_json::json!({
-                "timestamp": "",
-                "level": "INFO",
-                "message": format!("{} {}", text, id.trim_start_matches("Image ")),
-            }),
-        );
+        sink.log("INFO", &format!("{} {}", text, id.trim_start_matches("Image ")));
     }
     // Stamp the generation so the frontend can discard events from a pull it has
     // already closed (see PULL_GENERATION).
     if let Some(obj) = value.as_object_mut() {
         let _ = obj.insert("gen".into(), serde_json::json!(gen));
     }
-    let _ = app.emit("pull-progress", value);
+    sink.pull_progress(value);
     true
 }
 
-async fn run_compose_streaming(app: &AppHandle, args: Vec<String>) -> Result<(), String> {
-    run_compose_streaming_mode(app, args, StdoutMode::Log).await
+async fn run_compose_streaming(
+    sink: Arc<dyn ProgressSink>,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_compose_streaming_mode(sink, args, StdoutMode::Log).await
 }
 
 async fn run_compose_streaming_mode(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     args: Vec<String>,
     mode: StdoutMode,
 ) -> Result<(), String> {
-    let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let mut child = compose_cmd()
             .args(&args)
@@ -321,42 +410,28 @@ async fn run_compose_streaming_mode(
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let app_out = app.clone();
+        let sink_out = Arc::clone(&sink);
         let stdout_thread = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if matches!(mode, StdoutMode::Log) {
-                    let _ = app_out.emit("pull-progress", serde_json::json!({ "line": &line }));
+                    sink_out.pull_progress(serde_json::json!({ "line": &line }));
                 }
-                let _ = app_out.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_out.log("INFO", &line);
             }
         });
 
         // docker compose writes `--progress json` events to stderr, so the
         // PullJson parsing lives here. Non-progress lines stay error output.
-        let app_err = app.clone();
+        let sink_err = Arc::clone(&sink);
         let stderr_thread = std::thread::spawn(move || {
             let mut last = String::new();
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let StdoutMode::PullJson(gen) = mode {
-                    if emit_pull_progress_json(&app_err, gen, &line) {
+                    if emit_pull_progress_json(&*sink_err, gen, &line) {
                         continue;
                     }
                 }
-                let _ = app_err.emit(
-                    "node-log",
-                    serde_json::json!({
-                        "timestamp": "",
-                        "level": "INFO",
-                        "message": &line,
-                    }),
-                );
+                sink_err.log("INFO", &line);
                 last = line;
             }
             last
@@ -455,6 +530,18 @@ pub async fn check_docker_compose_installed() -> Result<bool, String> {
 /// registry for the configured v0.2 tags even if local copies exist.
 #[tauri::command]
 pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
+    pull_compose_images_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Pull every compose stack image, reporting per-image progress through `sink`.
+///
+/// Loads the current app settings, stages the compose assets and `.env` file
+/// (so compose sees the configured v0.2 image tags), then runs
+/// `docker compose --profile <p> pull [services...]`. The `pull-complete`
+/// notification is delivered via `sink.pull_complete` when the command exits.
+pub(crate) async fn pull_compose_images_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<(), String> {
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
@@ -469,13 +556,14 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
     // Write .env too: without it compose substitutes the compose.yml
     // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
     // start sequence) would silently fetch the wrong tag.
-    write_env_file(&settings)?;
+    let tags = resolve_channel_image_tags(&settings).await;
+    write_env_file(&settings, &tags)?;
 
-    pull_compose_images_for_settings(&app, &settings).await
+    pull_compose_images_for_settings(sink, &settings).await
 }
 
 async fn pull_compose_images_for_settings(
-    app: &AppHandle,
+    sink: Arc<dyn ProgressSink>,
     settings: &AppSettings,
 ) -> Result<(), String> {
     let profile = compose_profile(settings.image_tag);
@@ -495,21 +583,18 @@ async fn pull_compose_images_for_settings(
     // terminal pull-complete carry the same id.
     let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-    log_cmd(app, &format!("docker compose --profile {profile} pull ..."));
-    let result = run_compose_streaming_mode(app, args, StdoutMode::PullJson(gen)).await;
+    sink.log("INFO", &format!("$ docker compose --profile {profile} pull ..."));
+    let result = run_compose_streaming_mode(Arc::clone(&sink), args, StdoutMode::PullJson(gen)).await;
 
     // Tell the UI the pull is over so it can hide the progress panel. Process
     // exit is the authoritative "pull is done" signal: per-image "Pulled"
     // accounting can miss an image's terminal event on some platforms, and a
     // late progress event delivered after this one is discarded by the frontend
     // because its generation is already closed.
-    let _ = app.emit(
-        "pull-complete",
-        serde_json::json!({
-            "gen": gen,
-            "success": result.is_ok(),
-            "error": result.as_ref().err().cloned().unwrap_or_default(),
-        }),
+    sink.pull_complete(
+        gen,
+        result.is_ok(),
+        &result.as_ref().err().cloned().unwrap_or_default(),
     );
     result
 }
@@ -523,7 +608,7 @@ async fn pull_compose_images_for_settings(
 /// `nvidia-cuda-mps-control` binary or an already-running daemon just leaves
 /// MPS inactive, and the miner falls back to software / NVML throttling.
 #[cfg(target_os = "linux")]
-async fn ensure_mps_daemon(app: &AppHandle) {
+async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
     let out = tokio::task::spawn_blocking(|| {
         crate::cmd::new("nvidia-cuda-mps-control")
             .arg("-d")
@@ -532,8 +617,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
     .await;
     match out {
         Ok(Ok(o)) if o.status.success() => {
-            log_cmd(app, "nvidia-cuda-mps-control -d");
-            log_output(app, "Started NVIDIA MPS control daemon for GPU SM sharing.");
+            sink.log("INFO", "$ nvidia-cuda-mps-control -d");
+            sink.log("INFO", "Started NVIDIA MPS control daemon for GPU SM sharing.");
         }
         // Non-success is almost always "an instance is already running" — fine.
         // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
@@ -541,8 +626,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
             let detail = String::from_utf8_lossy(&o.stderr);
             let detail = detail.trim();
             if !detail.is_empty() {
-                log_output(
-                    app,
+                sink.log(
+                    "INFO",
                     &format!("NVIDIA MPS daemon already active or unavailable: {detail}"),
                 );
             }
@@ -553,6 +638,8 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 
 /// Start the compose stack (and, in Native mode, arrange for the native
 /// binary to be started separately by `native::start_native_node`).
+///
+/// Thin Tauri command wrapper — see [`start_stack_core`] for the full sequence.
 ///
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
@@ -566,6 +653,23 @@ async fn ensure_mps_daemon(app: &AppHandle) {
 ///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
+    start_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stage assets, pull, and `up -d` the compose stack, reporting via `sink`.
+///
+/// Sequence:
+///   1. migrate existing v0.1 config/env, if present
+///   2. auto-detect public_host in Docker mode
+///   3. force native miner REST settings when Native mode is used
+///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   5. write .env
+///   6. write_config_toml
+///   7. docker compose --profile <p> pull
+///   8. docker compose --profile <p> up -d [services...]
+pub(crate) async fn start_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
     let mut settings = crate::settings::load_settings();
 
     // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
@@ -576,20 +680,24 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         .promoted
         .apply_to_node_config(&mut settings.node_config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
-    crate::migration_v2::emit_report(&app, &migration);
+    for warning in &migration.warnings {
+        for line in warning.lines() {
+            sink.log("WARN", line);
+        }
+    }
 
     // (2) Docker-mode auto-detect of public_host; Native leaves it to the
     // binary.
     if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => {
-                log_cmd(&app, &format!("Auto-detected public IP: {}", ip));
+                sink.log("INFO", &format!("$ Auto-detected public IP: {}", ip));
                 settings.node_config.public_host = ip;
             }
             // Don't fail the start, but don't hide it either: without a
             // public_host the validator advertises no public address.
-            Err(e) => log_err(
-                &app,
+            Err(e) => sink.log(
+                "ERROR",
                 &format!(
                     "Warning: could not auto-detect public IP ({e}); the node will not \
                      advertise a public address. Set a public host in Settings."
@@ -618,25 +726,26 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
         settings.node_config.validator_rpc_port,
     )?;
 
-    // (5) .env
-    write_env_file(&settings)?;
+    // (5) .env — pin each QUIP_*_TAG to its image's channel-resolved tag.
+    let tags = resolve_channel_image_tags(&settings).await;
+    write_env_file(&settings, &tags)?;
 
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
-    log_cmd(&app, "Writing config.toml");
+    sink.log("INFO", "$ Writing config.toml");
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
-    pull_compose_images_for_settings(&app, &settings).await?;
+    pull_compose_images_for_settings(Arc::clone(&sink), &settings).await?;
 
     // Start the host NVIDIA MPS daemon before the cuda container so it can
     // attach (native Linux GPU hosts only; no-op everywhere else).
     #[cfg(target_os = "linux")]
     {
         if settings.run_mode == RunMode::Docker && settings.image_tag == ImageTag::Cuda {
-            ensure_mps_daemon(&app).await;
+            ensure_mps_daemon(Arc::clone(&sink)).await;
         }
     }
 
@@ -655,10 +764,10 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
-    log_cmd(
-        &app,
+    sink.log(
+        "INFO",
         &format!(
-            "docker compose --profile {profile} up -d --remove-orphans{}",
+            "$ docker compose --profile {profile} up -d --remove-orphans{}",
             if up_args.len() > 5 {
                 format!(" {}", up_args[5..].join(" "))
             } else {
@@ -666,7 +775,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
             }
         ),
     );
-    let mut up_result = run_compose_streaming(&app, up_args.clone()).await;
+    let mut up_result = run_compose_streaming(Arc::clone(&sink), up_args.clone()).await;
 
     // `up` only fails like this when a leftover container is holding one of our
     // fixed container_names and compose can't reconcile it — e.g. one created
@@ -675,20 +784,22 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     // (and image orphans) once, then retry. This runs ONLY on failure, so a
     // normal start never force-removes anything.
     if let Err(e) = &up_result {
-        log_err(
-            &app,
-            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
+        sink.log(
+            "ERROR",
+            &format!(
+                "docker compose up failed ({e}); reaping leftover containers and retrying"
+            ),
         );
-        force_remove_known_containers(&app).await;
-        sweep_orphan_node_containers(&app).await;
-        up_result = run_compose_streaming(&app, up_args).await;
+        force_remove_known_containers(Arc::clone(&sink)).await;
+        sweep_orphan_node_containers(Arc::clone(&sink)).await;
+        up_result = run_compose_streaming(Arc::clone(&sink), up_args).await;
     }
 
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
     // or foreign data volume keeps an old password and would otherwise leave
     // the dashboard crash-looping behind a silent 502.
     if up_result.is_ok() {
-        verify_dashboard_db(&app).await;
+        verify_dashboard_db(Arc::clone(&sink)).await;
     }
     up_result
 }
@@ -714,7 +825,7 @@ enum PgAuthProbe {
 /// the user only sees as a 502 behind Caddy. Surface it explicitly via the
 /// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
 /// are unaffected, so we don't abort the whole start.
-async fn verify_dashboard_db(app: &AppHandle) {
+async fn verify_dashboard_db(sink: Arc<dyn ProgressSink>) {
     let password = crate::settings::postgres_password();
     let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
         .await
@@ -728,11 +839,8 @@ async fn verify_dashboard_db(app: &AppHandle) {
                  dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
                  Dashboard tab to recreate it."
             );
-            log_err(app, &msg);
-            let _ = app.emit(
-                "dashboard-db-mismatch",
-                serde_json::json!({ "message": msg }),
-            );
+            sink.log("ERROR", &msg);
+            sink.dashboard_db_mismatch(&msg);
         }
     }
 }
@@ -873,12 +981,17 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// containers but leaves them — and the project network and named volumes
 /// (quip-pgdata, quip-caddy-data, quip-caddy-config) — in place. Stop must not
 /// destroy containers; recreating from a clean slate is the Start path's job
-/// (`down` + name reap). `docker compose stop` acts on every running container
-/// in the project, including profiled ones, without needing the profile flag.
+/// (`down` + name reap).
+///
+/// Every service in the upstream compose file is gated behind the `cpu`/`cuda`
+/// profile, so `stop` MUST activate those profiles. Compose v2 reconciles
+/// `stop`/`down`/`restart` against the *active* profile set; without
+/// `--profile`, profile-gated services are absent from the model and `stop`
+/// silently halts nothing (exit 0, no output). We activate both `cpu` and
+/// `cuda` so Stop halts the whole stack regardless of the configured miner
+/// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("stop-started", serde_json::json!({}));
-
     // Kill the log-streamer child first — same ordering as the old
     // stop_node_container sequence, so `docker compose logs -f` unblocks
     // before we stop the containers.
@@ -886,20 +999,47 @@ pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
     log_state.kill_child();
     *log_state.stop_flag.lock().unwrap() = true;
 
-    log_cmd(&app, "docker compose stop");
-    let result = run_compose_streaming(&app, vec!["stop".into()]).await;
+    stop_stack_core(Arc::new(TauriSink::new(app))).await
+}
+
+/// Stop the compose stack, reporting via `sink`.
+///
+/// Emits `stop-started`, runs `docker compose --profile cpu --profile cuda stop`
+/// (v0.2 semantics: stops containers but does not remove them), then emits
+/// `stop-complete`. Both cpu and cuda profiles are activated so the whole stack
+/// is halted regardless of the configured miner type or containers left over
+/// from a profile switch.
+///
+/// Args:
+///     sink: Receives `stop-started`, `node-log`, and `stop-complete` events.
+///
+/// Returns:
+///     `Ok(())` on success, `Err(message)` if the compose command fails.
+pub(crate) async fn stop_stack_core(
+    sink: Arc<dyn crate::progress::ProgressSink>,
+) -> Result<(), String> {
+    sink.stop_started();
+
+    let stop_args: Vec<String> = vec![
+        "--profile".into(),
+        compose_profile(ImageTag::Cpu).into(),
+        "--profile".into(),
+        compose_profile(ImageTag::Cuda).into(),
+        "stop".into(),
+    ];
+    sink.log("INFO", "$ docker compose --profile cpu --profile cuda stop");
+    let result = run_compose_streaming(Arc::clone(&sink), stop_args).await;
 
     match &result {
         Ok(_) => {
-            log_output(&app, "Compose stack stopped.");
-            let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
+            sink.log("INFO", "Compose stack stopped.");
+            sink.stop_complete(true, None);
         }
         Err(e) => {
-            log_err(&app, e);
-            let _ = app.emit(
-                "stop-complete",
-                serde_json::json!({ "success": false, "error": e }),
-            );
+            for line in e.lines() {
+                sink.log("ERROR", line);
+            }
+            sink.stop_complete(false, Some(e));
         }
     }
 
@@ -930,7 +1070,7 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
 /// silently no-op-ing when the project label doesn't line up with what
 /// we pass. `docker rm -f` on a missing name returns non-zero which we
 /// ignore; we only surface output when something is actually removed.
-async fn force_remove_known_containers(app: &AppHandle) {
+async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
     for &name in KNOWN_CONTAINER_NAMES {
         let out = tokio::task::spawn_blocking(move || {
             crate::cmd::new("docker").args(["rm", "-f", name]).output()
@@ -941,8 +1081,8 @@ async fn force_remove_known_containers(app: &AppHandle) {
             // Docker prints the removed container's name to stdout.
             let removed = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !removed.is_empty() {
-                log_cmd(app, &format!("docker rm -f {name}"));
-                log_output(app, &format!("Removed {removed}"));
+                sink.log("INFO", &format!("$ docker rm -f {name}"));
+                sink.log("INFO", &format!("Removed {removed}"));
             }
         }
     }
@@ -953,9 +1093,12 @@ async fn force_remove_known_containers(app: &AppHandle) {
 /// individual failures are logged but don't fail the stop. The name prefix
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
-async fn sweep_orphan_node_containers(app: &AppHandle) {
+async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
+    // Match the tag the miner actually runs (channel-resolved, pinned in .env),
+    // falling back to the compose default when .env hasn't been written yet.
+    let tag = current_pinned_tag("QUIP_MINER_TAG").unwrap_or_else(|| COMPOSE_IMAGE_TAG.to_string());
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
-        let image_ref = format!("{image}:{COMPOSE_IMAGE_TAG}");
+        let image_ref = format!("{image}:{tag}");
         let ps = tokio::task::spawn_blocking({
             let image_ref = image_ref.clone();
             move || {
@@ -983,9 +1126,9 @@ async fn sweep_orphan_node_containers(app: &AppHandle) {
             if name.starts_with("quip-") {
                 continue; // Managed by compose — leave for `down` to reap.
             }
-            log_cmd(
-                app,
-                &format!("docker rm -f {id}  # orphan {name} from {image_ref}"),
+            sink.log(
+                "INFO",
+                &format!("$ docker rm -f {id}  # orphan {name} from {image_ref}"),
             );
             let id = id.to_string();
             let _ = tokio::task::spawn_blocking(move || {
@@ -1082,28 +1225,44 @@ pub async fn get_stack_status() -> Result<StackStatus, String> {
         });
     }
 
-    let overall = if services.is_empty() {
-        StackHealth::Stopped
-    } else if services
+    let settings = crate::settings::load_settings();
+    let expected = expected_services(&settings.run_mode, settings.image_tag);
+    let overall = roll_up_health(&services, &expected);
+
+    Ok(StackStatus { services, overall })
+}
+
+/// Roll per-service states up into a `StackHealth`, considering only the
+/// `expected` services. Containers outside `expected` (stale miners from
+/// another profile or run mode) are ignored; an expected service with no
+/// container at all counts as not running.
+fn roll_up_health(services: &[ServiceStatus], expected: &[&str]) -> StackHealth {
+    let relevant: Vec<&ServiceStatus> = services
+        .iter()
+        .filter(|s| expected.contains(&s.service.as_str()))
+        .collect();
+    let running = relevant.iter().filter(|s| s.running).count();
+    if running == 0 {
+        return StackHealth::Stopped;
+    }
+    if relevant
         .iter()
         .any(|s| s.health.as_deref() == Some("unhealthy"))
     {
-        StackHealth::Unhealthy
-    } else if services.iter().all(|s| {
+        return StackHealth::Unhealthy;
+    }
+    let all_ok = relevant.iter().all(|s| {
         s.running
             && s.health
                 .as_deref()
                 .map(|h| h == "healthy" || h == "starting")
                 .unwrap_or(true)
-    }) {
+    });
+    if all_ok && running == expected.len() {
         StackHealth::Running
-    } else if services.iter().any(|s| s.running) {
-        StackHealth::Degraded
     } else {
-        StackHealth::Stopped
-    };
-
-    Ok(StackStatus { services, overall })
+        StackHealth::Degraded
+    }
 }
 
 /// `docker compose config` output — replaces the old `get_container_config`.
@@ -1125,6 +1284,114 @@ pub async fn get_stack_config() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_prefix_omits_override_when_absent() {
+        let args = compose_prefix_args("/d/docker-compose.yml", None, "/d");
+        assert_eq!(
+            args,
+            vec![
+                "compose",
+                "-f",
+                "/d/docker-compose.yml",
+                "--project-directory",
+                "/d",
+                "--project-name",
+                "quip"
+            ]
+        );
+    }
+
+    /// The override must follow the base file. Compose merges left to right, so
+    /// reversing these silently reinstates the bundled defaults over the
+    /// operator's changes.
+    #[test]
+    fn compose_prefix_puts_override_after_base_file() {
+        let args = compose_prefix_args(
+            "/d/docker-compose.yml",
+            Some("/d/docker-compose.override.yml"),
+            "/d",
+        );
+        let base = args.iter().position(|a| a == "/d/docker-compose.yml").unwrap();
+        let over = args
+            .iter()
+            .position(|a| a == "/d/docker-compose.override.yml")
+            .unwrap();
+        assert!(base < over, "override must win: {args:?}");
+        assert_eq!(args.iter().filter(|a| *a == "-f").count(), 2);
+    }
+
+    /// Same tag for all three images — most env tests don't exercise per-image
+    /// differences.
+    fn uniform_tags(tag: &str) -> ResolvedImageTags {
+        ResolvedImageTags {
+            miner: tag.to_string(),
+            validator: tag.to_string(),
+            dashboard: tag.to_string(),
+        }
+    }
+
+    fn svc(service: &str, running: bool, health: Option<&str>) -> ServiceStatus {
+        ServiceStatus {
+            name: format!("quip-{service}"),
+            service: service.to_string(),
+            running,
+            health: health.map(str::to_string),
+            status_text: String::new(),
+            image: String::new(),
+        }
+    }
+
+    #[test]
+    fn stale_exited_miner_does_not_degrade_health() {
+        // A leftover Exited quip-cpu from before a cpu→cuda switch (or a
+        // Docker→Native switch) must not drag the roll-up to Degraded.
+        let services = vec![
+            svc("cpu", false, None),
+            svc("cuda", true, None),
+            svc("quip-validator", true, None),
+            svc("dashboard", true, Some("healthy")),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cuda);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Running);
+
+        // Native mode ignores every miner container.
+        let expected = expected_services(&RunMode::Native, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Running);
+    }
+
+    #[test]
+    fn missing_expected_service_is_degraded() {
+        // Dashboard container never created — the stack is not fully Running.
+        let services = vec![
+            svc("cpu", true, None),
+            svc("quip-validator", true, None),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&services, &expected), StackHealth::Degraded);
+    }
+
+    #[test]
+    fn roll_up_health_terminal_states() {
+        let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
+        assert_eq!(roll_up_health(&[], &expected), StackHealth::Stopped);
+
+        let stopped = vec![svc("cpu", false, None), svc("caddy", false, None)];
+        assert_eq!(roll_up_health(&stopped, &expected), StackHealth::Stopped);
+
+        let unhealthy = vec![
+            svc("cpu", true, None),
+            svc("quip-validator", true, None),
+            svc("dashboard", true, Some("unhealthy")),
+            svc("postgres", true, Some("healthy")),
+            svc("caddy", true, None),
+        ];
+        assert_eq!(roll_up_health(&unhealthy, &expected), StackHealth::Unhealthy);
+    }
 
     #[test]
     fn compose_profile_uses_only_v02_cpu_and_cuda_profiles() {
@@ -1178,6 +1445,29 @@ mod tests {
         assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
     }
 
+    /// Unset must stay unset. Writing an explicit default here would fork the
+    /// 16g default across .env and the compose file, so bumping one would
+    /// silently leave the other behind.
+    #[test]
+    fn env_omits_miner_mem_limit_when_unset() {
+        let settings = AppSettings {
+            miner_mem_limit_gb: None,
+            ..AppSettings::default()
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        assert!(!env.contains("QUIP_MINER_MEM_LIMIT"), "{env}");
+    }
+
+    #[test]
+    fn env_writes_miner_mem_limit_in_gibibytes_when_set() {
+        let settings = AppSettings {
+            miner_mem_limit_gb: Some(48),
+            ..AppSettings::default()
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        assert!(env.contains("QUIP_MINER_MEM_LIMIT=48g"), "{env}");
+    }
+
     #[test]
     fn env_lines_use_v02_dashboard_and_validator_keys() {
         let mut settings = AppSettings {
@@ -1190,7 +1480,7 @@ mod tests {
         settings.node_config.node_name = "validator-home".to_string();
         settings.node_config.num_cpus = 4;
 
-        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret");
+        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret", &uniform_tags("v0.2"));
         let env = lines.join("\n");
 
         assert!(env.contains("PUID=501"));
@@ -1204,7 +1494,9 @@ mod tests {
         assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
-        assert!(env.contains("QUIP_VALIDATORS=ws://quip-validator:9944"));
+        // QUIP_VALIDATORS is no longer written — the miner is config-driven and
+        // the upstream compose dropped it from the cpu/cuda env contract.
+        assert!(!env.contains("QUIP_VALIDATORS"));
         // QUIP_VALIDATOR_RPC_URLS is deferred to the compose default
         // (ws://quip-caddy:8088/rpc), not written into .env.
         assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
@@ -1214,12 +1506,31 @@ mod tests {
     }
 
     #[test]
+    fn env_lines_pin_all_image_tags_to_resolved_channel_tag() {
+        let settings = AppSettings {
+            run_mode: RunMode::Docker,
+            ..AppSettings::default()
+        };
+        // Each image pins to its OWN channel-resolved tag — repos advance
+        // independently, so the three QUIP_*_TAG lines can differ.
+        let tags = ResolvedImageTags {
+            miner: "v0.2.1-rc49".to_string(),
+            validator: "v0.2.1-rc13".to_string(),
+            dashboard: "v0.2.1-rc15".to_string(),
+        };
+        let env = render_env_lines(&settings, 501, 1000, "pg", &tags).join("\n");
+        assert!(env.contains("QUIP_MINER_TAG=v0.2.1-rc49"));
+        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2.1-rc13"));
+        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2.1-rc15"));
+    }
+
+    #[test]
     fn env_lines_use_public_host_for_caddy_when_it_is_dns() {
         let mut settings = AppSettings::default();
         settings.node_config.public_host = "node.example.com".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
     }
@@ -1230,7 +1541,7 @@ mod tests {
         settings.node_config.public_host = "203.0.113.9".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
     }
@@ -1243,7 +1554,7 @@ mod tests {
             ..crate::settings::DwaveConfig::default()
         });
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
         assert!(env.contains("DWAVE_API_KEY=dwave-token"));
     }
 
@@ -1255,7 +1566,7 @@ mod tests {
         };
         settings.node_config.node_name = "physical-miner-validator".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(!env.contains("QUIP_VALIDATORS="));
         // Deferred to the compose default in both modes (see above).
@@ -1265,7 +1576,7 @@ mod tests {
     #[test]
     fn env_lines_default_validator_name_and_single_cpu_cpuset() {
         let settings = AppSettings::default();
-        let env = render_env_lines(&settings, 501, 1000, "pg").join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));

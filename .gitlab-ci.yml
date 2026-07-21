@@ -45,13 +45,13 @@ build-macos-universal:
   extends: .tauri_build
   tags: [macos, arm64]
   before_script:
-    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - rustup default stable 2>/dev/null || true
     - rustup target add x86_64-apple-darwin
     - curl -fsSL https://bun.sh/install | bash || true
     - bun install
   script:
-    - export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - rm -rf src-tauri/target/universal-apple-darwin/release/bundle
     - bun run tauri build --target universal-apple-darwin
     - mkdir -p dist

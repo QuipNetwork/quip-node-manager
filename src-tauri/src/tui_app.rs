@@ -10,7 +10,7 @@ use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
-use crate::settings::{AppSettings, DwaveConfig, RunMode, StackHealth};
+use crate::settings::{AppSettings, DwaveConfig, ImageTag, RunMode, StackHealth};
 
 // Compact status used by the TUI. The GUI exposes the full StackStatus shape.
 #[derive(Clone, Debug)]
@@ -32,6 +32,7 @@ pub enum FocusId {
     CheckPort,
     ConfigToggle,
     RunMode,
+    UpdateChannel,
     Port,
     ValidatorPort,
     SecretShow,
@@ -49,7 +50,6 @@ pub enum FocusId {
     QpuApiKey,
     QpuDailyBudget,
     ApplyRestart,
-    AutoUpdate,
     // Advanced (inside Custom Settings)
     LogLevel,
     NodeLog,
@@ -87,7 +87,8 @@ pub struct FormState {
     pub validator_port: String,
     pub node_name: String,
     pub auto_mine: bool,
-    pub run_mode_idx: usize, // 0=Docker, 1=Native
+    pub run_mode_idx: usize,        // 0=Docker, 1=Native
+    pub update_channel_idx: usize,  // 0=Release, 1=Beta
     pub public_host_enabled: bool,
     pub public_host: String,
     pub public_port: String,
@@ -113,9 +114,8 @@ pub struct FormState {
     pub telemetry_dir: String,
     pub node_log: String,
     pub http_log: String,
-    pub auto_update: bool,
-    // Image selector
-    pub image_tag: crate::settings::ImageTag,
+    // NOTE: no `image_tag` field. It is derived from the GPU config by
+    // `TuiApp::derive_image_tag` — storing it here let it go stale (QUI-895).
     /// Temporary buffer used while editing a text field.
     pub edit_buf: String,
 }
@@ -136,12 +136,17 @@ impl FormState {
             RunMode::Docker => 0,
             RunMode::Native => 1,
         };
+        let update_channel_idx = match s.update_channel {
+            crate::settings::UpdateChannel::Release => 0,
+            crate::settings::UpdateChannel::Beta => 1,
+        };
         FormState {
             port: nc.port.to_string(),
             validator_port: nc.validator_port.to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
+            update_channel_idx,
             public_host_enabled: !nc.public_host.is_empty() || nc.public_port.is_some(),
             public_host: nc.public_host.clone(),
             public_port: nc.public_port.map(|p| p.to_string()).unwrap_or_default(),
@@ -166,8 +171,6 @@ impl FormState {
             telemetry_dir: nc.telemetry_dir.clone(),
             node_log: nc.node_log.clone(),
             http_log: nc.http_log.clone(),
-            auto_update: s.auto_update_enabled,
-            image_tag: s.image_tag,
             edit_buf: String::new(),
         }
     }
@@ -177,6 +180,14 @@ impl FormState {
             RunMode::Native
         } else {
             RunMode::Docker
+        }
+    }
+
+    pub fn update_channel(&self) -> crate::settings::UpdateChannel {
+        if self.update_channel_idx == 1 {
+            crate::settings::UpdateChannel::Beta
+        } else {
+            crate::settings::UpdateChannel::Release
         }
     }
 
@@ -275,6 +286,17 @@ pub struct TuiApp {
     pub scroll_offset: u16,
     pub content_height: u16,
     last_status_check: Instant,
+    /// Shared native-process state; mirrors what the GUI holds in `tauri::State`.
+    native_state: std::sync::Arc<crate::native::NativeProcessState>,
+    /// Whether a stable (non-rc) release exists, fetched once in the background.
+    /// `None` until the check returns; `Some(false)` grays out the Release
+    /// channel and forces Beta (mirrors the web UI gating).
+    channel_stable: Arc<Mutex<Option<bool>>>,
+    /// GPU backend reported by the hardware survey ("cuda", "metal", "none", …).
+    /// Retained because `GpuDeviceConfig` records only index/enabled and carries
+    /// no vendor, so an enabled device alone cannot distinguish an NVIDIA card
+    /// from an Apple Metal GPU. `derive_image_tag` needs both signals.
+    gpu_backend: String,
 }
 
 impl Default for TuiApp {
@@ -285,7 +307,9 @@ impl Default for TuiApp {
 
 impl TuiApp {
     pub fn new() -> Self {
-        let settings = crate::settings::load_settings();
+        let mut settings = crate::settings::load_settings();
+        let survey = crate::hardware::run_survey();
+        merge_surveyed_gpus(&mut settings.node_config, &survey);
         let form = FormState::from_settings(&settings);
         let qpu_expanded = !form.qpu_api_key.is_empty();
         let (tx, rx) = mpsc::sync_channel(512);
@@ -296,6 +320,22 @@ impl TuiApp {
             let stream_tx = tx.clone();
             let stream_stop = Arc::clone(&log_stop);
             crate::log_stream::start_log_stream_core(stream_tx, stream_stop);
+        }
+        // Fetch stable-release availability in the background; drives the
+        // Release-channel gray-out without blocking startup.
+        let channel_stable: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        {
+            let slot = Arc::clone(&channel_stable);
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    let info = rt.block_on(crate::update::resolve_channel_info(
+                        crate::settings::UpdateChannel::Beta,
+                    ));
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(info.stable_available);
+                    }
+                }
+            });
         }
         TuiApp {
             focus: FocusId::StartNode,
@@ -330,6 +370,30 @@ impl TuiApp {
             content_height: 0,
             last_status_check: Instant::now() - Duration::from_secs(10),
             settings,
+            native_state: std::sync::Arc::new(crate::native::NativeProcessState::new()),
+            channel_stable,
+            gpu_backend: survey.gpu_backend.clone(),
+        }
+    }
+
+    /// Whether the Release channel is selectable. Unknown (check still running)
+    /// counts as available so the default Release choice stays usable; only a
+    /// confirmed `Some(false)` grays it out and forces Beta.
+    pub fn release_channel_available(&self) -> bool {
+        self.channel_stable
+            .lock()
+            .map(|g| g.unwrap_or(true))
+            .unwrap_or(true)
+    }
+
+    /// The channel to persist: the form's selection, coerced to Beta when the
+    /// Release channel has no stable build to point at.
+    fn effective_update_channel(&self) -> crate::settings::UpdateChannel {
+        match self.form.update_channel() {
+            crate::settings::UpdateChannel::Release if !self.release_channel_available() => {
+                crate::settings::UpdateChannel::Beta
+            }
+            other => other,
         }
     }
 
@@ -527,7 +591,10 @@ impl TuiApp {
             };
         };
 
-        let selected_service = self.form.image_tag.service();
+        let selected_service = self
+            .derive_image_tag(&self.settings.node_config)
+            .0
+            .service();
         let selected = stack
             .services
             .iter()
@@ -561,194 +628,114 @@ impl TuiApp {
 
     // ─── Actions ──────────────────────────────────────────────────────────────
 
+    /// Start the node stack for the currently selected run mode.
+    ///
+    /// In Docker mode: `start_stack_core` brings up the full compose stack.
+    /// In Native mode: `start_stack_core` starts support services first
+    /// (validator, dashboard, postgres, caddy), then `start_native_node_core`
+    /// starts the host miner (which waits for the validator RPC).
     fn start_node(&mut self) {
-        let run_mode = self.form.run_mode();
-        let mut config = self.form.to_node_config(&self.settings.node_config);
-
-        match crate::migration_v2::migrate_for_run_mode(&run_mode) {
-            Ok(report) => {
-                report.promoted.apply_to_node_config(&mut config);
-                if let Err(e) = crate::migration_v2::persist_promoted_settings(&report.promoted) {
-                    self.set_status(format!("Migration settings error: {}", e));
-                    return;
-                }
-                if report.changed {
-                    self.set_status("Migrated v0.1 node data to v0.2 layout");
-                }
-            }
-            Err(e) => {
-                self.set_status(format!("Migration error: {}", e));
-                return;
-            }
+        let mut settings = self.settings.clone();
+        settings.node_config = self.form.to_node_config(&self.settings.node_config);
+        let (image_tag, warning) = self.derive_image_tag(&settings.node_config);
+        settings.image_tag = image_tag;
+        if let Some(w) = warning {
+            self.set_status(w);
         }
-
-        // Auto-detect public IP when no public_host is configured
-        if config.public_host.is_empty() {
-            if let Ok(rt) = tokio::runtime::Runtime::new() {
-                match rt.block_on(crate::network::detect_public_ip()) {
-                    Ok(ip) => {
-                        self.set_status(format!("Auto-detected IP: {}", ip));
-                        config.public_host = ip;
-                    }
-                    Err(e) => self.set_status(format!(
-                        "Could not auto-detect public IP ({e}); node won't advertise a public address"
-                    )),
-                }
-            }
-        }
-
-        // The config renderer forces the native miner's REST host to loopback
-        // (reached via host.docker.internal), so no rest_host override here.
-        if let Err(e) = crate::config::write_config_toml(&config, &run_mode) {
-            self.set_status(format!("Config error: {}", e));
+        settings.run_mode = self.form.run_mode();
+        settings.update_channel = self.effective_update_channel();
+        if let Err(e) = crate::settings::save_settings(&settings) {
+            self.set_status(format!("Save error: {e}"));
             return;
         }
-
-        match run_mode {
-            RunMode::Native => self.start_node_native(&config),
-            RunMode::Docker => self.start_node_docker(&config),
-        }
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = settings.run_mode.clone();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                crate::compose::start_stack_core(std::sync::Arc::clone(&sink)).await?;
+                if run_mode == crate::settings::RunMode::Native {
+                    crate::native::start_native_node_core(sink, &state).await?;
+                }
+                Ok::<(), String>(())
+            });
+        });
+        self.set_status("Starting…");
         self.config_expanded = false;
     }
 
-    fn start_node_docker(&mut self, config: &crate::settings::NodeConfig) {
-        // Remove the legacy single-container TUI path if it was used before
-        // the manager moved to the v0.2 compose stack.
-        let _ = crate::cmd::new("docker")
-            .args(["rm", "-f", "quip-node"])
-            .output();
-
-        let mut settings = self.settings.clone();
-        settings.node_config = config.clone();
-        settings.image_tag = self.form.image_tag;
-        settings.run_mode = RunMode::Docker;
-
-        if let Err(e) = crate::stack_assets::sync_stack_assets(
-            &RunMode::Docker,
-            config.port,
-            config.validator_port,
-            &config.public_host,
-            crate::config::native_rest_port(config),
-            config.validator_rpc_port,
-        ) {
-            self.set_status(format!("Stack asset error: {}", e));
-            return;
-        }
-        if let Err(e) = crate::compose::write_env_file(&settings) {
-            self.set_status(format!("Env error: {}", e));
-            return;
-        }
-
-        let profile = crate::compose::compose_profile(settings.image_tag);
-
-        self.set_status("Stopping existing compose stack...");
-        let _ = crate::compose::compose_cmd().args(["down"]).output();
-
-        self.set_status("Pulling compose images...");
-        if !self.run_compose_step(&["--profile", profile, "pull"], "Pull failed") {
-            return;
-        }
-
-        self.set_status("Starting compose stack...");
-        if self.run_compose_step(&["--profile", profile, "up", "-d"], "Start failed") {
-            self.set_status("Stack started (Docker)");
-            self.refresh_status();
-        }
-    }
-
-    fn run_compose_step(&mut self, args: &[&str], label: &str) -> bool {
-        match crate::compose::compose_cmd().args(args).output() {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let detail = stderr.trim();
-                if detail.is_empty() {
-                    self.set_status(format!("{}: {}", label, stdout.trim()));
-                } else {
-                    self.set_status(format!("{}: {}", label, detail));
-                }
-                false
-            }
-            Err(e) => {
-                self.set_status(format!("{}: {}", label, e));
-                false
-            }
-        }
-    }
-
-    fn start_node_native(&mut self, config: &crate::settings::NodeConfig) {
-        if !crate::native::is_binary_available() {
-            self.set_status("No native binary found. Download it first.");
-            return;
-        }
-        // Use the async start via a blocking runtime
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(async {
-            let data_dir = crate::settings::data_dir();
-            let bin = data_dir.join("bin").join(crate::native::binary_name());
-            let config_path = data_dir.join("config.toml");
-            let log_path = data_dir.join("node-output.log");
-            let _ = crate::native::ensure_native_signer_key(&bin)?;
-            let miner_args = crate::native::native_miner_args(config, &config_path);
-            let log_file = std::fs::File::create(&log_path)
-                .map_err(|e| format!("Cannot create log file: {}", e))?;
-            let log_err = log_file
-                .try_clone()
-                .map_err(|e| format!("Cannot clone log file: {}", e))?;
-            let child = crate::cmd::new(&bin)
-                .args(&miner_args)
-                .stdout(log_file)
-                .stderr(log_err)
-                .spawn()
-                .map_err(|e| format!("Spawn failed: {}", e))?;
-            let pid_path = data_dir.join("node.pid");
-            let _ = std::fs::write(&pid_path, child.id().to_string());
-            Ok::<(), String>(())
-        }) {
-            Ok(()) => {
-                self.set_status("Node started (Native)");
-                self.refresh_status();
-            }
-            Err(e) => self.set_status(format!("Start failed: {}", e)),
-        }
-    }
-
+    /// Stop the node stack for the currently selected run mode.
+    ///
+    /// In Native mode: host miner is stopped first, then compose support
+    /// services. In Docker mode: compose stack is stopped directly.
     fn stop_node(&mut self) {
-        match self.form.run_mode() {
-            RunMode::Docker => {
-                let _ = crate::compose::compose_cmd().args(["down"]).output();
-            }
-            RunMode::Native => {
-                let pid_path = crate::settings::data_dir().join("node.pid");
-                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::kill(-pid, libc::SIGTERM);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = crate::cmd::new("taskkill")
-                                .args(["/F", "/PID", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                    let _ = std::fs::remove_file(&pid_path);
+        let tx = self.log_tx.clone();
+        let state = std::sync::Arc::clone(&self.native_state);
+        let run_mode = self.form.run_mode();
+        std::thread::spawn(move || {
+            let sink: std::sync::Arc<dyn crate::progress::ProgressSink> =
+                std::sync::Arc::new(crate::tui_sink::TuiSink::new(tx));
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let _ = rt.block_on(async {
+                if run_mode == crate::settings::RunMode::Native {
+                    // Best-effort: stop miner before tearing down support stack.
+                    let _ = crate::native::stop_native_node_core(
+                        std::sync::Arc::clone(&sink),
+                        &state,
+                    )
+                    .await;
                 }
-            }
-        }
-        self.set_status("Node stopped");
+                crate::compose::stop_stack_core(sink).await?;
+                Ok::<(), String>(())
+            });
+        });
+        self.set_status("Stopping…");
         self.config_expanded = true;
         self.refresh_status();
+    }
+
+    /// Which miner image the compose stack should run, derived from the GPU
+    /// configuration the user just edited.
+    ///
+    /// This MUST be derived rather than stored. `FormState.image_tag` used to
+    /// hold it, but nothing ever wrote that field after `from_settings`, so
+    /// toggling GPU-enable wrote `[gpu]`/`[cuda.0]` into config.toml while the
+    /// compose profile stayed `cpu` — the miner ran the CPU image against a
+    /// CUDA config (QUI-895).
+    ///
+    /// Inputs:
+    /// - `config.gpu_device_configs[].enabled` — per-device toggle. Carries NO
+    ///   vendor info; an enabled device may be NVIDIA or Apple Metal.
+    /// - `self.gpu_backend` — survey string: "cuda", "metal", "none", …
+    ///
+    /// The GUI's equivalent lives at `src/app.js:713-715` and reads:
+    ///     image_tag = (any device enabled && gpu_backend === 'cuda')
+    ///                   ? 'cuda' : 'cpu'
+    /// Note D-Wave/QPU is NOT a separate image — it activates via the
+    /// config.toml `[dwave]` section (see `settings.rs:56-59`).
+    /// Returns the tag plus an optional operator-facing warning. The warning is
+    /// what keeps the CPU fallback from being silent: a user who ticked GPU and
+    /// got a CPU miner must be told, since that mismatch is invisible in the
+    /// config.toml they just wrote. Suppressed in Native mode, where no miner
+    /// container runs at all and `image_tag` is therefore unused
+    /// (`compose::compose_services` excludes cpu/cuda for `RunMode::Native`).
+    fn derive_image_tag(&self, config: &crate::settings::NodeConfig) -> (ImageTag, Option<String>) {
+        derive_image_tag(config, &self.gpu_backend, self.form.run_mode())
     }
 
     fn apply_and_restart(&mut self) {
         let config = self.form.to_node_config(&self.settings.node_config);
         self.settings.node_config = config;
-        self.settings.image_tag = self.form.image_tag;
+        let (image_tag, warning) = self.derive_image_tag(&self.settings.node_config);
+        self.settings.image_tag = image_tag;
+        if let Some(w) = warning {
+            self.set_status(w);
+        }
         self.settings.run_mode = self.form.run_mode();
-        self.settings.auto_update_enabled = self.form.auto_update;
+        self.settings.update_channel = self.effective_update_channel();
         if let Err(e) = crate::settings::save_settings(&self.settings) {
             self.set_status(format!("Save error: {}", e));
             return;
@@ -808,6 +795,7 @@ impl TuiApp {
         list.push(FocusId::ConfigToggle);
         if self.config_expanded {
             list.push(FocusId::RunMode);
+            list.push(FocusId::UpdateChannel);
             list.push(FocusId::Port);
             list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
@@ -823,7 +811,6 @@ impl TuiApp {
                 list.push(FocusId::LogLevel);
                 list.push(FocusId::NodeLog);
                 list.push(FocusId::HttpLog);
-                list.push(FocusId::AutoUpdate);
             }
             list.push(FocusId::CpuCores);
             list.push(FocusId::GpuEnable);
@@ -871,4 +858,160 @@ fn load_secret_sync() -> String {
         return String::new();
     };
     v["secret"].as_str().unwrap_or("").to_string()
+}
+
+/// Pure form of `TuiApp::derive_image_tag`, split out so the decision table can
+/// be tested without standing up a whole `TuiApp` (which spawns threads and
+/// reads settings from disk). See the method for the full rationale.
+fn derive_image_tag(
+    config: &crate::settings::NodeConfig,
+    gpu_backend: &str,
+    run_mode: RunMode,
+) -> (ImageTag, Option<String>) {
+    if !config.gpu_device_configs.iter().any(|d| d.enabled) {
+        return (ImageTag::Cpu, None);
+    }
+    if gpu_backend == "cuda" {
+        return (ImageTag::Cuda, None);
+    }
+    if run_mode == RunMode::Native {
+        return (ImageTag::Cpu, None);
+    }
+    (
+        ImageTag::Cpu,
+        Some(format!(
+            "GPU enabled but no CUDA backend detected (gpu_backend={}) \
+             — starting the CPU image; config.toml still declares [cuda.*]",
+            if gpu_backend.is_empty() {
+                "unknown"
+            } else {
+                gpu_backend
+            }
+        )),
+    )
+}
+
+/// Add a GpuDeviceConfig for each surveyed device missing from `node_config`,
+/// preserving any saved enabled/utilization/yielding for existing indices.
+fn merge_surveyed_gpus(
+    node_config: &mut crate::settings::NodeConfig,
+    survey: &crate::hardware::HardwareSurvey,
+) {
+    for dev in &survey.gpu_devices {
+        if !node_config.gpu_device_configs.iter().any(|c| c.index == dev.index) {
+            node_config.gpu_device_configs.push(crate::settings::GpuDeviceConfig {
+                index: dev.index,
+                enabled: false,
+                utilization: 80,
+                yielding: false,
+            });
+        }
+    }
+    node_config.gpu_device_configs.sort_by_key(|c| c.index);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NodeConfig with `n` GPU devices, all set to `enabled`.
+    fn nc_with_gpus(n: u32, enabled: bool) -> crate::settings::NodeConfig {
+        crate::settings::NodeConfig {
+            gpu_device_configs: (0..n)
+                .map(|index| crate::settings::GpuDeviceConfig {
+                    index,
+                    enabled,
+                    utilization: 80,
+                    yielding: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// QUI-895: the reported failure. Enabling a GPU on a CUDA host must select
+    /// the cuda image — previously `image_tag` stayed at its startup value, so
+    /// config.toml got [cuda.0] while compose ran `--profile cpu`.
+    #[test]
+    fn enabled_gpu_on_cuda_host_selects_cuda_image() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cuda);
+        assert!(warn.is_none(), "no warning expected on the happy path");
+    }
+
+    #[test]
+    fn no_enabled_gpu_selects_cpu_image_without_warning() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(2, false), "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cpu);
+        assert!(warn.is_none(), "plain CPU mining is not a fallback");
+    }
+
+    /// Silent fallback is not acceptable: a user who ticked GPU and gets the CPU
+    /// image must be told, because config.toml still declares [cuda.*] and the
+    /// mismatch is otherwise invisible.
+    #[test]
+    fn enabled_gpu_without_cuda_backend_falls_back_loudly() {
+        for backend in ["", "none", "metal"] {
+            let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), backend, RunMode::Docker);
+            assert_eq!(tag, ImageTag::Cpu, "backend={backend}");
+            let warn = warn.unwrap_or_else(|| panic!("expected a warning for backend={backend}"));
+            assert!(warn.contains("CPU image"), "backend={backend}: {warn}");
+        }
+        // The empty survey string is rendered as "unknown", not as a blank.
+        let (_, warn) = derive_image_tag(&nc_with_gpus(1, true), "", RunMode::Docker);
+        assert!(warn.unwrap().contains("gpu_backend=unknown"));
+    }
+
+    /// Native mode runs no miner container at all, so `image_tag` is unused and
+    /// a macOS/Metal operator must not be nagged about a CPU fallback.
+    #[test]
+    fn native_mode_metal_falls_back_quietly() {
+        let (tag, warn) = derive_image_tag(&nc_with_gpus(1, true), "metal", RunMode::Native);
+        assert_eq!(tag, ImageTag::Cpu);
+        assert!(warn.is_none(), "Native mode starts no cpu/cuda container");
+    }
+
+    /// Mirrors the GUI at src/app.js:713-715 — only devices that are actually
+    /// enabled count, not merely present.
+    #[test]
+    fn one_enabled_device_among_several_is_enough() {
+        let mut nc = nc_with_gpus(3, false);
+        nc.gpu_device_configs[2].enabled = true;
+        let (tag, _) = derive_image_tag(&nc, "cuda", RunMode::Docker);
+        assert_eq!(tag, ImageTag::Cuda);
+    }
+
+    #[test]
+    fn merge_surveyed_gpus_adds_detected_and_preserves_saved() {
+        use crate::hardware::{GpuDevice, HardwareSurvey};
+        let mut nc = crate::settings::NodeConfig {
+            gpu_device_configs: vec![crate::settings::GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 55,
+                yielding: true,
+            }],
+            ..Default::default()
+        };
+        let survey = HardwareSurvey {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpu_count: 8,
+            gpu_backend: "cuda".into(),
+            gpu_devices: vec![
+                GpuDevice { index: 0, name: "RTX 3060".into(), memory_mb: Some(12288) },
+                GpuDevice { index: 1, name: "RTX 3060".into(), memory_mb: Some(12288) },
+            ],
+            docker_available: true,
+            docker_version: None,
+            python_available: false,
+            python_version: None,
+            recommended_mode: crate::settings::RunMode::Docker,
+        };
+        merge_surveyed_gpus(&mut nc, &survey);
+        assert_eq!(nc.gpu_device_configs.len(), 2);
+        assert!(nc.gpu_device_configs[0].enabled); // preserved
+        assert_eq!(nc.gpu_device_configs[0].utilization, 55); // preserved
+        assert!(!nc.gpu_device_configs[1].enabled); // new device defaults off
+    }
 }

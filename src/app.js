@@ -22,9 +22,14 @@ const state = {
   // Full StackStatus returned by get_stack_status:
   // { services: [{name, service, running, health, status_text, image}], overall }
   stack: null,
+  // HealthReport returned by get_health / health-changed event:
+  // { overall, infra:{state,detail}, chain:{state,detail}, participation:{state,detail} }
+  health: null,
   checksPassed: false,
   starting: false,
   stopping: false,
+  updateAvailable: null,   // null | { kind: 'image' | 'binary' }
+  updating: false,
   detectedGpus: [], // { index, name }
   logLines: [],
   MAX_LOG_LINES: 500,
@@ -120,12 +125,91 @@ function updateStackUiVisibility() {
   subs.style.display = tlsEl.checked ? '' : 'none';
 }
 
+// Show CPU subsettings (core count) only while CPU mining is enabled; the
+// toggle itself governs whether config.toml gets a [cpu] section.
+function updateCpuUiVisibility() {
+  const cpuEl = document.getElementById('cpu-enabled');
+  const subs = document.getElementById('cpu-subsettings');
+  if (!cpuEl || !subs) return;
+
+  subs.style.display = cpuEl.checked ? '' : 'none';
+}
+
 document.addEventListener('change', (e) => {
   if (!e.target) return;
   if (e.target.id === 'tls-enabled') {
     updateStackUiVisibility();
   }
+  if (e.target.id === 'cpu-enabled') {
+    updateCpuUiVisibility();
+  }
 });
+
+// Segmented Release/Beta channel control (buttons, not form inputs).
+document.addEventListener('click', (e) => {
+  const btn = e.target?.closest?.('.segmented-btn[data-channel]');
+  if (btn && !btn.disabled) {
+    setUpdateChannel(btn.dataset.channel);
+  }
+});
+
+// ─── Update channel (Release / Beta) ──────────────────────────────────────
+//
+// The channel selects which published tag each image + the native binary
+// tracks. Every image resolves its own tag independently from its own registry
+// (see src-tauri registry.rs): Release = its latest stable (no -rc); Beta = its
+// latest incl. rc. Release is grayed out and forced to Beta unless every image
+// has a stable tag to run.
+
+function updateChannelButtons() {
+  const ch = state.settings?.update_channel ?? 'release';
+  document.getElementById('channel-release')?.classList.toggle('active', ch === 'release');
+  document.getElementById('channel-beta')?.classList.toggle('active', ch === 'beta');
+}
+
+async function setUpdateChannel(channel) {
+  if (!state.settings || state.settings.update_channel === channel) return;
+  state.settings.update_channel = channel;
+  updateChannelButtons();
+  await invoke('update_settings', { settings: state.settings }).catch(console.error);
+  await refreshChannelInfo();
+}
+
+async function refreshChannelInfo() {
+  if (!state.settings) return;
+  const caption = document.getElementById('channel-caption');
+  const releaseBtn = document.getElementById('channel-release');
+  let info;
+  try {
+    info = await invoke('resolve_channel_info', {
+      channel: state.settings.update_channel,
+    });
+  } catch (e) {
+    if (caption) caption.textContent = 'Could not reach the release feed.';
+    return;
+  }
+  // Gray out Release until a stable (non-rc) release exists; force Beta.
+  if (releaseBtn) {
+    releaseBtn.disabled = !info.stable_available;
+    releaseBtn.title = info.stable_available
+      ? ''
+      : 'No stable release published yet — Beta only';
+  }
+  if (!info.stable_available && state.settings.update_channel === 'release') {
+    await setUpdateChannel('beta');
+    return;
+  }
+  updateChannelButtons();
+  if (caption) {
+    // Each image resolves its own tag from its own registry — they can differ.
+    const parts = (info.images || []).map(
+      ([name, tag]) => `${name} ${tag ?? '—'}`,
+    );
+    caption.textContent = parts.length
+      ? parts.join('  ·  ')
+      : 'No published builds on this channel yet.';
+  }
+}
 
 // ─── Dashboard tab iframe wiring ────────────────────────────────────────────
 
@@ -154,9 +238,7 @@ function refreshDashboardTab() {
   // refreshDashboardTab won't re-set an unchanged `src`, so it stays stuck
   // until a manual reload. The dashboard image ships a healthcheck, and Caddy
   // starts after it, so "healthy" implies the front door is up.
-  const dashSvc = state.stack?.services?.find(
-    (s) => s.service === 'dashboard' || s.service === 'dashboard-direct',
-  );
+  const dashSvc = state.stack?.services?.find((s) => s.service === 'dashboard');
   const dashRunning = !!dashSvc?.running
     && dashSvc.health !== 'starting'
     && dashSvc.health !== 'unhealthy';
@@ -607,6 +689,7 @@ function collectConfig() {
     log_level: document.getElementById('log-level')?.value || 'info',
     node_log: document.getElementById('node-log')?.value?.trim() ?? '',
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
+    cpu_enabled: document.getElementById('cpu-enabled')?.checked ?? true,
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
@@ -623,8 +706,6 @@ function collectConfig() {
 function applyFormToSettings() {
   if (!state.settings) return;
   state.settings.node_config = collectConfig();
-  state.settings.auto_update_enabled =
-    document.getElementById('auto-update-enabled')?.checked ?? false;
 
   // Image is auto-derived from the GPU config: CUDA when any NVIDIA GPU is
   // enabled, CPU otherwise. D-Wave mining is a config.toml [dwave] concern,
@@ -669,6 +750,9 @@ function populateForm(settings) {
   document.getElementById('http-log').value = c.http_log ?? '';
 
   // Stack Configuration (image_tag is auto-derived, no UI control)
+  settings.update_channel = settings.update_channel ?? 'release';
+  updateChannelButtons();
+  refreshChannelInfo();
   document.getElementById('tls-enabled').checked =
     settings.tls_enabled ?? false;
   document.getElementById('hostname').value =
@@ -690,7 +774,9 @@ function populateForm(settings) {
   }
 
   // CPU Miner
+  document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  updateCpuUiVisibility();
 
   // GPU Miner — for Metal, utilization/yielding come from metal_config;
   // for CUDA, from the first enabled device (or defaults).
@@ -729,12 +815,25 @@ function updateStartStopState() {
   const running = state.containerRunning || state.nativeRunning;
   const startBtn = document.getElementById('btn-start');
   const stopBtn = document.getElementById('btn-stop');
-  startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
-  startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
-  stopBtn.disabled = !running || state.starting || state.stopping;
+  const pendingUpdate = !!state.updateAvailable;
+
+  if (state.updating) {
+    startBtn.textContent = 'Updating…';
+    startBtn.disabled = true;
+  } else if (pendingUpdate && running) {
+    // Node running + update pending: btn-start becomes the apply action.
+    startBtn.textContent = 'Restart to Update';
+    startBtn.disabled = !state.checksPassed;
+  } else {
+    // Stopped (with or without update) or running with no update: normal Start.
+    startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+    startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
+  }
+
   stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  stopBtn.disabled = !running || state.starting || state.stopping || state.updating;
   document.getElementById('btn-apply').disabled =
-    !state.checksPassed || state.starting || state.stopping;
+    !state.checksPassed || state.starting || state.stopping || state.updating;
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
@@ -755,7 +854,12 @@ function setStatus(stateStr) {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
-    sub.textContent = 'Running but some checks failing';
+    sub.textContent = 'Running, but some stack services are down or unhealthy';
+  } else if (stateStr === 'unhealthy') {
+    dot.classList.add('status-unhealthy', 'active');
+    text.classList.add('status-unhealthy');
+    text.textContent = 'UNHEALTHY';
+    sub.textContent = 'Node health checks failing';
   } else {
     dot.classList.add('status-stopped');
     text.classList.add('status-stopped');
@@ -786,7 +890,6 @@ function visibleInMode(id, runMode) {
   switch (id) {
     case 'docker':
     case 'docker-compose':
-    case 'stack-images':
       return composeWillRun;
     case 'wsl':
       return isDocker && state.hardwareSurvey?.os === 'windows';
@@ -867,7 +970,6 @@ function defaultLabel(id) {
     case 'docker':            return 'Docker installed & running';
     case 'docker-compose':    return 'Docker Compose v2 available';
     case 'wsl':               return 'WSL installed with distro';
-    case 'stack-images':      return 'Stack images available';
     case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
@@ -926,12 +1028,11 @@ function mergeCheckUpdate(item) {
   state.checks.set(item.id, item);
   renderChecklist();
 
-  // The stack-images (Docker) and binary (Native) checks now cover node
-  // freshness too. When either reaches a terminal state the node version may
-  // have changed (a pull/download update fix ran), so refresh the header's
-  // "v<app> (node <node>)" label.
+  // The binary (Native) check covers miner freshness too. When it reaches a
+  // terminal state the node version may have changed (a download update fix
+  // ran), so refresh the header's "v<app> (node <node>)" label.
   if (
-    (item.id === 'stack-images' || item.id === 'binary') &&
+    item.id === 'binary' &&
     item.state !== 'idle' &&
     item.state !== 'running'
   ) {
@@ -1001,11 +1102,28 @@ document.getElementById('btn-recheck-all').addEventListener('click', () => {
 });
 
 // ─── Log panel ────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+// Append `text` to `el`, turning http(s) URLs into clickable anchors (opened
+// via the external-link handler at the bottom of this file). Built from DOM
+// nodes, never innerHTML — log text streams from node output and must not be
+// interpreted as markup.
+function appendTextWithLinks(el, text) {
+  const urlRe = /https?:\/\/\S+/g;
+  let last = 0;
+  for (const match of text.matchAll(urlRe)) {
+    // Trailing punctuation is sentence structure, not part of the URL.
+    const url = match[0].replace(/[.,;:!?)\]'"]+$/, '');
+    if (match.index > last) {
+      el.appendChild(document.createTextNode(text.slice(last, match.index)));
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.textContent = url;
+    el.appendChild(a);
+    last = match.index + url.length;
+  }
+  if (last < text.length) {
+    el.appendChild(document.createTextNode(text.slice(last)));
+  }
 }
 
 function appendLog(entry) {
@@ -1017,7 +1135,7 @@ function appendLog(entry) {
   const line = document.createElement('p');
   line.className = `log-line log-${(entry.level || 'info').toLowerCase()}`;
   const ts = entry.timestamp ? `[${entry.timestamp}] ` : '';
-  line.textContent = `${ts}${entry.message}`;
+  appendTextWithLinks(line, `${ts}${entry.message}`);
   output.appendChild(line);
   if (output.scrollHeight - output.scrollTop - output.clientHeight < 60) {
     output.scrollTop = output.scrollHeight;
@@ -1210,6 +1328,29 @@ function expandConfig() {
   document.getElementById('config-section').style.display = '';
 }
 
+async function runRestartToUpdate() {
+  const applyStatus = document.getElementById('apply-status');
+  state.updating = true;
+  updateStartStopState();
+  applyStatus.textContent = 'Updating…';
+  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting node to apply update…' });
+  try {
+    if (state.settings) { applyFormToSettings(); await invoke('update_settings', { settings: state.settings }); }
+    await invoke('restart_to_update');
+    state.updateAvailable = null;
+    document.getElementById('update-badge').style.display = 'none';
+    applyStatus.textContent = 'Node updated and started.';
+    await pollStatus();
+  } catch (e) {
+    // Keep the update flagged so the button stays actionable.
+    applyStatus.textContent = `Error: ${e}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Update failed: ${e}` });
+  } finally {
+    state.updating = false;
+    updateStartStopState();
+  }
+}
+
 async function startNode() {
   if (isDockerMode()) {
     await invoke('start_stack');
@@ -1235,6 +1376,10 @@ async function stopNode() {
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 document.getElementById('btn-start').addEventListener('click', async () => {
+  if (state.updateAvailable) {
+    await runRestartToUpdate();
+    return;
+  }
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
   updateStartStopState();
@@ -1265,6 +1410,7 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     await stopNode();
     state.containerRunning = false;
     state.nativeRunning = false;
+    state.health = null;
     setStatus('stopped');
     updateStartStopState();
     expandConfig();
@@ -1333,32 +1479,58 @@ function stackRunningInMode() {
   if (isDockerMode()) {
     // Node container must be one of the running services in Docker mode.
     const nodeRunning = s.services?.some(
-      (x) => ['cpu', 'cuda', 'qpu'].includes(x.service) && x.running,
+      (x) => ['cpu', 'cuda'].includes(x.service) && x.running,
     );
     return !!nodeRunning;
   }
   return s.services?.some((x) => x.running);
 }
 
+// Map the stack roll-up + miner state to the status pill. The miner (container
+// or native process) decides RUNNING vs STOPPED; support-service health
+// decides RUNNING vs DEGRADED. In Native mode a null stack means the support
+// containers aren't reachable at all — the miner alone is degraded, not fine.
+function statusFromStack(minerRunning) {
+  if (!minerRunning) return 'stopped';
+  // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
+  // while the transition is still in flight.
+  if (state.starting || state.stopping) return 'running';
+  // When the health monitor has reported, use its verdict directly so the
+  // pill reflects the three-dimensional check (infra + chain + participation).
+  if (state.health?.overall) return state.health.overall;
+  const overall = state.stack?.overall ?? 'stopped';
+  return overall === 'running' ? 'running' : 'degraded';
+}
+
+// Re-paint the status pill from current state without a full poll round-trip.
+// Called by renderHealth() so an inbound health-changed event immediately
+// updates the pill without waiting for the next 10 s pollStatus tick.
+function refreshStatusPill() {
+  const minerRunning = state.containerRunning || state.nativeRunning;
+  setStatus(statusFromStack(minerRunning));
+}
+
 async function pollStatus() {
   try {
-    // Stack status is valid in both Docker and Native modes (Native runs a
-    // subset — dashboard+postgres[+caddy]).
+    // Stack status is valid in both Docker and Native modes (Native still
+    // runs the validator/dashboard/postgres/caddy support services).
     try {
       state.stack = await invoke('get_stack_status');
     } catch {
-      state.stack = null;
+      // Keep the last known stack. The backend errors deliberately when
+      // `compose ps` output is unparseable, precisely so a running stack
+      // isn't reported as stopped (which would re-enable Start).
     }
 
     if (isDockerMode()) {
       state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
-      setStatus(state.containerRunning ? 'running' : 'stopped');
+      setStatus(statusFromStack(state.containerRunning));
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
       state.containerRunning = false;
-      setStatus(status.running ? 'running' : 'stopped');
+      setStatus(statusFromStack(status.running));
     }
   } catch {
     state.containerRunning = false;
@@ -1367,6 +1539,32 @@ async function pollStatus() {
   }
   updateStartStopState();
   refreshDashboardTab();
+}
+
+// ─── Node Health panel ────────────────────────────────────────────────────────
+// Color map for [data-state] values: ok → green, warn → yellow,
+// fail → red, unknown → faint; matches the existing CSS variable palette.
+const HEALTH_STATE_COLOR = {
+  ok: 'var(--success)',
+  warn: 'var(--warning)',
+  fail: 'var(--error)',
+  unknown: 'var(--text-faint)',
+};
+
+function renderHealth(report) {
+  if (!report) return;
+  state.health = report;
+  const paint = (id, dim) => {
+    const el = document.getElementById(id);
+    if (!el || !dim) return;
+    el.textContent = dim.state + (dim.detail ? ' — ' + dim.detail : '');
+    el.dataset.state = dim.state;
+    el.style.color = HEALTH_STATE_COLOR[dim.state] ?? 'var(--text-faint)';
+  };
+  paint('health-infra', report.infra);
+  paint('health-chain', report.chain);
+  paint('health-participation', report.participation);
+  refreshStatusPill();
 }
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
@@ -1378,14 +1576,6 @@ async function setupListeners() {
   // Single CheckItem per event — merged into state.checks by id.
   await listen('checklist-update', (event) => {
     mergeCheckUpdate(event.payload);
-  });
-
-  await listen('node-status', (event) => {
-    const { state: s } = event.payload;
-    const stateStr = s?.toLowerCase() || 'stopped';
-    state.containerRunning = stateStr === 'running';
-    setStatus(stateStr);
-    updateStartStopState();
   });
 
   // Docker pull lifecycle. The backend emits this when the `docker compose
@@ -1412,20 +1602,13 @@ async function setupListeners() {
     handlePullProgress(event.payload);
   });
 
-  // Stop lifecycle — update the status pill immediately; backend also
-  // emits container-status so we don't have to wait for the next poll.
+  // Stop lifecycle — surface stop failures in the log drawer; the 10s poll
+  // refreshes the status pill.
   await listen('stop-complete', (event) => {
     const { success, error } = event.payload || {};
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${error || 'unknown error'}` });
     }
-  });
-
-  await listen('stack-status', (event) => {
-    // Backend may emit lifecycle events in future; for now we just re-poll
-    // to refresh state.stack and the dashboard iframe visibility.
-    void event;
-    pollStatus();
   });
 
   // Postgres rejected the dashboard's password — surface the actionable error
@@ -1440,12 +1623,18 @@ async function setupListeners() {
   // Update notifications
   await listen('image-update-available', () => {
     appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+    state.updateAvailable = { kind: 'image' };
+    document.getElementById('update-badge').style.display = '';
+    updateStartStopState();
     refreshNodeVersion();
   });
 
   await listen('binary-update-available', (event) => {
     const info = event.payload;
-    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Download to update.` });
+    appendLog({ timestamp: '', level: 'INFO', message: `New native miner v${info.version} available. Restart to update.` });
+    state.updateAvailable = { kind: 'binary' };
+    document.getElementById('update-badge').style.display = '';
+    updateStartStopState();
     refreshNodeVersion();
   });
 
@@ -1465,6 +1654,11 @@ async function setupListeners() {
       const pct = Math.round((downloaded / total) * 100);
       if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
     }
+  });
+
+  // Health monitor \u2014 event-driven updates from the backend health loop.
+  await listen('health-changed', (event) => {
+    renderHealth(event.payload);
   });
 }
 
@@ -1493,13 +1687,28 @@ function showUpdateBadge(version, url) {
   versionEl.classList.add('has-update');
 
   versionEl.onclick = (e) => {
+    // stopPropagation keeps the toggle click from reaching the document-level
+    // hide listener — but it also keeps anchor clicks from reaching the
+    // external-link handler below, so the Download link must be handled here.
     e.stopPropagation();
+    const anchor = e.target.closest('a[href]');
+    if (anchor && anchor.getAttribute('href').startsWith('http')) {
+      e.preventDefault();
+      openUrl(anchor.getAttribute('href'));
+      tooltip.style.display = 'none';
+      return;
+    }
     tooltip.style.display = tooltip.style.display === 'none' ? 'flex' : 'none';
   };
-  document.addEventListener('click', () => {
-    tooltip.style.display = 'none';
-  }, { once: false });
 }
+
+// Hide the update tooltip on any click outside the version badge (badge
+// clicks never bubble here — see showUpdateBadge). Registered once at module
+// level; showUpdateBadge re-runs on every 30-min update check.
+document.addEventListener('click', () => {
+  const tooltip = document.getElementById('update-tooltip');
+  if (tooltip) tooltip.style.display = 'none';
+});
 
 // ─── First-boot prompt ────────────────────────────────────────────────────────
 async function checkFirstBoot() {
@@ -1559,8 +1768,6 @@ async function init() {
     populateForm(settings);
     // The Metal toggle (rendered once the hardware survey lands) reflects
     // run_mode; there is no separate run-mode control to seed here.
-    document.getElementById('auto-update-enabled').checked =
-      settings.auto_update_enabled ?? false;
     if (settings.active_tab && settings.active_tab !== 'status') {
       document
         .querySelector(`[data-tab="${settings.active_tab}"]`)
@@ -1636,6 +1843,12 @@ async function init() {
   });
 
   state.pollInterval = setInterval(pollStatus, 10_000);
+
+  // Fallback health poll — the health-changed event is the primary path;
+  // this catches any missed events (e.g. listener registered after first emit).
+  setInterval(async () => {
+    try { renderHealth(await invoke('get_health')); } catch (_) { /* transient — backend may not have sampled yet */ }
+  }, 15_000);
 }
 
 init().catch(console.error);

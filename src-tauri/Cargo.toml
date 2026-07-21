@@ -1,6 +1,6 @@
 [package]
 name = "quip-node-manager"
-version = "0.2.0"
+version = "0.2.1"
 description = "Quip Node Desktop Manager"
 authors = []
 edition = "2021"
@@ -27,11 +27,17 @@ rand = "0.8"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 hex = "0.4"
+# Read-only substrate storage-key hashing for the health monitor
+# (twox128 / blake2_128_concat). The two u64 values decode with stdlib
+# from_le_bytes, so no SCALE-codec crate is needed. No signing.
+twox-hash = "2.1"
+blake2 = "0.10"
 dirs = "5"
 libc = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 tauri-plugin-opener = "2.5.3"
+tauri-plugin-notification = "2"
 
 [profile.dev]
 incremental = true

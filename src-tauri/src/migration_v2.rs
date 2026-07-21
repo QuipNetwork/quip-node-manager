@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::config::{
     DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_HOST, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY,
-    DOCKER_VALIDATOR_RPC,
+    DOCKER_VALIDATOR_RPC, FAUCET_URL,
 };
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
@@ -127,9 +127,6 @@ pub fn persist_promoted_settings(promoted: &PromotedMinerConfig) -> Result<(), S
 }
 
 pub fn emit_report(app: &AppHandle, report: &MigrationReport) {
-    if report.changed {
-        emit_log(app, "INFO", "Migrated v0.1 node data to the v0.2 layout");
-    }
     for warning in &report.warnings {
         emit_log(app, "WARN", warning);
     }
@@ -289,9 +286,6 @@ fn migrate_env_file(path: &Path) -> Result<MigrationReport, String> {
     if has_legacy {
         warnings.push("removed v0.1 QUIP_NODE_URL/QUIP_NODE_TOKEN env keys".to_string());
     }
-    if !has_validator_rpc {
-        warnings.push("added QUIP_VALIDATOR_RPC_URLS placeholder to migrated .env".to_string());
-    }
 
     Ok(MigrationReport {
         changed: true,
@@ -351,6 +345,12 @@ fn convert_v01_config(root: &mut Table, run_mode: &RunMode) -> Result<ConfigMigr
     miner.insert(
         "signer_key".to_string(),
         Value::String(default_signer_key(run_mode)),
+    );
+    // The miner has no built-in faucet default; without it a migrated wallet
+    // fails fast with `wallet-underfunded` (matches fresh config rendering).
+    miner.insert(
+        "faucet_url".to_string(),
+        Value::String(FAUCET_URL.to_string()),
     );
     miner.insert(
         "rest_host".to_string(),
@@ -550,8 +550,11 @@ solver = "Advantage2_System1.13"
         assert!(migration
             .content
             .contains("signer_key = \"/data/keystore.json\""));
+        assert!(migration
+            .content
+            .contains("faucet_url = \"https://faucet.testnet.quip.network\""));
         assert!(migration.content.contains("rest_host = \"0.0.0.0\""));
-        assert!(migration.content.contains("rest_port = 80"));
+        assert!(migration.content.contains("rest_port = 8086"));
         assert!(migration.content.contains("node_name = \"cpu-home\""));
         assert!(migration
             .content

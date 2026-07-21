@@ -53,7 +53,8 @@ quip-node-manager/
         ├── network.rs             # Public IP detection only
         ├── update.rs              # Multi-image + app update monitor
         ├── migration_v2.rs        # v0.1 → v0.2 config/.env migration; backs up
-        │                          # old files and promotes hand-edited host/port
+        │                          # old files and promotes hand-edited host/port.
+        │                          # REMOVE in v0.3 (drop v0.1 → v0.2 upgrades)
         ├── hostnames.rs           # public_host parsing → Caddy hostname +
         │                          # validator libp2p --public-addr multiaddr
         ├── checklist.rs           # Pre-flight checks → checklist-update events;
@@ -162,9 +163,10 @@ starts.
 |------|------------------------|---------|
 | `app-settings.json` | settings.rs (user preferences) | UI toggles + NodeConfig |
 | `config.toml` | config.rs on every Start | Node config (bind-mounted into the node container in Docker mode; read directly by the binary in Native mode) |
-| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_VALIDATORS (Docker only); mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
+| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
+| `config/quip-miner.{cpu,cuda}.toml` | stack_assets.rs (embedded copy) | First-run miner config seed templates bind-mounted by the compose cpu/cuda services. Inert for the manager (our `data/config.toml` always exists first, so the entrypoint never seeds), but the mount source must exist on disk. |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
-| `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>` |
+| `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
 | `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
 | `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
@@ -218,9 +220,9 @@ It stages the embedded compose.yml, Caddyfile, and chain spec
 4. **Caddyfile faucet strip** (always): the optional local faucet route block is
    removed (the manager relies on the public testnet faucet).
 
-5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:80` becomes
+5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:8086` becomes
    `host.docker.internal:<native_rest_port>` so the dashboard container reaches
-   the host miner. Docker mode keeps `quip-miner:80`.
+   the host miner. Docker mode keeps `quip-miner:8086`.
 
 Why embedded + patched at stage time (instead of compose's `${VAR}` env
 substitution): the Caddyfile upstream rewrite and the validator `--public-addr`
@@ -242,7 +244,8 @@ validator/API ports:
 For the miner's own `config.toml`: `config.rs` emits `public_port` verbatim from
 `config.public_port` (`Option<u16>`, skipped when `None`) in both modes — there
 is no Docker-side hardcoded `port = 20049` in the miner config. The Docker miner
-config carries `rest_port = 80` (container-internal REST) and Native carries
+config carries `rest_port = 8086` (container-internal REST, matching the
+Caddyfile's `quip-miner:8086` upstream) and Native carries
 `rest_port = <native_rest_port>` (default 20100, loopback-only).
 
 ## Pre-flight Port Reachability Check
@@ -272,9 +275,8 @@ Probe responses are classified into `ProbeOutcome` with these rules:
 
 | Service response (`/checkport`) | `ProbeOutcome` | Rationale |
 |---------------------------------|----------------|-----------|
-| HTTP 200, `reachable:true` | `HostResponded` | success |
-| HTTP 200, `reachable:false` with `error` matching `is_connect_timeout()` (timeout / unreachable / no route) | `Timeout` | no host-level reply |
-| HTTP 200, `reachable:false` with any other error (RST, TLS error, banner timeout, ...) | `HostResponded` | host *did* respond; router forward works |
+| HTTP 200, `reachable:true` | `HostResponded` | TCP connect succeeded — forward works and something is listening |
+| HTTP 200, `reachable:false` (any `error`: timeout, RST/"connection refused", ...) | `Unreachable` | the external TCP connect could not be established |
 | HTTP 429 | `RateLimited(retry_after_seconds)` | service rate-limited us |
 | HTTP 5xx / network error / malformed body | `ServiceError` | not the user's fault |
 
@@ -282,7 +284,7 @@ Probe responses are classified into `ProbeOutcome` with these rules:
 
 - `Verified` (Pass) — port bound locally + `HostResponded`
 - `ForwardReady` (Pass) — port free locally + `HostResponded`
-- `Unreachable` (Warn) — `Timeout` (either branch)
+- `Unreachable` (Warn) — `Unreachable`
 - `Unverified` (Warn) — `ServiceError`: check.quip.network was down/errored, so
   we couldn't verify (no green check we didn't earn)
 - `RateLimited { retry_after_secs, endpoint }` (Warn) — service rate-limited
@@ -293,19 +295,20 @@ A check only goes **green** when check.quip.network positively confirmed the
 port (`Verified`/`ForwardReady`); `is_externally_reachable()` is true for those
 two and nothing else.
 
-**Design rule:** *any response from the host means the router forward is
-working; only a connect-level timeout fails the check.* ALPN mismatches,
-TLS errors, connection resets, and the like are all classified as
-passing — they prove the network path works, even if the protocol
-handshake didn't.
+**Design rule:** *`/checkport` is a plain-TCP connect, so reachability is
+binary.* Only `reachable:true` (a SYN-ACK proving the forward works and a
+listener is up) passes. Every `reachable:false` — timeout, RST, or
+"connection refused" — fails the check, because in each case the prober
+could not open a TCP connection to the port.
 
 ### Probe Diagnostics
 
 Every probe call emits a `[probe]` line to the `node-log` event with the
 full request URL, HTTP status, and response body (truncated at 1 KB).
-Users can copy/paste the raw output into support threads — `is_connect_timeout`
-might misclassify a future error string, and the raw body is the ground
-truth. The `AppHandle` is plumbed via `Option<AppHandle>` on `CheckCtx`,
+Users can copy/paste the raw output into support threads — the raw `error`
+string is the ground truth for *why* a port was unreachable (it no longer
+affects classification, which is binary on `reachable`). The `AppHandle` is
+plumbed via `Option<AppHandle>` on `CheckCtx`,
 so non-Tauri callers (the TUI) probe silently.
 
 ## Shared Types (defined in `settings.rs`)
@@ -328,17 +331,19 @@ so non-Tauri callers (the TUI) probe silently.
 The frontend uses `window.__TAURI__.core.invoke` (`withGlobalTauri: true`).
 
 Events emitted by backend (complete set): `node-log`, `checklist-update`,
-`pull-progress`, `stop-started`, `stop-complete`, `image-update-available`,
-`binary-update-available`, `binary-download-progress`, `app-update-available`.
-(The frontend also registers listeners for `node-status`, `stack-status`, and
-`pull-complete`, none of which the backend emits — dead listeners.)
+`pull-progress`, `pull-complete`, `stop-started`, `stop-complete`,
+`dashboard-db-mismatch`, `image-update-available`, `binary-update-available`,
+`binary-download-progress`, `app-update-available`.
 
 - `node-log` → `{ timestamp, level, message }`
 - `checklist-update` → `CheckItem { id, state, label, detail, required,
   fixable, updated_at_ms }`
 - `pull-progress` → `{ line }` (one `docker compose pull` output line) or a
   `--progress json` layer event forwarded verbatim
+- `pull-complete` → `{ gen, success, error }` (emitted when the pull process
+  exits — the authoritative "pull is over" signal)
 - `stop-started`, `stop-complete` — stop lifecycle
+- `dashboard-db-mismatch` → `{ message }` (Postgres volume password mismatch)
 - `image-update-available` → `{ image, info }` (emitted per image whose digest
   changed, gated on `info.update_available`)
 - `binary-update-available` → native-binary UpdateInfo
@@ -378,6 +383,30 @@ bun run build
 # Install dependencies
 bun install
 ```
+
+## Versioning & Release Tags
+
+Canonical spec: `quip-protocol/docs/VERSIONING.md`. This repo follows the same
+cross-repo standard so `update.rs::parse_semver` orders release candidates
+correctly — it splits the pre-release on `-`, so a no-hyphen `v0.2.1rc18` loses
+*both* the patch and the rc number and collapses every rc to one value, which
+freezes deployed nodes on an old rc.
+
+| Artifact | Format | Example |
+|----------|--------|---------|
+| Git release tag (pre-release) | hyphenated SemVer `vMAJOR.MINOR.PATCH-rcN` | `v0.2.1-rc18` |
+| Git release tag (stable) | `vMAJOR.MINOR.PATCH` | `v0.2.1` |
+| Package version (`package.json`, `Cargo.toml`, `tauri.conf.json`) | toolchain-native (npm/Cargo SemVer; PEP 440 elsewhere) | `0.2.1-rc2` |
+
+Rules:
+- Pre-release git tags MUST be hyphenated (`-rcN` / `-alphaN` / `-betaN`); never
+  the PEP 440 no-hyphen form for a git tag.
+- Numeric parts (MAJOR.MINOR.PATCH and the rc number) MUST match between the git
+  tag and the package version; only the separator may differ.
+- CI: pre-release tags publish `:<tag>` + the rolling `:vMAJOR.MINOR` and MUST
+  NOT move `:latest`; only `main` / a stable `vX.Y.Z` tag moves `:latest`. The
+  `:latest` rule binds on image-publishing repos (quip-protocol); this repo ships
+  desktop binaries via a per-tag GitLab Release and has no `:latest` to gate.
 
 ## Code Standards
 

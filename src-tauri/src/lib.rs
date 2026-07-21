@@ -5,18 +5,23 @@ pub mod cmd;
 pub mod compose;
 pub mod config;
 pub mod hardware;
+pub mod health;
 pub mod hostnames;
 pub mod log_stream;
 pub mod migration_v2;
 pub mod native;
 pub mod network;
+pub mod progress;
+pub mod registry;
 pub mod secret;
 pub mod settings;
 pub mod stack_assets;
 pub mod tui_app;
 pub mod tui_input;
+pub mod tui_sink;
 pub mod tui_ui;
 pub mod update;
+pub mod validator_rpc;
 
 use checklist::ChecklistState;
 use log_stream::LogStreamState;
@@ -59,6 +64,7 @@ pub fn set_tray_update(app: &tauri::AppHandle, has_update: bool, tooltip: &str) 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(LogStreamState::new())
         .manage(NativeProcessState::new())
         .manage(ChecklistState::new())
@@ -86,6 +92,7 @@ pub fn run() {
             compose::reset_dashboard_database,
             compose::get_stack_status,
             compose::get_stack_config,
+            health::get_health,
             // Hardware
             hardware::detect_gpu_backend,
             hardware::list_gpu_devices,
@@ -106,8 +113,8 @@ pub fn run() {
             update::get_app_version,
             update::get_node_version,
             update::check_app_update,
-            update::check_image_update,
-            update::check_dashboard_image_update,
+            update::resolve_channel_info,
+            update::restart_to_update,
             // Log streaming
             log_stream::start_log_stream,
             log_stream::stop_log_stream,
@@ -227,6 +234,9 @@ pub fn run() {
             // ── Background update monitor ────────────────────────
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(update::background_update_monitor(handle));
+
+            // ── Node health monitor (15 s poll loop) ─────────────
+            crate::health::spawn_health_monitor(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

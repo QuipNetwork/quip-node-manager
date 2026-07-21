@@ -17,13 +17,14 @@
 //!   - compose.yml: when `public_host` is set, the validator command gets
 //!     a matching `--public-addr=<multiaddr>` using the public validator port.
 //!   - Caddyfile: the optional local faucet route is stripped; the manager
-//!     uses the public testnet faucet exposed by the upstream miner bootstrap.
+//!     points the miner at the public testnet faucet directly via
+//!     `config::FAUCET_URL` in the rendered config.toml.
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
-//!     from `quip-miner:80` (compose network alias, absent when the miner
+//!     from `quip-miner:8086` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
-//!   - compose.yml (Native mode only): the validator's JSON-RPC port is
-//!     published on the host loopback (127.0.0.1:9944) so the host-side
-//!     miner can connect to `ws://127.0.0.1:9944` directly.
+//!   - compose.yml (both modes): the validator's JSON-RPC port is published
+//!     on the host loopback (127.0.0.1:9944) so the host health monitor and
+//!     the host-side miner (Native) can reach `ws://127.0.0.1:9944` directly.
 
 use crate::settings::{data_dir, RunMode};
 use std::fs;
@@ -42,6 +43,18 @@ const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Cadd
 const CHAIN_SPEC: &str =
     include_str!("../../vendor/nodes.quip.network/chain-specs/quip-testnet.json");
 
+/// First-run miner config seed templates. The compose cpu/cuda services
+/// bind-mount `./config/quip-miner.{cpu,cuda}.toml` over the container's
+/// `/app/quip-miner.docker.toml`; the entrypoint copies it to
+/// `/data/config.toml` only when that file is absent. The manager writes its
+/// own `data/config.toml` first, so the seed never fires — but the bind-mount
+/// source must exist on disk or Docker fabricates an empty directory. We stage
+/// the upstream templates verbatim to satisfy the mount.
+const MINER_CONFIG_CPU: &str =
+    include_str!("../../vendor/nodes.quip.network/config/quip-miner.cpu.toml");
+const MINER_CONFIG_CUDA: &str =
+    include_str!("../../vendor/nodes.quip.network/config/quip-miner.cuda.toml");
+
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
 /// Validator libp2p port inside the validator container. The host side
@@ -58,6 +71,20 @@ pub fn stack_compose_file() -> PathBuf {
     data_dir().join("docker-compose.yml")
 }
 
+/// `<data_dir>/docker-compose.override.yml` — operator-owned, never written or
+/// read by this app beyond checking that it exists.
+///
+/// `sync_stack_assets` rewrites `docker-compose.yml` from the embedded bytes on
+/// every Start and Apply, so edits to the staged file do not survive. This is
+/// the supported place to change the bundled stack: compose merges it over the
+/// base file, and staging never touches it.
+///
+/// Compose auto-discovers this filename only when invoked with no `-f`. Every
+/// invocation here passes `-f`, so `compose_cmd` must add it explicitly.
+pub fn stack_override_file() -> PathBuf {
+    data_dir().join("docker-compose.override.yml")
+}
+
 /// `<data_dir>/caddy/Caddyfile` — staged from the embedded bytes, possibly
 /// patched for Native mode.
 pub fn stack_caddyfile() -> PathBuf {
@@ -67,6 +94,12 @@ pub fn stack_caddyfile() -> PathBuf {
 /// `<data_dir>/chain-specs/quip-testnet.json` — staged from embedded bytes.
 pub fn stack_chain_spec_file() -> PathBuf {
     data_dir().join("chain-specs").join("quip-testnet.json")
+}
+
+/// `<data_dir>/config/quip-miner.{cpu,cuda}.toml` — staged seed templates
+/// bind-mounted by the compose cpu/cuda services.
+pub fn stack_miner_config_file(backend: &str) -> PathBuf {
+    data_dir().join("config").join(format!("quip-miner.{backend}.toml"))
 }
 
 /// `--project-directory` for every `docker compose` invocation.
@@ -85,7 +118,7 @@ pub fn stack_project_dir() -> PathBuf {
 /// using `validator_port`.
 ///
 /// In Native mode the Caddyfile's upstream for `/api/v1/*` is also
-/// rewritten from `quip-miner:80` to `host.docker.internal:<rest_port>`.
+/// rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>`.
 pub fn sync_stack_assets(
     run_mode: &RunMode,
     public_api_port: u16,
@@ -95,12 +128,11 @@ pub fn sync_stack_assets(
     validator_rpc_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
-    for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
+    for sub in ["data", "dashboard-data", "caddy", "chain-specs", "config"] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
     let compose_out = patch_compose_file(
-        run_mode,
         COMPOSE_YML,
         public_api_port,
         validator_port,
@@ -115,11 +147,15 @@ pub fn sync_stack_assets(
 
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
+    fs::write(stack_miner_config_file("cpu"), MINER_CONFIG_CPU)
+        .map_err(|e| format!("write quip-miner.cpu.toml: {e}"))?;
+    fs::write(stack_miner_config_file("cuda"), MINER_CONFIG_CUDA)
+        .map_err(|e| format!("write quip-miner.cuda.toml: {e}"))?;
+
     Ok(())
 }
 
 fn patch_compose_file(
-    run_mode: &RunMode,
     src: &str,
     public_api_port: u16,
     validator_port: u16,
@@ -127,8 +163,7 @@ fn patch_compose_file(
     validator_rpc_port: u16,
 ) -> String {
     let patched = patch_compose_ports(src, public_api_port, validator_port);
-    let patched =
-        expose_native_validator_rpc(run_mode, &patched, validator_port, validator_rpc_port);
+    let patched = expose_validator_rpc(&patched, validator_port, validator_rpc_port);
     let patched = patch_validator_public_addr(&patched, public_host, validator_port);
     strip_volume_names(&patched)
 }
@@ -148,19 +183,11 @@ fn strip_volume_names(src: &str) -> String {
         .replace("\n    name: quip-caddy-config", "")
 }
 
-/// In Native mode, publish the validator's JSON-RPC port on the host loopback
-/// (`127.0.0.1:<validator_rpc_port>`) so the host-side miner can reach it. In
-/// Docker mode the miner is a container and reaches `quip-validator:9944` over
-/// the compose network, so no host publish is needed.
-fn expose_native_validator_rpc(
-    run_mode: &RunMode,
-    src: &str,
-    validator_port: u16,
-    validator_rpc_port: u16,
-) -> String {
-    if !matches!(run_mode, RunMode::Native) {
-        return src.to_string();
-    }
+/// Publish the validator's JSON-RPC port on the host loopback
+/// (`127.0.0.1:<validator_rpc_port>`) in both run modes so the host health
+/// monitor can reach `ws://127.0.0.1:<validator_rpc_port>` directly.
+/// In Native mode the host-side miner also uses this binding.
+fn expose_validator_rpc(src: &str, validator_port: u16, validator_rpc_port: u16) -> String {
     // Anchor on the (already port-patched) validator UDP mapping so the RPC
     // mapping lands inside the quip-validator service's `ports:` list.
     let udp_line = format!("      - \"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\"\n");
@@ -202,7 +229,7 @@ fn patch_caddyfile(run_mode: &RunMode, src: &str, native_rest_port: u16) -> Stri
     let src = strip_local_faucet_route(src);
     match run_mode {
         RunMode::Native => src.replace(
-            "quip-miner:80",
+            "quip-miner:8086",
             &format!("host.docker.internal:{native_rest_port}"),
         ),
         RunMode::Docker => src,
@@ -288,7 +315,6 @@ mod tests {
     #[test]
     fn patch_compose_file_adds_public_addr_from_dns_public_host() {
         let patched = patch_compose_file(
-            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
@@ -300,18 +326,11 @@ mod tests {
 
     #[test]
     fn patch_compose_file_adds_public_addr_from_ip_public_host() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "1.2.3.4",
-            9944,
-        );
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "1.2.3.4", 9944);
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
         let patched = patch_compose_file(
-            &RunMode::Docker,
             COMPOSE_YML,
             CONTAINER_PUBLIC_API_PORT,
             30033,
@@ -323,55 +342,33 @@ mod tests {
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
-        );
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(!patched.contains("--public-addr"));
     }
 
     #[test]
-    fn native_mode_publishes_validator_rpc_on_configured_host_port() {
-        let patched = patch_compose_file(
-            &RunMode::Native,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
-        );
+    fn both_modes_publish_validator_rpc_on_configured_host_port() {
+        let patched =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
         // Inserted right after the validator's UDP mapping, inside its ports.
         assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
 
         // The host side honours the configured port; the container side is
         // always the validator's fixed 9944.
-        let custom = patch_compose_file(
-            &RunMode::Native,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9955,
-        );
+        let custom =
+            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9955);
         assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
     }
 
     #[test]
-    fn docker_mode_does_not_publish_validator_rpc() {
-        let patched = patch_compose_file(
-            &RunMode::Docker,
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "",
-            9944,
+    fn docker_mode_also_publishes_validator_rpc_to_host() {
+        let out = expose_validator_rpc(COMPOSE_YML, 30333, 9944);
+        assert!(
+            out.contains("127.0.0.1:9944:9944"),
+            "Docker mode must publish validator RPC to host loopback for the health monitor"
         );
-        assert!(!patched.contains("9944:9944"));
     }
 
     #[test]
@@ -381,11 +378,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_miner_config_templates_match_the_caddy_rest_port() {
+        // The seed templates and the Caddyfile's `quip-miner:8086` upstream (and
+        // our DOCKER_MINER_REST_PORT) must agree on the container REST port.
+        for template in [MINER_CONFIG_CPU, MINER_CONFIG_CUDA] {
+            assert!(template.contains("[miner]"));
+            assert!(template.contains("rest_port = 8086"));
+        }
+        assert!(MINER_CONFIG_CPU.contains("[cpu]"));
+        assert!(MINER_CONFIG_CUDA.contains("[cuda.0]"));
+    }
+
+    #[test]
     fn docker_caddyfile_keeps_v02_routes_and_miner_upstream() {
         let patched = patch_caddyfile(&RunMode::Docker, CADDYFILE, 20100);
         assert!(patched.contains("handle /rpc"));
         assert!(patched.contains("handle /api/v1/*"));
-        assert!(patched.contains("reverse_proxy quip-miner:80"));
+        assert!(patched.contains("reverse_proxy quip-miner:8086"));
         assert!(!patched.contains("/api/faucet"));
         assert!(!patched.contains("quip-faucet"));
         assert!(!patched.contains("host.docker.internal:20100"));
@@ -397,7 +406,7 @@ mod tests {
         assert!(patched.contains("handle /rpc"));
         assert!(patched.contains("handle /api/v1/*"));
         assert!(patched.contains("reverse_proxy host.docker.internal:20100"));
-        assert!(!patched.contains("reverse_proxy quip-miner:80"));
+        assert!(!patched.contains("reverse_proxy quip-miner:8086"));
         assert!(!patched.contains("/api/faucet"));
         assert!(!patched.contains("quip-faucet"));
     }

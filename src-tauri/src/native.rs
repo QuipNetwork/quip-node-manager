@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::log_stream::LogEntry;
-use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
+use crate::progress::ProgressSink;
+use crate::settings::{data_dir, NodeConfig, RunMode};
 use serde::Serialize;
 use std::path::Path;
 use std::process::Child;
@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
-const PUBLIC_TESTNET_FAUCET_URL: &str = "https://faucet.testnet.quip.network";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -89,7 +88,12 @@ fn binary_release_marker_path() -> std::path::PathBuf {
 }
 
 /// Fetch the quip-protocol releases list (GitLab returns them newest-first).
-async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json::Value> {
+/// Returns the URL it hit and the specific cause on failure so callers can show
+/// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
+/// than a generic "couldn't list releases".
+pub(crate) async fn fetch_protocol_releases(
+    client: &reqwest::Client,
+) -> Result<serde_json::Value, String> {
     let url = format!(
         "https://gitlab.com/api/v4/projects/{}/releases?per_page=20",
         PROTOCOL_PROJECT
@@ -99,20 +103,26 @@ async fn fetch_protocol_releases(client: &reqwest::Client) -> Option<serde_json:
         .header("User-Agent", "quip-node-manager")
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("GET {url} returned HTTP {status}"));
     }
-    resp.json().await.ok()
+    resp.json()
+        .await
+        .map_err(|e| format!("GET {url} returned unparseable JSON: {e}"))
 }
 
-/// (tag, asset_url, description) for every release that ships `asset_name`,
-/// newest-first (GitLab returns releases newest-first). This tracks whatever
-/// the latest releases are tagged (`v0.2`, `v0.2.0rc1`, …) and skips older
-/// releases that only carry the legacy asset name.
+/// (tag, asset_url, description) for every release that ships `asset_name` on
+/// the given channel, newest-first (GitLab returns releases newest-first). This
+/// tracks whatever the latest releases are tagged (`v0.2.1`, `v0.2.1-rc9`, …)
+/// and skips older releases that only carry the legacy asset name. On the
+/// `Release` channel, `-rc` prereleases are filtered out so only stable tags
+/// remain.
 fn binary_release_candidates(
     releases: &serde_json::Value,
     asset_name: &str,
+    channel: crate::settings::UpdateChannel,
 ) -> Vec<(String, String, String)> {
     releases
         .as_array()
@@ -120,6 +130,9 @@ fn binary_release_candidates(
         .flatten()
         .filter_map(|rel| {
             let tag = rel["tag_name"].as_str()?.to_string();
+            if !crate::update::tag_matches_channel(&tag, channel) {
+                return None;
+            }
             let url = release_asset_url(rel, asset_name)?;
             let desc = rel["description"].as_str().unwrap_or("").to_string();
             Some((tag, url, desc))
@@ -150,8 +163,9 @@ async fn resolve_latest_downloadable_release(
     client: &reqwest::Client,
     releases: &serde_json::Value,
     asset_name: &str,
+    channel: crate::settings::UpdateChannel,
 ) -> Option<(String, String, String)> {
-    for candidate in binary_release_candidates(releases, asset_name) {
+    for candidate in binary_release_candidates(releases, asset_name, channel) {
         if asset_is_downloadable(client, &candidate.1).await {
             return Some(candidate);
         }
@@ -225,34 +239,14 @@ fn validator_rpc_http_probe_url(validator_url: &str) -> String {
         .unwrap_or_else(|| validator_url.to_string())
 }
 
-pub(crate) fn native_miner_subcommand(config: &NodeConfig) -> &'static str {
-    if config.dwave_config.is_some() {
-        return "qpu";
-    }
-
-    if matches!(config.gpu_backend, GpuBackend::Mps | GpuBackend::Modal)
-        || config
-            .gpu_device_configs
-            .iter()
-            .any(|device| device.enabled)
-    {
-        return "gpu";
-    }
-
-    "cpu"
-}
-
-pub(crate) fn native_miner_args(config: &NodeConfig, config_path: &Path) -> Vec<String> {
-    let subcommand = native_miner_subcommand(config);
-    let signer_key = native_signer_key_path().to_string_lossy().to_string();
+// The miner picks its own backends (cpu/gpu/qpu) from the config.toml
+// sections — the manager passes no subcommand and no per-key CLI overrides
+// (signer_key and faucet_url both live in [miner]; see config::FAUCET_URL —
+// the miner has no built-in faucet default, so the rendered config supplies it).
+pub(crate) fn native_miner_args(config_path: &Path) -> Vec<String> {
     vec![
-        subcommand.to_string(),
         "--config".to_string(),
         config_path.to_string_lossy().to_string(),
-        "--signer-key".to_string(),
-        signer_key,
-        "--faucet-url".to_string(),
-        PUBLIC_TESTNET_FAUCET_URL.to_string(),
     ]
 }
 
@@ -306,20 +300,13 @@ pub(crate) fn ensure_native_signer_key(bin: &Path) -> Result<bool, String> {
 }
 
 async fn wait_for_native_miner_validator_rpc(
-    app: &tauri::AppHandle,
+    sink: &dyn ProgressSink,
     validator_url: &str,
 ) -> Result<(), String> {
     // TODO: Revisit this readiness gate; it likely needs another pass to make
     // the flow and diagnostics more eloquent.
     let probe_url = validator_rpc_http_probe_url(validator_url);
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: format!("Waiting for validator RPC at {validator_url}"),
-        },
-    );
+    sink.log("INFO", &format!("Waiting for validator RPC at {validator_url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -346,13 +333,9 @@ async fn wait_for_native_miner_validator_rpc(
                             })
                             .unwrap_or(false)
                         {
-                            let _ = app.emit(
-                                "node-log",
-                                &LogEntry {
-                                    timestamp: String::new(),
-                                    level: "INFO".to_string(),
-                                    message: format!("Validator RPC is ready at {validator_url}"),
-                                },
+                            sink.log(
+                                "INFO",
+                                &format!("Validator RPC is ready at {validator_url}"),
                             );
                             return Ok(());
                         }
@@ -506,23 +489,45 @@ pub fn installed_binary_version() -> Option<String> {
     }
 }
 
+/// Serializes `download_native_binary` so concurrent callers coalesce instead
+/// of racing: the loser waits on the lock, then finds the binary already
+/// current and skips its own download. Belt-and-suspenders against duplicate
+/// fetches from any pair of callers (checklist Retry, Start provisioning, the
+/// update-restart `DownloadBinary` step) writing the same fixed temp path.
+fn download_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Download the latest native miner binary from GitLab releases. Tracks the
 /// most recent release that ships this platform's asset, so release-candidate
 /// tags (e.g. `v0.2.0rc1`) are picked up automatically.
 #[tauri::command]
 pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, String> {
+    download_native_binary_core(Arc::new(crate::progress::TauriSink::new(app))).await
+}
+
+/// Core binary-download logic decoupled from Tauri. Resolves the latest
+/// downloadable release for this platform, coalesces concurrent callers via the
+/// download guard, streams the binary with per-chunk progress events, and writes
+/// a release marker for subsequent update checks.
+///
+/// Args:
+///     sink: Progress/log sink for `node-log` and `binary-download-progress`
+///         events. GUI callers pass a `TauriSink`; TUI callers pass a `TuiSink`.
+///
+/// Returns:
+///     The normalized version string of the installed binary (e.g. `"0.2.1"`).
+pub(crate) async fn download_native_binary_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<String, String> {
     use std::io::Write;
 
     let name = binary_name();
 
-    let log = |msg: String| {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "INFO",
-            "message": msg,
-        });
-        let _ = app.emit("node-log", entry);
-    };
+    // Serialize downloads so concurrent callers coalesce instead of racing the
+    // shared temp path (see `download_guard`). Held across the whole download.
+    let _guard = download_guard().lock().await;
 
     // Resolve the latest release that actually ships this binary (rc-aware).
     let meta_client = reqwest::Client::builder()
@@ -530,20 +535,31 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| e.to_string())?;
-    let releases = fetch_protocol_releases(&meta_client)
-        .await
-        .ok_or_else(|| "Could not list quip-protocol releases".to_string())?;
-    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name)
+    let channel = crate::settings::load_settings().update_channel;
+    let releases = fetch_protocol_releases(&meta_client).await?;
+    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name, channel)
         .await
         .ok_or_else(|| {
             format!(
-                "The latest quip-protocol release ships {name}, but its artifact \
-                 isn't available yet — the build may still be running. Try again shortly."
+                "No downloadable quip-protocol release ships {name} on the {channel:?} \
+                 channel yet — the build may still be running, or the channel has no \
+                 published builds. Try again shortly."
             )
         })?;
 
-    log(format!("Downloading {name} ({tag})"));
-    log(format!("From {url}"));
+    // If a concurrent caller installed this version while we waited on the
+    // lock, skip the redundant re-download.
+    let latest_version = normalize_release_version(&tag);
+    if installed_binary_version().as_deref() == Some(latest_version.as_str()) {
+        sink.log(
+            "INFO",
+            &format!("{name} already up to date (v{latest_version}); skipping download"),
+        );
+        return Ok(latest_version);
+    }
+
+    sink.log("INFO", &format!("Downloading {name} ({tag})"));
+    sink.log("INFO", &format!("From {url}"));
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -586,15 +602,7 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
         file.write_all(&chunk)
             .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
-
-        let _ = app.emit(
-            "binary-download-progress",
-            BinaryDownloadProgress {
-                downloaded,
-                total,
-                done: false,
-            },
-        );
+        sink.binary_download_progress(downloaded, total, false);
     }
     drop(file);
 
@@ -615,40 +623,51 @@ pub async fn download_native_binary(app: tauri::AppHandle) -> Result<String, Str
     // affects update detection, so warn instead of failing the download — but
     // don't swallow it silently, or stale-marker bugs become invisible.
     if let Err(e) = write_binary_release_marker(&tag) {
-        log(format!(
-            "Warning: could not record release marker ({e}); \
-             update checks may keep re-offering this version"
-        ));
+        sink.log(
+            "INFO",
+            &format!(
+                "Warning: could not record release marker ({e}); \
+                 update checks may keep re-offering this version"
+            ),
+        );
     }
 
-    let _ = app.emit(
-        "binary-download-progress",
-        BinaryDownloadProgress {
-            downloaded,
-            total,
-            done: true,
-        },
-    );
+    sink.binary_download_progress(downloaded, total, true);
 
     let version = installed_binary_version().unwrap_or_else(|| normalize_release_version(&tag));
-    log(format!(
-        "Installed {} from {} (binary version: {})",
-        name, tag, version
-    ));
+    sink.log(
+        "INFO",
+        &format!("Installed {} from {} (binary version: {})", name, tag, version),
+    );
 
     Ok(version)
 }
 
-/// Check if the configured v0.2 native miner release is installed.
-#[tauri::command]
-pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
-    let current = match tokio::task::spawn_blocking(installed_binary_version)
+/// Installed vs. latest-downloadable native miner versions, and whether an
+/// update is warranted. `latest` is `None` when the release feed couldn't be
+/// reached (so callers can distinguish "confirmed current" from "couldn't
+/// check"). `update` is `Some` only when `latest` is strictly newer.
+#[derive(Debug, Clone)]
+pub struct BinaryVersions {
+    pub installed: Option<String>,
+    pub latest: Option<String>,
+    pub update: Option<crate::update::UpdateInfo>,
+}
+
+/// Resolve installed and latest-online versions in one pass. Surfaces both
+/// numbers so the UI can show what it discovered, not just a yes/no verdict.
+pub async fn resolve_binary_versions() -> Result<BinaryVersions, String> {
+    let installed = tokio::task::spawn_blocking(installed_binary_version)
         .await
         .ok()
-        .flatten()
-    {
-        Some(v) => v,
-        None => return Ok(None),
+        .flatten();
+    // No installed binary → nothing to compare against; skip the network call.
+    let Some(current) = installed.clone() else {
+        return Ok(BinaryVersions {
+            installed: None,
+            latest: None,
+            update: None,
+        });
     };
 
     let client = reqwest::Client::builder()
@@ -656,41 +675,93 @@ pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, 
         .build()
         .map_err(|e| e.to_string())?;
 
-    let Some(releases) = fetch_protocol_releases(&client).await else {
-        return Ok(None);
+    // Update check is best-effort: an unreachable feed leaves the installed
+    // binary running, so a fetch failure is non-fatal here (unlike the download
+    // path, which surfaces the cause to the user). Leave `latest` as None so the
+    // caller can say "couldn't check" rather than over-claiming "up to date".
+    let channel = crate::settings::load_settings().update_channel;
+    let latest_release = match fetch_protocol_releases(&client).await {
+        Ok(releases) => {
+            // Only offer an update we can actually install — a just-tagged
+            // release whose artifact build hasn't finished is skipped until
+            // it's downloadable.
+            resolve_latest_downloadable_release(&client, &releases, binary_name(), channel)
+                .await
+                .filter(|(tag, _, _)| !tag.is_empty())
+        }
+        Err(_) => None,
     };
-    // Only offer an update we can actually install — a just-tagged release
-    // whose artifact build hasn't finished is skipped until it's downloadable.
-    let Some((tag, url, description)) =
-        resolve_latest_downloadable_release(&client, &releases, binary_name()).await
-    else {
-        return Ok(None);
+    let Some((tag, url, description)) = latest_release else {
+        return Ok(BinaryVersions {
+            installed: Some(normalize_release_version(&current)),
+            latest: None,
+            update: None,
+        });
     };
-    if tag.is_empty() {
-        return Ok(None);
-    }
 
-    let current_tag_matches = installed_binary_release_tag()
-        .map(|installed| installed == tag)
-        .unwrap_or(false);
-    let current_version_matches =
-        normalize_release_version(&current) == normalize_release_version(&tag);
-
-    if !current_tag_matches && !current_version_matches {
-        Ok(Some(crate::update::UpdateInfo {
-            version: normalize_release_version(&tag),
-            url,
-            notes: description,
-        }))
-    } else {
-        Ok(None)
+    // Only offer a strictly newer release — never a downgrade. A bare
+    // inequality check walks an installed `-rcN` back to the lower final
+    // release (e.g. local 0.2.1-rc2 → latest-downloadable 0.2.0) whenever
+    // the higher version's artifact is missing or sorts older by date.
+    // Compare semver against the higher of the binary's own `--version` and
+    // the recorded install tag, since either may lag the other.
+    let mut installed_sv = crate::update::parse_semver(current.trim_start_matches('v'));
+    if let Some(marker) = installed_binary_release_tag() {
+        installed_sv =
+            installed_sv.max(crate::update::parse_semver(marker.trim_start_matches('v')));
     }
+    let latest_sv = crate::update::parse_semver(tag.trim_start_matches('v'));
+    let latest_version = normalize_release_version(&tag);
+
+    let update = (latest_sv > installed_sv).then(|| crate::update::UpdateInfo {
+        version: latest_version.clone(),
+        url,
+        notes: description,
+    });
+
+    Ok(BinaryVersions {
+        installed: Some(normalize_release_version(&current)),
+        latest: Some(latest_version),
+        update,
+    })
+}
+
+/// Check if a newer v0.2 native miner release is available. Thin wrapper over
+/// [`resolve_binary_versions`] preserving the `Option<UpdateInfo>` contract the
+/// frontend update banner consumes.
+#[tauri::command]
+pub async fn check_binary_update() -> Result<Option<crate::update::UpdateInfo>, String> {
+    Ok(resolve_binary_versions().await?.update)
 }
 
 #[tauri::command]
 pub async fn start_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
+) -> Result<String, String> {
+    let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
+    let msg = start_native_node_core(Arc::clone(&sink), &state).await?;
+    // Log tail uses AppHandle directly (continuous streaming; TUI provides its
+    // own path). Start it after core succeeds so the log file exists.
+    start_log_tail(app, Arc::clone(&state.stop_flag));
+    Ok(msg)
+}
+
+/// Core native-node start logic decoupled from Tauri. Runs pre-flight checks,
+/// migrates config, auto-provisions the miner binary, waits for the validator
+/// RPC, and spawns the miner process. The caller is responsible for starting
+/// log streaming after this returns (GUI via `start_log_tail`; TUI via its own
+/// path).
+///
+/// Args:
+///     sink: Progress/log sink for `node-log` events.
+///     state: Shared native-process state (child handle, stop flag, PID).
+///
+/// Returns:
+///     A human-readable start confirmation (e.g. `"Native miner started (PID 42)"`).
+pub(crate) async fn start_native_node_core(
+    sink: Arc<dyn ProgressSink>,
+    state: &NativeProcessState,
 ) -> Result<String, String> {
     // Check for already-running process (in-memory or orphan from PID file)
     if let Some(child) = state.child.lock().unwrap().as_ref() {
@@ -710,7 +781,12 @@ pub async fn start_native_node(
     let migration = crate::migration_v2::migrate_for_run_mode(&RunMode::Native)?;
     migration.promoted.apply_to_node_config(&mut config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
-    crate::migration_v2::emit_report(&app, &migration);
+    // emit_report emits node-log WARN lines for each migration warning.
+    for warning in &migration.warnings {
+        for line in warning.lines() {
+            sink.log("WARN", line);
+        }
+    }
 
     // Auto-detect public IP when no public_host is configured. A detection
     // failure must not be silent: without a public_host the validator
@@ -720,16 +796,12 @@ pub async fn start_native_node(
         match crate::network::detect_public_ip().await {
             Ok(ip) => config.public_host = ip,
             Err(e) => {
-                let _ = app.emit(
-                    "node-log",
-                    &LogEntry {
-                        timestamp: String::new(),
-                        level: "WARN".to_string(),
-                        message: format!(
-                            "Could not auto-detect public IP ({e}); the node will not \
-                             advertise a public address. Set a public host in Settings."
-                        ),
-                    },
+                sink.log(
+                    "WARN",
+                    &format!(
+                        "Could not auto-detect public IP ({e}); the node will not \
+                         advertise a public address. Set a public host in Settings."
+                    ),
                 );
             }
         }
@@ -745,18 +817,14 @@ pub async fn start_native_node(
     // dead-end here.
     let bin = binary_path();
     if !bin.exists() {
-        let _ = app.emit(
-            "node-log",
-            &LogEntry {
-                timestamp: String::new(),
-                level: "INFO".to_string(),
-                message: format!(
-                    "Native miner binary not found at {} — downloading…",
-                    bin.display()
-                ),
-            },
+        sink.log(
+            "INFO",
+            &format!(
+                "Native miner binary not found at {} — downloading…",
+                bin.display()
+            ),
         );
-        download_native_binary(app.clone()).await?;
+        download_native_binary_core(Arc::clone(&sink)).await?;
     }
     if !bin.exists() {
         return Err(format!(
@@ -780,23 +848,19 @@ pub async fn start_native_node(
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
 
     if ensure_native_signer_key(&bin)? {
-        let _ = app.emit(
-            "node-log",
-            &LogEntry {
-                timestamp: String::new(),
-                level: "INFO".to_string(),
-                message: format!(
-                    "Generated native miner keystore at {}",
-                    native_signer_key_path().display()
-                ),
-            },
+        sink.log(
+            "INFO",
+            &format!(
+                "Generated native miner keystore at {}",
+                native_signer_key_path().display()
+            ),
         );
     }
 
     let validator_url = native_miner_validator_url(&config);
-    wait_for_native_miner_validator_rpc(&app, &validator_url).await?;
+    wait_for_native_miner_validator_rpc(sink.as_ref(), &validator_url).await?;
 
-    let miner_args = native_miner_args(&config, &config_path);
+    let miner_args = native_miner_args(&config_path);
     let mut cmd = crate::cmd::new(&bin);
     cmd.args(&miner_args)
         .current_dir(&work_dir)
@@ -817,30 +881,13 @@ pub async fn start_native_node(
 
     let pid = child.id();
 
-    // Log the command
-    let cmd_msg = format!("$ {} {}", bin.display(), miner_args.join(" "));
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: cmd_msg,
-        },
-    );
-    let _ = app.emit(
-        "node-log",
-        &LogEntry {
-            timestamp: String::new(),
-            level: "INFO".to_string(),
-            message: format!("Native miner started (PID {})", pid),
-        },
-    );
+    // Log the command and PID.
+    sink.log("INFO", &format!("$ {} {}", bin.display(), miner_args.join(" ")));
+    sink.log("INFO", &format!("Native miner started (PID {})", pid));
 
-    // Start tailing node.log (the protocol's own log, not stdout)
-    let stop_flag = Arc::clone(&state.stop_flag);
-    *stop_flag.lock().unwrap() = false;
-    start_log_tail(app.clone(), Arc::clone(&stop_flag));
-
+    // Arm the stop flag before storing the child so stop_native_node_core can
+    // observe the flag immediately if called in quick succession.
+    *state.stop_flag.lock().unwrap() = false;
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
@@ -902,7 +949,33 @@ pub async fn stop_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
-    let _ = app.emit("stop-started", serde_json::json!({}));
+    let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
+    stop_native_node_core(sink, &state).await?;
+    // trigger_recheck_auto requires an AppHandle; runs only in the GUI wrapper.
+    // The TUI has its own recheck path.
+    let rc_app = app.clone();
+    tokio::spawn(async move {
+        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
+    });
+    Ok(())
+}
+
+/// Core native-node stop logic decoupled from Tauri. Signals `stop-started`,
+/// kills the managed child and any orphan PID, verifies the processes are gone
+/// within `NATIVE_STOP_DEADLINE`, then signals `stop-complete`.
+///
+/// Args:
+///     sink: Progress/log sink for `stop-started` and `stop-complete` events.
+///     state: Shared native-process state (child handle, stop flag, PID file).
+///
+/// Returns:
+///     `Ok(())` when the node has stopped; `Err` with a human-readable cause
+///     when the deadline fires or the process survives SIGKILL.
+pub(crate) async fn stop_native_node_core(
+    sink: Arc<dyn ProgressSink>,
+    state: &NativeProcessState,
+) -> Result<(), String> {
+    sink.stop_started();
     *state.stop_flag.lock().unwrap() = true;
 
     // Snapshot PIDs we need to kill. Drops the guards before awaiting.
@@ -946,21 +1019,11 @@ pub async fn stop_native_node(
         } else {
             "native process still alive after SIGKILL — manual kill required"
         };
-        let _ = app.emit(
-            "stop-complete",
-            serde_json::json!({ "success": false, "error": msg }),
-        );
+        sink.stop_complete(false, Some(msg));
         return Err(msg.to_string());
     }
 
-    let _ = app.emit("stop-complete", serde_json::json!({ "success": true }));
-
-    let rc_app = app.clone();
-    tokio::spawn(async move {
-        // The binary check now covers both presence and freshness.
-        crate::checklist::trigger_recheck_auto(rc_app, vec!["binary".into()]).await;
-    });
-
+    sink.stop_complete(true, None);
     Ok(())
 }
 
@@ -1064,7 +1127,11 @@ mod tests {
             }
         ]);
 
-        let candidates = binary_release_candidates(&releases, binary_name());
+        let candidates = binary_release_candidates(
+            &releases,
+            binary_name(),
+            crate::settings::UpdateChannel::Beta,
+        );
         let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
         assert_eq!(tags, vec!["v0.2.0rc2", "v0.2.0rc1"]);
         assert_eq!(
@@ -1075,12 +1142,40 @@ mod tests {
     }
 
     #[test]
+    fn release_channel_excludes_rc_binary_candidates() {
+        use crate::settings::UpdateChannel;
+        // A stable above the v0.2.0 Release floor, plus a newer rc.
+        let releases = serde_json::json!([
+            { "tag_name": "v0.2.2-rc1", "assets": { "links": [
+                { "name": binary_name(), "direct_asset_url": "https://example/rc" } ]}},
+            { "tag_name": "v0.2.1", "assets": { "links": [
+                { "name": binary_name(), "direct_asset_url": "https://example/stable" } ]}},
+        ]);
+
+        let tags = |ch| -> Vec<String> {
+            binary_release_candidates(&releases, binary_name(), ch)
+                .into_iter()
+                .map(|(t, _, _)| t)
+                .collect()
+        };
+
+        // Beta keeps every candidate; Release drops the -rc tag.
+        assert_eq!(tags(UpdateChannel::Beta), vec!["v0.2.2-rc1", "v0.2.1"]);
+        assert_eq!(tags(UpdateChannel::Release), vec!["v0.2.1"]);
+    }
+
+    #[test]
     fn no_release_shipping_the_binary_yields_no_candidates() {
         let releases = serde_json::json!([
             { "tag_name": "v0.1.20",
               "assets": { "links": [ { "name": "quip-network-node-macos-arm64" } ] } }
         ]);
-        assert!(binary_release_candidates(&releases, binary_name()).is_empty());
+        assert!(binary_release_candidates(
+            &releases,
+            binary_name(),
+            crate::settings::UpdateChannel::Beta,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1103,23 +1198,12 @@ mod tests {
     }
 
     #[test]
-    fn native_miner_args_pass_config_signer_and_public_faucet() {
-        let cfg = NodeConfig::default();
-        let args = native_miner_args(&cfg, Path::new("/tmp/config.toml"));
-        let signer_key = native_signer_key_path().to_string_lossy().to_string();
+    fn native_miner_args_pass_only_the_config_path() {
+        // No backend subcommand and no per-key CLI overrides: the miner
+        // decides cpu/gpu/qpu from the config.toml sections alone.
+        let args = native_miner_args(Path::new("/tmp/config.toml"));
 
-        assert_eq!(
-            args,
-            vec![
-                "cpu".to_string(),
-                "--config".to_string(),
-                "/tmp/config.toml".to_string(),
-                "--signer-key".to_string(),
-                signer_key,
-                "--faucet-url".to_string(),
-                PUBLIC_TESTNET_FAUCET_URL.to_string()
-            ]
-        );
+        assert_eq!(args, vec!["--config".to_string(), "/tmp/config.toml".to_string()]);
     }
 
     #[test]
@@ -1130,27 +1214,6 @@ mod tests {
             args,
             vec!["keygen", "--out", "/tmp/quip-data/keystore.json"]
         );
-    }
-
-    #[test]
-    fn native_miner_subcommand_prefers_qpu_over_gpu() {
-        let cfg = NodeConfig {
-            dwave_config: Some(crate::settings::DwaveConfig::default()),
-            gpu_backend: GpuBackend::Mps,
-            ..NodeConfig::default()
-        };
-
-        assert_eq!(native_miner_subcommand(&cfg), "qpu");
-    }
-
-    #[test]
-    fn native_miner_subcommand_uses_gpu_for_mps() {
-        let cfg = NodeConfig {
-            gpu_backend: GpuBackend::Mps,
-            ..NodeConfig::default()
-        };
-
-        assert_eq!(native_miner_subcommand(&cfg), "gpu");
     }
 
     #[test]

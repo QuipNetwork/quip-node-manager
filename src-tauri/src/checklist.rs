@@ -334,34 +334,20 @@ impl PortProbeResult {
 /// the host at all" from "host responded, just not as expected" and from
 /// service-side errors we shouldn't blame the user for.
 enum ProbeOutcome {
-    /// Service returned success-key=true OR success-key=false with an
-    /// error indicating the host *did* respond (protocol-level mismatch,
-    /// RST, handshake succeeded but status response missing, etc.). From
-    /// the router-forwarding perspective these are all passing cases.
+    /// `/checkport` reported `reachable:true`: the external TCP connect got a
+    /// SYN-ACK, so the router forward works and something is listening. The
+    /// only passing case.
     HostResponded,
-    /// Service returned success-key=false AND the error indicates no
-    /// response at the UDP/TCP layer (timeout, unreachable, no route).
-    Timeout,
+    /// `/checkport` reported `reachable:false`: the external TCP connect could
+    /// not be established — the SYN timed out, or the host/router replied with
+    /// a RST ("connection refused"). Either way the port is not reachable.
+    Unreachable,
     /// HTTP 429 with `retry_after_seconds`. We can't verify right now, so
     /// we surface a warning but preserve the retry time for the UX.
     RateLimited(u64),
     /// Any other failure — HTTP 5xx, non-JSON body, client-side network
     /// error. Treated as lenient-pass (not the user's fault).
     ServiceError,
-}
-
-/// Classify an `error` string from check.quip.network as a pure
-/// connect-level timeout (no response from the host) vs any other kind
-/// of failure (host responded, just not with a full protocol success).
-///
-/// Conservative heuristic — when in doubt, treat as responded. That
-/// matches the "only failure to connect is a fail" rule.
-fn is_connect_timeout(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("unreachable")
-        || lower.contains("no route")
 }
 
 /// TCP forwarding check. One `/checkport` probe runs:
@@ -434,7 +420,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
             );
             match probe_external_tcp(ctx, port).await {
                 ProbeOutcome::HostResponded => PortProbeResult::Verified,
-                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
+                ProbeOutcome::Unreachable => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
                     retry_after_secs: retry,
                     endpoint: "checkport",
@@ -464,7 +450,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
             accept_task.abort();
             match outcome {
                 ProbeOutcome::HostResponded => PortProbeResult::ForwardReady,
-                ProbeOutcome::Timeout => PortProbeResult::Unreachable,
+                ProbeOutcome::Unreachable => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
                     retry_after_secs: retry,
                     endpoint: "checkport",
@@ -563,22 +549,26 @@ async fn fetch_probe_json(
     let Ok(json) = serde_json::from_str::<Value>(&body) else {
         return ProbeOutcome::ServiceError;
     };
-    let success = json
+    let reachable = json
         .get(success_key)
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if success {
-        return ProbeOutcome::HostResponded;
-    }
-    // success-key is false — classify by the error string. A pure connect
-    // timeout means the host didn't respond at all. Anything else (ALPN
-    // mismatch, RST, TLS error, banner timeout, etc.) means the host IS
-    // reachable at the transport layer, so the router forward is working.
-    let error_str = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
-    if is_connect_timeout(error_str) {
-        ProbeOutcome::Timeout
-    } else {
+    classify_checkport(reachable)
+}
+
+/// Classify a parsed `/checkport` `reachable` flag into a `ProbeOutcome`.
+///
+/// `/checkport` performs a single plain-TCP connect from check.quip.network to
+/// the caller's public IP, so the result is binary: `reachable:true` is a
+/// SYN-ACK (forward works *and* something is listening); `reachable:false` is
+/// either a timeout (SYN dropped) or a RST/"connection refused" — in every
+/// `false` case the prober could not open a TCP connection, so the port is not
+/// externally reachable.
+fn classify_checkport(reachable: bool) -> ProbeOutcome {
+    if reachable {
         ProbeOutcome::HostResponded
+    } else {
+        ProbeOutcome::Unreachable
     }
 }
 
@@ -778,12 +768,24 @@ async fn fetch_binary_update(ctx: &CheckCtx, base: CheckItem, version: &str) -> 
     }
 }
 
-/// Native miner binary. Mirrors the stack-images check: a retry actively
-/// fetches the binary before reporting — a missing binary is downloaded and an
-/// outdated one is updated. A current binary is left untouched (the PyInstaller
-/// binary is large, so the full download is gated on need rather than re-run
-/// every retry; Docker images differ only because compose pulls layer deltas).
-async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
+/// Report an available binary update without downloading it. Used by automatic
+/// rechecks (a Warn never blocks Start); the user remediates via the
+/// Restart-to-Update flow or an explicit checklist Retry.
+fn binary_update_available_item(base: CheckItem, installed: &str, version: &str) -> CheckItem {
+    base.with_state(CheckState::Warn).with_label(format!(
+        "Native miner update available \u{2014} v{version} (installed v{installed})"
+    ))
+}
+
+/// Native miner binary. A missing binary is always downloaded (the required
+/// check can't otherwise pass). An *available update* is downloaded only on a
+/// user-initiated Retry (`auto == false`); an automatic recheck — e.g. the one
+/// fired after a stop — reports it as a Warn without downloading. That matters
+/// during Restart-to-Update: its plan already has a dedicated DownloadBinary
+/// step, so an auto recheck that also downloaded would race it, re-fetching the
+/// whole binary into the same fixed temp path. A current binary is left
+/// untouched (the PyInstaller binary is large, so downloads are gated on need).
+async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
     let base = idle_item("binary", ctx);
     let mut available = tokio::task::spawn_blocking(crate::native::is_binary_available)
         .await
@@ -791,28 +793,58 @@ async fn run_check_binary(ctx: &CheckCtx) -> CheckItem {
 
     // Missing → download before reporting. Skipped when there's no app handle.
     if !available {
+        // Capture the download error verbatim — download_native_binary already
+        // returns a precise, user-actionable reason (release feed unreachable,
+        // artifact not built yet, HTTP status, write error). Replacing it with a
+        // generic "check your connection" hid the real cause.
+        let mut download_err: Option<String> = None;
         if let Some(app) = &ctx.app {
-            let _ = crate::native::download_native_binary(app.clone()).await;
+            if let Err(e) = crate::native::download_native_binary(app.clone()).await {
+                download_err = Some(e);
+            }
             available = tokio::task::spawn_blocking(crate::native::is_binary_available)
                 .await
                 .unwrap_or(false);
         }
         if !available {
+            let detail = download_err.unwrap_or_else(|| {
+                "no app handle available to start the download".to_string()
+            });
             return base
                 .with_state(CheckState::Fail)
-                .with_label("Native miner binary not installed")
-                .with_detail("download failed \u{2014} check your connection and retry");
+                .with_label("Native miner binary download failed")
+                .with_detail(detail);
         }
     }
 
-    match crate::native::check_binary_update().await {
-        Ok(Some(info)) => fetch_binary_update(ctx, base, &info.version).await,
-        Ok(None) => base
-            .with_state(CheckState::Pass)
-            .with_label("Native miner binary up to date"),
-        // Binary is installed, but we couldn't reach the release feed to
-        // confirm it's current. Green would over-claim, so warn (the binary
-        // still runs — a Warn never blocks start).
+    match crate::native::resolve_binary_versions().await {
+        Ok(v) => {
+            let installed = v.installed.as_deref().unwrap_or("unknown");
+            match (v.update, v.latest) {
+                // A newer release exists. A user Retry fetches it now; an
+                // automatic recheck reports it without downloading so it can't
+                // race the Restart-to-Update flow's own DownloadBinary step.
+                (Some(info), _) if !auto => {
+                    fetch_binary_update(ctx, base, &info.version).await
+                }
+                (Some(info), _) => binary_update_available_item(base, installed, &info.version),
+                // Confirmed current: show both numbers so the user can see what
+                // was discovered, not just a green check.
+                (None, Some(latest)) => base.with_state(CheckState::Pass).with_label(format!(
+                    "Native miner binary up to date (installed v{installed}, latest v{latest})"
+                )),
+                // Installed, but the release feed was unreachable — we can't
+                // confirm it's current. Green would over-claim, so warn (the
+                // binary still runs — a Warn never blocks start).
+                (None, None) => base
+                    .with_state(CheckState::Warn)
+                    .with_label(format!(
+                        "Native miner binary installed (v{installed}); couldn't reach release feed"
+                    ))
+                    .with_detail("update check skipped — could not list quip-protocol releases"),
+            }
+        }
+        // Rare: HTTP client couldn't even be built. Binary still runs.
         Err(e) => base
             .with_state(CheckState::Warn)
             .with_label("Native miner binary installed (update check failed)")
@@ -934,13 +966,15 @@ async fn run_check_dwave_key(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
-/// Dispatch by id. Unknown ids return a Skip item.
-async fn run_check_by_id(id: &str, ctx: &CheckCtx) -> CheckItem {
+/// Dispatch by id. Unknown ids return a Skip item. `auto` distinguishes a
+/// system-triggered recheck from a user Retry; only the binary check reads it
+/// (to gate the update download).
+async fn run_check_by_id(id: &str, ctx: &CheckCtx, auto: bool) -> CheckItem {
     match id {
         "docker" => run_check_docker(ctx).await,
         "docker-compose" => run_check_docker_compose(ctx).await,
         "wsl" => run_check_wsl(ctx).await,
-        "binary" => run_check_binary(ctx).await,
+        "binary" => run_check_binary(ctx, auto).await,
         "secret" => run_check_secret(ctx).await,
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
@@ -1032,7 +1066,7 @@ async fn recheck_one(
     );
 
     // Run the check.
-    let final_item = run_check_by_id(id, ctx).await;
+    let final_item = run_check_by_id(id, ctx, auto).await;
 
     {
         let mut cache = state.cache.lock().await;
@@ -1154,7 +1188,9 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     };
     let mut results = Vec::new();
     for id in visible_ids(&ctx) {
-        results.push(run_check_by_id(&id, &ctx).await);
+        // TUI "run everything" is user-initiated (auto = false). It never has an
+        // app handle, so no download happens regardless.
+        results.push(run_check_by_id(&id, &ctx, false).await);
     }
     results
 }
@@ -1199,6 +1235,20 @@ mod tests {
     }
 
     #[test]
+    fn auto_recheck_reports_binary_update_without_downloading() {
+        // Regression guard for the double-download race: the post-stop auto
+        // recheck must report an available update, not fetch it (the
+        // Restart-to-Update flow's DownloadBinary step owns the download). The
+        // item is a Warn (never blocks Start) showing both versions.
+        let base = idle_item("binary", &test_ctx());
+        let item = binary_update_available_item(base, "0.2.1-rc4", "0.2.1-rc39");
+        assert_eq!(item.state, CheckState::Warn);
+        assert!(item.label.contains("update available"));
+        assert!(item.label.contains("v0.2.1-rc39"));
+        assert!(item.label.contains("installed v0.2.1-rc4"));
+    }
+
+    #[test]
     fn image_availability_is_not_pre_checked() {
         // Start always runs `docker compose pull`, so there is no separate
         // pre-flight image-availability check (the old "stack-images" check is
@@ -1240,6 +1290,30 @@ mod tests {
             label.contains("couldn't externally verify"),
             "label was: {label}"
         );
+    }
+
+    #[test]
+    fn connection_refused_is_not_reachable() {
+        // From the field: GET /checkport?port=30333 → HTTP 200
+        // {"reachable":false,"error":"dial tcp 96.233.112.201:30333: connect:
+        // connection refused"}. A plain-TCP RST means the prober never reached
+        // our listener, so the port is NOT externally reachable — this must map
+        // to the not-reachable outcome (Warn/orange), never a pass.
+        let outcome = classify_checkport(false);
+        assert!(
+            matches!(outcome, ProbeOutcome::Unreachable),
+            "connection refused should classify as not-reachable"
+        );
+    }
+
+    #[test]
+    fn reachable_true_is_the_only_passing_outcome() {
+        // Guards the success path so the binary classifier can't regress into
+        // failing a genuinely reachable port.
+        assert!(matches!(
+            classify_checkport(true),
+            ProbeOutcome::HostResponded
+        ));
     }
 
     #[test]

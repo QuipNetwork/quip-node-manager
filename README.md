@@ -55,11 +55,11 @@ Click **More info**, then **Run anyway**.
 
 ## Features
 
-- **Full compose stack** -- runs node + dashboard + postgres (+ optional Caddy for TLS) via Docker Compose; dashboard UI is embedded in the app's Dashboard tab
-- **Two run modes** -- Docker (default on Windows/Linux) drives the full container stack; Native (macOS) runs a standalone binary on the host and still runs the dashboard/postgres containers, wired to the host via `host.docker.internal`
-- **Per-image type** -- CPU, CUDA (NVIDIA GPU), or QPU (D-Wave) — selected from the Stack Configuration panel
-- **Dashboard + TLS toggles** -- optional dashboard (Postgres-backed telemetry UI) and optional Caddy reverse proxy with automatic Let's Encrypt certificates
-- **Pre-flight checklist** -- verifies Docker + Compose v2 availability, stack asset staging, node secret, public IP, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
+- **Full compose stack** -- runs miner + validator + dashboard + postgres behind a Caddy front door via Docker Compose; dashboard UI is embedded in the app's Dashboard tab
+- **Two run modes** -- Docker (default on Windows/Linux) drives the full container stack; Native (macOS) runs a standalone binary on the host and still runs the validator/dashboard/postgres/caddy containers, wired to the host via `host.docker.internal`
+- **CPU or CUDA image** -- chosen automatically from the GPU device toggles (CUDA whenever an NVIDIA device is enabled); D-Wave mining runs on the CPU image via the `[dwave]` config section
+- **TLS toggle** -- the dashboard (Postgres-backed telemetry UI) and Caddy front door are always part of the stack; TLS is optional, with automatic Let's Encrypt or ZeroSSL certificates
+- **Pre-flight checklist** -- verifies Docker + Compose v2 availability (plus WSL on Windows, the miner binary in Native mode, and the D-Wave token when QPU mining is configured), node secret, public IP, hostname, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
 - **Live log streaming** -- tails `docker compose logs -f <node>` in a collapsible drawer; switches to `data/node.log` once the node writes to it
 - **GPU configuration** -- detects CUDA and Metal devices, per-device enable/disable, utilization slider, yielding mode
 - **D-Wave QPU support** -- optional quantum processing unit configuration with daily budget controls
@@ -113,11 +113,39 @@ quip-node-manager --cli
 
 - **Frontend**: `src/` -- vanilla HTML/CSS/JS with Tauri IPC (`withGlobalTauri: true`). Dashboard tab embeds the running dashboard container in an iframe.
 - **Backend**: `src-tauri/src/` -- Rust + Tauri v2 commands. `compose.rs` drives the stack via `docker compose`; `stack_assets.rs` stages the bundled compose files into `~/quip-data/`.
-- **Stack definition**: `vendor/nodes.quip.network/` -- git submodule tracking the upstream Docker Compose setup (node + dashboard + postgres + caddy).
+- **Stack definition**: `vendor/nodes.quip.network/` -- git submodule tracking the upstream Docker Compose setup (miner + validator + dashboard + postgres + caddy).
 - **Config**: TOML generation matching quip-protocol format; `.env` generated from settings on every Start.
-- **Data**: `~/quip-data/` holds app settings, runtime config, secrets, binaries, trust database, and the staged compose files.
+- **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files.
 
-> **Native mode note (macOS):** when the dashboard is enabled alongside the native binary, the node's REST API binds to `127.0.0.1:20100`. Docker Desktop's vpnkit forwards container traffic from `host.docker.internal` through to the host's loopback, so the REST port is not exposed to the LAN.
+> **Native mode note (macOS):** the node's REST API binds to `127.0.0.1:20100`. Docker Desktop's vpnkit forwards container traffic from `host.docker.internal` through to the host's loopback, so the REST port is not exposed to the LAN.
+
+### Overriding the bundled stack
+
+Node Manager rewrites `~/quip-data/docker-compose.yml` from its embedded copy on every Start and Apply, discarding whatever you edited there. Put changes in `~/quip-data/docker-compose.override.yml` instead. Staging never touches that file, and compose merges it over the base.
+
+```yaml
+services:
+  quip-validator:
+    environment:
+      RUST_LOG: debug
+```
+
+Compose loads an override file automatically only when it discovers the compose file itself. Node Manager always passes `-f`, so it adds the override explicitly when the file exists, after the base file so the override wins.
+
+Two things to watch:
+
+- `command:` replaces the whole list rather than merging it. To change one validator flag, copy the entire `command:` block and edit the line you want.
+- Copy that block from the staged `~/quip-data/docker-compose.yml`, not from `vendor/nodes.quip.network/`. Staging adds flags the vendored file doesn't contain, such as `--public-addr`.
+
+The compose file caps the miner container at 16 GiB, which stops a runaway round from triggering a host-wide out-of-memory kill. On a dedicated miner with more RAM, raise it by setting `miner_mem_limit_gb` in `~/quip-data/app-settings.json`:
+
+```json
+{ "miner_mem_limit_gb": 48 }
+```
+
+Set it there rather than in `.env`, which Node Manager regenerates on every Start. There's no UI control for this yet.
+
+> **Validator pruning isn't recommended.** The validator runs `--state-pruning=archive --blocks-pruning=archive`, keeping every state trie and block body from genesis. Size the disk for that. Pruning reclaims disk, but it breaks the dashboard: the descriptor worker scans from genesis and fails with `State already discarded` once it reads past the pruning window. Pruning also likely reduces your point awards on the SNAG platform. Only prune if you accept losing the dashboard.
 
 See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 

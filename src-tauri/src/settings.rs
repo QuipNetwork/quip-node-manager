@@ -22,6 +22,24 @@ impl Default for RunMode {
     }
 }
 
+// ─── Update channel ─────────────────────────────────────────────────────────
+
+/// Which published tag line the stack tracks. Each image resolves its own tag
+/// independently from its own GitLab container registry by semver (see
+/// `crate::registry`):
+/// - `Release` → the highest tag with no `-rc` suffix (latest stable).
+/// - `Beta` → the highest tag overall, including `-rc` (bleeding edge).
+///
+/// Defaults to `Release`; the UI grays it out and forces `Beta` unless every
+/// image has a stable tag to run.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Release,
+    Beta,
+}
+
 // ─── GPU types ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -159,6 +177,9 @@ fn default_listen() -> String {
 fn default_num_cpus() -> u32 {
     1
 }
+fn default_cpu_enabled() -> bool {
+    true
+}
 fn default_timeout() -> u32 {
     3
 }
@@ -266,7 +287,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub http_log: String,
 
-    // CPU mining
+    // CPU mining. cpu_enabled controls whether config.toml gets a [cpu]
+    // section at all; defaults true so pre-toggle settings keep CPU mining.
+    #[serde(default = "default_cpu_enabled")]
+    pub cpu_enabled: bool,
     #[serde(default = "default_num_cpus")]
     pub num_cpus: u32,
 
@@ -320,6 +344,7 @@ impl Default for NodeConfig {
             log_level: "info".to_string(),
             node_log: String::new(),
             http_log: String::new(),
+            cpu_enabled: true,
             num_cpus: 1,
             gpu_backend: GpuBackend::Local,
             gpu_device_configs: vec![],
@@ -374,7 +399,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub run_mode: RunMode,
     #[serde(default)]
-    pub auto_update_enabled: bool,
+    pub update_channel: UpdateChannel,
+    /// Memory ceiling for the miner container, in GiB. `None` defers to the
+    /// compose default (`QUIP_MINER_MEM_LIMIT:-16g`).
+    ///
+    /// Needs to live here rather than in `.env`: `write_env_file` regenerates
+    /// `.env` on every Start, so a hand-edited value there never survives.
+    #[serde(default)]
+    pub miner_mem_limit_gb: Option<u32>,
 }
 
 impl Default for AppSettings {
@@ -389,7 +421,8 @@ impl Default for AppSettings {
             cert_email: String::new(),
             zerossl_api_key: String::new(),
             run_mode: RunMode::default(),
-            auto_update_enabled: false,
+            update_channel: UpdateChannel::default(),
+            miner_mem_limit_gb: None,
         }
     }
 }
@@ -411,8 +444,8 @@ pub struct ServiceStatus {
     pub image: String,
 }
 
-/// Aggregate roll-up of the compose stack, exposed to the frontend as a
-/// single `stack-status` event / `get_stack_status` response.
+/// Aggregate roll-up of the compose stack, exposed to the frontend as the
+/// `get_stack_status` response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StackStatus {
     pub services: Vec<ServiceStatus>,
@@ -592,6 +625,14 @@ mod tests {
 
         assert_eq!(config.port, 20049);
         assert_eq!(config.validator_port, 30333);
+    }
+
+    #[test]
+    fn node_config_missing_cpu_enabled_defaults_to_true() {
+        // Pre-toggle app-settings.json files have no cpu_enabled key; they
+        // must load as enabled, not silently stop CPU mining on upgrade.
+        let config: NodeConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(config.cpu_enabled);
     }
 
     #[test]

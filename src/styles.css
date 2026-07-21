@@ -214,6 +214,10 @@ body {
   background-color: var(--error);
 }
 
+.status-dot.status-unhealthy {
+  background-color: var(--error);
+}
+
 .status-dot.status-running.active {
   animation: pulse-green 2s infinite;
 }
@@ -223,6 +227,10 @@ body {
 }
 
 .status-dot.status-stopped.active {
+  animation: pulse-red 2s infinite;
+}
+
+.status-dot.status-unhealthy.active {
   animation: pulse-red 2s infinite;
 }
 
@@ -286,6 +294,10 @@ body {
 }
 
 .status-text.status-stopped {
+  color: var(--error);
+}
+
+.status-text.status-unhealthy {
   color: var(--error);
 }
 
@@ -756,6 +768,13 @@ button.check-action:disabled {
   color: var(--text-faint);
 }
 
+/* URLs in log lines are clickable (opened in the system browser); inherit
+   the line's level color so links don't break the log's color coding. */
+.log-line a {
+  color: inherit;
+  text-decoration: underline;
+}
+
 /* ─── Dashboard Placeholder ──────────────────────────────────────────────── */
 .dashboard-placeholder {
   display: flex;
@@ -917,4 +936,31 @@ button.check-action:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* ─── Segmented control (Release / Beta channel) ─────────────────────────── */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-input);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented-btn {
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  border: none;
+  padding: 6px 18px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.segmented-btn + .segmented-btn {
+  border-left: 1px solid var(--border-input);
+}
+.segmented-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+.segmented-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
