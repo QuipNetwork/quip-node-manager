@@ -114,9 +114,9 @@ tag live in `src-tauri/src/compose.rs` (`CPU_IMAGE`, `CUDA_IMAGE`,
 `VALIDATOR_IMAGE`, `DASHBOARD_IMAGE`, `COMPOSE_IMAGE_TAG = "v0.2"`), written into
 `.env` as `QUIP_MINER_TAG`/`QUIP_VALIDATOR_TAG`/`QUIP_DASHBOARD_TAG`:
 
-- Miner (CPU): `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:v0.2`
-- Miner (CUDA): `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2`
-- Validator: `registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2`
+- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu:v0.2`
+- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda:v0.2`
+- Validator: `registry.gitlab.com/quip.network/quip-validator/quip-network-node:v0.2`
 - Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network:v0.2`
 - Postgres: `postgres:16` (Docker Hub)
 - Caddy: `caddy:2-alpine` (Docker Hub)

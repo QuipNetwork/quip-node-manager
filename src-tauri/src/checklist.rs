@@ -841,7 +841,7 @@ async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
                     .with_label(format!(
                         "Native miner binary installed (v{installed}); couldn't reach release feed"
                     ))
-                    .with_detail("update check skipped — could not list quip-protocol releases"),
+                    .with_detail("update check skipped — could not list quip-miner releases"),
             }
         }
         // Rare: HTTP client couldn't even be built. Binary still runs.

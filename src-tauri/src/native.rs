@@ -7,7 +7,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
-const PROTOCOL_PROJECT: &str = "quip.network%2Fquip-protocol";
+const MINER_PROJECT: &str = "quip.network%2Fquip-miner";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -87,7 +87,7 @@ fn binary_release_marker_path() -> std::path::PathBuf {
         .join(format!("{}.release", binary_name()))
 }
 
-/// Fetch the quip-protocol releases list (GitLab returns them newest-first).
+/// Fetch the quip-miner releases list (GitLab returns them newest-first).
 /// Returns the URL it hit and the specific cause on failure so callers can show
 /// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
 /// than a generic "couldn't list releases".
@@ -96,7 +96,7 @@ pub(crate) async fn fetch_protocol_releases(
 ) -> Result<serde_json::Value, String> {
     let url = format!(
         "https://gitlab.com/api/v4/projects/{}/releases?per_page=20",
-        PROTOCOL_PROJECT
+        MINER_PROJECT
     );
     let resp = client
         .get(&url)
@@ -541,7 +541,7 @@ pub(crate) async fn download_native_binary_core(
         .await
         .ok_or_else(|| {
             format!(
-                "No downloadable quip-protocol release ships {name} on the {channel:?} \
+                "No downloadable quip-miner release ships {name} on the {channel:?} \
                  channel yet — the build may still be running, or the channel has no \
                  published builds. Try again shortly."
             )
@@ -577,7 +577,7 @@ pub(crate) async fn download_native_binary_core(
     if !resp.status().is_success() {
         return Err(format!(
             "Download failed: HTTP {}. No release found — \
-             a tagged release of quip-protocol is required.",
+             a tagged release of quip-miner is required.",
             resp.status()
         ));
     }

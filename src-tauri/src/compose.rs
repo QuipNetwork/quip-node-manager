@@ -474,10 +474,10 @@ async fn run_compose_streaming_mode(
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu";
-pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda";
+pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu";
+pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda";
 pub const VALIDATOR_IMAGE: &str =
-    "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node";
+    "registry.gitlab.com/quip.network/quip-validator/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
 pub const COMPOSE_IMAGE_TAG: &str = "v0.2";
 
@@ -1428,15 +1428,15 @@ mod tests {
     fn miner_image_paths_use_v02_names() {
         assert_eq!(
             image_for_tag(ImageTag::Cpu),
-            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu"
+            "registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu"
         );
         assert_eq!(
             image_for_tag(ImageTag::Cuda),
-            "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda"
+            "registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda"
         );
         assert_eq!(
             VALIDATOR_IMAGE,
-            "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node"
+            "registry.gitlab.com/quip.network/quip-validator/quip-network-node"
         );
         assert_eq!(
             DASHBOARD_IMAGE,
