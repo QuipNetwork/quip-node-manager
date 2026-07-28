@@ -391,7 +391,7 @@ Tasks:
   - CPU miner: `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu`
   - CUDA miner: `registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda`
   - validator:
-    `registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node`
+    `registry.gitlab.com/quip.network/quip-validator/quip-network-node`
   - dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network`
 - Use configured preview tags where possible instead of hardcoded `latest`.
 - Include validator in relevant image checks for Docker mode.

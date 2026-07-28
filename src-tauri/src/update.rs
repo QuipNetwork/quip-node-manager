@@ -427,8 +427,8 @@ mod tests {
             ),
             (
                 ImageRef::Validator,
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
-                "quip.network/quip-protocol-rs/quip-network-node",
+                "registry.gitlab.com/quip.network/quip-validator/quip-network-node:v0.2",
+                "quip.network/quip-validator/quip-network-node",
                 "Validator",
             ),
             (
@@ -463,7 +463,7 @@ mod tests {
             docker_images,
             vec![
                 "registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:v0.2",
-                "registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node:v0.2",
+                "registry.gitlab.com/quip.network/quip-validator/quip-network-node:v0.2",
                 "registry.gitlab.com/quip.network/dashboard.quip.network:v0.2",
             ]
         );

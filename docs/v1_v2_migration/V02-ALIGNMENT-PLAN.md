@@ -19,7 +19,7 @@ The v0.2 stack is a topology change, not just an image update.
   - `quip-miner-cuda:${QUIP_MINER_TAG:-v0.2-preview}`
 - A new substrate validator service is bundled into the `cpu` and `cuda`
   profiles:
-  - `registry.gitlab.com/quip.network/quip-protocol-rs/quip-network-node`
+  - `registry.gitlab.com/quip.network/quip-validator/quip-network-node`
 - The old `qpu` compose service/profile is removed. QPU mining is now CPU miner
   plus `[qpu]` and `[dwave]` config sections.
 - A new `quip-bootstrap` sidecar registers and funds the miner before the miner
@@ -426,7 +426,7 @@ Update image references:
 
 - CPU miner: `quip-protocol/quip-miner-cpu`
 - CUDA miner: `quip-protocol/quip-miner-cuda`
-- Validator: `quip-protocol-rs/quip-network-node`
+- Validator: `quip-validator/quip-network-node`
 - Dashboard: `dashboard.quip.network`
 
 Digest checks should use the configured tags, not hardcoded `latest`, once the
