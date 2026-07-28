@@ -53,6 +53,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.2
+
+- **Fixed image pulls after the GitLab project renames**: upstream renamed `quip-protocol` to `quip-miner` and `quip-protocol-rs` to `quip-validator`. The container registry doesn't redirect renamed paths, so pulls from the old paths failed with "denied, requested access to the resource is denied" and the stack couldn't start. The compose file, the update checker's image list, and the native-binary release lookup all point at the new paths now. Existing installs pick this up on the next Start, which rewrites the staged `docker-compose.yml`.
+
+---
+
 ## v0.2
 
 - **Bundled local validator**: every Docker stack now runs a Substrate block-producing validator (`quip-validator`) alongside the miner, dashboard, postgres, and Caddy. The miner self-bootstraps on first start — it funds your keystore from the testnet faucet and registers it in `QuantumPow.Miners` — so no separate bootstrap container is needed. The miner talks to the validator over RPC — `ws://quip-validator:9944` in Docker mode, or `ws://127.0.0.1:9944` (published on the host loopback) when the miner runs natively on macOS. The manager waits for the validator's RPC to come up before starting a native miner.

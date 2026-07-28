@@ -56,7 +56,7 @@ pub fn pick_channel_tag(tags: &[String], channel: UpdateChannel) -> Option<Strin
 
 /// The registry path a repository is addressed by in the v2 API — the image
 /// reference with the `registry.gitlab.com/` host stripped (e.g.
-/// `quip.network/quip-protocol/quip-miner-cpu`).
+/// `quip.network/quip-miner/quip-miner-cpu`).
 pub fn repo_path(image: &str) -> &str {
     image
         .strip_prefix("registry.gitlab.com/")
@@ -201,8 +201,8 @@ mod tests {
     #[test]
     fn repo_path_strips_registry_host() {
         assert_eq!(
-            repo_path("registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu"),
-            "quip.network/quip-protocol/quip-miner-cpu"
+            repo_path("registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu"),
+            "quip.network/quip-miner/quip-miner-cpu"
         );
         assert_eq!(repo_path("quip.network/x"), "quip.network/x");
     }
