@@ -53,6 +53,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc1
+
+- **Track the v0.3 miner images**: v0.3 replaced the per-backend miner images with one image per accelerator, each bundling the coordinator and every miner it supports. Those images live in new registry repositories, so the manager kept resolving the v0.2 line and reported Miner v0.2.1 on both channels. It now reads `quip-miner/v0.3/quip-miner` and `quip-miner/v0.3/quip-miner-cuda`, and the image tag is the single version it tracks — the miners inside move on their own cadence. Beta picks up `v0.3.0-rc1`.
+
+  This build is itself a release candidate, so only the Beta channel offers it. The v0.3 repositories carry no stable tag yet, so switching a v0.3-tracking build to the Release channel leaves the miner image unresolved until a stable v0.3 image is cut.
+
+  Native mode is unchanged and still installs the v0.2 binary from quip-miner releases. v0.3 publishes no such binary, so Native mode does not yet reach v0.3.
+
+---
+
 ## v0.2.2
 
 - **Fixed image pulls after the GitLab project renames**: upstream renamed `quip-protocol` to `quip-miner` and `quip-protocol-rs` to `quip-validator`. The container registry doesn't redirect renamed paths, so pulls from the old paths failed with "denied, requested access to the resource is denied" and the stack couldn't start. The compose file, the update checker's image list, and the native-binary release lookup all point at the new paths now. Existing installs pick this up on the next Start, which rewrites the staged `docker-compose.yml`.
