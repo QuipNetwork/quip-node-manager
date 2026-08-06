@@ -474,8 +474,13 @@ async fn run_compose_streaming_mode(
 
 // ── image registry paths ───────────────────────────────────────────────────
 
-pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu";
-pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda";
+// v0.3 ships one image per accelerator, each bundling the coordinator with
+// every miner it supports, so the image tag is the single version the manager
+// tracks — the miners inside move on their own cadence. The v0.2 images
+// (`quip-miner/quip-miner-{cpu,cuda}`) are a separate repository line and stop
+// at v0.2.1.
+pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner";
+pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda";
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-validator/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
@@ -1425,14 +1430,14 @@ mod tests {
     }
 
     #[test]
-    fn miner_image_paths_use_v02_names() {
+    fn miner_image_paths_use_v03_names() {
         assert_eq!(
             image_for_tag(ImageTag::Cpu),
-            "registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu"
+            "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner"
         );
         assert_eq!(
             image_for_tag(ImageTag::Cuda),
-            "registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda"
+            "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda"
         );
         assert_eq!(
             VALIDATOR_IMAGE,
