@@ -44,19 +44,124 @@ impl Default for NativeProcessState {
     }
 }
 
-pub fn binary_name() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "quip-miner-macos-arm64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "quip-miner-macos-x86_64"
-    } else {
-        "quip-miner"
+/// The release asset Native mode installs. v0.3 ships one macOS bundle holding
+/// the coordinator and every darwin-arm64 miner, rather than the single
+/// `quip-miner-*` binary v0.2 published.
+pub fn bundle_asset_name() -> &'static str {
+    "quip-miner-darwin-arm64.tar.gz"
+}
+
+/// Native mode exists so Metal mining can reach the Apple Silicon GPU, which a
+/// container cannot. Every other platform is served by the v0.3 images, which
+/// carry the CPU, D-Wave and CUDA miners, so Native mode is offered only here.
+pub fn native_supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+/// Refuse Native mode where the bundle does not exist, before any download.
+///
+/// Without this the failure is a 404 on the release asset, which reads as a
+/// broken release rather than an unsupported platform.
+fn ensure_native_supported() -> Result<(), String> {
+    if native_supported() {
+        return Ok(());
+    }
+    Err("Native mode requires an Apple Silicon Mac. On this platform, use \
+         Docker mode — the v0.3 images carry the CPU, D-Wave and CUDA miners."
+        .to_string())
+}
+
+fn bin_dir() -> std::path::PathBuf {
+    data_dir().join("bin")
+}
+
+/// The process Native mode supervises. The coordinator spawns the miners
+/// itself, per the `[cpu]`/`[metal]` sections of the config it is given.
+pub fn coordinator_path() -> std::path::PathBuf {
+    bin_dir().join("quip-coordinator")
+}
+
+/// Absolute path to a bundled miner, for the `binary` key of a config section.
+///
+/// The coordinator spawns miners with `Command::new(binary)`. A bare name there
+/// goes through a PATH lookup, and the bundle's bin dir is not on PATH, so
+/// naming a miner by absolute path is what makes Native mode resolve it.
+pub fn miner_binary_path(name: &str) -> std::path::PathBuf {
+    bin_dir().join(name)
+}
+
+/// Extract the bundle into `dest`, flattening the archive's single top-level
+/// directory so binaries land at `dest/<name>`, which is the path the rendered
+/// config names in each section's `binary` key (see `config::native_binary`).
+///
+/// Returns the installed binary paths. `MANIFEST` is unpacked but not returned:
+/// it records which miner release each binary came from, which matters for
+/// support because the miners are versioned independently.
+fn extract_bundle(tarball: &Path, dest: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("Cannot create bin dir: {e}"))?;
+
+    let f = std::fs::File::open(tarball).map_err(|e| format!("Cannot open bundle: {e}"))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(f));
+
+    let mut installed = Vec::new();
+    for entry in archive.entries().map_err(|e| format!("Bad bundle: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("Bad bundle entry: {e}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().map_err(|e| format!("Bad bundle path: {e}"))?;
+        // Flatten to the final component. This also makes path traversal
+        // impossible: a bare filename cannot escape `dest`.
+        let Some(name) = path.file_name().map(std::ffi::OsString::from) else {
+            continue;
+        };
+        let out = dest.join(&name);
+        entry
+            .unpack(&out)
+            .map_err(|e| format!("Cannot write {}: {e}", out.display()))?;
+        if name != "MANIFEST" {
+            installed.push(out);
+        }
+    }
+    if installed.is_empty() {
+        return Err("Bundle contained no binaries".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in &installed {
+            let mut perms = std::fs::metadata(p)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(installed)
+}
+
+/// Remove `com.apple.quarantine` from the freshly installed binaries.
+///
+/// They are ad-hoc signed rather than notarised, so Gatekeeper rejects them
+/// (`spctl -a -t exec` reports "rejected"). Unquarantined they run normally;
+/// quarantined they are killed with SIGKILL and produce no output at all,
+/// which is indistinguishable from a crash. `reqwest` does not set the
+/// attribute, but a quarantined `.app` can propagate it to files it writes, so
+/// strip it rather than depend on that. Having nothing to remove is the normal
+/// case and `xattr -d` exits non-zero for it, so failures are ignored.
+#[cfg(target_os = "macos")]
+fn strip_quarantine(paths: &[std::path::PathBuf]) {
+    for p in paths {
+        let _ = crate::cmd::new("xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(p)
+            .output();
     }
 }
 
-fn binary_path() -> std::path::PathBuf {
-    data_dir().join("bin").join(binary_name())
-}
+#[cfg(not(target_os = "macos"))]
+fn strip_quarantine(_paths: &[std::path::PathBuf]) {}
 
 /// Remove pre-v0.2 native binaries (named `quip-network-node-*`) and their
 /// `.release` markers from `bin_dir`. The v0.2 manager downloads and runs
@@ -84,7 +189,7 @@ pub fn cleanup_legacy_binaries() -> Vec<String> {
 fn binary_release_marker_path() -> std::path::PathBuf {
     data_dir()
         .join("bin")
-        .join(format!("{}.release", binary_name()))
+        .join("quip-miner.release")
 }
 
 /// Fetch the quip-miner releases list (GitLab returns them newest-first).
@@ -211,7 +316,7 @@ fn normalize_release_version(value: &str) -> String {
 }
 
 pub fn is_binary_available() -> bool {
-    let path = binary_path();
+    let path = coordinator_path();
     path.exists() && path.is_file()
 }
 
@@ -438,7 +543,7 @@ pub fn detect_orphan_node() -> Option<u32> {
 /// Get the installed binary version by running `--version`.
 /// Uses a 60-second timeout since some binary versions are slow to respond.
 pub fn installed_binary_version() -> Option<String> {
-    let bin = binary_path();
+    let bin = coordinator_path();
     if !bin.exists() {
         return None;
     }
@@ -475,17 +580,27 @@ pub fn installed_binary_version() -> Option<String> {
         use std::io::Read;
         let _ = stdout.read_to_string(&mut text);
     }
-    let version = text
-        .trim()
-        .rsplit(' ')
-        .next()
-        .unwrap_or(text.trim())
-        .trim_start_matches('v')
-        .to_string();
+    parse_version_output(&text)
+}
+
+/// Pull the version out of a `--version` line.
+///
+/// Clap prints `<program> <version>`, and the coordinator's version string
+/// carries a protocol suffix, so the real output is
+/// `quip-coordinator 0.3.0 protocol 1`. Take the token after the program name
+/// rather than the last token: the last token is the protocol number, which
+/// would be reported as the miner version and would sort as newer than every
+/// release tag, suppressing update prompts forever.
+fn parse_version_output(text: &str) -> Option<String> {
+    let line = text.lines().next()?.trim();
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    // A bare `0.3.0` with no program name is still accepted.
+    let version = tokens.next().unwrap_or(first).trim_start_matches('v');
     if version.is_empty() {
         None
     } else {
-        Some(version)
+        Some(version.to_string())
     }
 }
 
@@ -523,7 +638,9 @@ pub(crate) async fn download_native_binary_core(
 ) -> Result<String, String> {
     use std::io::Write;
 
-    let name = binary_name();
+    ensure_native_supported()?;
+
+    let name = bundle_asset_name();
 
     // Serialize downloads so concurrent callers coalesce instead of racing the
     // shared temp path (see `download_guard`). Held across the whole download.
@@ -584,12 +701,11 @@ pub(crate) async fn download_native_binary_core(
 
     let total = resp.content_length();
 
-    // Stream to file
-    let bin_dir = data_dir().join("bin");
+    // Stream the bundle to a temp file, then extract it over the bin dir.
+    let bin_dir = bin_dir();
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("Cannot create bin dir: {}", e))?;
 
-    let dest = binary_path();
-    let tmp = dest.with_extension("tmp");
+    let tmp = bin_dir.join("bundle.tar.gz.tmp");
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("Cannot create file: {}", e))?;
 
     // Progress is surfaced as a bar in the UI via binary-download-progress;
@@ -606,19 +722,14 @@ pub(crate) async fn download_native_binary_core(
     }
     drop(file);
 
-    // Move tmp → final
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("Cannot install binary: {}", e))?;
+    let installed = extract_bundle(&tmp, &bin_dir)?;
+    strip_quarantine(&installed);
+    let _ = std::fs::remove_file(&tmp);
+    sink.log(
+        "INFO",
+        &format!("Installed {} binaries from {tag}", installed.len()),
+    );
 
-    // chmod +x on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)
-            .map_err(|e| e.to_string())?
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
-    }
     // Best-effort: the binary is already installed. A failed marker only
     // affects update detection, so warn instead of failing the download — but
     // don't swallow it silently, or stale-marker bugs become invisible.
@@ -685,7 +796,7 @@ pub async fn resolve_binary_versions() -> Result<BinaryVersions, String> {
             // Only offer an update we can actually install — a just-tagged
             // release whose artifact build hasn't finished is skipped until
             // it's downloadable.
-            resolve_latest_downloadable_release(&client, &releases, binary_name(), channel)
+            resolve_latest_downloadable_release(&client, &releases, bundle_asset_name(), channel)
                 .await
                 .filter(|(tag, _, _)| !tag.is_empty())
         }
@@ -763,6 +874,8 @@ pub(crate) async fn start_native_node_core(
     sink: Arc<dyn ProgressSink>,
     state: &NativeProcessState,
 ) -> Result<String, String> {
+    ensure_native_supported()?;
+
     // Check for already-running process (in-memory or orphan from PID file)
     if let Some(child) = state.child.lock().unwrap().as_ref() {
         let pid = child.id();
@@ -815,7 +928,7 @@ pub(crate) async fn start_native_node_core(
     // Auto-provision the miner binary when it's missing — mirrors Docker
     // mode pulling images on start, so a fresh or relocated data dir doesn't
     // dead-end here.
-    let bin = binary_path();
+    let bin = coordinator_path();
     if !bin.exists() {
         sink.log(
             "INFO",
@@ -1074,18 +1187,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_binary_name_uses_v02_miner_asset() {
-        assert!(binary_name().starts_with("quip-miner"));
-        assert!(!binary_name().starts_with("quip-network-node"));
-    }
-
-    #[test]
     fn cleanup_removes_legacy_node_binaries_keeps_current() {
         let dir = std::env::temp_dir().join(format!("quip-bin-cleanup-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = dir.join("quip-network-node-macos-arm64");
         let legacy_marker = dir.join("quip-network-node-macos-arm64.release");
-        let current = dir.join(binary_name());
+        let current = dir.join("quip-coordinator");
         std::fs::write(&legacy, b"old").unwrap();
         std::fs::write(&legacy_marker, b"v0.1").unwrap();
         std::fs::write(&current, b"new").unwrap();
@@ -1110,14 +1217,14 @@ mod tests {
                 "tag_name": "v0.2.0rc2",
                 "description": "rc2 notes",
                 "assets": { "links": [
-                    { "name": binary_name(),
+                    { "name": bundle_asset_name(),
                       "direct_asset_url": "https://example/releases/v0.2.0rc2/downloads/bin" }
                 ]}
             },
             {
                 "tag_name": "v0.2.0rc1",
                 "assets": { "links": [
-                    { "name": binary_name(),
+                    { "name": bundle_asset_name(),
                       "direct_asset_url": "https://example/releases/v0.2.0rc1/downloads/bin" }
                 ]}
             },
@@ -1129,7 +1236,7 @@ mod tests {
 
         let candidates = binary_release_candidates(
             &releases,
-            binary_name(),
+            bundle_asset_name(),
             crate::settings::UpdateChannel::Beta,
         );
         let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
@@ -1147,13 +1254,13 @@ mod tests {
         // A stable above the v0.2.0 Release floor, plus a newer rc.
         let releases = serde_json::json!([
             { "tag_name": "v0.2.2-rc1", "assets": { "links": [
-                { "name": binary_name(), "direct_asset_url": "https://example/rc" } ]}},
+                { "name": bundle_asset_name(), "direct_asset_url": "https://example/rc" } ]}},
             { "tag_name": "v0.2.1", "assets": { "links": [
-                { "name": binary_name(), "direct_asset_url": "https://example/stable" } ]}},
+                { "name": bundle_asset_name(), "direct_asset_url": "https://example/stable" } ]}},
         ]);
 
         let tags = |ch| -> Vec<String> {
-            binary_release_candidates(&releases, binary_name(), ch)
+            binary_release_candidates(&releases, bundle_asset_name(), ch)
                 .into_iter()
                 .map(|(t, _, _)| t)
                 .collect()
@@ -1172,7 +1279,7 @@ mod tests {
         ]);
         assert!(binary_release_candidates(
             &releases,
-            binary_name(),
+            bundle_asset_name(),
             crate::settings::UpdateChannel::Beta,
         )
         .is_empty());
@@ -1181,10 +1288,10 @@ mod tests {
     #[test]
     fn asset_url_falls_back_to_url_when_no_direct_asset_url() {
         let rel = serde_json::json!({
-            "assets": { "links": [ { "name": binary_name(), "url": "https://example/u" } ] }
+            "assets": { "links": [ { "name": bundle_asset_name(), "url": "https://example/u" } ] }
         });
         assert_eq!(
-            release_asset_url(&rel, binary_name()).as_deref(),
+            release_asset_url(&rel, bundle_asset_name()).as_deref(),
             Some("https://example/u")
         );
     }
@@ -1195,6 +1302,33 @@ mod tests {
         assert_eq!(normalize_release_version("0.2-preview"), "0.2-preview");
         // Release-candidate tags normalize too, so equality checks match.
         assert_eq!(normalize_release_version("v0.2.0rc1"), "0.2.0rc1");
+    }
+
+    #[test]
+    fn unsupported_platforms_are_refused_and_pointed_at_docker() {
+        let result = ensure_native_supported();
+        assert_eq!(result.is_ok(), native_supported());
+        if let Err(msg) = result {
+            // A refusal without an alternative is a dead end for the user.
+            assert!(msg.contains("Docker"), "no Docker guidance in {msg:?}");
+        }
+    }
+
+    #[test]
+    fn version_parsing_ignores_the_protocol_suffix() {
+        // Measured against the real v0.3.0-rc3 binary.
+        assert_eq!(
+            parse_version_output("quip-coordinator 0.3.0 protocol 1\n").as_deref(),
+            Some("0.3.0")
+        );
+        // The plain two-token shape the v0.2 miner printed still works.
+        assert_eq!(
+            parse_version_output("quip-miner-cpu v0.2.1\n").as_deref(),
+            Some("0.2.1")
+        );
+        assert_eq!(parse_version_output("0.3.0").as_deref(), Some("0.3.0"));
+        assert_eq!(parse_version_output("  \n"), None);
+        assert_eq!(parse_version_output(""), None);
     }
 
     #[test]
@@ -1245,4 +1379,80 @@ mod tests {
             "http://127.0.0.1:20049/rpc"
         );
     }
+
+    #[test]
+    fn bundle_asset_is_the_macos_tarball() {
+        assert_eq!(bundle_asset_name(), "quip-miner-darwin-arm64.tar.gz");
+    }
+
+    #[test]
+    fn native_is_supported_only_on_macos_arm64() {
+        let expected = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        assert_eq!(native_supported(), expected);
+    }
+
+    #[test]
+    fn coordinator_is_the_supervised_process() {
+        let p = coordinator_path();
+        assert!(p.ends_with("quip-coordinator"), "got {}", p.display());
+        assert!(p.parent().is_some_and(|d| d.ends_with("bin")));
+    }
+
+    #[test]
+    fn extract_bundle_flattens_and_marks_executable() {
+        let tmp = std::env::temp_dir().join(format!("quip-bundle-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("quip-miner-darwin-arm64");
+        std::fs::create_dir_all(&src).expect("setup dir");
+        std::fs::write(src.join("quip-coordinator"), b"#!/bin/sh\nexit 0\n").expect("w1");
+        std::fs::write(src.join("quip-cpu-sa"), b"#!/bin/sh\nexit 0\n").expect("w2");
+        std::fs::write(src.join("MANIFEST"), b"quip-miner v0.3.0-rc3\n").expect("w3");
+
+        let tarball = tmp.join("b.tar.gz");
+        let f = std::fs::File::create(&tarball).expect("create tarball");
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut ar = tar::Builder::new(enc);
+        ar.append_dir_all("quip-miner-darwin-arm64", &src).expect("append");
+        ar.into_inner().expect("inner").finish().expect("finish");
+
+        let dest = tmp.join("bin");
+        let installed = extract_bundle(&tarball, &dest).expect("extract should succeed");
+
+        assert!(dest.join("quip-coordinator").is_file());
+        assert!(dest.join("quip-cpu-sa").is_file());
+        assert!(dest.join("MANIFEST").is_file(), "MANIFEST is unpacked");
+        assert!(
+            !dest.join("quip-miner-darwin-arm64").exists(),
+            "archive top-level dir must be flattened away"
+        );
+        assert_eq!(installed.len(), 2, "MANIFEST is not an installed binary");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dest.join("quip-coordinator"))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "every binary must be executable");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_bundle_rejects_an_empty_archive() {
+        let tmp = std::env::temp_dir().join(format!("quip-empty-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("setup");
+        let tarball = tmp.join("empty.tar.gz");
+        let f = std::fs::File::create(&tarball).expect("create");
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        tar::Builder::new(enc).into_inner().expect("inner").finish().expect("finish");
+
+        let err = extract_bundle(&tarball, &tmp.join("bin")).expect_err("must reject");
+        assert!(err.contains("no binaries"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 }
