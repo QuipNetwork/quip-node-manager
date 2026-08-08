@@ -7,13 +7,13 @@
 **macOS / Linux:**
 
 ```sh
-curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0/scripts/install.sh | sh
+curl -fsSL https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://gitlab.com/quip.network/quip-node-manager/-/raw/v0.2.0/scripts/install.ps1 | iex
+irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
 ```
 
 ## Manual Install
@@ -52,6 +52,16 @@ Download the `.exe` and run it. Windows SmartScreen may show a warning because t
 Click **More info**, then **Run anyway**.
 
 ---
+
+## v0.2.3-rc2
+
+- **Native mode installs the v0.3 macOS bundle**: the manager downloaded the single `quip-miner` binary that v0.2 published and v0.3 does not, so it had nothing to install. It now fetches `quip-miner-darwin-arm64.tar.gz` and extracts the coordinator with every darwin-arm64 miner. The coordinator is the supervised process and starts the miners itself.
+
+  Three details decide whether this works at all. The extracted binaries are ad-hoc signed rather than notarized, so a quarantine attribute kills them with no output. The install strips that attribute. Each miner is named by absolute path in the generated `config.toml`, because the coordinator resolves a bare name through PATH and the install directory is not on it. Version detection reads the coordinator and ignores the protocol suffix in its output.
+
+  Native mode now refuses to start anywhere except an Apple Silicon Mac, and points at Docker mode instead. The v0.3 images carry the CPU, D-Wave and CUDA miners, so the one capability Native mode adds is Metal, which reaches a GPU no container can.
+
+- **Install links track `main`**: the Quick Install commands fetched the installer from the `v0.2.0` tag, two releases back. They now read it from `main`. The installer resolves the newest release itself, so the fetch URL needs no further bump.
 
 ## v0.2.3-rc1
 

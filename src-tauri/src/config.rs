@@ -67,8 +67,25 @@ struct MinerToml {
     node_log: String,
 }
 
+/// Absolute path to a bundled miner in Native mode, empty in Docker mode.
+///
+/// The coordinator resolves a bare `binary` name through PATH. In the image the
+/// miners are installed to `/usr/local/bin`, so the default bare name is right
+/// there and a host path would not exist. On the host nothing puts the bundle's
+/// bin dir on PATH, so the section must name the miner outright.
+fn native_binary(run_mode: &RunMode, name: &str) -> String {
+    match run_mode {
+        RunMode::Docker => String::new(),
+        RunMode::Native => crate::native::miner_binary_path(name)
+            .to_string_lossy()
+            .to_string(),
+    }
+}
+
 #[derive(Serialize)]
 struct CpuToml {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    binary: String,
     num_cpus: u32,
 }
 
@@ -89,6 +106,8 @@ struct CudaDeviceToml {
 #[derive(Serialize)]
 struct DwaveToml {
     #[serde(skip_serializing_if = "String::is_empty")]
+    binary: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     token: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     daily_budget: String,
@@ -106,6 +125,8 @@ struct MarkerToml {}
 /// than relying on a shared `[gpu]` block.
 #[derive(Serialize)]
 struct MetalToml {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    binary: String,
     utilization: u8,
     yielding: bool,
     active_util: u8,
@@ -227,6 +248,7 @@ impl ConfigToml {
             }
             Some(GpuBackend::Mps) => {
                 metal = Some(MetalToml {
+                    binary: native_binary(run_mode, "quip-metal-sa"),
                     utilization: config.metal_config.utilization,
                     yielding: config.metal_config.yielding,
                     active_util: config.metal_config.active_util,
@@ -241,6 +263,7 @@ impl ConfigToml {
             Some(dw) => (
                 Some(MarkerToml::default()),
                 Some(DwaveToml {
+                    binary: native_binary(run_mode, "quip-dwave-qa"),
                     token: dw.token.clone(),
                     daily_budget: dw.daily_budget.clone(),
                     solver: dw.solver.clone(),
@@ -253,6 +276,7 @@ impl ConfigToml {
         ConfigToml {
             miner,
             cpu: config.cpu_enabled.then_some(CpuToml {
+                binary: native_binary(run_mode, "quip-cpu-sa"),
                 num_cpus: config.num_cpus,
             }),
             gpu,
@@ -305,6 +329,55 @@ mod tests {
             gpu_device_configs: devices,
             ..NodeConfig::default()
         }
+    }
+
+    #[test]
+    fn native_miner_binaries_are_absolute_paths() {
+        // The coordinator spawns each miner with `Command::new(binary)`. A bare
+        // name there is resolved through PATH, not through the coordinator's
+        // working directory, and the bundle's bin dir is on neither. So Native
+        // mode must name each miner by absolute path.
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            dwave_config: Some(DwaveConfig {
+                token: "tok".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        let rendered = render_config_toml(&cfg, &RunMode::Native);
+        let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
+
+        for (section, binary) in [
+            ("cpu", "quip-cpu-sa"),
+            ("metal", "quip-metal-sa"),
+            ("dwave", "quip-dwave-qa"),
+        ] {
+            let got = parsed[section]["binary"]
+                .as_str()
+                .unwrap_or_else(|| panic!("[{section}] has no binary key"));
+            let path = std::path::Path::new(got);
+            assert!(path.is_absolute(), "[{section}] binary {got} is not absolute");
+            assert!(path.ends_with(binary), "[{section}] binary is {got}");
+        }
+    }
+
+    #[test]
+    fn docker_miner_binaries_stay_bare_names() {
+        // Inside the image the miners live in /usr/local/bin, which is on PATH.
+        // A host path would not exist in the container.
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "tok".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        let rendered = render_config_toml(&cfg, &RunMode::Docker);
+        let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
+
+        assert!(parsed["cpu"].get("binary").is_none());
+        assert!(parsed["dwave"].get("binary").is_none());
     }
 
     #[test]
@@ -577,3 +650,4 @@ mod tests {
         assert!(toml.contains("solver = \"Advantage2_System1.13\""));
     }
 }
+
