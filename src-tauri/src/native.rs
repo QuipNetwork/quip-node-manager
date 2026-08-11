@@ -1007,23 +1007,35 @@ pub(crate) async fn start_native_node_core(
     Ok(format!("Native miner started (PID {})", pid))
 }
 
-/// Tail node logs: starts with node-output.log (process stdout),
-/// then switches to node.log once the node creates it.
+/// Tail native-mode logs: host `node-output.log` (miner) plus compose logs
+/// for the containerized support services (validator/dashboard/postgres/caddy).
 fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
-    use crate::log_stream::{start_log_stream_for_app, FallbackSource};
+    use crate::log_stream::{
+        sources_for_run_mode, start_log_stream_for_app, LogStreamState,
+    };
+    use crate::settings::RunMode;
+    use tauri::Manager;
     let path = node_output_log_path();
     let _ = app.emit(
         "node-log",
         serde_json::json!({
             "timestamp": "",
             "level": "INFO",
-            "message": format!("[log-stream] tailing {}", path.display()),
+            "message": format!(
+                "[log-stream] native hybrid: tail {} + compose logs -f",
+                path.display()
+            ),
+            "source": "app",
         }),
     );
-    // Native path has no `docker logs` child, so the PID slot goes unused.
-    let child_pid = Arc::new(Mutex::new(None));
-    let fallback = FallbackSource::File(path);
-    start_log_stream_for_app(app, stop_flag, child_pid, fallback);
+    // ComposeAll spawns `docker compose logs -f`; store its PID in the shared
+    // LogStreamState so stop_stack / stop_log_stream / stop_native_node can
+    // kill it and unblock BufReader::lines().
+    let log_state = app.state::<LogStreamState>();
+    log_state.kill_child();
+    let child_pid = Arc::clone(&log_state.child_pid);
+    let sources = sources_for_run_mode(&RunMode::Native);
+    start_log_stream_for_app(app, stop_flag, child_pid, sources);
 }
 
 /// Start tailing native node logs (for orphan reconnect on app restart).
@@ -1037,7 +1049,8 @@ pub async fn start_native_log_tail(
         serde_json::json!({
             "timestamp": "",
             "level": "INFO",
-            "message": "[log-stream] starting native tail (node-output.log \u{2192} node.log)",
+            "message": "[log-stream] starting native multi-source tail",
+            "source": "app",
         }),
     );
     let stop_flag = Arc::clone(&state.stop_flag);
@@ -1062,6 +1075,13 @@ pub async fn stop_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
+    // Unblock the hybrid compose log child before signalling the stop flag.
+    {
+        use crate::log_stream::LogStreamState;
+        use tauri::Manager;
+        let log_state = app.state::<LogStreamState>();
+        log_state.kill_child();
+    }
     let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
     stop_native_node_core(sink, &state).await?;
     // trigger_recheck_auto requires an AppHandle; runs only in the GUI wrapper.

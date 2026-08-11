@@ -171,6 +171,7 @@ impl CheckCtx {
             "timestamp": "",
             "level": level,
             "message": format!("[probe] {}", message.into()),
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     }
@@ -1011,6 +1012,7 @@ fn emit_log(app: &AppHandle, auto: bool, verb: &str, item: &CheckItem, level: &s
         "timestamp": "",
         "level": level,
         "message": message,
+        "source": "app",
     });
     let _ = app.emit("node-log", entry);
 }

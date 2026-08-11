@@ -113,6 +113,7 @@ pub fn run() {
             update::get_app_version,
             update::get_node_version,
             update::check_app_update,
+            update::check_for_updates_now,
             update::resolve_channel_info,
             update::restart_to_update,
             // Log streaming

@@ -289,15 +289,19 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
         .map_err(|e| e.to_string())?;
 
     let url = "https://gitlab.com/api/v4/projects/quip.network%2Fquip-node-manager/releases";
-    let releases: Vec<GitLabRelease> = match client
+    let resp = client
         .get(url)
         .header("User-Agent", "quip-node-manager")
         .send()
         .await
-    {
-        Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => return Ok(None),
-    };
+        .map_err(|e| format!("releases API: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("releases API HTTP {}", resp.status()));
+    }
+    let releases: Vec<GitLabRelease> = resp
+        .json()
+        .await
+        .map_err(|e| format!("releases API body: {e}"))?;
 
     // Track the channel: Release only offers new stable app releases, Beta also
     // offers newer rc's. Picks the highest matching release, not just the newest
@@ -320,30 +324,213 @@ pub async fn check_app_update() -> Result<Option<UpdateInfo>, String> {
     }
 }
 
-/// Per-image `(display name, newer tag)` for every stack image whose registry
-/// now carries a higher channel tag than the one pinned in `.env`. Each image
-/// is checked against its OWN registry and its OWN pinned tag — they advance
-/// independently. Images with no `.env` pin (stack never started) or an
-/// unreachable registry are skipped. Postgres and Caddy use Docker Hub version
-/// tags and come in via routine `docker compose pull`.
-async fn check_stack_image_updates(
+// ── Shared update-check path (periodic monitor + manual button) ────────────
+
+/// High-level classification of one full update sweep. Found updates win over
+/// partial check failures so a user still sees what is available when only
+/// one source is unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheckStatus {
+    UpdatesAvailable,
+    UpToDate,
+    CheckFailed,
+}
+
+/// One stack image with a newer channel tag than the pin in `.env`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUpdateInfo {
+    pub image: String,
+    pub version: String,
+}
+
+/// Result of one app + images + (optional) native-binary update sweep.
+/// Returned by the manual "Check for updates" command so the UI can show
+/// "you are up to date" and surface registry/API failures distinctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheckOutcome {
+    pub status: UpdateCheckStatus,
+    pub app_update: Option<UpdateInfo>,
+    pub image_updates: Vec<ImageUpdateInfo>,
+    pub binary_update: Option<UpdateInfo>,
+    /// Per-source failure messages (registry / releases API unreachable).
+    pub errors: Vec<String>,
+    /// Single line suitable for the log drawer.
+    pub message: String,
+}
+
+/// Pure classifier: any found update → `UpdatesAvailable`; else any check
+/// error → `CheckFailed`; else `UpToDate`. Found updates take priority so a
+/// partial outage does not hide a real update.
+pub fn classify_update_check(found_updates: bool, check_errors: bool) -> UpdateCheckStatus {
+    if found_updates {
+        UpdateCheckStatus::UpdatesAvailable
+    } else if check_errors {
+        UpdateCheckStatus::CheckFailed
+    } else {
+        UpdateCheckStatus::UpToDate
+    }
+}
+
+/// Build the user-facing summary line for a completed update sweep.
+pub fn summarize_update_check(
+    status: UpdateCheckStatus,
+    app_update: &Option<UpdateInfo>,
+    image_updates: &[ImageUpdateInfo],
+    binary_update: &Option<UpdateInfo>,
+    errors: &[String],
+) -> String {
+    match status {
+        UpdateCheckStatus::UpToDate => "You are up to date.".to_string(),
+        UpdateCheckStatus::CheckFailed => {
+            if errors.is_empty() {
+                "Update check failed.".to_string()
+            } else {
+                format!("Update check failed: {}", errors.join("; "))
+            }
+        }
+        UpdateCheckStatus::UpdatesAvailable => {
+            let mut parts = Vec::new();
+            if let Some(info) = app_update {
+                parts.push(format!("Node Manager v{}", info.version));
+            }
+            for img in image_updates {
+                parts.push(format!("{} image {}", img.image, img.version));
+            }
+            if let Some(info) = binary_update {
+                parts.push(format!("native miner v{}", info.version));
+            }
+            let mut msg = if parts.is_empty() {
+                "Updates available.".to_string()
+            } else {
+                format!("Updates available: {}.", parts.join(", "))
+            };
+            if !errors.is_empty() {
+                msg.push_str(&format!(" (partial check failures: {})", errors.join("; ")));
+            }
+            msg
+        }
+    }
+}
+
+/// Resolve whether `image` has a newer channel tag than `current`. Returns
+/// `Ok(Some(target))` when an update exists, `Ok(None)` when current is
+/// latest (or the channel has no tag), and `Err` when the registry is
+/// unreachable so callers can distinguish failure from "up to date".
+async fn resolve_image_update(
+    image: &str,
+    current: &str,
+    channel: UpdateChannel,
+) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let tags = crate::registry::fetch_registry_tags(&client, crate::registry::repo_path(image))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(target) = crate::registry::pick_channel_tag(&tags, channel) else {
+        return Ok(None);
+    };
+    if parse_semver(&target) > parse_semver(current) {
+        Ok(Some(target))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Dedup ids for OS-notification suppression (image + binary only; app
+/// updates are out of scope for the desktop notification set).
+fn update_ids_from_outcome(outcome: &UpdateCheckOutcome) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for img in &outcome.image_updates {
+        ids.insert(format!("image:{}:{}", img.image, img.version));
+    }
+    if let Some(info) = &outcome.binary_update {
+        ids.insert(format!("binary:{}", info.version));
+    }
+    ids
+}
+
+/// Single implementation of the update sweep used by both the background
+/// monitor and the manual "Check for updates" command. Emits the same
+/// events the monitor has always emitted when updates are found.
+///
+/// Check failures (unreachable registry / releases API) land in
+/// `outcome.errors` and never masquerade as "up to date".
+pub async fn run_update_checks(
+    app: &tauri::AppHandle,
     settings: &crate::settings::AppSettings,
-) -> Vec<(&'static str, String)> {
+) -> UpdateCheckOutcome {
+    let mut errors: Vec<String> = Vec::new();
+    let mut app_update: Option<UpdateInfo> = None;
+    let mut image_updates: Vec<ImageUpdateInfo> = Vec::new();
+    let mut binary_update: Option<UpdateInfo> = None;
+
+    // App release (node-manager itself).
+    match check_app_update().await {
+        Ok(Some(info)) => {
+            let _ = app.emit("app-update-available", &info);
+            crate::set_tray_update(
+                app,
+                true,
+                &format!("Quip Node Manager — v{} available", info.version),
+            );
+            app_update = Some(info);
+        }
+        Ok(None) => {}
+        Err(e) => errors.push(format!("app release: {e}")),
+    }
+
+    // Compose images — each against its own registry + pinned `.env` tag.
+    // Applies in both modes (dashboard + support images run under Native too).
+    // No pin ⇒ stack never started; skip silently (not a check failure).
     let env_keys = ["QUIP_MINER_TAG", "QUIP_VALIDATOR_TAG", "QUIP_DASHBOARD_TAG"];
-    let mut out = Vec::new();
     for ((name, image), key) in stack_images(settings).iter().zip(env_keys) {
         let Some(current) = crate::compose::current_pinned_tag(key) else {
             continue;
         };
-        if let Some(target) =
-            crate::registry::resolve_image_channel_tag(image, settings.update_channel).await
-        {
-            if parse_semver(&target) > parse_semver(&current) {
-                out.push((*name, target));
+        match resolve_image_update(image, &current, settings.update_channel).await {
+            Ok(Some(target)) => {
+                let _ = app.emit(
+                    "image-update-available",
+                    serde_json::json!({ "image": name, "version": target }),
+                );
+                image_updates.push(ImageUpdateInfo {
+                    image: name.to_string(),
+                    version: target,
+                });
             }
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{name} image: {e}")),
         }
     }
-    out
+
+    // Native binary lives on GitLab Releases, not the container registry.
+    if settings.run_mode == crate::settings::RunMode::Native {
+        match crate::native::check_binary_update().await {
+            Ok(Some(info)) => {
+                let _ = app.emit("binary-update-available", &info);
+                binary_update = Some(info);
+            }
+            Ok(None) => {}
+            Err(e) => errors.push(format!("native binary: {e}")),
+        }
+    }
+
+    let found = app_update.is_some() || !image_updates.is_empty() || binary_update.is_some();
+    let status = classify_update_check(found, !errors.is_empty());
+    let message =
+        summarize_update_check(status, &app_update, &image_updates, &binary_update, &errors);
+
+    UpdateCheckOutcome {
+        status,
+        app_update,
+        image_updates,
+        binary_update,
+        errors,
+        message,
+    }
 }
 
 /// True when `current` contains an update id not present in `last` — i.e. a
@@ -363,58 +550,38 @@ fn notify_update_available(app: &tauri::AppHandle) {
         .show();
 }
 
-/// Background task that checks for updates every 30 minutes.
-/// - Docker mode: checks for new image digest
-/// - Native mode: checks for new binary release
-/// - Always: checks for new node-manager app release
+/// User-initiated full update sweep. Always reports what it found (including
+/// "you are up to date" and check failures). Does not touch the background
+/// monitor's `last_notified` dedup set — that lives only in the monitor task.
+#[tauri::command]
+pub async fn check_for_updates_now(app: tauri::AppHandle) -> UpdateCheckOutcome {
+    let settings = crate::settings::load_settings();
+    run_update_checks(&app, &settings).await
+}
+
+/// Background task: first check ~30s after launch, then every 30 minutes.
+/// - Compose images (both modes) + native binary (Native mode)
+/// - Always: node-manager app release
+///
+/// OS notifications are deduped via `last_notified` so the same update does
+/// not re-nag every period. Manual checks never write this set.
 pub async fn background_update_monitor(app: tauri::AppHandle) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
-    // Skip the first immediate tick
-    interval.tick().await;
+    // Stay clear of startup work; do not fire at t=0.
+    tokio::time::sleep(Duration::from_secs(30)).await;
 
     let mut last_notified: HashSet<String> = HashSet::new();
 
     loop {
-        interval.tick().await;
-
         let settings = crate::settings::load_settings();
-
-        // Check for node-manager app updates (out of scope for dedup notification)
-        if let Ok(Some(info)) = check_app_update().await {
-            let _ = app.emit("app-update-available", &info);
-            crate::set_tray_update(
-                &app,
-                true,
-                &format!("Quip Node Manager — v{} available", info.version),
-            );
-        }
-
-        let mut current: HashSet<String> = HashSet::new();
-
-        // Compose-image check — each image compared against its OWN registry
-        // and OWN pinned tag on the selected channel. Applies in both modes:
-        // the dashboard + supporting images run even in Native mode.
-        for (name, target) in check_stack_image_updates(&settings).await {
-            let _ = app.emit(
-                "image-update-available",
-                serde_json::json!({ "image": name, "version": target }),
-            );
-            current.insert(format!("image:{name}:{target}"));
-        }
-
-        // Native binary: separate channel because the binary is not a
-        // container image and lives on GitLab Releases, not the registry.
-        if settings.run_mode == crate::settings::RunMode::Native {
-            if let Ok(Some(info)) = crate::native::check_binary_update().await {
-                let _ = app.emit("binary-update-available", &info);
-                current.insert(format!("binary:{}", info.version));
-            }
-        }
+        let outcome = run_update_checks(&app, &settings).await;
+        let current = update_ids_from_outcome(&outcome);
 
         if has_new_update(&current, &last_notified) {
             notify_update_available(&app);
         }
         last_notified = current;
+
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
     }
 }
 
@@ -469,6 +636,117 @@ mod tests {
         assert!(has_new_update(&ab, &a), "a newly added id notifies");
         assert!(!has_new_update(&a, &ab), "shrinking set does not notify");
         assert!(!has_new_update(&none, &a), "cleared set does not notify");
+    }
+
+    #[test]
+    fn classify_update_check_priority() {
+        // Found updates always win — including when some sources also failed.
+        assert_eq!(
+            classify_update_check(true, false),
+            UpdateCheckStatus::UpdatesAvailable
+        );
+        assert_eq!(
+            classify_update_check(true, true),
+            UpdateCheckStatus::UpdatesAvailable
+        );
+        // No updates + any check error → failed, never "up to date".
+        assert_eq!(
+            classify_update_check(false, true),
+            UpdateCheckStatus::CheckFailed
+        );
+        // Clean sweep, nothing newer.
+        assert_eq!(
+            classify_update_check(false, false),
+            UpdateCheckStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn summarize_update_check_messages() {
+        let none: Option<UpdateInfo> = None;
+        let empty_imgs: Vec<ImageUpdateInfo> = vec![];
+        let no_errs: Vec<String> = vec![];
+
+        assert_eq!(
+            summarize_update_check(
+                UpdateCheckStatus::UpToDate,
+                &none,
+                &empty_imgs,
+                &none,
+                &no_errs
+            ),
+            "You are up to date."
+        );
+
+        let errs = vec!["app release: timeout".into()];
+        let failed = summarize_update_check(
+            UpdateCheckStatus::CheckFailed,
+            &none,
+            &empty_imgs,
+            &none,
+            &errs,
+        );
+        assert!(failed.contains("Update check failed"));
+        assert!(failed.contains("app release: timeout"));
+
+        let app = Some(UpdateInfo {
+            version: "0.2.4".into(),
+            url: "https://example.com".into(),
+            notes: String::new(),
+        });
+        let images = vec![ImageUpdateInfo {
+            image: "Miner".into(),
+            version: "v0.3.0".into(),
+        }];
+        let msg = summarize_update_check(
+            UpdateCheckStatus::UpdatesAvailable,
+            &app,
+            &images,
+            &none,
+            &no_errs,
+        );
+        assert!(msg.contains("Node Manager v0.2.4"));
+        assert!(msg.contains("Miner image v0.3.0"));
+        assert!(!msg.contains("partial check failures"));
+
+        // Partial failure noted alongside found updates.
+        let partial = summarize_update_check(
+            UpdateCheckStatus::UpdatesAvailable,
+            &app,
+            &empty_imgs,
+            &none,
+            &errs,
+        );
+        assert!(partial.contains("Node Manager v0.2.4"));
+        assert!(partial.contains("partial check failures"));
+    }
+
+    #[test]
+    fn update_ids_from_outcome_covers_image_and_binary_only() {
+        let outcome = UpdateCheckOutcome {
+            status: UpdateCheckStatus::UpdatesAvailable,
+            app_update: Some(UpdateInfo {
+                version: "9.9.9".into(),
+                url: "u".into(),
+                notes: String::new(),
+            }),
+            image_updates: vec![ImageUpdateInfo {
+                image: "Miner".into(),
+                version: "v1".into(),
+            }],
+            binary_update: Some(UpdateInfo {
+                version: "0.3.0".into(),
+                url: "u".into(),
+                notes: String::new(),
+            }),
+            errors: vec![],
+            message: String::new(),
+        };
+        let ids = update_ids_from_outcome(&outcome);
+        assert!(ids.contains("image:Miner:v1"));
+        assert!(ids.contains("binary:0.3.0"));
+        // App updates stay out of the OS-notification dedup set.
+        assert!(!ids.iter().any(|id| id.contains("9.9.9")));
     }
 
     #[test]

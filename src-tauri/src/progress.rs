@@ -40,7 +40,12 @@ impl ProgressSink for TauriSink {
     fn log(&self, level: &str, message: &str) {
         let _ = self.app.emit(
             "node-log",
-            serde_json::json!({ "timestamp": "", "level": level, "message": message }),
+            serde_json::json!({
+                "timestamp": "",
+                "level": level,
+                "message": message,
+                "source": "app",
+            }),
         );
     }
     fn pull_progress(&self, event: serde_json::Value) {

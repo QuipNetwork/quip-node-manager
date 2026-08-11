@@ -78,14 +78,27 @@ body {
   flex-shrink: 0;
 }
 
-.app-version {
+.app-version-wrap {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 12px;
+  flex-shrink: 0;
+}
+
+.app-version {
   color: var(--text-faint);
   font-size: 12px;
-  padding: 0 16px;
+  padding: 0 4px;
   align-self: center;
   position: relative;
   cursor: default;
+}
+
+#btn-check-updates {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .app-version.has-update {
@@ -766,6 +779,179 @@ button.check-action:disabled {
 
 .log-line.log-debug {
   color: var(--text-faint);
+}
+
+/* Per-source tag on each log line (miner / validator / app / …). */
+.log-source {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 0 5px;
+  border-radius: 3px;
+  margin-right: 4px;
+  vertical-align: baseline;
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+}
+
+.log-source-miner {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.log-source-validator {
+  color: #a78bfa;
+  border-color: rgba(167, 139, 250, 0.35);
+}
+
+.log-source-dashboard {
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+.log-source-postgres {
+  color: #60a5fa;
+  border-color: rgba(96, 165, 250, 0.35);
+}
+
+.log-source-caddy {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.35);
+}
+
+.log-source-app {
+  color: var(--text-faint);
+}
+
+/* Source filter chips in the log drawer header. */
+.log-source-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+  margin-left: 4px;
+}
+
+.log-source-chip {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  line-height: 1.4;
+}
+
+.log-source-chip:hover {
+  border-color: var(--text-faint);
+}
+
+.log-source-chip[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.log-source-chip.off,
+.log-source-chip[aria-pressed="false"] {
+  opacity: 0.45;
+  color: var(--text-faint);
+  background: transparent;
+}
+
+/* Console-style text filter + match count in the log drawer header. */
+.log-text-filter-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 1;
+  min-width: 80px;
+  max-width: 180px;
+  margin-left: 2px;
+}
+
+.log-text-filter {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 22px 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-dim);
+  outline: none;
+  line-height: 1.4;
+}
+
+.log-text-filter::placeholder {
+  color: var(--text-faint);
+}
+
+.log-text-filter:focus {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--text);
+}
+
+/* Hide native search clear so we use our own × control. */
+.log-text-filter::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+.log-text-filter-clear {
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.log-text-filter-clear:hover {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.log-text-filter-clear[hidden] {
+  display: none;
+}
+
+.log-match-count {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  flex-shrink: 0;
+  white-space: nowrap;
+  margin-left: 2px;
+}
+
+.log-empty-filter {
+  margin: 12px 4px;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-style: italic;
 }
 
 /* URLs in log lines are clickable (opened in the system browser); inherit

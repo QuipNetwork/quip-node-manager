@@ -34,6 +34,7 @@ fn log_cmd(app: &AppHandle, cmd: &str) {
         "timestamp": "",
         "level": "INFO",
         "message": format!("$ {}", cmd),
+        "source": "app",
     });
     let _ = app.emit("node-log", entry);
 }
@@ -44,6 +45,7 @@ fn log_output(app: &AppHandle, text: &str) {
             "timestamp": "",
             "level": "INFO",
             "message": line,
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     }
@@ -55,6 +57,7 @@ fn log_err(app: &AppHandle, text: &str) {
             "timestamp": "",
             "level": "ERROR",
             "message": line,
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     }
