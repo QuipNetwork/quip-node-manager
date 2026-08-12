@@ -714,10 +714,18 @@ pub(crate) async fn start_stack_core(
         }
     }
 
-    // (2) Auto-detect public_host when the operator has not set one. Detection
-    // is a last-chance fill-in so Docker and Native start paths share one
-    // gate. A failed detect must not stay silent: the require below refuses
-    // to start without a usable host.
+    // (2) Auto-detect public_host when the user has not set one. An empty
+    // public_host means "automatic", not "omit".
+    //
+    // This runs in both modes. The validator, dashboard, caddy and postgres
+    // are containers whichever mode we are in, and step (4) feeds public_host
+    // into the staged assets that set the validator's advertised address.
+    // Gating this on Docker left the Native validator advertising nothing,
+    // even though the Native miner detects its own IP in `start_native_node_core`.
+    //
+    // Detection is the last chance to fill the field. The require below
+    // refuses to start when the value stays empty or names an address peers
+    // cannot reach.
     if settings.node_config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => {

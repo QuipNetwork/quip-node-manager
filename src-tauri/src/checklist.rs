@@ -254,7 +254,13 @@ fn make_client(timeout_secs: u64) -> Option<reqwest::Client> {
         .ok()
 }
 
-async fn fetch_public_ip() -> Option<String> {
+/// Public IP as check.quip.network sees us, falling back to ipify when the
+/// service is down.
+///
+/// This is the same value the start paths render into the miner's
+/// `public_host`, so the `ip` checklist row and the address the node actually
+/// advertises cannot disagree.
+pub(crate) async fn fetch_public_ip() -> Option<String> {
     if let Some(ip) = fetch_ip_check_service().await {
         return Some(ip);
     }

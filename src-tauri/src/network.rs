@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::time::Duration;
-
+/// Public IP of this host, used to fill in an unset `public_host`.
+///
+/// Delegates to the checklist's fetcher (check.quip.network first, ipify as a
+/// fallback) rather than querying ipify directly. The `ip` checklist row shows
+/// the user the same value, and a node that advertises an address the
+/// reachability probes never tested is worse than no address at all.
 #[tauri::command]
 pub async fn detect_public_ip() -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get("https://api.ipify.org")
-        .send()
+    crate::checklist::fetch_public_ip()
         .await
-        .map_err(|e| e.to_string())?;
-    let ip = resp.text().await.map_err(|e| e.to_string())?;
-    Ok(ip.trim().to_string())
+        .ok_or_else(|| "no IP detection service reachable".to_string())
 }
