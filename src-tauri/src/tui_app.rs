@@ -87,8 +87,8 @@ pub struct FormState {
     pub validator_port: String,
     pub node_name: String,
     pub auto_mine: bool,
-    pub run_mode_idx: usize,        // 0=Docker, 1=Native
-    pub update_channel_idx: usize,  // 0=Release, 1=Beta
+    pub run_mode_idx: usize,       // 0=Docker, 1=Native
+    pub update_channel_idx: usize, // 0=Release, 1=Beta
     pub public_host_enabled: bool,
     pub public_host: String,
     pub public_port: String,
@@ -682,11 +682,9 @@ impl TuiApp {
             let _ = rt.block_on(async {
                 if run_mode == crate::settings::RunMode::Native {
                     // Best-effort: stop miner before tearing down support stack.
-                    let _ = crate::native::stop_native_node_core(
-                        std::sync::Arc::clone(&sink),
-                        &state,
-                    )
-                    .await;
+                    let _ =
+                        crate::native::stop_native_node_core(std::sync::Arc::clone(&sink), &state)
+                            .await;
                 }
                 crate::compose::stop_stack_core(sink).await?;
                 Ok::<(), String>(())
@@ -898,13 +896,19 @@ fn merge_surveyed_gpus(
     survey: &crate::hardware::HardwareSurvey,
 ) {
     for dev in &survey.gpu_devices {
-        if !node_config.gpu_device_configs.iter().any(|c| c.index == dev.index) {
-            node_config.gpu_device_configs.push(crate::settings::GpuDeviceConfig {
-                index: dev.index,
-                enabled: false,
-                utilization: 80,
-                yielding: false,
-            });
+        if !node_config
+            .gpu_device_configs
+            .iter()
+            .any(|c| c.index == dev.index)
+        {
+            node_config
+                .gpu_device_configs
+                .push(crate::settings::GpuDeviceConfig {
+                    index: dev.index,
+                    enabled: false,
+                    utilization: 80,
+                    yielding: false,
+                });
         }
     }
     node_config.gpu_device_configs.sort_by_key(|c| c.index);
@@ -999,8 +1003,16 @@ mod tests {
             cpu_count: 8,
             gpu_backend: "cuda".into(),
             gpu_devices: vec![
-                GpuDevice { index: 0, name: "RTX 3060".into(), memory_mb: Some(12288) },
-                GpuDevice { index: 1, name: "RTX 3060".into(), memory_mb: Some(12288) },
+                GpuDevice {
+                    index: 0,
+                    name: "RTX 3060".into(),
+                    memory_mb: Some(12288),
+                },
+                GpuDevice {
+                    index: 1,
+                    name: "RTX 3060".into(),
+                    memory_mb: Some(12288),
+                },
             ],
             docker_available: true,
             docker_version: None,

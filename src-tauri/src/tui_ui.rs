@@ -376,7 +376,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 },
             ),
         ));
-
     }
 
     // CPU Cores

@@ -61,9 +61,10 @@ impl ProgressSink for TauriSink {
         let _ = self.app.emit("stop-started", serde_json::json!({}));
     }
     fn stop_complete(&self, success: bool, error: Option<&str>) {
-        let _ = self
-            .app
-            .emit("stop-complete", serde_json::json!({ "success": success, "error": error }));
+        let _ = self.app.emit(
+            "stop-complete",
+            serde_json::json!({ "success": success, "error": error }),
+        );
     }
     fn binary_download_progress(&self, downloaded: u64, total: Option<u64>, done: bool) {
         let _ = self.app.emit(
@@ -72,9 +73,10 @@ impl ProgressSink for TauriSink {
         );
     }
     fn dashboard_db_mismatch(&self, message: &str) {
-        let _ = self
-            .app
-            .emit("dashboard-db-mismatch", serde_json::json!({ "message": message }));
+        let _ = self.app.emit(
+            "dashboard-db-mismatch",
+            serde_json::json!({ "message": message }),
+        );
     }
 }
 

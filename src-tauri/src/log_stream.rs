@@ -279,10 +279,7 @@ pub enum StreamSource {
     /// parsed into `LogEntry.source`.
     ComposeAll,
     /// Tail a host file, tagging every line with a fixed `source`.
-    File {
-        path: PathBuf,
-        source: &'static str,
-    },
+    File { path: PathBuf, source: &'static str },
 }
 
 /// Sources for the given run mode.
@@ -341,11 +338,8 @@ fn stream_multiplexed<F>(
 /// Follow all compose services; parse the `service | line` prefix into
 /// `source`. Stderr is drained on a second thread (compose / container
 /// loggers often write there).
-fn stream_compose_all<F>(
-    stop: &Arc<Mutex<bool>>,
-    child_pid: &Arc<Mutex<Option<u32>>>,
-    emit: Arc<F>,
-) where
+fn stream_compose_all<F>(stop: &Arc<Mutex<bool>>, child_pid: &Arc<Mutex<Option<u32>>>, emit: Arc<F>)
+where
     F: Fn(LogEntry) -> bool + Send + Sync + 'static,
 {
     // Reuse the shared builder so log streaming sees the same compose model
@@ -439,7 +433,9 @@ pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
     let run_mode = crate::settings::load_settings().run_mode;
     let sources = sources_for_run_mode(&run_mode);
     std::thread::spawn(move || {
-        stream_multiplexed(sources, stop, child_pid, move |entry| tx.send(entry).is_ok());
+        stream_multiplexed(sources, stop, child_pid, move |entry| {
+            tx.send(entry).is_ok()
+        });
     });
 }
 
@@ -539,7 +535,10 @@ mod tests {
             map_compose_service_to_source("quip-validator"),
             Some("validator")
         );
-        assert_eq!(map_compose_service_to_source("dashboard"), Some("dashboard"));
+        assert_eq!(
+            map_compose_service_to_source("dashboard"),
+            Some("dashboard")
+        );
         assert_eq!(map_compose_service_to_source("postgres"), Some("postgres"));
         assert_eq!(map_compose_service_to_source("caddy"), Some("caddy"));
     }
@@ -652,8 +651,7 @@ mod tests {
     #[test]
     fn parse_structured_quip_format_double_bracket() {
         // [file.py:123][node] 2026-01-01T12:00:00+00:00 ERROR - boom
-        let e =
-            parse_log_line("[file.py:123][node] 2026-01-01T12:00:00+00:00 ERROR - boom");
+        let e = parse_log_line("[file.py:123][node] 2026-01-01T12:00:00+00:00 ERROR - boom");
         assert_eq!(e.timestamp, "2026-01-01T12:00:00+00:00");
         assert_eq!(e.level, "ERROR");
         assert_eq!(e.message, "boom");

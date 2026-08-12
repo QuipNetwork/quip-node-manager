@@ -32,7 +32,14 @@ fn update_restart_steps(
     match mode {
         crate::settings::RunMode::Docker => vec![StopStack, PullImages, StartStack],
         crate::settings::RunMode::Native if binary_update_pending => {
-            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+            vec![
+                StopNative,
+                StopStack,
+                DownloadBinary,
+                PullImages,
+                StartStack,
+                StartNative,
+            ]
         }
         crate::settings::RunMode::Native => {
             vec![StopNative, StopStack, PullImages, StartStack, StartNative]
@@ -49,14 +56,16 @@ async fn run_update_step(app: &tauri::AppHandle, step: UpdateStep) -> Result<(),
             crate::native::stop_native_node(app.clone(), state).await
         }
         UpdateStep::StopStack => crate::compose::stop_stack(app.clone()).await,
-        UpdateStep::DownloadBinary => {
-            crate::native::download_native_binary(app.clone()).await.map(|_| ())
-        }
+        UpdateStep::DownloadBinary => crate::native::download_native_binary(app.clone())
+            .await
+            .map(|_| ()),
         UpdateStep::PullImages => crate::compose::pull_compose_images(app.clone()).await,
         UpdateStep::StartStack => crate::compose::start_stack(app.clone()).await,
         UpdateStep::StartNative => {
             let state = app.state::<NativeProcessState>();
-            crate::native::start_native_node(app.clone(), state).await.map(|_| ())
+            crate::native::start_native_node(app.clone(), state)
+                .await
+                .map(|_| ())
         }
     }
 }
@@ -73,10 +82,7 @@ async fn run_update_step(app: &tauri::AppHandle, step: UpdateStep) -> Result<(),
 #[tauri::command]
 pub async fn restart_to_update(app: tauri::AppHandle) -> Result<(), String> {
     let mode = crate::settings::load_settings().run_mode;
-    let binary_update_pending = matches!(
-        crate::native::check_binary_update().await,
-        Ok(Some(_))
-    );
+    let binary_update_pending = matches!(crate::native::check_binary_update().await, Ok(Some(_)));
     for step in update_restart_steps(&mode, binary_update_pending) {
         run_update_step(&app, step).await?;
     }
@@ -599,7 +605,10 @@ mod tests {
         // Only rc's newer than the running build: Beta nags (newest rc),
         // Release stays quiet (no stable to offer).
         let rc_only = vec!["v0.2.1-rc11", "v0.2.1-rc12"];
-        assert_eq!(pick(rc_only.clone(), UpdateChannel::Beta), Some("v0.2.1-rc12"));
+        assert_eq!(
+            pick(rc_only.clone(), UpdateChannel::Beta),
+            Some("v0.2.1-rc12")
+        );
         assert_eq!(pick(rc_only, UpdateChannel::Release), None);
 
         // A stable release above the floor exists: both channels see it, and
@@ -768,7 +777,14 @@ mod tests {
         use UpdateStep::*;
         assert_eq!(
             update_restart_steps(&RunMode::Native, true),
-            vec![StopNative, StopStack, DownloadBinary, PullImages, StartStack, StartNative]
+            vec![
+                StopNative,
+                StopStack,
+                DownloadBinary,
+                PullImages,
+                StartStack,
+                StartNative
+            ]
         );
     }
 

@@ -148,7 +148,10 @@ pub(crate) fn compose_cmd() -> Command {
     let override_file = crate::stack_assets::stack_override_file();
     let args = compose_prefix_args(
         &to_forward_slash(stack_compose_file()),
-        override_file.is_file().then(|| to_forward_slash(override_file)).as_deref(),
+        override_file
+            .is_file()
+            .then(|| to_forward_slash(override_file))
+            .as_deref(),
         &to_forward_slash(stack_project_dir()),
     );
     let mut c = crate::cmd::new("docker");
@@ -167,7 +170,11 @@ fn compose_prefix_args(
     override_file: Option<&str>,
     project_dir: &str,
 ) -> Vec<String> {
-    let mut args = vec!["compose".to_string(), "-f".to_string(), compose_file.to_string()];
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string(),
+    ];
     if let Some(o) = override_file {
         args.push("-f".to_string());
         args.push(o.to_string());
@@ -243,7 +250,10 @@ pub(crate) fn current_pinned_tag(key: &str) -> Option<String> {
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
 /// there is no merge with an existing file. `tags` holds the channel-resolved
 /// per-image tags (see `resolve_channel_image_tags`).
-pub(crate) fn write_env_file(settings: &AppSettings, tags: &ResolvedImageTags) -> Result<(), String> {
+pub(crate) fn write_env_file(
+    settings: &AppSettings,
+    tags: &ResolvedImageTags,
+) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
     let pg_password = crate::settings::postgres_password();
     let lines = render_env_lines(settings, puid, pgid, &pg_password, tags);
@@ -379,7 +389,10 @@ fn emit_pull_progress_json(sink: &dyn ProgressSink, gen: u64, line: &str) -> boo
     // Image-level events have no parent layer; mirror them to the log.
     if value.get("parent_id").is_none() && id.starts_with("Image ") {
         let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        sink.log("INFO", &format!("{} {}", text, id.trim_start_matches("Image ")));
+        sink.log(
+            "INFO",
+            &format!("{} {}", text, id.trim_start_matches("Image ")),
+        );
     }
     // Stamp the generation so the frontend can discard events from a pull it has
     // already closed (see PULL_GENERATION).
@@ -547,9 +560,7 @@ pub async fn pull_compose_images(app: AppHandle) -> Result<(), String> {
 /// (so compose sees the configured v0.2 image tags), then runs
 /// `docker compose --profile <p> pull [services...]`. The `pull-complete`
 /// notification is delivered via `sink.pull_complete` when the command exits.
-pub(crate) async fn pull_compose_images_core(
-    sink: Arc<dyn ProgressSink>,
-) -> Result<(), String> {
+pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Result<(), String> {
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
@@ -591,8 +602,12 @@ async fn pull_compose_images_for_settings(
     // terminal pull-complete carry the same id.
     let gen = PULL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-    sink.log("INFO", &format!("$ docker compose --profile {profile} pull ..."));
-    let result = run_compose_streaming_mode(Arc::clone(&sink), args, StdoutMode::PullJson(gen)).await;
+    sink.log(
+        "INFO",
+        &format!("$ docker compose --profile {profile} pull ..."),
+    );
+    let result =
+        run_compose_streaming_mode(Arc::clone(&sink), args, StdoutMode::PullJson(gen)).await;
 
     // Tell the UI the pull is over so it can hide the progress panel. Process
     // exit is the authoritative "pull is done" signal: per-image "Pulled"
@@ -626,7 +641,10 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
     match out {
         Ok(Ok(o)) if o.status.success() => {
             sink.log("INFO", "$ nvidia-cuda-mps-control -d");
-            sink.log("INFO", "Started NVIDIA MPS control daemon for GPU SM sharing.");
+            sink.log(
+                "INFO",
+                "Started NVIDIA MPS control daemon for GPU SM sharing.",
+            );
         }
         // Non-success is almost always "an instance is already running" — fine.
         // A missing binary (spawn error) means no NVIDIA tooling; stay quiet.
@@ -794,9 +812,7 @@ pub(crate) async fn start_stack_core(
     if let Err(e) = &up_result {
         sink.log(
             "ERROR",
-            &format!(
-                "docker compose up failed ({e}); reaping leftover containers and retrying"
-            ),
+            &format!("docker compose up failed ({e}); reaping leftover containers and retrying"),
         );
         force_remove_known_containers(Arc::clone(&sink)).await;
         sweep_orphan_node_containers(Arc::clone(&sink)).await;
@@ -1320,7 +1336,10 @@ mod tests {
             Some("/d/docker-compose.override.yml"),
             "/d",
         );
-        let base = args.iter().position(|a| a == "/d/docker-compose.yml").unwrap();
+        let base = args
+            .iter()
+            .position(|a| a == "/d/docker-compose.yml")
+            .unwrap();
         let over = args
             .iter()
             .position(|a| a == "/d/docker-compose.override.yml")
@@ -1398,7 +1417,10 @@ mod tests {
             svc("postgres", true, Some("healthy")),
             svc("caddy", true, None),
         ];
-        assert_eq!(roll_up_health(&unhealthy, &expected), StackHealth::Unhealthy);
+        assert_eq!(
+            roll_up_health(&unhealthy, &expected),
+            StackHealth::Unhealthy
+        );
     }
 
     #[test]
@@ -1488,7 +1510,13 @@ mod tests {
         settings.node_config.node_name = "validator-home".to_string();
         settings.node_config.num_cpus = 4;
 
-        let lines = render_env_lines(&settings, 501, 1000, "postgres-secret", &uniform_tags("v0.2"));
+        let lines = render_env_lines(
+            &settings,
+            501,
+            1000,
+            "postgres-secret",
+            &uniform_tags("v0.2"),
+        );
         let env = lines.join("\n");
 
         assert!(env.contains("PUID=501"));

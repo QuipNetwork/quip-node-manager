@@ -808,9 +808,8 @@ async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
                 .unwrap_or(false);
         }
         if !available {
-            let detail = download_err.unwrap_or_else(|| {
-                "no app handle available to start the download".to_string()
-            });
+            let detail = download_err
+                .unwrap_or_else(|| "no app handle available to start the download".to_string());
             return base
                 .with_state(CheckState::Fail)
                 .with_label("Native miner binary download failed")
@@ -825,9 +824,7 @@ async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
                 // A newer release exists. A user Retry fetches it now; an
                 // automatic recheck reports it without downloading so it can't
                 // race the Restart-to-Update flow's own DownloadBinary step.
-                (Some(info), _) if !auto => {
-                    fetch_binary_update(ctx, base, &info.version).await
-                }
+                (Some(info), _) if !auto => fetch_binary_update(ctx, base, &info.version).await,
                 (Some(info), _) => binary_update_available_item(base, installed, &info.version),
                 // Confirmed current: show both numbers so the user can see what
                 // was discovered, not just a green check.

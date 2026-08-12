@@ -99,7 +99,9 @@ pub fn stack_chain_spec_file() -> PathBuf {
 /// `<data_dir>/config/quip-miner.{cpu,cuda}.toml` — staged seed templates
 /// bind-mounted by the compose cpu/cuda services.
 pub fn stack_miner_config_file(backend: &str) -> PathBuf {
-    data_dir().join("config").join(format!("quip-miner.{backend}.toml"))
+    data_dir()
+        .join("config")
+        .join(format!("quip-miner.{backend}.toml"))
 }
 
 /// `--project-directory` for every `docker compose` invocation.
@@ -326,8 +328,13 @@ mod tests {
 
     #[test]
     fn patch_compose_file_adds_public_addr_from_ip_public_host() {
-        let patched =
-            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "1.2.3.4", 9944);
+        let patched = patch_compose_file(
+            COMPOSE_YML,
+            CONTAINER_PUBLIC_API_PORT,
+            30033,
+            "1.2.3.4",
+            9944,
+        );
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
         let patched = patch_compose_file(
@@ -342,23 +349,20 @@ mod tests {
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
-        let patched =
-            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
+        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(!patched.contains("--public-addr"));
     }
 
     #[test]
     fn both_modes_publish_validator_rpc_on_configured_host_port() {
-        let patched =
-            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
+        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
         assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
         // Inserted right after the validator's UDP mapping, inside its ports.
         assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
 
         // The host side honours the configured port; the container side is
         // always the validator's fixed 9944.
-        let custom =
-            patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9955);
+        let custom = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9955);
         assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
     }
 
