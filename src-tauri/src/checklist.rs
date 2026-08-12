@@ -590,6 +590,47 @@ async fn check_hostname_dns(hostname: &str) -> Option<bool> {
     Some(json["match"].as_bool().unwrap_or(false))
 }
 
+// ─── public_host start precondition ───────────────────────────────────────────
+
+/// Operator message when `public_host` is missing or empty.
+pub(crate) const PUBLIC_HOST_REQUIRED: &str = concat!(
+    "public_host is required. It is the address peers use to reach this node ",
+    "from outside the host. Set it in Settings to a public DNS name or public IP.",
+);
+
+/// Operator message when `public_host` is a loopback or unspecified address.
+pub(crate) const PUBLIC_HOST_NOT_ADVERTISABLE: &str = concat!(
+    "public_host is required. It is the address peers use to reach this node ",
+    "from outside the host. localhost, 127.0.0.1, and 0.0.0.0 are not reachable ",
+    "from outside the host.",
+);
+
+/// Refuse to start when peers would have no usable address.
+///
+/// Empty, whitespace, and unparseable values fail as unset. Loopback and
+/// unspecified addresses (localhost, 127.0.0.1, 0.0.0.0, ::1, ::) fail
+/// because they are never reachable from outside the host.
+pub(crate) fn require_public_host(public_host: &str) -> Result<(), String> {
+    let Some(host) = crate::hostnames::public_host_name(public_host) else {
+        return Err(PUBLIC_HOST_REQUIRED.to_string());
+    };
+    if is_unadvertisable_host(&host) {
+        return Err(PUBLIC_HOST_NOT_ADVERTISABLE.to_string());
+    }
+    Ok(())
+}
+
+fn is_unadvertisable_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
 // ─── Check registry ───────────────────────────────────────────────────────────
 
 /// IDs of all checks in render order. Filter by `visible_for_mode`.
@@ -599,6 +640,7 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "wsl",
     "binary",
     "secret",
+    "public-host",
     "ip",
     "hostname",
     "port",
@@ -624,8 +666,8 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         // non-empty, fails otherwise.
         "dwave-key" => ctx.has_dwave_config,
         // Everything else is always visible: the two externally-probed
-        // ports — public API + validator libp2p.
-        "secret" | "ip" | "hostname" | "port" | "port-validator" => true,
+        // ports — public API + validator libp2p — plus public_host.
+        "secret" | "public-host" | "ip" | "hostname" | "port" | "port-validator" => true,
         _ => false,
     }
 }
@@ -665,6 +707,7 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             true,
             Some(FixKind::GenerateSecret),
         ),
+        "public-host" => CheckItem::new(id, "public_host configured", true, None),
         "ip" => CheckItem::new(id, "Public IP reachable", false, None),
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(
@@ -860,6 +903,14 @@ async fn run_check_secret(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
+async fn run_check_public_host(ctx: &CheckCtx) -> CheckItem {
+    let base = idle_item("public-host", ctx);
+    match require_public_host(&ctx.public_host) {
+        Ok(()) => base.with_state(CheckState::Pass),
+        Err(detail) => base.with_state(CheckState::Fail).with_detail(detail),
+    }
+}
+
 async fn run_check_ip(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("ip", ctx);
     match ctx.public_ip().await {
@@ -974,6 +1025,7 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx, auto: bool) -> CheckItem {
         "wsl" => run_check_wsl(ctx).await,
         "binary" => run_check_binary(ctx, auto).await,
         "secret" => run_check_secret(ctx).await,
+        "public-host" => run_check_public_host(ctx).await,
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
@@ -1355,5 +1407,71 @@ mod tests {
         let item = idle_item("port-validator", &ctx);
         assert!(!item.required);
         assert_eq!(item.fixable, None);
+    }
+
+    #[test]
+    fn empty_public_host_fails_the_start_precondition() {
+        let config = crate::settings::NodeConfig::default();
+        let err = require_public_host(&config.public_host).expect_err("empty must fail");
+        assert!(
+            err.contains("public_host"),
+            "message must name the field: {err}"
+        );
+        assert!(
+            err.contains("required"),
+            "message must say the field is required: {err}"
+        );
+        assert!(
+            err.contains("outside the host"),
+            "message must say what public_host is for: {err}"
+        );
+    }
+
+    #[test]
+    fn loopback_public_host_fails_the_start_precondition() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "0.0.0.0",
+            "127.0.0.1:20049",
+            "::1",
+            "[::1]",
+        ] {
+            let config = crate::settings::NodeConfig {
+                public_host: host.to_string(),
+                ..crate::settings::NodeConfig::default()
+            };
+            let err =
+                require_public_host(&config.public_host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertisable_public_host_passes_the_start_precondition() {
+        for host in [
+            "node.example.com",
+            "203.0.113.9",
+            "https://node.example.com:9443/rpc",
+            "2001:db8::1",
+        ] {
+            require_public_host(host).unwrap_or_else(|e| panic!("{host:?} must pass: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_public_host_check_fails_and_names_the_field() {
+        let item = run_check_public_host(&test_ctx()).await;
+        assert_eq!(item.state, CheckState::Fail);
+        assert!(item.required);
+        let detail = item.detail.expect("fail must carry an operator message");
+        assert!(
+            detail.contains("public_host"),
+            "detail must name the field: {detail}"
+        );
     }
 }

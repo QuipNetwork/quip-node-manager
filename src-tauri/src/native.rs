@@ -908,10 +908,10 @@ pub(crate) async fn start_native_node_core(
         }
     }
 
-    // Auto-detect public IP when no public_host is configured. A detection
-    // failure must not be silent: without a public_host the validator
-    // advertises no public address and peers can't dial in, so surface a
-    // warning the user can act on.
+    // Auto-detect public IP when no public_host is configured. Combined
+    // start already ran this in start_stack_core; a direct start_native_node
+    // call still needs the fill-in. After that, refuse to start without a
+    // usable public_host so the coordinator does not exit 64 later.
     if config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => config.public_host = ip,
@@ -925,6 +925,10 @@ pub(crate) async fn start_native_node_core(
                 );
             }
         }
+    }
+    if let Err(e) = crate::checklist::require_public_host(&config.public_host) {
+        sink.log("ERROR", &e);
+        return Err(e);
     }
 
     // Write config.toml for native mode. The renderer forces the native

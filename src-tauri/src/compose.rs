@@ -669,7 +669,8 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 ///
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
-///   2. auto-detect public_host in Docker mode
+///   2. auto-detect public_host when unset, then refuse to start if it is
+///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
 ///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
 ///   5. write .env
@@ -686,7 +687,8 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 ///
 /// Sequence:
 ///   1. migrate existing v0.1 config/env, if present
-///   2. auto-detect public_host in Docker mode
+///   2. auto-detect public_host when unset, then refuse to start if it is
+///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
 ///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
 ///   5. write .env
@@ -712,16 +714,16 @@ pub(crate) async fn start_stack_core(
         }
     }
 
-    // (2) Docker-mode auto-detect of public_host; Native leaves it to the
-    // binary.
-    if settings.run_mode == RunMode::Docker && settings.node_config.public_host.is_empty() {
+    // (2) Auto-detect public_host when the operator has not set one. Detection
+    // is a last-chance fill-in so Docker and Native start paths share one
+    // gate. A failed detect must not stay silent: the require below refuses
+    // to start without a usable host.
+    if settings.node_config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => {
                 sink.log("INFO", &format!("$ Auto-detected public IP: {}", ip));
                 settings.node_config.public_host = ip;
             }
-            // Don't fail the start, but don't hide it either: without a
-            // public_host the validator advertises no public address.
             Err(e) => sink.log(
                 "ERROR",
                 &format!(
@@ -730,6 +732,10 @@ pub(crate) async fn start_stack_core(
                 ),
             ),
         }
+    }
+    if let Err(e) = crate::checklist::require_public_host(&settings.node_config.public_host) {
+        sink.log("ERROR", &e);
+        return Err(e);
     }
 
     let rest_port = crate::config::native_rest_port(&settings.node_config);

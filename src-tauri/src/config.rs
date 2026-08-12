@@ -58,7 +58,10 @@ struct MinerToml {
     rest_port: u16,
     #[serde(skip_serializing_if = "String::is_empty")]
     node_name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    // Always emitted. Peers need an advertised host, and an omitted key
+    // leaves the miner guessing. An empty value is still written so an
+    // operator inspecting the file can see the key is unset. Start refuses
+    // an empty value separately.
     public_host: String,
     public_port: u16,
     log_level: String,
@@ -478,6 +481,31 @@ mod tests {
             assert!(
                 toml.contains("public_port = 21000"),
                 "{mode:?} omitted public_port: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_host_is_always_emitted_in_both_modes() {
+        // An omitted key leaves the miner guessing after the coordinator
+        // starts requiring public_host. Always write the key, even when the
+        // operator has not set a value.
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let empty = NodeConfig::default();
+            let toml = render_config_toml(&empty, &mode);
+            assert!(
+                toml.contains("public_host"),
+                "{mode:?} omitted public_host: {toml}"
+            );
+
+            let set = NodeConfig {
+                public_host: "node.example.com".to_string(),
+                ..NodeConfig::default()
+            };
+            let set_toml = render_config_toml(&set, &mode);
+            assert!(
+                set_toml.contains("public_host = \"node.example.com\""),
+                "{mode:?} dropped a set public_host: {set_toml}"
             );
         }
     }

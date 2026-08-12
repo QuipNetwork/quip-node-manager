@@ -293,7 +293,7 @@ function refreshDashboardTab() {
 // combo (they're skipped). Mirrors ALL_CHECK_IDS in checklist.rs.
 const CHECK_ORDER = [
   'docker', 'docker-compose', 'wsl',
-  'binary', 'secret',
+  'binary', 'secret', 'public-host',
   'ip', 'hostname', 'port', 'port-validator', 'dwave-key',
 ];
 
@@ -931,7 +931,7 @@ function visibleInMode(id, runMode) {
       return !isDocker;
     case 'dwave-key':
       return hasDwave;
-    // version / secret / ip / hostname / ports — always shown.
+    // version / secret / public-host / ip / hostname / ports — always shown.
     default:
       return true;
   }
@@ -1006,6 +1006,7 @@ function defaultLabel(id) {
     case 'wsl':               return 'WSL installed with distro';
     case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
+    case 'public-host':       return 'public_host configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
     case 'port':              return `Public API port ${port} — press Retry to test`;
