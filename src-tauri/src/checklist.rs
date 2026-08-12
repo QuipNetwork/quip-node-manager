@@ -646,7 +646,6 @@ pub const ALL_CHECK_IDS: &[&str] = &[
     "wsl",
     "binary",
     "secret",
-    "public-host",
     "ip",
     "hostname",
     "port",
@@ -672,8 +671,8 @@ pub fn visible_for_mode(id: &str, ctx: &CheckCtx) -> bool {
         // non-empty, fails otherwise.
         "dwave-key" => ctx.has_dwave_config,
         // Everything else is always visible: the two externally-probed
-        // ports — public API + validator libp2p — plus public_host.
-        "secret" | "public-host" | "ip" | "hostname" | "port" | "port-validator" => true,
+        // ports — public API + validator libp2p.
+        "secret" | "ip" | "hostname" | "port" | "port-validator" => true,
         _ => false,
     }
 }
@@ -713,11 +712,6 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
             true,
             Some(FixKind::GenerateSecret),
         ),
-        // Advisory, like the other externally-probed rows. The address is
-        // auto-detected, so there is nothing for the operator to configure,
-        // and whether peers can actually reach it is what the warn-only
-        // `port` row already answers.
-        "public-host" => CheckItem::new(id, "Public host reachable by peers", false, None),
         "ip" => CheckItem::new(id, "Public IP reachable", false, None),
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(
@@ -913,37 +907,6 @@ async fn run_check_secret(ctx: &CheckCtx) -> CheckItem {
     }
 }
 
-/// Checks the host the node will actually advertise, not the stored setting.
-///
-/// An empty `public_host` means "automatic", so the start paths fill it from
-/// check.quip.network before they render the config. Testing the stored value
-/// alone would fail every default install and demand the operator hand-type an
-/// address the app already knows how to find. Resolve the same way the start
-/// paths do, and fail only when nothing usable is available.
-async fn run_check_public_host(ctx: &CheckCtx) -> CheckItem {
-    let base = idle_item("public-host", ctx);
-    let configured = !ctx.public_host.trim().is_empty();
-    let effective = if configured {
-        ctx.public_host.clone()
-    } else {
-        ctx.public_ip().await.unwrap_or_default()
-    };
-
-    match require_public_host(&effective) {
-        Ok(()) => {
-            let source = if configured { "configured" } else { "auto" };
-            base.with_state(CheckState::Pass)
-                .with_label(format!("Public host: {effective} ({source})"))
-        }
-        // Auto-detection is the default path, so say when it is what failed
-        // rather than telling the operator they forgot to set something.
-        Err(_) if !configured => base
-            .with_state(CheckState::Warn)
-            .with_detail("could not auto-detect a public address — set one in Settings"),
-        Err(detail) => base.with_state(CheckState::Warn).with_detail(detail),
-    }
-}
-
 async fn run_check_ip(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("ip", ctx);
     match ctx.public_ip().await {
@@ -1058,7 +1021,6 @@ async fn run_check_by_id(id: &str, ctx: &CheckCtx, auto: bool) -> CheckItem {
         "wsl" => run_check_wsl(ctx).await,
         "binary" => run_check_binary(ctx, auto).await,
         "secret" => run_check_secret(ctx).await,
-        "public-host" => run_check_public_host(ctx).await,
         "ip" => run_check_ip(ctx).await,
         "hostname" => run_check_hostname(ctx).await,
         "port" => run_check_port(ctx).await,
@@ -1304,53 +1266,6 @@ mod tests {
         }
     }
 
-    /// A default install stores no public_host and relies on detection, so the
-    /// check must pass on the detected address rather than demanding the
-    /// operator type one in.
-    #[tokio::test]
-    async fn unset_public_host_passes_on_the_detected_address() {
-        let ctx = CheckCtx {
-            public_ip: OnceCell::new_with(Some(Some("203.0.113.7".to_string()))),
-            ..test_ctx()
-        };
-        let item = run_check_public_host(&ctx).await;
-        assert_eq!(item.state, CheckState::Pass);
-        assert_eq!(item.label, "Public host: 203.0.113.7 (auto)");
-    }
-
-    #[tokio::test]
-    async fn detection_failure_does_not_read_as_a_missing_setting() {
-        let ctx = CheckCtx {
-            public_ip: OnceCell::new_with(Some(None)),
-            ..test_ctx()
-        };
-        let item = run_check_public_host(&ctx).await;
-        assert!(
-            item.detail.unwrap().contains("auto-detect"),
-            "an operator who set nothing must not be told they forgot to"
-        );
-    }
-
-    /// An explicit value still wins, and is still rejected when peers could
-    /// never reach it.
-    #[tokio::test]
-    async fn configured_public_host_is_used_and_loopback_still_fails() {
-        let ok = CheckCtx {
-            public_host: "node.example.com".to_string(),
-            ..test_ctx()
-        };
-        assert_eq!(
-            run_check_public_host(&ok).await.label,
-            "Public host: node.example.com (configured)"
-        );
-
-        let bad = CheckCtx {
-            public_host: "127.0.0.1".to_string(),
-            ..test_ctx()
-        };
-        assert_eq!(run_check_public_host(&bad).await.state, CheckState::Warn);
-    }
-
     #[test]
     fn v02_port_labels_use_api_and_validator_defaults() {
         let ctx = test_ctx();
@@ -1543,17 +1458,10 @@ mod tests {
         }
     }
 
-    /// Advisory, never blocking. Reachability is the warn-only `port` row's
-    /// job, and the address itself is auto-detected, so this row must not gate
-    /// Start the way `secret` or `docker` do.
-    #[tokio::test]
-    async fn public_host_row_is_advisory_not_required() {
-        let ctx = CheckCtx {
-            public_ip: OnceCell::new_with(Some(None)),
-            ..test_ctx()
-        };
-        let item = run_check_public_host(&ctx).await;
-        assert!(!item.required);
-        assert_eq!(item.state, CheckState::Warn);
+    /// The public host is covered by the `port` rows, which probe it end to
+    /// end. A dedicated row would duplicate that with a weaker signal.
+    #[test]
+    fn there_is_no_standalone_public_host_row() {
+        assert!(!ALL_CHECK_IDS.contains(&"public-host"));
     }
 }
