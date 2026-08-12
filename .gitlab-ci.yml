@@ -2,6 +2,7 @@
 # Tauri v2 desktop app builds for macOS (universal), Linux, Windows
 
 stages:
+  - lint
   - build
   - release
 
@@ -35,6 +36,37 @@ variables:
         - src-tauri/**/*
         - package.json
         - bun.lock
+        - .gitlab-ci.yml
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+
+# Without this gate the repository accumulated formatting drift, so anyone who
+# ran the formatter while fixing something unrelated got a diff spanning a
+# dozen files they never touched. Checking it here keeps that at zero.
+#
+# Tracks floating stable, like every other job. A new stable rustfmt can
+# therefore fail this on unchanged code; the fix is to run the formatter, not
+# to pin, since nothing else in this file pins either.
+rustfmt:
+  stage: lint
+  image: rust:slim
+  variables:
+    # rustfmt parses the crate but never builds it, so the vendored submodule
+    # and its Tauri resources are not needed.
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    # The official rust images install with rustup's minimal profile, which
+    # leaves rustfmt out.
+    - rustup component add rustfmt
+  script:
+    - cargo fmt --manifest-path src-tauri/Cargo.toml --check
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src-tauri/**/*
         - .gitlab-ci.yml
 
 # ---------------------------------------------------------------------------
