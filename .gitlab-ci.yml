@@ -161,6 +161,9 @@ release-binaries:
         n >= 2  { exit }
         { print }
       ' CHANGELOG.md | tail -n +2)
+    # Point the install one-liners at this tag instead of the main branch, so
+    # the release page installs the released version, not the tip of main.
+    - DESCRIPTION=$(printf '%s\n' "$DESCRIPTION" | sed "s#/-/raw/main/#/-/raw/${CI_COMMIT_TAG}/#g")
     - |
       release-cli create --name "$CI_COMMIT_TAG" \
         --tag-name "$CI_COMMIT_TAG" \

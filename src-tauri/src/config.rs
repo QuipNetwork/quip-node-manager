@@ -60,8 +60,7 @@ struct MinerToml {
     node_name: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     public_host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_port: Option<u16>,
+    public_port: u16,
     log_level: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     node_log: String,
@@ -185,7 +184,11 @@ impl ConfigToml {
             },
             node_name: config.node_name.clone(),
             public_host: config.public_host.clone(),
-            public_port: config.public_port,
+            // Always emitted. Peers need an advertised port, and an omitted
+            // key leaves the miner guessing. With no explicit override the
+            // public port is the Caddy front door (`port`), which is what a
+            // peer actually reaches from outside the host.
+            public_port: config.public_port.unwrap_or(config.port),
             log_level: config.log_level.clone(),
             node_log: config.node_log.clone(),
         };
@@ -357,7 +360,10 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("[{section}] has no binary key"));
             let path = std::path::Path::new(got);
-            assert!(path.is_absolute(), "[{section}] binary {got} is not absolute");
+            assert!(
+                path.is_absolute(),
+                "[{section}] binary {got} is not absolute"
+            );
             assert!(path.ends_with(binary), "[{section}] binary is {got}");
         }
     }
@@ -414,7 +420,9 @@ mod tests {
 
         for legacy_key in [
             "listen =",
-            "port = 20049",
+            // Anchored: a bare top-level `port` is the v0.1 schema. Matching
+            // it unanchored would also flag the legitimate `public_port`.
+            "\nport = ",
             "peer =",
             "auto_mine",
             "secret =",
@@ -456,6 +464,22 @@ mod tests {
         assert!(toml.contains("public_port = 24444"));
         assert!(toml.contains("log_level = \"debug\""));
         assert!(toml.contains("node_log = \"/data/logs/miner.log\""));
+    }
+
+    #[test]
+    fn public_port_falls_back_to_the_public_front_door() {
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let cfg = NodeConfig {
+                port: 21000,
+                public_port: None,
+                ..NodeConfig::default()
+            };
+            let toml = render_config_toml(&cfg, &mode);
+            assert!(
+                toml.contains("public_port = 21000"),
+                "{mode:?} omitted public_port: {toml}"
+            );
+        }
     }
 
     #[test]
@@ -650,4 +674,3 @@ mod tests {
         assert!(toml.contains("solver = \"Advantage2_System1.13\""));
     }
 }
-

@@ -241,9 +241,12 @@ validator/API ports:
 | `validator_port` | validator libp2p 30333 | 30333 | `<validator_port>:30333/tcp+udp` |
 | `validator_rpc_port` | validator JSON-RPC 9944 | 9944 | Native only: `127.0.0.1:<validator_rpc_port>:9944` |
 
-For the miner's own `config.toml`: `config.rs` emits `public_port` verbatim from
-`config.public_port` (`Option<u16>`, skipped when `None`) in both modes — there
-is no Docker-side hardcoded `port = 20049` in the miner config. The Docker miner
+For the miner's own `config.toml`: `config.rs` always emits `public_port` in both
+modes. It takes `config.public_port` when the user sets an override, and falls
+back to `port` (the Caddy front door) otherwise, because that is the port an
+outside peer actually reaches. There is no separate top-level `port` key in the
+miner config — that is the v0.1 schema, and a test asserts it stays gone. The
+Docker miner
 config carries `rest_port = 8086` (container-internal REST, matching the
 Caddyfile's `quip-miner:8086` upstream) and Native carries
 `rest_port = <native_rest_port>` (default 20100, loopback-only).
