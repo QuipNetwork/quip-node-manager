@@ -604,18 +604,19 @@ pub(crate) const PUBLIC_HOST_REQUIRED: &str = concat!(
     "from outside the host. Set it in Settings to a public DNS name or public IP.",
 );
 
-/// Operator message when `public_host` is a loopback or unspecified address.
+/// Operator message when `public_host` is not reachable from outside the host.
 pub(crate) const PUBLIC_HOST_NOT_ADVERTISABLE: &str = concat!(
     "public_host is required. It is the address peers use to reach this node ",
-    "from outside the host. localhost, 127.0.0.1, and 0.0.0.0 are not reachable ",
-    "from outside the host.",
+    "from outside the host. localhost, loopback, private, link-local, and ",
+    "other non-public addresses are not reachable from outside the host.",
 );
 
 /// Refuse to start when peers would have no usable address.
 ///
-/// Empty, whitespace, and unparseable values fail as unset. Loopback and
-/// unspecified addresses (localhost, 127.0.0.1, 0.0.0.0, ::1, ::) fail
-/// because they are never reachable from outside the host.
+/// Empty, whitespace, and unparseable values fail as unset. Loopback,
+/// unspecified, private, link-local, CGNAT, multicast, reserved,
+/// unique-local, and mDNS `.local` names fail because a peer outside this
+/// host cannot reach them.
 pub(crate) fn require_public_host(public_host: &str) -> Result<(), String> {
     let Some(host) = crate::hostnames::public_host_name(public_host) else {
         return Err(PUBLIC_HOST_REQUIRED.to_string());
@@ -627,14 +628,42 @@ pub(crate) fn require_public_host(public_host: &str) -> Result<(), String> {
 }
 
 fn is_unadvertisable_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return true;
-    }
     match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
-        Err(_) => false,
+        Ok(std::net::IpAddr::V4(v4)) => is_unadvertisable_v4(v4),
+        Ok(std::net::IpAddr::V6(v6)) => is_unadvertisable_v6(v6),
+        // Reuse the hostname rule: reject localhost, *.localhost, and *.local.
+        Err(_) => !crate::hostnames::is_public_dns_host(host),
     }
+}
+
+fn is_unadvertisable_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        // 100.64.0.0/10 CGNAT. Ipv4Addr::is_shared is unstable.
+        || (a == 100 && (64..=127).contains(&b))
+        // 240.0.0.0/4 reserved. Ipv4Addr::is_reserved is unstable.
+        || a >= 240
+}
+
+fn is_unadvertisable_v6(v6: std::net::Ipv6Addr) -> bool {
+    // An IPv4-mapped address (::ffff:a.b.c.d) carries an IPv4 address in the
+    // low bits, so the segment tests below read 0 and pass it. Apply the IPv4
+    // rules to the address it maps, otherwise ::ffff:10.0.0.1 slips through.
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_unadvertisable_v4(mapped);
+    }
+    let [s0, ..] = v6.segments();
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        // fc00::/7 unique local. Ipv6Addr::is_unique_local is unstable.
+        || s0 & 0xfe00 == 0xfc00
+        // fe80::/10 link-local. Ipv6Addr::is_unicast_link_local is unstable.
+        || s0 & 0xffc0 == 0xfe80
 }
 
 // ─── Check registry ───────────────────────────────────────────────────────────
@@ -1463,5 +1492,82 @@ mod tests {
     #[test]
     fn there_is_no_standalone_public_host_row() {
         assert!(!ALL_CHECK_IDS.contains(&"public-host"));
+    }
+
+    #[test]
+    fn private_and_special_use_public_host_fails_the_start_precondition() {
+        for host in [
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.50",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let err = require_public_host(host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_does_not_bypass_the_ipv4_rules() {
+        // ::ffff:a.b.c.d holds an IPv4 address in the low bits. A first-segment
+        // test reads 0 and would accept it, so the mapped address must be
+        // unwrapped and judged by the IPv4 rules.
+        for host in [
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.50",
+            "::ffff:127.0.0.1",
+            "[::ffff:172.16.0.1]",
+        ] {
+            require_public_host(host).expect_err(&format!("{host} must fail"));
+        }
+        require_public_host("::ffff:96.233.112.201")
+            .expect("a mapped public address must still pass");
+    }
+
+    #[test]
+    fn private_range_boundaries_sit_on_the_correct_side() {
+        for host in ["172.16.0.0", "172.31.255.255", "100.64.0.0", "10.0.0.0"] {
+            require_public_host(host).expect_err(&format!("{host} is inside a rejected range"));
+        }
+        for host in [
+            "172.15.255.255",
+            "172.32.0.0",
+            "100.63.255.255",
+            "9.255.255.255",
+        ] {
+            require_public_host(host)
+                .unwrap_or_else(|e| panic!("{host} is outside a rejected range: {e}"));
+        }
+    }
+
+    #[test]
+    fn routable_public_host_still_passes_the_start_precondition() {
+        for host in [
+            "96.233.112.201",
+            "2606:4700:4700::1111",
+            "nodes.quip.network",
+        ] {
+            require_public_host(host).unwrap_or_else(|e| panic!("{host:?} must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn mdns_local_hostname_fails_the_start_precondition() {
+        for host in ["node.local", "NODE.LOCAL", "printer.local:30333"] {
+            let err = require_public_host(host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
     }
 }
