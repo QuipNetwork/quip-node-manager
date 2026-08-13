@@ -17,10 +17,19 @@ pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 pub(crate) const FAUCET_URL: &str = "https://faucet.testnet.quip.network";
 pub(crate) const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
 // Container-internal miner REST port. Must match the upstream Caddyfile's
-// `reverse_proxy quip-miner:8086` and the seeded `quip-miner.{cpu,cuda}.toml`
-// `rest_port` (see stack_assets); the miner publishes no host port.
+// `reverse_proxy quip-miner:8086`; the miner publishes no host port.
 pub(crate) const DOCKER_MINER_REST_PORT: u16 = 8086;
 pub(crate) const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
+// Where the coordinator writes `<qblock_id>/attempts.jsonl`. In Docker this is
+// inside the `./data:/data` mount, so it lands beside config.toml on the host
+// and survives a container replacement.
+pub(crate) const DOCKER_ATTEMPTS_DIR: &str = "/data/attempts";
+
+/// Attempt-log directory for the native coordinator: `<data_dir>/attempts`,
+/// mirroring where the Docker path puts it inside the volume.
+fn native_attempts_dir() -> String {
+    data_dir().join("attempts").to_string_lossy().to_string()
+}
 
 /// Native miner → local validator: the validator container publishes its raw
 /// JSON-RPC on the host loopback (see stack_assets), so the host-side miner
@@ -54,8 +63,6 @@ struct MinerToml {
     validators: Vec<String>,
     signer_key: String,
     faucet_url: String,
-    rest_host: String,
-    rest_port: u16,
     #[serde(skip_serializing_if = "String::is_empty")]
     node_name: String,
     // Always emitted. Peers need an advertised host, and an omitted key
@@ -67,6 +74,19 @@ struct MinerToml {
     log_level: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     node_log: String,
+}
+
+/// `[dashboard]`: the coordinator's attempt-log REST surface, which Caddy
+/// proxies at `/api/v1/*`.
+///
+/// v0.3 replaced the v0.2 `[miner].rest_host` / `rest_port` pair with this
+/// section. The coordinator does not read those keys at all, and it disables
+/// the dashboard unless **both** fields below are present, so neither may be
+/// optional.
+#[derive(Serialize)]
+struct DashboardToml {
+    listen: String,
+    data_dir: String,
 }
 
 /// Absolute path to a bundled miner in Native mode, empty in Docker mode.
@@ -138,6 +158,7 @@ struct MetalToml {
 #[derive(Serialize)]
 struct ConfigToml {
     miner: MinerToml,
+    dashboard: DashboardToml,
     // None when CPU mining is disabled — the miner treats [cpu] presence as
     // the backend switch, so the section must vanish entirely, not zero out.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,20 +192,6 @@ impl ConfigToml {
                 native_signer_key()
             },
             faucet_url: FAUCET_URL.to_string(),
-            // Native miner REST is loopback-only by design — the dashboard
-            // container reaches it via host.docker.internal. Forcing it here
-            // (rather than at each start path) keeps the invariant in one
-            // place so a promoted or user-set rest_host can't expose it.
-            rest_host: if is_docker {
-                DOCKER_MINER_REST_HOST.to_string()
-            } else {
-                "127.0.0.1".to_string()
-            },
-            rest_port: if is_docker {
-                DOCKER_MINER_REST_PORT
-            } else {
-                native_rest_port(config)
-            },
             node_name: config.node_name.clone(),
             public_host: config.public_host.clone(),
             // Always emitted. Peers need an advertised port, and an omitted
@@ -281,6 +288,28 @@ impl ConfigToml {
 
         ConfigToml {
             miner,
+            // Must match what Caddy proxies `/api/v1/*` to, which
+            // `stack_assets` patches per mode: `quip-miner:8086` on the compose
+            // network in Docker, `host.docker.internal:<native_rest_port>` in
+            // Native.
+            //
+            // Native stays on loopback. The Caddy container reaches it through
+            // Docker Desktop's host.docker.internal proxy, which originates the
+            // connection on the host, so binding wider would expose the miner's
+            // REST surface to the operator's LAN for nothing. Native is
+            // macOS-only, so no host-gateway Linux path has to work here.
+            dashboard: DashboardToml {
+                listen: if is_docker {
+                    format!("{DOCKER_MINER_REST_HOST}:{DOCKER_MINER_REST_PORT}")
+                } else {
+                    format!("127.0.0.1:{}", native_rest_port(config))
+                },
+                data_dir: if is_docker {
+                    DOCKER_ATTEMPTS_DIR.to_string()
+                } else {
+                    native_attempts_dir()
+                },
+            },
             cpu: config.cpu_enabled.then_some(CpuToml {
                 binary: native_binary(run_mode, "quip-cpu-sa"),
                 num_cpus: config.num_cpus,
@@ -417,9 +446,22 @@ mod tests {
         assert!(!toml.contains("[global]"));
         assert!(toml.contains("validators = [\"ws://quip-validator:9944\"]"));
         assert!(toml.contains("signer_key = \"/data/keystore.json\""));
-        assert!(toml.contains("rest_host = \"0.0.0.0\""));
-        assert!(toml.contains("rest_port = 8086"));
+        assert!(toml.contains("[dashboard]\n"));
+        assert!(toml.contains("listen = \"0.0.0.0:8086\""));
+        assert!(toml.contains("data_dir = \"/data/attempts\""));
+        // v0.3 ignores these; emitting them would look configured and do
+        // nothing. See DashboardToml.
+        assert!(!toml.contains("rest_host"));
+        assert!(!toml.contains("rest_port"));
         assert!(toml.contains("[cpu]\n"));
+
+        // `listen` is a real key inside `[dashboard]`, so scan everything
+        // except that section — a bare top-level `listen` is still v0.1.
+        let dashboard = toml.find("[dashboard]").expect("dashboard section");
+        let after = toml[dashboard..]
+            .find("\n[")
+            .expect("section after dashboard");
+        let scanned = format!("{}{}", &toml[..dashboard], &toml[dashboard + after..]);
 
         for legacy_key in [
             "listen =",
@@ -444,7 +486,7 @@ mod tests {
             "telemetry_dir",
         ] {
             assert!(
-                !toml.contains(legacy_key),
+                !scanned.contains(legacy_key),
                 "rendered legacy key: {legacy_key}"
             );
         }
@@ -525,8 +567,8 @@ mod tests {
         assert!(toml.contains("validators = [\"ws://127.0.0.1:9944\"]"));
         assert!(toml.contains("signer_key = "));
         assert!(toml.contains("keystore.json"));
-        assert!(toml.contains("rest_host = \"127.0.0.1\""));
-        assert!(toml.contains("rest_port = 20123"));
+        assert!(toml.contains("listen = \"127.0.0.1:20123\""));
+        assert!(toml.contains("attempts"));
     }
 
     #[test]

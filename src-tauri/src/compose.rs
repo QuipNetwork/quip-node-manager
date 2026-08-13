@@ -500,7 +500,7 @@ pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/q
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-validator/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
-pub const COMPOSE_IMAGE_TAG: &str = "v0.2";
+pub const COMPOSE_IMAGE_TAG: &str = "v0.3.0-rc7";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -1486,7 +1486,7 @@ mod tests {
             DASHBOARD_IMAGE,
             "registry.gitlab.com/quip.network/dashboard.quip.network"
         );
-        assert_eq!(COMPOSE_IMAGE_TAG, "v0.2");
+        assert_eq!(COMPOSE_IMAGE_TAG, "v0.3.0-rc7");
     }
 
     /// Unset must stay unset. Writing an explicit default here would fork the

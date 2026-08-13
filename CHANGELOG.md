@@ -53,6 +53,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc4
+
+- **Docker mode pulls the v0.3 miner images again**: an image update pinned a v0.3 tag. The compose file still named the v0.2 repositories, which stop at `v0.2.1-rc54`. Every pull then failed with `not found`, and no stack would start. Both miner services now point at the v0.3 repository line, and a fresh install with no pinned tag asks for `v0.3.0-rc7`.
+
+- **The miner serves its REST surface again**: the manager wrote `rest_host` and `rest_port`, which the v0.3 coordinator does not read. The miner started, Caddy proxied `/api/v1/*` to a port nothing listened on, and the dashboard had no data source. The manager now writes a `[dashboard]` section, which is where v0.3 takes the listen address and the attempt-log directory. Docker binds port 8086 and Native binds port 20100 on loopback.
+
+- **Note for hand-edited configs**: a `config.toml` written for v0.2 does not start under v0.3. The coordinator requires a backend section, `public_host`, and `public_port`. Let the manager write the file, or copy the template the miner image ships at `/app/config.toml`.
+
+---
+
 ## v0.2.3-rc3
 
 - **The miner advertises a public address again**: `config.toml` omitted `public_port` whenever no explicit override existed, so peers had no advertised port. The manager now always writes `public_port`, and falls back to the Caddy front door port, which is the port a peer reaches from outside the host.
