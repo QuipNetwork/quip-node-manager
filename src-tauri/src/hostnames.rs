@@ -91,7 +91,7 @@ fn fallback_has_public_dns_host(fallback: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_public_dns_host(host: &str) -> bool {
+pub(crate) fn is_public_dns_host(host: &str) -> bool {
     if host.parse::<IpAddr>().is_ok() {
         return false;
     }

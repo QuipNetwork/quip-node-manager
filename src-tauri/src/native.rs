@@ -66,9 +66,11 @@ fn ensure_native_supported() -> Result<(), String> {
     if native_supported() {
         return Ok(());
     }
-    Err("Native mode requires an Apple Silicon Mac. On this platform, use \
+    Err(
+        "Native mode requires an Apple Silicon Mac. On this platform, use \
          Docker mode — the v0.3 images carry the CPU, D-Wave and CUDA miners."
-        .to_string())
+            .to_string(),
+    )
 }
 
 fn bin_dir() -> std::path::PathBuf {
@@ -187,9 +189,7 @@ pub fn cleanup_legacy_binaries() -> Vec<String> {
 }
 
 fn binary_release_marker_path() -> std::path::PathBuf {
-    data_dir()
-        .join("bin")
-        .join("quip-miner.release")
+    data_dir().join("bin").join("quip-miner.release")
 }
 
 /// Fetch the quip-miner releases list (GitLab returns them newest-first).
@@ -411,7 +411,10 @@ async fn wait_for_native_miner_validator_rpc(
     // TODO: Revisit this readiness gate; it likely needs another pass to make
     // the flow and diagnostics more eloquent.
     let probe_url = validator_rpc_http_probe_url(validator_url);
-    sink.log("INFO", &format!("Waiting for validator RPC at {validator_url}"));
+    sink.log(
+        "INFO",
+        &format!("Waiting for validator RPC at {validator_url}"),
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -654,15 +657,16 @@ pub(crate) async fn download_native_binary_core(
         .map_err(|e| e.to_string())?;
     let channel = crate::settings::load_settings().update_channel;
     let releases = fetch_protocol_releases(&meta_client).await?;
-    let (tag, url, _desc) = resolve_latest_downloadable_release(&meta_client, &releases, name, channel)
-        .await
-        .ok_or_else(|| {
-            format!(
-                "No downloadable quip-miner release ships {name} on the {channel:?} \
+    let (tag, url, _desc) =
+        resolve_latest_downloadable_release(&meta_client, &releases, name, channel)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "No downloadable quip-miner release ships {name} on the {channel:?} \
                  channel yet — the build may still be running, or the channel has no \
                  published builds. Try again shortly."
-            )
-        })?;
+                )
+            })?;
 
     // If a concurrent caller installed this version while we waited on the
     // lock, skip the redundant re-download.
@@ -748,7 +752,10 @@ pub(crate) async fn download_native_binary_core(
     let version = installed_binary_version().unwrap_or_else(|| normalize_release_version(&tag));
     sink.log(
         "INFO",
-        &format!("Installed {} from {} (binary version: {})", name, tag, version),
+        &format!(
+            "Installed {} from {} (binary version: {})",
+            name, tag, version
+        ),
     );
 
     Ok(version)
@@ -901,10 +908,10 @@ pub(crate) async fn start_native_node_core(
         }
     }
 
-    // Auto-detect public IP when no public_host is configured. A detection
-    // failure must not be silent: without a public_host the validator
-    // advertises no public address and peers can't dial in, so surface a
-    // warning the user can act on.
+    // Auto-detect public IP when no public_host is configured. Combined
+    // start already ran this in start_stack_core; a direct start_native_node
+    // call still needs the fill-in. After that, refuse to start without a
+    // usable public_host so the coordinator does not exit 64 later.
     if config.public_host.is_empty() {
         match crate::network::detect_public_ip().await {
             Ok(ip) => config.public_host = ip,
@@ -918,6 +925,10 @@ pub(crate) async fn start_native_node_core(
                 );
             }
         }
+    }
+    if let Err(e) = crate::checklist::require_public_host(&config.public_host) {
+        sink.log("ERROR", &e);
+        return Err(e);
     }
 
     // Write config.toml for native mode. The renderer forces the native
@@ -995,7 +1006,10 @@ pub(crate) async fn start_native_node_core(
     let pid = child.id();
 
     // Log the command and PID.
-    sink.log("INFO", &format!("$ {} {}", bin.display(), miner_args.join(" ")));
+    sink.log(
+        "INFO",
+        &format!("$ {} {}", bin.display(), miner_args.join(" ")),
+    );
     sink.log("INFO", &format!("Native miner started (PID {})", pid));
 
     // Arm the stop flag before storing the child so stop_native_node_core can
@@ -1007,23 +1021,33 @@ pub(crate) async fn start_native_node_core(
     Ok(format!("Native miner started (PID {})", pid))
 }
 
-/// Tail node logs: starts with node-output.log (process stdout),
-/// then switches to node.log once the node creates it.
+/// Tail native-mode logs: host `node-output.log` (miner) plus compose logs
+/// for the containerized support services (validator/dashboard/postgres/caddy).
 fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
-    use crate::log_stream::{start_log_stream_for_app, FallbackSource};
+    use crate::log_stream::{sources_for_run_mode, start_log_stream_for_app, LogStreamState};
+    use crate::settings::RunMode;
+    use tauri::Manager;
     let path = node_output_log_path();
     let _ = app.emit(
         "node-log",
         serde_json::json!({
             "timestamp": "",
             "level": "INFO",
-            "message": format!("[log-stream] tailing {}", path.display()),
+            "message": format!(
+                "[log-stream] native hybrid: tail {} + compose logs -f",
+                path.display()
+            ),
+            "source": "app",
         }),
     );
-    // Native path has no `docker logs` child, so the PID slot goes unused.
-    let child_pid = Arc::new(Mutex::new(None));
-    let fallback = FallbackSource::File(path);
-    start_log_stream_for_app(app, stop_flag, child_pid, fallback);
+    // ComposeAll spawns `docker compose logs -f`; store its PID in the shared
+    // LogStreamState so stop_stack / stop_log_stream / stop_native_node can
+    // kill it and unblock BufReader::lines().
+    let log_state = app.state::<LogStreamState>();
+    log_state.kill_child();
+    let child_pid = Arc::clone(&log_state.child_pid);
+    let sources = sources_for_run_mode(&RunMode::Native);
+    start_log_stream_for_app(app, stop_flag, child_pid, sources);
 }
 
 /// Start tailing native node logs (for orphan reconnect on app restart).
@@ -1037,7 +1061,8 @@ pub async fn start_native_log_tail(
         serde_json::json!({
             "timestamp": "",
             "level": "INFO",
-            "message": "[log-stream] starting native tail (node-output.log \u{2192} node.log)",
+            "message": "[log-stream] starting native multi-source tail",
+            "source": "app",
         }),
     );
     let stop_flag = Arc::clone(&state.stop_flag);
@@ -1062,6 +1087,13 @@ pub async fn stop_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
+    // Unblock the hybrid compose log child before signalling the stop flag.
+    {
+        use crate::log_stream::LogStreamState;
+        use tauri::Manager;
+        let log_state = app.state::<LogStreamState>();
+        log_state.kill_child();
+    }
     let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
     stop_native_node_core(sink, &state).await?;
     // trigger_recheck_auto requires an AppHandle; runs only in the GUI wrapper.
@@ -1337,7 +1369,10 @@ mod tests {
         // decides cpu/gpu/qpu from the config.toml sections alone.
         let args = native_miner_args(Path::new("/tmp/config.toml"));
 
-        assert_eq!(args, vec!["--config".to_string(), "/tmp/config.toml".to_string()]);
+        assert_eq!(
+            args,
+            vec!["--config".to_string(), "/tmp/config.toml".to_string()]
+        );
     }
 
     #[test]
@@ -1412,7 +1447,8 @@ mod tests {
         let f = std::fs::File::create(&tarball).expect("create tarball");
         let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
         let mut ar = tar::Builder::new(enc);
-        ar.append_dir_all("quip-miner-darwin-arm64", &src).expect("append");
+        ar.append_dir_all("quip-miner-darwin-arm64", &src)
+            .expect("append");
         ar.into_inner().expect("inner").finish().expect("finish");
 
         let dest = tmp.join("bin");
@@ -1448,11 +1484,14 @@ mod tests {
         let tarball = tmp.join("empty.tar.gz");
         let f = std::fs::File::create(&tarball).expect("create");
         let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
-        tar::Builder::new(enc).into_inner().expect("inner").finish().expect("finish");
+        tar::Builder::new(enc)
+            .into_inner()
+            .expect("inner")
+            .finish()
+            .expect("finish");
 
         let err = extract_bundle(&tarball, &tmp.join("bin")).expect_err("must reject");
         assert!(err.contains("no binaries"), "got: {err}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
 }

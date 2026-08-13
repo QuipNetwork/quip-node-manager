@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "quip-node-manager"
-version = "0.2.3-rc2"
+version = "0.2.3-rc3"
 dependencies = [
  "blake2",
  "crossterm",

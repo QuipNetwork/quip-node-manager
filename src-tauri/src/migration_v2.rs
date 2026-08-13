@@ -138,6 +138,7 @@ fn emit_log(app: &AppHandle, level: &str, message: &str) {
             "timestamp": "",
             "level": level,
             "message": line,
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     }

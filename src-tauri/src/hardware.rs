@@ -199,6 +199,7 @@ pub async fn run_hardware_survey(app: tauri::AppHandle) -> Result<HardwareSurvey
             "timestamp": "",
             "level": "INFO",
             "message": msg,
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     };

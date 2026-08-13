@@ -30,14 +30,17 @@
       <img src="quipv4.png" class="tab-logo" alt="Quip" />
       <button class="tab-btn active" data-tab="status">Status Monitor</button>
       <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-      <span id="app-version" class="app-version">
-        v0.0.0
-        <span id="update-dot" class="update-dot" style="display:none;"></span>
-        <div id="update-tooltip" class="update-tooltip" style="display:none;">
-          <span id="update-tooltip-text"></span>
-          <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
-        </div>
-      </span>
+      <div class="app-version-wrap">
+        <span id="app-version" class="app-version">
+          v0.0.0
+          <span id="update-dot" class="update-dot" style="display:none;"></span>
+          <div id="update-tooltip" class="update-tooltip" style="display:none;">
+            <span id="update-tooltip-text"></span>
+            <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
+          </div>
+        </span>
+        <button id="btn-check-updates" type="button" class="btn btn-sm btn-secondary">Check for updates</button>
+      </div>
     </div>
 
     <!-- Status Monitor Tab -->
@@ -329,11 +332,32 @@
     <!-- Log Drawer (fixed bottom) -->
     <div id="log-drawer">
       <div id="log-drawer-handle" class="log-drawer-handle">
-        <div style="display:flex;align-items:center;gap:10px;">
+        <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
           <span id="log-drawer-chevron" class="log-drawer-chevron"></span>
           <div class="section-heading" style="margin:0;">Node Logs</div>
+          <div id="log-source-filters" class="log-source-filters" aria-label="Log source filters"></div>
+          <div class="log-text-filter-wrap">
+            <input
+              id="log-text-filter"
+              class="log-text-filter"
+              type="search"
+              placeholder="Filter logs…"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Filter logs"
+            />
+            <button
+              id="log-text-filter-clear"
+              class="log-text-filter-clear"
+              type="button"
+              title="Clear filter"
+              aria-label="Clear filter"
+              hidden
+            >&times;</button>
+          </div>
+          <span id="log-match-count" class="log-match-count" aria-live="polite"></span>
         </div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;flex-shrink:0;">
           <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
           <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
         </div>

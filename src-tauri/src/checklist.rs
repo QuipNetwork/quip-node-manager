@@ -171,6 +171,7 @@ impl CheckCtx {
             "timestamp": "",
             "level": level,
             "message": format!("[probe] {}", message.into()),
+            "source": "app",
         });
         let _ = app.emit("node-log", entry);
     }
@@ -253,7 +254,13 @@ fn make_client(timeout_secs: u64) -> Option<reqwest::Client> {
         .ok()
 }
 
-async fn fetch_public_ip() -> Option<String> {
+/// Public IP as check.quip.network sees us, falling back to ipify when the
+/// service is down.
+///
+/// This is the same value the start paths render into the miner's
+/// `public_host`, so the `ip` checklist row and the address the node actually
+/// advertises cannot disagree.
+pub(crate) async fn fetch_public_ip() -> Option<String> {
     if let Some(ip) = fetch_ip_check_service().await {
         return Some(ip);
     }
@@ -589,6 +596,76 @@ async fn check_hostname_dns(hostname: &str) -> Option<bool> {
     Some(json["match"].as_bool().unwrap_or(false))
 }
 
+// ─── public_host start precondition ───────────────────────────────────────────
+
+/// Operator message when `public_host` is missing or empty.
+pub(crate) const PUBLIC_HOST_REQUIRED: &str = concat!(
+    "public_host is required. It is the address peers use to reach this node ",
+    "from outside the host. Set it in Settings to a public DNS name or public IP.",
+);
+
+/// Operator message when `public_host` is not reachable from outside the host.
+pub(crate) const PUBLIC_HOST_NOT_ADVERTISABLE: &str = concat!(
+    "public_host is required. It is the address peers use to reach this node ",
+    "from outside the host. localhost, loopback, private, link-local, and ",
+    "other non-public addresses are not reachable from outside the host.",
+);
+
+/// Refuse to start when peers would have no usable address.
+///
+/// Empty, whitespace, and unparseable values fail as unset. Loopback,
+/// unspecified, private, link-local, CGNAT, multicast, reserved,
+/// unique-local, and mDNS `.local` names fail because a peer outside this
+/// host cannot reach them.
+pub(crate) fn require_public_host(public_host: &str) -> Result<(), String> {
+    let Some(host) = crate::hostnames::public_host_name(public_host) else {
+        return Err(PUBLIC_HOST_REQUIRED.to_string());
+    };
+    if is_unadvertisable_host(&host) {
+        return Err(PUBLIC_HOST_NOT_ADVERTISABLE.to_string());
+    }
+    Ok(())
+}
+
+fn is_unadvertisable_host(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => is_unadvertisable_v4(v4),
+        Ok(std::net::IpAddr::V6(v6)) => is_unadvertisable_v6(v6),
+        // Reuse the hostname rule: reject localhost, *.localhost, and *.local.
+        Err(_) => !crate::hostnames::is_public_dns_host(host),
+    }
+}
+
+fn is_unadvertisable_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        // 100.64.0.0/10 CGNAT. Ipv4Addr::is_shared is unstable.
+        || (a == 100 && (64..=127).contains(&b))
+        // 240.0.0.0/4 reserved. Ipv4Addr::is_reserved is unstable.
+        || a >= 240
+}
+
+fn is_unadvertisable_v6(v6: std::net::Ipv6Addr) -> bool {
+    // An IPv4-mapped address (::ffff:a.b.c.d) carries an IPv4 address in the
+    // low bits, so the segment tests below read 0 and pass it. Apply the IPv4
+    // rules to the address it maps, otherwise ::ffff:10.0.0.1 slips through.
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_unadvertisable_v4(mapped);
+    }
+    let [s0, ..] = v6.segments();
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        // fc00::/7 unique local. Ipv6Addr::is_unique_local is unstable.
+        || s0 & 0xfe00 == 0xfc00
+        // fe80::/10 link-local. Ipv6Addr::is_unicast_link_local is unstable.
+        || s0 & 0xffc0 == 0xfe80
+}
+
 // ─── Check registry ───────────────────────────────────────────────────────────
 
 /// IDs of all checks in render order. Filter by `visible_for_mode`.
@@ -807,9 +884,8 @@ async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
                 .unwrap_or(false);
         }
         if !available {
-            let detail = download_err.unwrap_or_else(|| {
-                "no app handle available to start the download".to_string()
-            });
+            let detail = download_err
+                .unwrap_or_else(|| "no app handle available to start the download".to_string());
             return base
                 .with_state(CheckState::Fail)
                 .with_label("Native miner binary download failed")
@@ -824,9 +900,7 @@ async fn run_check_binary(ctx: &CheckCtx, auto: bool) -> CheckItem {
                 // A newer release exists. A user Retry fetches it now; an
                 // automatic recheck reports it without downloading so it can't
                 // race the Restart-to-Update flow's own DownloadBinary step.
-                (Some(info), _) if !auto => {
-                    fetch_binary_update(ctx, base, &info.version).await
-                }
+                (Some(info), _) if !auto => fetch_binary_update(ctx, base, &info.version).await,
                 (Some(info), _) => binary_update_available_item(base, installed, &info.version),
                 // Confirmed current: show both numbers so the user can see what
                 // was discovered, not just a green check.
@@ -1011,6 +1085,7 @@ fn emit_log(app: &AppHandle, auto: bool, verb: &str, item: &CheckItem, level: &s
         "timestamp": "",
         "level": level,
         "message": message,
+        "source": "app",
     });
     let _ = app.emit("node-log", entry);
 }
@@ -1356,5 +1431,143 @@ mod tests {
         let item = idle_item("port-validator", &ctx);
         assert!(!item.required);
         assert_eq!(item.fixable, None);
+    }
+
+    #[test]
+    fn empty_public_host_fails_the_start_precondition() {
+        let config = crate::settings::NodeConfig::default();
+        let err = require_public_host(&config.public_host).expect_err("empty must fail");
+        assert!(
+            err.contains("public_host"),
+            "message must name the field: {err}"
+        );
+        assert!(
+            err.contains("required"),
+            "message must say the field is required: {err}"
+        );
+        assert!(
+            err.contains("outside the host"),
+            "message must say what public_host is for: {err}"
+        );
+    }
+
+    #[test]
+    fn loopback_public_host_fails_the_start_precondition() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "0.0.0.0",
+            "127.0.0.1:20049",
+            "::1",
+            "[::1]",
+        ] {
+            let config = crate::settings::NodeConfig {
+                public_host: host.to_string(),
+                ..crate::settings::NodeConfig::default()
+            };
+            let err =
+                require_public_host(&config.public_host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertisable_public_host_passes_the_start_precondition() {
+        for host in [
+            "node.example.com",
+            "203.0.113.9",
+            "https://node.example.com:9443/rpc",
+            "2001:db8::1",
+        ] {
+            require_public_host(host).unwrap_or_else(|e| panic!("{host:?} must pass: {e}"));
+        }
+    }
+
+    /// The public host is covered by the `port` rows, which probe it end to
+    /// end. A dedicated row would duplicate that with a weaker signal.
+    #[test]
+    fn there_is_no_standalone_public_host_row() {
+        assert!(!ALL_CHECK_IDS.contains(&"public-host"));
+    }
+
+    #[test]
+    fn private_and_special_use_public_host_fails_the_start_precondition() {
+        for host in [
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.50",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let err = require_public_host(host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_does_not_bypass_the_ipv4_rules() {
+        // ::ffff:a.b.c.d holds an IPv4 address in the low bits. A first-segment
+        // test reads 0 and would accept it, so the mapped address must be
+        // unwrapped and judged by the IPv4 rules.
+        for host in [
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.50",
+            "::ffff:127.0.0.1",
+            "[::ffff:172.16.0.1]",
+        ] {
+            require_public_host(host).expect_err(&format!("{host} must fail"));
+        }
+        require_public_host("::ffff:96.233.112.201")
+            .expect("a mapped public address must still pass");
+    }
+
+    #[test]
+    fn private_range_boundaries_sit_on_the_correct_side() {
+        for host in ["172.16.0.0", "172.31.255.255", "100.64.0.0", "10.0.0.0"] {
+            require_public_host(host).expect_err(&format!("{host} is inside a rejected range"));
+        }
+        for host in [
+            "172.15.255.255",
+            "172.32.0.0",
+            "100.63.255.255",
+            "9.255.255.255",
+        ] {
+            require_public_host(host)
+                .unwrap_or_else(|e| panic!("{host} is outside a rejected range: {e}"));
+        }
+    }
+
+    #[test]
+    fn routable_public_host_still_passes_the_start_precondition() {
+        for host in [
+            "96.233.112.201",
+            "2606:4700:4700::1111",
+            "nodes.quip.network",
+        ] {
+            require_public_host(host).unwrap_or_else(|e| panic!("{host:?} must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn mdns_local_hostname_fails_the_start_precondition() {
+        for host in ["node.local", "NODE.LOCAL", "printer.local:30333"] {
+            let err = require_public_host(host).expect_err(&format!("{host} must fail"));
+            assert!(
+                err.contains("public_host"),
+                "host {host:?} message must name the field: {err}"
+            );
+        }
     }
 }

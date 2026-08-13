@@ -58,9 +58,7 @@ pub fn pick_channel_tag(tags: &[String], channel: UpdateChannel) -> Option<Strin
 /// reference with the `registry.gitlab.com/` host stripped (e.g.
 /// `quip.network/quip-miner/quip-miner-cpu`).
 pub fn repo_path(image: &str) -> &str {
-    image
-        .strip_prefix("registry.gitlab.com/")
-        .unwrap_or(image)
+    image.strip_prefix("registry.gitlab.com/").unwrap_or(image)
 }
 
 /// Fetch every tag name for a public registry repository via the Docker

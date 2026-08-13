@@ -31,7 +31,20 @@ const state = {
   updateAvailable: null,   // null | { kind: 'image' | 'binary' }
   updating: false,
   detectedGpus: [], // { index, name }
-  logLines: [],
+  // Per-source ring buffers (each capped at MAX_LOG_LINES) so a chatty
+  // validator cannot evict miner history. Entries carry `_seq` for arrival order.
+  logBuffers: {},
+  // source -> bool; default true when a source first produces lines.
+  logSourceVisible: {},
+  // Console-style substring filter (applied to message + source tag).
+  // `logTextFilter` is the live input value; `logTextFilterApplied` is the
+  // debounced value used for matching so typing does not thrash the DOM.
+  logTextFilter: '',
+  logTextFilterApplied: '',
+  // Cached visible line count (both filters). Updated by render/append.
+  logVisibleCount: 0,
+  // Monotonic arrival counter for render order (not timestamps).
+  logSeq: 0,
   MAX_LOG_LINES: 500,
   pollInterval: null,
   // Map<id, CheckItem> — single source of truth for the checklist UI.
@@ -365,8 +378,14 @@ document.getElementById('dashboard-reset-btn')?.addEventListener('click', async 
 
 // ─── Log drawer toggle ──────────────────────────────────────────────────────
 document.getElementById('log-drawer-handle').addEventListener('click', (e) => {
-  // Don't toggle if clicking Copy/Clear buttons inside the handle
-  if (e.target.closest('.btn')) return;
+  // Don't toggle if clicking Copy/Clear, source chips, or the text filter
+  if (
+    e.target.closest('.btn') ||
+    e.target.closest('.log-source-chip') ||
+    e.target.closest('.log-text-filter-wrap')
+  ) {
+    return;
+  }
   document.getElementById('log-drawer').classList.toggle('expanded');
 });
 
@@ -831,7 +850,15 @@ function updateStartStopState() {
   }
 
   stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
-  stopBtn.disabled = !running || state.starting || state.stopping || state.updating;
+  // Stop is gated on "is there anything to stop", not on `running`. `running`
+  // tracks the *miner* only, so a partially started stack — validator, postgres,
+  // caddy and dashboard up with no miner container — left Stop disabled while
+  // the stack was plainly alive, with no way to shut it down from the UI.
+  stopBtn.disabled =
+    !(running || anyStackServiceRunning()) ||
+    state.starting ||
+    state.stopping ||
+    state.updating;
   document.getElementById('btn-apply').disabled =
     !state.checksPassed || state.starting || state.stopping || state.updating;
 }
@@ -855,6 +882,13 @@ function setStatus(stateStr) {
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
     sub.textContent = 'Running, but some stack services are down or unhealthy';
+  } else if (stateStr === 'partial') {
+    // Amber, like degraded: the stack is up but not mining. Name the running
+    // services so the state is actionable rather than just "not stopped".
+    dot.classList.add('status-degraded', 'active');
+    text.classList.add('status-degraded');
+    text.textContent = 'PARTIAL';
+    sub.textContent = partialSubtext();
   } else if (stateStr === 'unhealthy') {
     dot.classList.add('status-unhealthy', 'active');
     text.classList.add('status-unhealthy');
@@ -1126,35 +1160,303 @@ function appendTextWithLinks(el, text) {
   }
 }
 
-function appendLog(entry) {
-  state.logLines.push(entry);
-  if (state.logLines.length > state.MAX_LOG_LINES) {
-    state.logLines.shift();
+/** Stable display order for source filter chips. */
+const LOG_SOURCE_ORDER = ['app', 'miner', 'validator', 'dashboard', 'postgres', 'caddy'];
+
+/** Debounce timer for text-filter re-renders (~120ms). */
+let logTextFilterTimer = null;
+
+function normalizeLogEntry(entry) {
+  const source = entry.source || 'app';
+  return {
+    timestamp: entry.timestamp || '',
+    level: entry.level || 'INFO',
+    message: entry.message || '',
+    source,
+    _seq: state.logSeq++,
+  };
+}
+
+/** All buffered lines across sources, sorted by arrival (`_seq`). */
+function allLogEntriesInArrivalOrder() {
+  const all = [];
+  for (const lines of Object.values(state.logBuffers)) {
+    for (const e of lines) all.push(e);
   }
-  const output = document.getElementById('log-output');
+  all.sort((a, b) => a._seq - b._seq);
+  return all;
+}
+
+/** Case-insensitive substring match on message and source tag. */
+function entryMatchesTextFilter(entry, needle) {
+  if (!needle) return true;
+  const q = needle.toLowerCase();
+  if ((entry.source || '').toLowerCase().includes(q)) return true;
+  if ((entry.message || '').toLowerCase().includes(q)) return true;
+  return false;
+}
+
+/** Lines that pass BOTH source chips (AND) text filter, in arrival order. */
+function visibleLogEntries() {
+  const needle = state.logTextFilterApplied;
+  return allLogEntriesInArrivalOrder().filter(
+    (e) =>
+      state.logSourceVisible[e.source] !== false &&
+      entryMatchesTextFilter(e, needle),
+  );
+}
+
+function totalBufferedLogCount() {
+  let n = 0;
+  for (const lines of Object.values(state.logBuffers)) {
+    n += lines.length;
+  }
+  return n;
+}
+
+function updateLogMatchCount(visibleCount, totalCount) {
+  const el = document.getElementById('log-match-count');
+  if (!el) return;
+  const total = totalCount ?? totalBufferedLogCount();
+  if (visibleCount !== undefined) state.logVisibleCount = visibleCount;
+  if (total === 0) {
+    state.logVisibleCount = 0;
+    el.textContent = '';
+    return;
+  }
+  el.textContent = `${state.logVisibleCount} / ${total}`;
+}
+
+function updateLogFilterClearButton() {
+  const btn = document.getElementById('log-text-filter-clear');
+  if (!btn) return;
+  btn.hidden = !state.logTextFilter;
+}
+
+function buildLogLineElement(entry) {
   const line = document.createElement('p');
   line.className = `log-line log-${(entry.level || 'info').toLowerCase()}`;
   const ts = entry.timestamp ? `[${entry.timestamp}] ` : '';
-  appendTextWithLinks(line, `${ts}${entry.message}`);
-  output.appendChild(line);
-  if (output.scrollHeight - output.scrollTop - output.clientHeight < 60) {
+  const tag = document.createElement('span');
+  tag.className = `log-source log-source-${entry.source}`;
+  tag.textContent = entry.source;
+  line.appendChild(tag);
+  line.appendChild(document.createTextNode(' '));
+  // Wrap message (+ optional ts) so URLs stay clickable.
+  const msgSpan = document.createElement('span');
+  appendTextWithLinks(msgSpan, `${ts}${entry.message}`);
+  line.appendChild(msgSpan);
+  return line;
+}
+
+function renderLogSourceChips() {
+  const host = document.getElementById('log-source-filters');
+  if (!host) return;
+  const sources = Object.keys(state.logBuffers).sort((a, b) => {
+    const ia = LOG_SOURCE_ORDER.indexOf(a);
+    const ib = LOG_SOURCE_ORDER.indexOf(b);
+    if (ia === -1 && ib === -1) return a.localeCompare(b);
+    if (ia === -1) return 1;
+    if (ib === -1) return -1;
+    return ia - ib;
+  });
+  host.innerHTML = '';
+  for (const src of sources) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'log-source-chip';
+    chip.dataset.source = src;
+    const on = state.logSourceVisible[src] !== false;
+    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (!on) chip.classList.add('off');
+    chip.textContent = src;
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.logSourceVisible[src] = state.logSourceVisible[src] === false;
+      renderLogSourceChips();
+      renderLogOutput();
+    });
+    host.appendChild(chip);
+  }
+}
+
+/**
+ * Rebuild the log body from ring buffers (arrival order), applying both
+ * source chips and the text filter. Uses a DocumentFragment so the DOM is
+ * not thrashing per-line during the rebuild.
+ */
+function renderLogOutput() {
+  const output = document.getElementById('log-output');
+  if (!output) return;
+  const stickToBottom =
+    output.scrollHeight - output.scrollTop - output.clientHeight < 60;
+  const visible = visibleLogEntries();
+  const total = totalBufferedLogCount();
+  const frag = document.createDocumentFragment();
+  if (visible.length === 0 && total > 0) {
+    const empty = document.createElement('p');
+    empty.className = 'log-empty-filter';
+    empty.textContent = 'No lines match the current filter';
+    frag.appendChild(empty);
+  } else {
+    for (const entry of visible) {
+      frag.appendChild(buildLogLineElement(entry));
+    }
+  }
+  output.replaceChildren(frag);
+  updateLogMatchCount(visible.length, total);
+  if (stickToBottom) {
     output.scrollTop = output.scrollHeight;
   }
-  while (output.children.length > state.MAX_LOG_LINES) {
-    output.removeChild(output.firstChild);
+}
+
+function entryIsVisible(entry) {
+  return (
+    state.logSourceVisible[entry.source] !== false &&
+    entryMatchesTextFilter(entry, state.logTextFilterApplied)
+  );
+}
+
+function applyLogTextFilterNow() {
+  state.logTextFilterApplied = state.logTextFilter;
+  renderLogOutput();
+}
+
+function scheduleLogTextFilterApply() {
+  if (logTextFilterTimer !== null) {
+    clearTimeout(logTextFilterTimer);
+  }
+  logTextFilterTimer = setTimeout(() => {
+    logTextFilterTimer = null;
+    applyLogTextFilterNow();
+  }, 120);
+}
+
+function setLogTextFilter(value, { immediate = false } = {}) {
+  state.logTextFilter = value;
+  const input = document.getElementById('log-text-filter');
+  if (input && input.value !== value) input.value = value;
+  updateLogFilterClearButton();
+  if (immediate) {
+    if (logTextFilterTimer !== null) {
+      clearTimeout(logTextFilterTimer);
+      logTextFilterTimer = null;
+    }
+    applyLogTextFilterNow();
+  } else {
+    scheduleLogTextFilterApply();
+  }
+}
+
+function appendLog(entry) {
+  const normalized = normalizeLogEntry(entry);
+  const src = normalized.source;
+  if (!state.logBuffers[src]) {
+    state.logBuffers[src] = [];
+    // Default: all sources visible.
+    if (state.logSourceVisible[src] === undefined) {
+      state.logSourceVisible[src] = true;
+    }
+    renderLogSourceChips();
+  }
+  const buf = state.logBuffers[src];
+  // If the ring buffer drops a line that currently matches both filters,
+  // keep the match count in sync with the buffers (DOM eviction of that
+  // single node is left for the next full re-render — same as pre-filter).
+  let droppedVisible = false;
+  if (buf.length >= state.MAX_LOG_LINES) {
+    const dropped = buf[0];
+    if (entryIsVisible(dropped)) droppedVisible = true;
+    buf.shift();
+  }
+  buf.push(normalized);
+
+  const total = totalBufferedLogCount();
+  if (!entryIsVisible(normalized)) {
+    if (droppedVisible) {
+      updateLogMatchCount(Math.max(0, state.logVisibleCount - 1), total);
+    } else {
+      updateLogMatchCount(undefined, total);
+    }
+    return;
+  }
+
+  const output = document.getElementById('log-output');
+  if (!output) return;
+  // Drop empty-state placeholder if present (first matching line after a miss).
+  const emptyMsg = output.querySelector('.log-empty-filter');
+  if (emptyMsg) emptyMsg.remove();
+
+  const stickToBottom =
+    output.scrollHeight - output.scrollTop - output.clientHeight < 60;
+  // New lines always arrive last, so append preserves arrival order among
+  // currently visible lines.
+  output.appendChild(buildLogLineElement(normalized));
+  // +1 for the new line; -1 if we also dropped a previously-visible line.
+  const nextVisible = state.logVisibleCount + 1 - (droppedVisible ? 1 : 0);
+  updateLogMatchCount(nextVisible, total);
+  if (stickToBottom) {
+    output.scrollTop = output.scrollHeight;
+  }
+}
+
+// Text filter input (live, debounced re-render from buffers).
+{
+  const input = document.getElementById('log-text-filter');
+  const clearBtn = document.getElementById('log-text-filter-clear');
+  if (input) {
+    input.addEventListener('input', () => {
+      state.logTextFilter = input.value;
+      updateLogFilterClearButton();
+      scheduleLogTextFilterApply();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setLogTextFilter('', { immediate: true });
+      }
+    });
+    // Keep focus from collapsing/expanding the drawer.
+    input.addEventListener('click', (e) => e.stopPropagation());
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setLogTextFilter('', { immediate: true });
+      document.getElementById('log-text-filter')?.focus();
+    });
   }
 }
 
 document.getElementById('btn-copy-log').addEventListener('click', () => {
-  const text = state.logLines
-    .map((e) => `${e.timestamp} ${e.level} ${e.message}`)
+  // Export exactly the lines currently visible under both filters.
+  const text = visibleLogEntries()
+    .map((e) => {
+      const ts = e.timestamp ? `${e.timestamp} ` : '';
+      return `${ts}[${e.source}] ${e.level} ${e.message}`;
+    })
     .join('\n');
   navigator.clipboard.writeText(text).catch(console.error);
 });
 
 document.getElementById('btn-clear-log').addEventListener('click', () => {
-  state.logLines = [];
+  state.logBuffers = {};
+  state.logSourceVisible = {};
+  state.logSeq = 0;
+  state.logTextFilter = '';
+  state.logTextFilterApplied = '';
+  state.logVisibleCount = 0;
+  if (logTextFilterTimer !== null) {
+    clearTimeout(logTextFilterTimer);
+    logTextFilterTimer = null;
+  }
+  const input = document.getElementById('log-text-filter');
+  if (input) input.value = '';
+  updateLogFilterClearButton();
   document.getElementById('log-output').innerHTML = '';
+  updateLogMatchCount(0, 0);
+  renderLogSourceChips();
 });
 
 // ─── Image pull progress ──────────────────────────────────────────────────────
@@ -1486,12 +1788,39 @@ function stackRunningInMode() {
   return s.services?.some((x) => x.running);
 }
 
+// True when *any* compose service is up, miner or support. Distinct from
+// `stackRunningInMode`, which asks the narrower "is the miner up" question that
+// drives RUNNING. A partially started stack is still a stack that has to be
+// detected, shown, and stoppable.
+function anyStackServiceRunning() {
+  return !!state.stack?.services?.some((x) => x.running);
+}
+
+// Subtext for the PARTIAL pill: which services are up, so the operator can see
+// at a glance that the miner is the missing one.
+function partialSubtext() {
+  const up = (state.stack?.services ?? [])
+    .filter((x) => x.running)
+    .map((x) => x.service);
+  if (!up.length) return 'Miner not running';
+  return `Miner not running; ${up.length} support service${
+    up.length === 1 ? '' : 's'
+  } up (${up.join(', ')})`;
+}
+
 // Map the stack roll-up + miner state to the status pill. The miner (container
 // or native process) decides RUNNING vs STOPPED; support-service health
 // decides RUNNING vs DEGRADED. In Native mode a null stack means the support
 // containers aren't reachable at all — the miner alone is degraded, not fine.
 function statusFromStack(minerRunning) {
-  if (!minerRunning) return 'stopped';
+  if (!minerRunning) {
+    // The miner is down, but support services (validator, postgres, caddy,
+    // dashboard) can still be up — a partially started stack, which is what
+    // you get after a miner crash, a profile switch, or a Start that only
+    // brought up part of the stack. Reporting that as STOPPED hid a live
+    // stack from the UI and left Stop disabled with no way to shut it down.
+    return anyStackServiceRunning() ? 'partial' : 'stopped';
+  }
   // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
   // while the transition is still in flight.
   if (state.starting || state.stopping) return 'running';
@@ -1672,6 +2001,37 @@ async function refreshNodeVersion() {
   } catch { /* ignore */ }
 }
 
+// ─── Manual "Check for updates" ───────────────────────────────────────────────
+// Runs the same sweep as the background monitor (app + images + native binary).
+// Events from the backend drive the existing update-badge handlers; the return
+// value covers "up to date" and check-failed so the user always gets feedback.
+document.getElementById('btn-check-updates')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-check-updates');
+  if (!btn || btn.disabled) return;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Checking\u2026';
+  try {
+    const outcome = await invoke('check_for_updates_now');
+    const status = outcome && outcome.status;
+    let level = 'INFO';
+    if (status === 'check_failed') level = 'WARN';
+    const message = (outcome && outcome.message)
+      || (status === 'up_to_date' ? 'You are up to date.' : 'Update check finished.');
+    appendLog({ timestamp: '', level, message, source: 'app' });
+  } catch (e) {
+    appendLog({
+      timestamp: '',
+      level: 'ERROR',
+      message: `Update check failed: ${e}`,
+      source: 'app',
+    });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+});
+
 // ─── Update Badge ─────────────────────────────────────────────────────────────
 function showUpdateBadge(version, url) {
   const dot = document.getElementById('update-dot');
@@ -1831,12 +2191,22 @@ async function init() {
 
   // Poll status — also fire-and-forget, handles log stream reconnect
   pollStatus().then(() => {
-    const running = state.containerRunning || state.nativeRunning;
-    if (running) {
+    const minerRunning = state.containerRunning || state.nativeRunning;
+    // Attach to logs whenever *something* is up, not only when the miner is.
+    // `docker compose logs -f` follows the whole project, so a partially
+    // started stack still has logs worth showing — and those logs are usually
+    // how an operator finds out why the miner is the piece that is missing.
+    // (Unified log stream already tags per-service sources; partial attach is
+    // what feeds those chips when the miner container is absent.)
+    const anythingRunning = minerRunning || anyStackServiceRunning();
+    if (anythingRunning) {
       collapseConfig();
       if (isDockerMode()) {
         invoke('start_log_stream').catch(console.error);
-      } else {
+      } else if (minerRunning) {
+        // Native log tail follows the host miner process only — keep it gated
+        // on the miner actually running. Docker `start_log_stream` is the path
+        // that widens to "any service up".
         invoke('start_native_log_tail').catch(console.error);
       }
     }

@@ -18,7 +18,8 @@ fn blake2_128(data: &[u8]) -> [u8; 16] {
     let mut h = Blake2bVar::new(16).expect("16 is a valid blake2b length");
     h.update(data);
     let mut out = [0u8; 16];
-    h.finalize_variable(&mut out).expect("output buffer is 16 bytes");
+    h.finalize_variable(&mut out)
+        .expect("output buffer is 16 bytes");
     out
 }
 
@@ -80,7 +81,9 @@ pub struct ValidatorRpc {
 
 impl ValidatorRpc {
     pub fn new(url: &str) -> Self {
-        ValidatorRpc { base: rpc_base_url(url) }
+        ValidatorRpc {
+            base: rpc_base_url(url),
+        }
     }
 
     async fn call(
@@ -101,9 +104,13 @@ impl ValidatorRpc {
             .send()
             .await
             .map_err(|e| format!("{method} request failed: {e}"))?;
-        let v: serde_json::Value =
-            resp.json().await.map_err(|e| format!("{method} bad json: {e}"))?;
-        v.get("result").cloned().ok_or_else(|| format!("{method}: no result field"))
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("{method} bad json: {e}"))?;
+        v.get("result")
+            .cloned()
+            .ok_or_else(|| format!("{method}: no result field"))
     }
 
     pub async fn current_block(&self) -> Result<u64, String> {
@@ -122,7 +129,9 @@ impl ValidatorRpc {
 
     pub async fn storage_u64(&self, key: &[u8]) -> Result<Option<u64>, String> {
         let hex_key = format!("0x{}", hex::encode(key));
-        let r = self.call("state_getStorage", serde_json::json!([hex_key])).await?;
+        let r = self
+            .call("state_getStorage", serde_json::json!([hex_key]))
+            .await?;
         match r.as_str() {
             None => Ok(None),
             Some(s) => {
@@ -139,11 +148,15 @@ impl ValidatorRpc {
 pub fn parse_account_id_hex(keystore_json: &str) -> Result<[u8; 32], String> {
     let v: serde_json::Value =
         serde_json::from_str(keystore_json).map_err(|e| format!("keystore not json: {e}"))?;
-    let s = v.get("account_id_hex").and_then(|x| x.as_str())
+    let s = v
+        .get("account_id_hex")
+        .and_then(|x| x.as_str())
         .ok_or("keystore missing account_id_hex")?;
     let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))
         .map_err(|e| format!("bad account_id_hex: {e}"))?;
-    bytes.try_into().map_err(|_| "account_id_hex is not 32 bytes".to_string())
+    bytes
+        .try_into()
+        .map_err(|_| "account_id_hex is not 32 bytes".to_string())
 }
 
 pub fn read_account_id(keystore_path: &std::path::Path) -> Result<[u8; 32], String> {
@@ -158,8 +171,14 @@ mod tests {
 
     #[test]
     fn twox_128_matches_known_substrate_vectors() {
-        assert_eq!(hex::encode(twox_128(b"System")), "26aa394eea5630e07c48ae0c9558cef7");
-        assert_eq!(hex::encode(twox_128(b"Account")), "b99d880ec681799c0cf30e8886371da9");
+        assert_eq!(
+            hex::encode(twox_128(b"System")),
+            "26aa394eea5630e07c48ae0c9558cef7"
+        );
+        assert_eq!(
+            hex::encode(twox_128(b"Account")),
+            "b99d880ec681799c0cf30e8886371da9"
+        );
     }
 
     #[test]
@@ -176,7 +195,11 @@ mod tests {
             hex::decode("b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a")
                 .unwrap();
         assert_eq!(
-            hex::encode(storage_map_key("MinerRegistry", "LatestParticipation", &account)),
+            hex::encode(storage_map_key(
+                "MinerRegistry",
+                "LatestParticipation",
+                &account
+            )),
             "491850926eb92ce9861fdcc5504d045e3b989607de2d2e007e711506edd2b037\
 c3d972b93e95d78499f6ca768214647b\
 b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
@@ -210,7 +233,8 @@ b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
     #[test]
     fn parses_system_health() {
         let v: serde_json::Value =
-            serde_json::from_str(r#"{"peers":8,"isSyncing":false,"shouldHavePeers":true}"#).unwrap();
+            serde_json::from_str(r#"{"peers":8,"isSyncing":false,"shouldHavePeers":true}"#)
+                .unwrap();
         let h = parse_system_health(&v).unwrap();
         assert_eq!(h.peers, 8);
         assert!(!h.is_syncing);

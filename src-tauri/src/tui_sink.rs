@@ -25,6 +25,7 @@ impl TuiSink {
             timestamp: String::new(),
             level: level.to_string(),
             message,
+            source: "app".to_string(),
         });
     }
 }
