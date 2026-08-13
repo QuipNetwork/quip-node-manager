@@ -111,11 +111,17 @@ quip-node-manager/
 Images are declared in `vendor/nodes.quip.network/docker-compose.yml` (with
 `${QUIP_*_TAG:-v0.2}` placeholders); the manager's authoritative image paths +
 tag live in `src-tauri/src/compose.rs` (`CPU_IMAGE`, `CUDA_IMAGE`,
-`VALIDATOR_IMAGE`, `DASHBOARD_IMAGE`, `COMPOSE_IMAGE_TAG = "v0.2"`), written into
+`VALIDATOR_IMAGE`, `DASHBOARD_IMAGE`, `COMPOSE_IMAGE_TAG = "v0.3.0-rc7"`), written into
 `.env` as `QUIP_MINER_TAG`/`QUIP_VALIDATOR_TAG`/`QUIP_DASHBOARD_TAG`:
 
-- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/quip-miner-cpu:v0.2`
-- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/quip-miner-cuda:v0.2`
+- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner:v0.3.0-rc7`
+- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda:v0.3.0-rc7`
+
+  The v0.3 images are a **separate repository line**, not new tags on the v0.2
+  paths, which stop at `v0.2.1-rc54`. The CPU image also dropped its `-cpu`
+  suffix when the coordinator absorbed the miner binaries, so the two names are
+  no longer symmetric. Pointing a v0.3 tag at a v0.2 path fails the pull with
+  `not found`.
 - Validator: `registry.gitlab.com/quip.network/quip-validator/quip-network-node:v0.2`
 - Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network:v0.2`
 - Postgres: `postgres:16` (Docker Hub)
@@ -164,7 +170,6 @@ starts.
 | `app-settings.json` | settings.rs (user preferences) | UI toggles + NodeConfig |
 | `config.toml` | config.rs on every Start | Node config (bind-mounted into the node container in Docker mode; read directly by the binary in Native mode) |
 | `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
-| `config/quip-miner.{cpu,cuda}.toml` | stack_assets.rs (embedded copy) | First-run miner config seed templates bind-mounted by the compose cpu/cuda services. Inert for the manager (our `data/config.toml` always exists first, so the entrypoint never seeds), but the mount source must exist on disk. |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
 | `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
 | `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
@@ -246,10 +251,16 @@ modes. It takes `config.public_port` when the user sets an override, and falls
 back to `port` (the Caddy front door) otherwise, because that is the port an
 outside peer actually reaches. There is no separate top-level `port` key in the
 miner config — that is the v0.1 schema, and a test asserts it stays gone. The
-Docker miner
-config carries `rest_port = 8086` (container-internal REST, matching the
-Caddyfile's `quip-miner:8086` upstream) and Native carries
-`rest_port = <native_rest_port>` (default 20100, loopback-only).
+The miner's REST surface is a `[dashboard]` section, not the v0.2
+`[miner].rest_host` / `rest_port` pair. The v0.3 coordinator ignores those two
+keys outright, and it disables the dashboard unless **both** `listen` and
+`data_dir` are set, so neither may be omitted. Docker renders
+`listen = "0.0.0.0:8086"` to match the Caddyfile's `quip-miner:8086` upstream,
+with `data_dir = "/data/attempts"` inside the volume. Native renders
+`listen = "127.0.0.1:<native_rest_port>"` (default 20100) and
+`data_dir = <data_dir>/attempts`. Native stays on loopback because Docker
+Desktop's `host.docker.internal` originates the connection on the host, so the
+Caddy container still reaches it.
 
 ### `public_host` resolution and the start gate
 
