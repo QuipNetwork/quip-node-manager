@@ -53,6 +53,20 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc3
+
+- **The miner advertises a public address again**: `config.toml` omitted `public_port` whenever no explicit override existed, so peers had no advertised port. The manager now always writes `public_port`, and falls back to the Caddy front door port, which is the port a peer reaches from outside the host.
+
+- **`public_host` fills itself in on both run modes**: the detection ran only in Docker mode, so a Native miner advertised nothing. It now runs on every start path and resolves through check.quip.network, the same service behind the `ip` row in the pre-flight checklist. The checklist and the advertised address can no longer disagree.
+
+- **The manager refuses to start when no peer can reach the resolved `public_host`**: it rejects loopback and unspecified addresses, RFC1918 private ranges, link-local, carrier-grade NAT, multicast, and reserved ranges. It also rejects IPv6 unique-local addresses, IPv6 link-local addresses, and mDNS `.local` names. A local network or air-gapped deployment that advertises a private address on purpose cannot start. No opt-in override exists yet.
+
+- **Release pages link to the released version**: the install commands on a release page pointed at the tip of `main`, so they installed something other than the release. They now point at the tag.
+
+- **CI checks Rust formatting**: a `lint` stage runs `cargo fmt --check` against `src-tauri`, which stops the formatting drift that produced diffs across files nobody touched.
+
+---
+
 ## v0.2.3-rc2
 
 - **Native mode installs the v0.3 macOS bundle**: the manager downloaded the single `quip-miner` binary that v0.2 published and v0.3 does not, so it had nothing to install. It now fetches `quip-miner-darwin-arm64.tar.gz` and extracts the coordinator with every darwin-arm64 miner. The coordinator is the supervised process and starts the miners itself.

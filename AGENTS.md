@@ -251,6 +251,27 @@ config carries `rest_port = 8086` (container-internal REST, matching the
 Caddyfile's `quip-miner:8086` upstream) and Native carries
 `rest_port = <native_rest_port>` (default 20100, loopback-only).
 
+### `public_host` resolution and the start gate
+
+Both start paths (`compose::start_stack_core` and `native::start_native_node_core`)
+fill an unset `public_host` before they write `config.toml`. The value comes from
+`checklist::fetch_public_ip` (check.quip.network first, ipify as a fallback), which
+is the same fetcher behind the `ip` checklist row, so the row and the advertised
+address cannot disagree. The resolution is per start and is never persisted to
+`app-settings.json`.
+
+`checklist::require_public_host` then hard-aborts the start when the resolved value
+is one no outside peer can reach: loopback, unspecified, RFC1918 private,
+169.254.0.0/16 link-local, 100.64.0.0/10 carrier-grade NAT, multicast,
+240.0.0.0/4 reserved, IPv6 `fc00::/7` unique-local, IPv6 `fe80::/10` link-local,
+and (for names) anything `hostnames::is_public_dns_host` rejects, including mDNS
+`.local`. IPv4-mapped IPv6 is unwrapped before the test. A local-network or
+air-gapped deployment that wants to advertise a private address cannot start, and
+no opt-in override exists yet.
+
+There is no standalone `public-host` checklist row. The two port rows already probe
+host and port together through `/checkport`, and they stay warn-only.
+
 ## Pre-flight Port Reachability Check
 
 `run_check_port` (public API port) and `run_check_port_validator` (validator
