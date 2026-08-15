@@ -141,10 +141,11 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
-        FocusId::GpuEnable => {
-            if let Some(d) = app.settings.node_config.gpu_device_configs.first_mut() {
-                d.enabled = !d.enabled;
-            }
+        FocusId::GpuDevice(index) => {
+            crate::tui_app::toggle_gpu_device(
+                &mut app.settings.node_config.gpu_device_configs,
+                index,
+            );
             app.dirty = true;
             Action::None
         }
@@ -178,7 +179,8 @@ fn activate(app: &mut TuiApp) -> Action {
         }
 
         // Text fields — enter edit mode
-        FocusId::Port
+        FocusId::DataDir
+        | FocusId::Port
         | FocusId::ValidatorPort
         | FocusId::NodeName
         | FocusId::PublicHostInput
@@ -194,20 +196,17 @@ fn activate(app: &mut TuiApp) -> Action {
     }
 }
 
+/// Space behaves like Enter everywhere: `activate` already toggles the
+/// checkboxes and cycles the selectors.
 fn toggle_or_activate(app: &mut TuiApp) -> Action {
-    match app.focus {
-        FocusId::PublicHostEnable
-        | FocusId::GpuYielding
-        | FocusId::RunMode
-        | FocusId::GpuEnable => activate(app),
-        _ => activate(app),
-    }
+    activate(app)
 }
 
 // ─── Edit mode helpers ────────────────────────────────────────────────────────
 
 fn start_edit(app: &mut TuiApp) {
     let current = match &app.focus {
+        FocusId::DataDir => app.form.data_dir.clone(),
         FocusId::Port => app.form.port.clone(),
         FocusId::ValidatorPort => app.form.validator_port.clone(),
         FocusId::NodeName => app.form.node_name.clone(),
@@ -228,6 +227,7 @@ fn commit_edit(app: &mut TuiApp) {
     let buf = app.form.edit_buf.clone();
     match &app.edit_mode {
         EditMode::EditingField(id) => match id {
+            FocusId::DataDir => app.form.data_dir = buf,
             FocusId::Port => app.form.port = buf,
             FocusId::ValidatorPort => app.form.validator_port = buf,
             FocusId::NodeName => app.form.node_name = buf,

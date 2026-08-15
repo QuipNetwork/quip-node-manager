@@ -12,10 +12,86 @@ use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
 use crate::settings::{AppSettings, DwaveConfig, ImageTag, RunMode, StackHealth};
 
+/// Headline state shown at the top of the TUI, mirroring the GUI status pill
+/// (`statusFromStack` in `app.js`). The miner decides Running versus Stopped.
+/// Support-service health decides Running versus Degraded. A miner that is down
+/// while support services are up is Partial, not Stopped — that is the state a
+/// crashed miner, a profile switch, or a half-finished Start leaves behind, and
+/// reporting it as Stopped hides a live stack the operator still has to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Running,
+    /// Miner up, at least one expected support service down.
+    Degraded,
+    /// Miner up, at least one healthcheck reports unhealthy.
+    Unhealthy,
+    /// Miner down, but part of the stack is still up.
+    Partial,
+    Stopped,
+}
+
+impl StatusKind {
+    /// Symbol and label for the status line.
+    pub fn display(self) -> (&'static str, &'static str) {
+        match self {
+            StatusKind::Running => ("●", "RUNNING"),
+            StatusKind::Degraded => ("◐", "DEGRADED"),
+            StatusKind::Unhealthy => ("◐", "UNHEALTHY"),
+            StatusKind::Partial => ("◐", "PARTIAL"),
+            StatusKind::Stopped => ("○", "STOPPED"),
+        }
+    }
+
+    /// True when the miner itself is up. Start/Stop and Apply key off this, not
+    /// off the headline state: Partial means the miner is down even though
+    /// containers are running.
+    pub fn miner_running(self) -> bool {
+        matches!(
+            self,
+            StatusKind::Running | StatusKind::Degraded | StatusKind::Unhealthy
+        )
+    }
+
+    /// True when anything at all is up, so Stop stays available on a Partial
+    /// stack instead of leaving the operator with no way to shut it down.
+    pub fn anything_running(self) -> bool {
+        !matches!(self, StatusKind::Stopped)
+    }
+}
+
+/// Map miner state plus the compose roll-up to a headline state. Pure so the
+/// mapping is testable without Docker.
+///
+/// Args:
+///     miner_running: Whether the miner (container or host process) is up.
+///     stack: Compose roll-up, or `None` when compose could not be queried.
+///     any_service_running: Whether any compose service is up.
+pub fn derive_status(
+    miner_running: bool,
+    stack: Option<StackHealth>,
+    any_service_running: bool,
+) -> StatusKind {
+    if !miner_running {
+        return if any_service_running {
+            StatusKind::Partial
+        } else {
+            StatusKind::Stopped
+        };
+    }
+    match stack {
+        Some(StackHealth::Running) | None => StatusKind::Running,
+        Some(StackHealth::Unhealthy) => StatusKind::Unhealthy,
+        Some(StackHealth::Degraded) => StatusKind::Degraded,
+        // The miner is up, so an overall Stopped roll-up means the support
+        // services are not there. That is degraded, not stopped.
+        Some(StackHealth::Stopped) => StatusKind::Degraded,
+    }
+}
+
 // Compact status used by the TUI. The GUI exposes the full StackStatus shape.
 #[derive(Clone, Debug)]
 pub struct ContainerStatus {
-    pub running: bool,
+    pub kind: StatusKind,
     pub container_id: Option<String>,
     pub image: String,
     pub status_text: String,
@@ -31,6 +107,9 @@ pub enum FocusId {
     RunChecklist,
     CheckPort,
     ConfigToggle,
+    /// Data directory, editable so a headless install can choose its storage
+    /// location without the GUI first-boot dialog.
+    DataDir,
     RunMode,
     UpdateChannel,
     Port,
@@ -43,7 +122,10 @@ pub enum FocusId {
     PublicHostInput,
     PublicPortInput,
     CpuCores,
-    GpuEnable,
+    /// One entry per detected GPU, carrying that device's index. A single
+    /// shared id let only the first device be toggled while the rest still
+    /// rendered a checkbox.
+    GpuDevice(u32),
     GpuUtilization,
     GpuYielding,
     QpuToggle,
@@ -83,6 +165,10 @@ pub enum Action {
 
 #[derive(Debug, Clone)]
 pub struct FormState {
+    /// Storage directory. Lives in bootstrap.json rather than app-settings.json
+    /// and only takes effect after a restart, so it is applied separately from
+    /// the rest of the form.
+    pub data_dir: String,
     pub port: String,
     pub validator_port: String,
     pub node_name: String,
@@ -141,6 +227,7 @@ impl FormState {
             crate::settings::UpdateChannel::Beta => 1,
         };
         FormState {
+            data_dir: crate::settings::data_dir().display().to_string(),
             port: nc.port.to_string(),
             validator_port: nc.validator_port.to_string(),
             node_name: nc.node_name.clone(),
@@ -218,11 +305,18 @@ impl FormState {
             .map(str::to_string)
             .collect();
         nc.num_cpus = self.cpu_cores.parse().unwrap_or(1);
-        // GPU: update utilization/yielding on existing device configs
+        // GPU: utilization and yielding are global in both front ends, so they
+        // go to every device. Per-device enable is edited directly on
+        // `settings.node_config` and must not be touched here.
         for d in &mut nc.gpu_device_configs {
             d.utilization = self.gpu_utilization;
             d.yielding = self.gpu_yielding;
         }
+        // Metal reads `[metal]`, not the per-device list, so a macOS Native
+        // miner ignored the TUI's slider entirely until this mirrored it.
+        // active_util and idle_after_s are GUI-only knobs and stay as they are.
+        nc.metal_config.utilization = self.gpu_utilization;
+        nc.metal_config.yielding = self.gpu_yielding;
         let dwave_token = self.qpu_api_key.trim();
         nc.dwave_config = if dwave_token.is_empty() {
             None
@@ -279,6 +373,9 @@ pub struct TuiApp {
     pub config_expanded: bool,
     pub custom_expanded: bool,
     pub qpu_expanded: bool,
+    /// Set when the storage directory changed. It is read once at startup, so
+    /// the footer keeps saying so until the operator relaunches.
+    pub restart_required: bool,
     pub form: FormState,
     pub node_secret: String,
     pub secret_visible: bool,
@@ -343,11 +440,12 @@ impl TuiApp {
             form,
             dirty: false,
             status: ContainerStatus {
-                running: false,
+                kind: StatusKind::Stopped,
                 container_id: None,
                 image: String::new(),
                 status_text: "unknown".to_string(),
             },
+            restart_required: false,
             checks: vec![],
             checklist_running: false,
             checklist_rx: None,
@@ -536,93 +634,93 @@ impl TuiApp {
 
     // ─── Docker status ────────────────────────────────────────────────────────
 
+    /// Refresh the headline status.
+    ///
+    /// The compose stack is queried in BOTH run modes. Native mode still runs
+    /// the validator, dashboard, Postgres and Caddy in Docker, so reading only
+    /// `node.pid` reported a dead miner as a fully stopped stack and hid four
+    /// running containers from the operator.
     pub fn refresh_status(&mut self) {
-        match self.form.run_mode() {
-            RunMode::Native => {
-                let pid_path = crate::settings::data_dir().join("node.pid");
-                let running = if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        #[cfg(unix)]
-                        {
-                            unsafe { libc::kill(pid, 0) == 0 }
-                        }
-                        #[cfg(windows)]
-                        {
-                            true
-                        } // Assume running if PID file exists on Windows
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                self.status = ContainerStatus {
-                    running,
-                    container_id: None,
-                    image: String::new(),
-                    status_text: if running {
-                        "running (native)".to_string()
-                    } else {
-                        "not running".to_string()
-                    },
-                };
-            }
-            RunMode::Docker => {
-                self.status = self.stack_status_for_tui();
-            }
-        }
+        let native = self.form.run_mode() == RunMode::Native;
+        let miner_running = if native {
+            native_miner_running()
+        } else {
+            false // Docker: decided below from the miner service's own state.
+        };
+        self.status = self.stack_status_for_tui(native, miner_running);
     }
 
-    fn stack_status_for_tui(&self) -> ContainerStatus {
+    /// Build the status line from `docker compose ps` plus, in Native mode, the
+    /// host miner's PID.
+    fn stack_status_for_tui(&self, native: bool, native_miner_running: bool) -> ContainerStatus {
+        let unavailable = |text: &str| ContainerStatus {
+            // Compose is unreadable, so the stack cannot be judged. In Native
+            // mode the host miner is still knowable on its own.
+            kind: if native && native_miner_running {
+                StatusKind::Running
+            } else {
+                StatusKind::Stopped
+            },
+            container_id: None,
+            image: String::new(),
+            status_text: text.to_string(),
+        };
         let Ok(rt) = tokio::runtime::Runtime::new() else {
-            return ContainerStatus {
-                running: false,
-                container_id: None,
-                image: String::new(),
-                status_text: "cannot create runtime".to_string(),
-            };
+            return unavailable("cannot create runtime");
         };
         let Ok(stack) = rt.block_on(crate::compose::get_stack_status()) else {
-            return ContainerStatus {
-                running: false,
-                container_id: None,
-                image: String::new(),
-                status_text: "compose status unavailable".to_string(),
-            };
+            return unavailable("compose status unavailable");
         };
 
-        let selected_service = self
+        let miner_service = self
             .derive_image_tag(&self.settings.node_config)
             .0
             .service();
-        let selected = stack
-            .services
-            .iter()
-            .find(|s| s.service == selected_service)
-            .or_else(|| {
-                stack
+        let miner_running = if native {
+            native_miner_running
+        } else {
+            stack
+                .services
+                .iter()
+                .any(|s| s.service == miner_service && s.running)
+        };
+        let any_running = stack.services.iter().any(|s| s.running);
+        let kind = derive_status(miner_running, Some(stack.overall), any_running);
+
+        // Name the running support services on a Partial stack so the operator
+        // can see the miner is the missing piece, matching the GUI subtext.
+        let status_text = match kind {
+            StatusKind::Partial => {
+                let up: Vec<&str> = stack
                     .services
                     .iter()
-                    .find(|s| s.service == "quip-validator")
-            })
-            .or_else(|| stack.services.iter().find(|s| s.running))
-            .or_else(|| stack.services.first());
-
-        let running = matches!(stack.overall, StackHealth::Running | StackHealth::Degraded);
-        let Some(service) = selected else {
-            return ContainerStatus {
-                running: false,
-                container_id: None,
-                image: String::new(),
-                status_text: "not found".to_string(),
-            };
+                    .filter(|s| s.running)
+                    .map(|s| s.service.as_str())
+                    .collect();
+                format!("miner not running; {} up", up.join(", "))
+            }
+            _ if native => format!("{:?} (native miner)", stack.overall),
+            _ => stack
+                .services
+                .iter()
+                .find(|s| s.service == miner_service)
+                .map(|s| format!("{} ({:?})", s.status_text, stack.overall))
+                .unwrap_or_else(|| format!("{:?}", stack.overall)),
         };
 
+        // Identify by the miner in Docker mode. In Native mode the miner is a
+        // host process, so fall back to any service that names the stack.
+        let anchor = stack
+            .services
+            .iter()
+            .find(|s| s.service == miner_service)
+            .or_else(|| stack.services.iter().find(|s| s.running));
+
         ContainerStatus {
-            running,
-            container_id: Some(service.name.clone()),
-            image: service.image.clone(),
-            status_text: format!("{} ({:?})", service.status_text, stack.overall),
+            kind,
+            container_id: anchor.map(|s| s.name.clone()),
+            image: anchor.map(|s| s.image.clone()).unwrap_or_default(),
+            status_text,
         }
     }
 
@@ -725,6 +823,14 @@ impl TuiApp {
     }
 
     fn apply_and_restart(&mut self) {
+        // The data dir lives in bootstrap.json and is read once at startup, so
+        // it is applied first and separately, and only takes effect on the next
+        // launch. Everything below still saves, so a failed relocation does not
+        // discard the rest of the operator's edits.
+        if let Err(e) = self.apply_data_dir() {
+            self.set_status(e);
+            return;
+        }
         let config = self.form.to_node_config(&self.settings.node_config);
         self.settings.node_config = config;
         let (image_tag, warning) = self.derive_image_tag(&self.settings.node_config);
@@ -739,12 +845,50 @@ impl TuiApp {
             return;
         }
         self.dirty = false;
-        if self.status.running {
+        if self.restart_required {
+            // A stop/start would use the old directory, so say what is needed
+            // instead of cycling the stack misleadingly.
+            self.set_status(format!(
+                "Storage dir set to {} — restart the app to use it",
+                self.form.data_dir
+            ));
+            return;
+        }
+        // Restart whenever anything is up, including a Partial stack. Settings
+        // only reach running containers through a stop/start cycle, and a
+        // Partial stack is exactly what an operator is trying to fix here.
+        if self.status.kind.anything_running() {
             self.stop_node();
             self.start_node();
         } else {
             self.set_status("Settings saved");
         }
+    }
+
+    /// Persist a changed storage directory to bootstrap.json.
+    ///
+    /// No-op when the path is unchanged. An empty value clears the override and
+    /// returns the app to the platform default, matching the GUI.
+    ///
+    /// Returns:
+    ///     `Ok(true)` when the directory changed and a restart is needed,
+    ///     `Ok(false)` when nothing changed, `Err(message)` when the path is
+    ///     unusable.
+    fn apply_data_dir(&mut self) -> Result<bool, String> {
+        let requested = self.form.data_dir.trim().to_string();
+        let current = crate::settings::data_dir().display().to_string();
+        if requested == current {
+            return Ok(false);
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("Data dir: cannot create runtime: {e}"))?;
+        rt.block_on(crate::settings::set_data_dir(requested.clone()))
+            .map_err(|e| format!("Data dir: {e}"))?;
+        // Re-read rather than echo the request: an empty value resolves to the
+        // platform default, which is what the operator now has.
+        self.form.data_dir = crate::settings::data_dir().display().to_string();
+        self.restart_required = true;
+        Ok(true)
     }
 
     fn regenerate_secret(&mut self) {
@@ -792,6 +936,7 @@ impl TuiApp {
         }
         list.push(FocusId::ConfigToggle);
         if self.config_expanded {
+            list.push(FocusId::DataDir);
             list.push(FocusId::RunMode);
             list.push(FocusId::UpdateChannel);
             list.push(FocusId::Port);
@@ -811,7 +956,11 @@ impl TuiApp {
                 list.push(FocusId::HttpLog);
             }
             list.push(FocusId::CpuCores);
-            list.push(FocusId::GpuEnable);
+            // One focusable checkbox per device, so every GPU can be toggled
+            // rather than only the first.
+            for dev in &self.settings.node_config.gpu_device_configs {
+                list.push(FocusId::GpuDevice(dev.index));
+            }
             if !self.settings.node_config.gpu_device_configs.is_empty() {
                 list.push(FocusId::GpuUtilization);
                 list.push(FocusId::GpuYielding);
@@ -846,6 +995,39 @@ impl TuiApp {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Flip `enabled` on the GPU carrying `index`, leaving every other device
+/// untouched. Unknown indexes are ignored.
+pub fn toggle_gpu_device(devices: &mut [crate::settings::GpuDeviceConfig], index: u32) {
+    if let Some(d) = devices.iter_mut().find(|d| d.index == index) {
+        d.enabled = !d.enabled;
+    }
+}
+
+/// Whether the host miner is alive, from `node.pid`.
+///
+/// A PID file alone is not proof: the process may have died without cleaning
+/// up. On Unix `kill(pid, 0)` probes it without sending a signal. Windows has
+/// no equivalent here and Native mode is macOS-only, so the file's presence is
+/// the best available answer there.
+fn native_miner_running() -> bool {
+    let pid_path = crate::settings::data_dir().join("node.pid");
+    let Ok(pid_str) = std::fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        true
+    }
+}
 
 fn load_secret_sync() -> String {
     let path = crate::settings::data_dir().join("node-secret.json");
@@ -1025,5 +1207,146 @@ mod tests {
         assert!(nc.gpu_device_configs[0].enabled); // preserved
         assert_eq!(nc.gpu_device_configs[0].utilization, 55); // preserved
         assert!(!nc.gpu_device_configs[1].enabled); // new device defaults off
+    }
+
+    // ─── Status roll-up ───────────────────────────────────────────────────
+
+    /// The failure this fixes: in Native mode the miner is down while the four
+    /// Docker support services are up. Reading only node.pid called that
+    /// Stopped and hid a live stack.
+    #[test]
+    fn miner_down_with_support_services_up_is_partial() {
+        assert_eq!(
+            derive_status(false, Some(StackHealth::Running), true),
+            StatusKind::Partial
+        );
+    }
+
+    #[test]
+    fn miner_down_with_nothing_up_is_stopped() {
+        assert_eq!(
+            derive_status(false, Some(StackHealth::Stopped), false),
+            StatusKind::Stopped
+        );
+    }
+
+    /// Previously Unhealthy fell outside the running match and rendered as
+    /// Stopped, contradicting the status text on the same line.
+    #[test]
+    fn unhealthy_stack_is_not_reported_as_stopped() {
+        let kind = derive_status(true, Some(StackHealth::Unhealthy), true);
+        assert_eq!(kind, StatusKind::Unhealthy);
+        assert_ne!(kind, StatusKind::Stopped);
+        assert!(kind.miner_running());
+    }
+
+    #[test]
+    fn degraded_stack_is_distinct_from_running() {
+        assert_eq!(
+            derive_status(true, Some(StackHealth::Degraded), true),
+            StatusKind::Degraded
+        );
+        assert_eq!(
+            derive_status(true, Some(StackHealth::Running), true),
+            StatusKind::Running
+        );
+    }
+
+    /// A Native miner running with no support services at all is degraded, not
+    /// healthy: the validator it needs is missing.
+    #[test]
+    fn miner_up_with_no_stack_is_degraded() {
+        assert_eq!(
+            derive_status(true, Some(StackHealth::Stopped), false),
+            StatusKind::Degraded
+        );
+    }
+
+    /// Compose unreadable: the host miner is still knowable on its own.
+    #[test]
+    fn miner_up_with_unknown_stack_is_running() {
+        assert_eq!(derive_status(true, None, false), StatusKind::Running);
+    }
+
+    // ─── Per-device GPU toggling ──────────────────────────────────────────
+
+    /// The bug: one shared FocusId meant `first_mut()` was toggled no matter
+    /// which checkbox was focused, so every GPU after the first was inert.
+    #[test]
+    fn toggling_a_gpu_affects_only_that_device() {
+        let mut nc = nc_with_gpus(3, false);
+        toggle_gpu_device(&mut nc.gpu_device_configs, 1);
+        assert!(!nc.gpu_device_configs[0].enabled);
+        assert!(nc.gpu_device_configs[1].enabled);
+        assert!(!nc.gpu_device_configs[2].enabled);
+    }
+
+    #[test]
+    fn toggling_an_unknown_gpu_index_changes_nothing() {
+        let mut nc = nc_with_gpus(2, true);
+        toggle_gpu_device(&mut nc.gpu_device_configs, 9);
+        assert!(nc.gpu_device_configs.iter().all(|d| d.enabled));
+    }
+
+    /// Metal reads `[metal]`, not the per-device list, so the TUI slider did
+    /// nothing on macOS Native until Apply mirrored it across.
+    #[test]
+    fn apply_mirrors_utilization_into_metal_config() {
+        let mut settings = AppSettings {
+            node_config: nc_with_gpus(1, true),
+            ..Default::default()
+        };
+        settings.node_config.metal_config.active_util = 42;
+        settings.node_config.metal_config.idle_after_s = 900;
+
+        let mut form = FormState::from_settings(&settings);
+        form.gpu_utilization = 65;
+        form.gpu_yielding = true;
+
+        let nc = form.to_node_config(&settings.node_config);
+        assert_eq!(nc.metal_config.utilization, 65);
+        assert!(nc.metal_config.yielding);
+        // GUI-only adaptive-cap knobs must survive a TUI Apply.
+        assert_eq!(nc.metal_config.active_util, 42);
+        assert_eq!(nc.metal_config.idle_after_s, 900);
+    }
+
+    /// Per-device enable is edited directly on settings, so Apply must not
+    /// reset it from the form.
+    #[test]
+    fn apply_preserves_per_device_enable_flags() {
+        let mut settings = AppSettings {
+            node_config: nc_with_gpus(3, false),
+            ..Default::default()
+        };
+        settings.node_config.gpu_device_configs[2].enabled = true;
+
+        let form = FormState::from_settings(&settings);
+        let nc = form.to_node_config(&settings.node_config);
+        assert!(!nc.gpu_device_configs[0].enabled);
+        assert!(!nc.gpu_device_configs[1].enabled);
+        assert!(nc.gpu_device_configs[2].enabled);
+    }
+
+    // ─── Data directory ───────────────────────────────────────────────────
+
+    #[test]
+    fn form_seeds_the_data_dir_from_the_resolved_location() {
+        let form = FormState::from_settings(&AppSettings::default());
+        assert_eq!(
+            form.data_dir,
+            crate::settings::data_dir().display().to_string()
+        );
+        assert!(!form.data_dir.is_empty());
+    }
+
+    #[test]
+    fn partial_keeps_stop_available_but_reports_miner_down() {
+        let partial = StatusKind::Partial;
+        assert!(!partial.miner_running());
+        // Stop must stay reachable, otherwise a Partial stack cannot be shut
+        // down from the TUI at all.
+        assert!(partial.anything_running());
+        assert!(!StatusKind::Stopped.anything_running());
     }
 }
