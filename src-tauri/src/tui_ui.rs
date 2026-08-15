@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::log_stream::LogEntry;
-use crate::tui_app::{EditMode, FocusId, TuiApp};
+use crate::tui_app::{EditMode, FocusId, StatusKind, TuiApp};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -67,24 +67,29 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
 
 fn title_span() -> Span<'static> {
     Span::styled(
-        " Quip Node Manager v0.1.0 ",
+        concat!(" Quip Node Manager v", env!("CARGO_PKG_VERSION"), " "),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )
 }
 
 fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
-    let (state_color, state_text) = if app.status.running {
-        (PASS, "● RUNNING")
-    } else {
-        (FAIL, "○ STOPPED")
+    let kind = app.status.kind;
+    let (symbol, label) = kind.display();
+    let state_color = match kind {
+        StatusKind::Running => PASS,
+        StatusKind::Degraded | StatusKind::Unhealthy | StatusKind::Partial => WARN_COLOR,
+        StatusKind::Stopped => FAIL,
     };
+    let state_text = format!("{symbol} {label}");
     let id_part = app
         .status
         .container_id
         .as_deref()
         .unwrap_or("—")
         .to_string();
-    let img_part = if app.status.image.is_empty() {
+    // On a Partial stack the service list is the point — it tells the operator
+    // the miner is the missing piece — so it takes the slot the image uses.
+    let img_part = if kind == StatusKind::Partial || app.status.image.is_empty() {
         app.status.status_text.clone()
     } else {
         shorten_image(&app.status.image)
@@ -217,13 +222,20 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         return;
     }
 
-    // Storage Directory (read-only info)
-    let data_dir = crate::settings::data_dir();
-    lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{:<16} ", "Storage Dir"), Style::default().fg(DIM)),
-        Span::styled(data_dir.display().to_string(), Style::default().fg(DIM)),
-    ]));
+    // Storage Directory. Editable so a headless install can pick its location
+    // without the GUI's first-boot dialog.
+    lines.push(field_line(
+        app,
+        &FocusId::DataDir,
+        "Storage Dir",
+        &field_value(app, &FocusId::DataDir, &app.form.data_dir),
+    ));
+    if app.restart_required {
+        lines.push(Line::from(Span::styled(
+            "      restart required for the new storage dir",
+            Style::default().fg(WARN_COLOR),
+        )));
+    }
 
     // Run Mode
     let modes = ["Docker", "Native"];
@@ -400,7 +412,9 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 Span::raw("    "),
                 Span::styled(
                     format!("{} GPU {}", check, dev.index),
-                    focus_style(app, &FocusId::GpuEnable),
+                    // Each device carries its own focus id. Sharing one id made
+                    // every checkbox after the first inert.
+                    focus_style(app, &FocusId::GpuDevice(dev.index)),
                 ),
             ]));
         }

@@ -109,6 +109,12 @@ The app also supports a terminal UI mode:
 quip-node-manager --cli
 ```
 
+The terminal UI starts and stops the stack, runs the pre-flight checklist,
+streams logs, and edits the node configuration. Configuration covers the storage
+directory, ports, run mode, update channel, CPU and GPU settings, and the D-Wave
+keys. The dashboard, the health panel, TLS settings, and in-app updates stay in
+the desktop app.
+
 ## Architecture
 
 - **Frontend**: `src/` -- vanilla HTML/CSS/JS with Tauri IPC (`withGlobalTauri: true`). Dashboard tab embeds the running dashboard container in an iframe.

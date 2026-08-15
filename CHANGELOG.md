@@ -53,6 +53,20 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc6
+
+- **The terminal UI reports a partly started stack**: it read only the miner, so a dead miner beside four running support containers showed as STOPPED. The desktop app called the same state PARTIAL. The terminal UI now reads the compose stack in both run modes and names the services that are up. An unhealthy stack no longer shows as STOPPED.
+
+- **Each GPU checkbox controls its own device**: every checkbox toggled the first GPU, so devices after the first did nothing.
+
+- **The terminal UI GPU limit reaches Metal**: Apply wrote the limit only to the per-device list. A macOS Metal miner reads the `[metal]` section instead, so the setting had no effect. Apply now writes both. The adaptive-cap values stay as the desktop app left them.
+
+- **The storage directory is editable from the terminal UI**: the old build showed the path but gave no way to change it. A headless install had no way to choose where its data goes. The field now accepts a path, and the app must restart before the change takes effect.
+
+- **The terminal UI shows its real version**: the title bar said v0.1.0 on every build.
+
+---
+
 ## v0.2.3-rc5
 
 - **The stack recovers when Docker leaves a container off its network**: Docker can leave a container running with no endpoint on the project network. That container publishes none of its declared ports. `docker compose up` does not repair it, because the container already runs and its configuration has not changed, so compose only starts it.
