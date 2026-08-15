@@ -833,6 +833,12 @@ pub(crate) async fn start_stack_core(
         up_result = run_compose_streaming(Arc::clone(&sink), up_args).await;
     }
 
+    // (9) Confirm Docker actually wired up what it started. `up` exiting zero
+    // only means the containers are running, not that they are reachable.
+    if up_result.is_ok() {
+        verify_stack_networking(Arc::clone(&sink), &settings).await;
+    }
+
     // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
     // or foreign data volume keeps an old password and would otherwise leave
     // the dashboard crash-looping behind a silent 502.
@@ -881,6 +887,199 @@ async fn verify_dashboard_db(sink: Arc<dyn ProgressSink>) {
             sink.dashboard_db_mismatch(&msg);
         }
     }
+}
+
+/// Container name for a compose service. Every service in the upstream compose
+/// file pins `container_name:` to the service name prefixed with `quip-`;
+/// `quip-validator` already carries the prefix.
+fn container_name_for_service(service: &str) -> String {
+    if service.starts_with("quip-") {
+        service.to_string()
+    } else {
+        format!("quip-{service}")
+    }
+}
+
+/// What `docker inspect` reports about one container's live network wiring.
+#[derive(Debug, Default, PartialEq)]
+struct ContainerWiring {
+    /// `State.Running`.
+    running: bool,
+    /// `NetworkSettings.Networks` is non-empty — the container holds an
+    /// endpoint on at least one Docker network.
+    attached: bool,
+    /// Ports the container *declares* (`HostConfig.PortBindings`) that have no
+    /// live binding under `NetworkSettings.Ports`. A container detached from
+    /// its network declares its bindings but publishes none of them.
+    unpublished: Vec<String>,
+}
+
+/// Reduce one `docker inspect` object to the facts that decide whether compose
+/// actually wired the container up.
+fn wiring_from_inspect(v: &serde_json::Value) -> ContainerWiring {
+    let running = v
+        .pointer("/State/Running")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let attached = v
+        .pointer("/NetworkSettings/Networks")
+        .and_then(|x| x.as_object())
+        .is_some_and(|nets| !nets.is_empty());
+    let live = v
+        .pointer("/NetworkSettings/Ports")
+        .and_then(|x| x.as_object());
+    let unpublished = v
+        .pointer("/HostConfig/PortBindings")
+        .and_then(|x| x.as_object())
+        .map(|declared| {
+            declared
+                .keys()
+                .filter(|port| {
+                    // Docker emits `"9615/tcp": null` for an exposed-but-
+                    // unpublished port, so a null entry counts as absent.
+                    !live.is_some_and(|l| l.get(*port).is_some_and(|b| !b.is_null()))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    ContainerWiring {
+        running,
+        attached,
+        unpublished,
+    }
+}
+
+/// Decide whether a container's wiring is broken badly enough to justify
+/// recreating it mid-Start.
+///
+/// Docker has been observed leaving a container running with `NetworkMode` set
+/// and a network namespace allocated, but with no endpoint on the project
+/// network: `NetworkSettings.Networks` and `NetworkSettings.Ports` both come
+/// back empty while `HostConfig.PortBindings` still lists every declared
+/// mapping. Nothing on the host can reach it, and `docker compose up` will not
+/// repair it — the config hash is unchanged, so compose only `start`s the
+/// container and never re-attaches the lost endpoint.
+///
+/// A recreate is disruptive (it drops the container's uptime and any writable
+/// layer state), so the predicate decides how much evidence is enough.
+///
+/// Args:
+///     wiring: Live inspect facts for one expected service's container.
+///
+/// Returns:
+///     `true` to force-recreate the service, `false` to leave it alone.
+fn is_wiring_broken(wiring: &ContainerWiring) -> bool {
+    // A container that isn't running is the Start path's problem, not ours —
+    // compose brings those up. We only judge containers Docker claims are up.
+    if !wiring.running {
+        return false;
+    }
+    // A running container with no endpoint on any network is never legitimate
+    // in this stack, so this cannot fire on a healthy container. Unpublished
+    // ports alone are deliberately NOT a trigger: `NetworkSettings.Ports` is
+    // only reliably populated for attached containers, and recreating on that
+    // signal risks disrupting a healthy service over a reporting quirk.
+    !wiring.attached
+}
+
+/// Post-`up` invariant check, sibling to `verify_dashboard_db`: confirm Docker
+/// actually wired up every expected service, and recreate the ones it did not.
+///
+/// `docker compose up` exiting zero only means "the containers are running",
+/// never "the containers are reachable". This closes that gap.
+///
+/// Best-effort and non-fatal: a service that stays broken after one recreate is
+/// reported plainly so the caller's own readiness probe fails with a cause
+/// instead of a bare connection error.
+async fn verify_stack_networking(sink: Arc<dyn ProgressSink>, settings: &AppSettings) {
+    let services: Vec<String> = expected_services(&settings.run_mode, settings.image_tag)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let broken = broken_services(&services).await;
+    if broken.is_empty() {
+        return;
+    }
+
+    let profile = compose_profile(settings.image_tag);
+    for service in &broken {
+        sink.log(
+            "WARN",
+            &format!(
+                "{} is running but holds no Docker network endpoint, so its published ports are \
+                 inactive; recreating it",
+                container_name_for_service(service)
+            ),
+        );
+        sink.log(
+            "INFO",
+            &format!(
+                "$ docker compose --profile {profile} up -d --force-recreate --no-deps {service}"
+            ),
+        );
+        let args: Vec<String> = vec![
+            "--profile".into(),
+            profile.into(),
+            "up".into(),
+            "-d".into(),
+            "--force-recreate".into(),
+            "--no-deps".into(),
+            service.clone(),
+        ];
+        if let Err(e) = run_compose_streaming(Arc::clone(&sink), args).await {
+            sink.log("ERROR", &format!("Failed to recreate {service}: {e}"));
+        }
+    }
+
+    // Re-check once. Anything still broken is beyond our reach.
+    for service in broken_services(&broken).await {
+        sink.log(
+            "ERROR",
+            &format!(
+                "{} is still not wired into the compose network after a recreate. Restart Docker, \
+                 then Start again.",
+                container_name_for_service(&service)
+            ),
+        );
+    }
+}
+
+/// Inspect each service's container and return the services whose wiring is
+/// broken. Containers that don't exist yet drop out: `docker inspect a b c`
+/// prints one JSON array for the names it found and reports the rest on stderr.
+async fn broken_services(services: &[String]) -> Vec<String> {
+    if services.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = services
+        .iter()
+        .map(|s| container_name_for_service(s))
+        .collect();
+    let out = tokio::task::spawn_blocking(move || {
+        crate::cmd::new("docker")
+            .arg("inspect")
+            .args(&names)
+            .output()
+    })
+    .await;
+    let Ok(Ok(output)) = out else {
+        return Vec::new();
+    };
+    let objects: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).unwrap_or_default();
+
+    objects
+        .iter()
+        .filter(|v| is_wiring_broken(&wiring_from_inspect(v)))
+        .filter_map(|v| {
+            v.pointer("/Config/Labels/com.docker.compose.service")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| services.contains(s))
+        .collect()
 }
 
 /// Wait (bounded) for `quip-postgres` to accept connections, then attempt an
@@ -1630,5 +1829,105 @@ mod tests {
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));
+    }
+
+    // ── post-up wiring check ───────────────────────────────────────────────
+
+    #[test]
+    fn container_names_prefix_services_once() {
+        assert_eq!(container_name_for_service("caddy"), "quip-caddy");
+        assert_eq!(container_name_for_service("cpu"), "quip-cpu");
+        // Already prefixed in the compose file — must not double up.
+        assert_eq!(
+            container_name_for_service("quip-validator"),
+            "quip-validator"
+        );
+    }
+
+    /// Captured from a real `docker inspect quip-validator` while the container
+    /// was running detached from `quip_default`: it still declares every port
+    /// binding, but publishes none and holds no endpoint.
+    const DETACHED_VALIDATOR: &str = r#"{
+        "State": {"Running": true},
+        "HostConfig": {
+            "NetworkMode": "quip_default",
+            "PortBindings": {
+                "30333/tcp": [{"HostIp": "", "HostPort": "30333"}],
+                "30333/udp": [{"HostIp": "", "HostPort": "30333"}],
+                "9944/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9944"}]
+            }
+        },
+        "NetworkSettings": {"Networks": {}, "Ports": {}},
+        "Config": {"Labels": {"com.docker.compose.service": "quip-validator"}}
+    }"#;
+
+    /// The same container after a force-recreate: attached, ports published.
+    /// `9615/tcp` is EXPOSEd but never published, so Docker reports it as null
+    /// under `Ports` and omits it from `PortBindings` — that is not a fault.
+    const HEALTHY_VALIDATOR: &str = r#"{
+        "State": {"Running": true},
+        "HostConfig": {
+            "NetworkMode": "quip_default",
+            "PortBindings": {
+                "30333/tcp": [{"HostIp": "", "HostPort": "30333"}],
+                "9944/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9944"}]
+            }
+        },
+        "NetworkSettings": {
+            "Networks": {"quip_default": {"IPAddress": "192.168.117.5"}},
+            "Ports": {
+                "30333/tcp": [{"HostIp": "0.0.0.0", "HostPort": "30333"}],
+                "9615/tcp": null,
+                "9944/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9944"}]
+            }
+        },
+        "Config": {"Labels": {"com.docker.compose.service": "quip-validator"}}
+    }"#;
+
+    fn wiring(json: &str) -> ContainerWiring {
+        wiring_from_inspect(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn detached_container_reports_no_endpoint_and_unpublished_ports() {
+        let w = wiring(DETACHED_VALIDATOR);
+        assert!(w.running);
+        assert!(!w.attached);
+        assert_eq!(w.unpublished.len(), 3);
+        assert!(w.unpublished.contains(&"9944/tcp".to_string()));
+    }
+
+    #[test]
+    fn healthy_container_reports_clean_wiring() {
+        let w = wiring(HEALTHY_VALIDATOR);
+        assert!(w.running);
+        assert!(w.attached);
+        assert!(
+            w.unpublished.is_empty(),
+            "EXPOSEd-but-unpublished ports are not a fault: {:?}",
+            w.unpublished
+        );
+    }
+
+    #[test]
+    fn detached_validator_is_recreated() {
+        assert!(is_wiring_broken(&wiring(DETACHED_VALIDATOR)));
+    }
+
+    #[test]
+    fn healthy_validator_is_left_alone() {
+        assert!(!is_wiring_broken(&wiring(HEALTHY_VALIDATOR)));
+    }
+
+    #[test]
+    fn stopped_container_is_left_to_compose() {
+        // Stop leaves containers in place; `up` restarts them. Recreating a
+        // stopped container here would fight the Start path.
+        let w = ContainerWiring {
+            running: false,
+            attached: false,
+            unpublished: vec!["9944/tcp".into()],
+        };
+        assert!(!is_wiring_broken(&w));
     }
 }
