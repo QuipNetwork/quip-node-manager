@@ -53,6 +53,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc5
+
+- **The stack recovers when Docker leaves a container off its network**: Docker can leave a container running with no endpoint on the project network. That container publishes none of its declared ports. `docker compose up` does not repair it, because the container already runs and its configuration has not changed, so compose only starts it.
+
+  In Native mode this hit the validator, which stopped publishing `127.0.0.1:9944`. The miner start waits on that port for 90 seconds. The miner never started, and the stack sat at PARTIAL with no miner logs.
+
+  The manager now inspects every expected service after `up`. It recreates a running container that holds no network endpoint, then checks once more. The log names any service that stays broken, instead of letting it surface later as a connection error.
+
+---
+
 ## v0.2.3-rc4
 
 - **Docker mode pulls the v0.3 miner images again**: an image update pinned a v0.3 tag. The compose file still named the v0.2 repositories, which stop at `v0.2.1-rc54`. Every pull then failed with `not found`, and no stack would start. Both miner services now point at the v0.3 repository line, and a fresh install with no pinned tag asks for `v0.3.0-rc7`.
