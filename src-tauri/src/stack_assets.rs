@@ -33,7 +33,8 @@ use std::path::PathBuf;
 /// Upstream compose.yml, embedded at compile time from the vendored
 /// `nodes.quip.network` submodule. rustc's dep-info tracks the included
 /// path so `cargo build` rebuilds whenever the file changes.
-const COMPOSE_YML: &str = include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
+pub(crate) const COMPOSE_YML: &str =
+    include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
 
 /// Upstream Caddyfile, embedded alongside the compose.yml. Patched at
 /// runtime for Native mode (see `sync_stack_assets`).
@@ -374,6 +375,22 @@ mod tests {
     #[test]
     fn compose_mounts_no_miner_config_template() {
         assert!(!COMPOSE_YML.contains("quip-miner.docker.toml"));
+    }
+
+    /// Caddy picks console vs JSON from whether stderr is a terminal, and under
+    /// compose it never is. The Caddyfile pins console explicitly; if the
+    /// submodule drops that block, every Caddy line reverts to a JSON blob that
+    /// `log_stream::parse_log_line` cannot level-tag.
+    #[test]
+    fn caddyfile_pins_human_readable_console_logging() {
+        assert!(
+            CADDYFILE.contains("wrap console"),
+            "Caddyfile must pin the console encoder"
+        );
+        assert!(
+            patch_caddyfile(&RunMode::Native, CADDYFILE, 20100).contains("wrap console"),
+            "patching must not drop the log block"
+        );
     }
 
     #[test]

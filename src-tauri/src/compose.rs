@@ -216,10 +216,14 @@ pub(crate) struct ResolvedImageTags {
 
 /// Resolve each image's tag from its own GitLab container registry for the
 /// settings' update channel (see `crate::registry`). Every image falls back
-/// independently to `COMPOSE_IMAGE_TAG` — the compose `:-v0.2` default — when
-/// its registry is unreachable or carries no canonical tag on the channel, so
-/// starting the stack never hard-fails on a network hiccup and one image's
-/// gap never blocks the others.
+/// independently to `COMPOSE_IMAGE_TAG` when its registry is unreachable or
+/// carries no canonical tag on the channel, so starting the stack never
+/// hard-fails on a network hiccup and one image's gap never blocks the others.
+///
+/// The fallback is what keeps the manager off the compose file's own
+/// `${QUIP_*_TAG:-latest}` defaults: `env_lines` writes all three keys on every
+/// start, so the `:-latest` branch is never taken and the running stack always
+/// names an explicit version.
 pub(crate) async fn resolve_channel_image_tags(settings: &AppSettings) -> ResolvedImageTags {
     let ch = settings.update_channel;
     let (miner, validator, dashboard) = tokio::join!(
@@ -1771,6 +1775,48 @@ mod tests {
         assert!(env.contains("QUIP_MINER_TAG=v0.2.1-rc49"));
         assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2.1-rc13"));
         assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2.1-rc15"));
+    }
+
+    /// Upstream defaults every `${QUIP_*_TAG}` to `latest`. The manager must
+    /// never take that branch — a stack that floats to `latest` breaks both the
+    /// pinning policy and the update monitor, which compares digests for a
+    /// named tag. `.env` therefore has to define every tag variable the compose
+    /// file reads, including any added upstream later.
+    #[test]
+    fn env_lines_define_every_image_tag_variable_the_compose_file_reads() {
+        let env = render_env_lines(
+            &AppSettings::default(),
+            501,
+            1000,
+            "pg",
+            &uniform_tags(COMPOSE_IMAGE_TAG),
+        )
+        .join("\n");
+
+        // The faucet sidecar sits behind a profile the manager never starts,
+        // and `stack_assets` strips its Caddy route, so its image is never
+        // pulled and its tag never has to be pinned.
+        const NOT_STARTED_BY_THE_MANAGER: [&str; 1] = ["QUIP_FAUCET_TAG"];
+
+        let mut checked = 0;
+        for chunk in crate::stack_assets::COMPOSE_YML.split("${").skip(1) {
+            let Some(expr) = chunk.split('}').next() else {
+                continue;
+            };
+            let name = expr.split(':').next().unwrap_or(expr);
+            if !name.ends_with("_TAG") || NOT_STARTED_BY_THE_MANAGER.contains(&name) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                env.contains(&format!("{name}=")),
+                ".env must pin {name}; the compose default is `latest`"
+            );
+        }
+        assert!(
+            checked >= 3,
+            "expected the compose file to read miner, validator, and dashboard tags"
+        );
     }
 
     #[test]
