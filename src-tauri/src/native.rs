@@ -931,9 +931,10 @@ pub(crate) async fn start_native_node_core(
         return Err(e);
     }
 
-    // Write config.toml for native mode. The renderer forces the native
-    // miner's REST host to loopback (it's reached via host.docker.internal),
-    // so no rest_host override is needed here.
+    // Write config.toml for native mode. The renderer derives the miner's REST
+    // bind address from the run mode (all interfaces, so the Caddy container
+    // can reach it via host.docker.internal), so no rest_host override is
+    // needed here.
     crate::config::write_config_toml(&config, &RunMode::Native)?;
 
     // Auto-provision the miner binary when it's missing — mirrors Docker
