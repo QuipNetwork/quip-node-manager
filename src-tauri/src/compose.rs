@@ -183,9 +183,25 @@ fn compose_prefix_args(
         "--project-directory".to_string(),
         project_dir.to_string(),
         "--project-name".to_string(),
-        "quip".to_string(),
+        COMPOSE_PROJECT.to_string(),
     ]);
     args
+}
+
+/// The compose project name. Docker stamps it onto every container the manager
+/// starts as the `com.docker.compose.project` label, which is what lets
+/// `force_stop_hint` select exactly this stack and nothing else on the host.
+const COMPOSE_PROJECT: &str = "quip";
+
+/// The command that force-stops the stack, for the user to run themselves when
+/// compose will not. Selecting by project label rather than by container name
+/// keeps it correct across profiles and run modes, and keeps it from touching
+/// containers the manager does not own.
+fn force_stop_hint() -> String {
+    format!(
+        "If containers are still running, force them from a terminal:  \
+         docker kill $(docker ps -q --filter label=com.docker.compose.project={COMPOSE_PROJECT})"
+    )
 }
 
 // ── postgres identity ──────────────────────────────────────────────────────
@@ -1280,6 +1296,7 @@ pub(crate) async fn stop_stack_core(
             for line in e.lines() {
                 sink.log("ERROR", line);
             }
+            sink.log("ERROR", &force_stop_hint());
             sink.stop_complete(false, Some(e));
         }
     }
@@ -1525,6 +1542,22 @@ pub async fn get_stack_config() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hint is only useful if its filter selects the stack the manager
+    /// actually started, so it has to name the same project compose runs under.
+    #[test]
+    fn the_force_stop_hint_selects_the_project_compose_runs_under() {
+        let project = compose_prefix_args("/d/docker-compose.yml", None, "/d")
+            .windows(2)
+            .find(|w| w[0] == "--project-name")
+            .map(|w| w[1].clone())
+            .expect("compose runs under an explicit project name");
+        assert!(
+            force_stop_hint().contains(&format!("com.docker.compose.project={project}")),
+            "hint must filter on the running project: {}",
+            force_stop_hint()
+        );
+    }
 
     #[test]
     fn compose_prefix_omits_override_when_absent() {

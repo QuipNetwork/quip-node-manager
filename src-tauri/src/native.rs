@@ -509,13 +509,19 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// How long the miner gets to shut down on its own after SIGTERM before the
 /// stop path escalates to SIGKILL.
-const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// Wide on purpose. A miner mid-round finishes its work, flushes state and
+/// releases its GPU context before exiting, and killing it partway through
+/// that is worse than waiting. The window costs nothing in the normal case
+/// because `wait_until_gone` returns the moment the process is gone — it only
+/// bounds how long a genuinely wedged miner delays the failure report.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(100);
 
 /// How long to keep watching after SIGKILL. Signals are asynchronous: `kill`
 /// returns as soon as the signal is queued, and the PID stays observable until
 /// the kernel finishes tearing the process down and the parent reaps it. A
 /// miner holding GPU buffers and open sockets routinely needs a beat here.
-const STOP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const STOP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Gap between liveness samples while waiting for a signalled process to go.
 const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -550,6 +556,71 @@ fn wait_until_gone(timeout: std::time::Duration, mut still_running: impl FnMut()
     }
 }
 
+/// The command that force-kills the miner, for the user to run themselves once
+/// the manager has run out of options. The negated PID targets the process
+/// group, matching what the stop path signals, so it reaches the miner's
+/// workers rather than orphaning them.
+fn force_kill_command(pid: u32) -> String {
+    #[cfg(unix)]
+    {
+        format!("kill -9 -{pid}")
+    }
+    #[cfg(windows)]
+    {
+        format!("taskkill /PID {pid} /T /F")
+    }
+}
+
+/// How long a stop waits at each stage. A parameter rather than a direct read
+/// of the constants so the escalation can be exercised in milliseconds; at
+/// production timings a test of the SIGKILL path would take two minutes.
+#[derive(Clone, Copy)]
+struct StopTiming {
+    grace: std::time::Duration,
+    reap: std::time::Duration,
+}
+
+impl StopTiming {
+    const DEFAULT: Self = Self {
+        grace: STOP_GRACE,
+        reap: STOP_REAP_TIMEOUT,
+    };
+
+    fn total(&self) -> std::time::Duration {
+        self.grace + self.reap
+    }
+}
+
+/// What the user is told when a stop does not take.
+///
+/// Hedged, and on one line. The manager cannot tell a process wedged in the
+/// kernel from one the OS is still unwinding, so claiming the stop failed
+/// outright sends people hunting for a problem that may not exist. The frontend
+/// echoes this string twice (the `stop-complete` listener and the catch around
+/// the invoke), so the force-kill command rides along inside it rather than as
+/// a separate line that would land between the two copies.
+fn stuck_message(timed_out: bool, stuck_pids: &[u32]) -> String {
+    let what = if timed_out {
+        format!(
+            "Miner did not stop within {}s",
+            NATIVE_STOP_DEADLINE.as_secs()
+        )
+    } else {
+        format!(
+            "Miner is still running {}s after being asked to stop",
+            StopTiming::DEFAULT.total().as_secs()
+        )
+    };
+    let commands: Vec<String> = stuck_pids
+        .iter()
+        .map(|pid| force_kill_command(*pid))
+        .collect();
+    format!(
+        "{what} and may be stuck. Force it from a terminal:  {}",
+        commands.join("; ")
+    )
+}
+
 /// Stop the process group led by `pid`, escalating SIGTERM to SIGKILL.
 /// Returns true once the process is gone.
 ///
@@ -558,30 +629,54 @@ fn wait_until_gone(timeout: std::time::Duration, mut still_running: impl FnMut()
 /// but unreaped child is a zombie, and `kill(pid, 0)` reports zombies as alive,
 /// so this would escalate to SIGKILL and then time out against a process that
 /// already exited cleanly.
-fn terminate(pid: u32, mut still_running: impl FnMut() -> bool) -> bool {
+///
+/// `note` reports each step. The grace period runs to `timing.grace`, so
+/// without a line when the wait starts and another when it escalates, a slow
+/// shutdown is indistinguishable from a hung app for a minute and a half.
+fn terminate(
+    pid: u32,
+    timing: StopTiming,
+    note: &dyn Fn(&str, &str),
+    mut still_running: impl FnMut() -> bool,
+) -> bool {
     #[cfg(unix)]
     {
+        note(
+            "INFO",
+            &format!(
+                "Signalled miner (PID {pid}) to shut down; allowing up to {}s",
+                timing.grace.as_secs()
+            ),
+        );
         signal_group(pid, libc::SIGTERM);
-        if wait_until_gone(STOP_GRACE, &mut still_running) {
+        if wait_until_gone(timing.grace, &mut still_running) {
             return true;
         }
+        note(
+            "WARN",
+            &format!(
+                "Miner (PID {pid}) has not exited after {}s — forcing it",
+                timing.grace.as_secs()
+            ),
+        );
         signal_group(pid, libc::SIGKILL);
-        wait_until_gone(STOP_REAP_TIMEOUT, &mut still_running)
+        wait_until_gone(timing.reap, &mut still_running)
     }
     #[cfg(windows)]
     {
+        note("INFO", &format!("Stopping miner (PID {pid})"));
         // /T kills the process tree (all children), /F skips the graceful ask.
         let _ = crate::cmd::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
-        wait_until_gone(STOP_GRACE + STOP_REAP_TIMEOUT, &mut still_running)
+        wait_until_gone(timing.total(), &mut still_running)
     }
 }
 
 /// Stop the managed child, reaping it as we poll. Returns true once it exited.
-fn terminate_child(child: &mut Child) -> bool {
+fn terminate_child(child: &mut Child, timing: StopTiming, note: &dyn Fn(&str, &str)) -> bool {
     let pid = child.id();
-    terminate(pid, || match child.try_wait() {
+    terminate(pid, timing, note, || match child.try_wait() {
         Ok(None) => true,
         // Exited, or no longer waitable at all (already reaped elsewhere).
         // Either way there is nothing left to kill.
@@ -592,8 +687,8 @@ fn terminate_child(child: &mut Child) -> bool {
 /// Stop a process we do not own — an orphan left by a previous app session.
 /// Nothing here can reap it, but init/launchd adopted it and does so promptly,
 /// so `is_process_alive` clears once the kernel is done with it.
-fn terminate_orphan(pid: u32) -> bool {
-    terminate(pid, || is_process_alive(pid))
+fn terminate_orphan(pid: u32, timing: StopTiming, note: &dyn Fn(&str, &str)) -> bool {
+    terminate(pid, timing, note, || is_process_alive(pid))
 }
 
 /// Check if a node is already running from a previous session.
@@ -1176,8 +1271,12 @@ pub async fn stop_native_node(
 }
 
 /// Core native-node stop logic decoupled from Tauri. Signals `stop-started`,
-/// kills the managed child and any orphan PID, verifies the processes are gone
-/// within `NATIVE_STOP_DEADLINE`, then signals `stop-complete`.
+/// stops the managed child and any orphan PID, then signals `stop-complete`.
+///
+/// A stop that does not take is reported as "may be stuck" with the exact
+/// force-kill command, not as a flat failure: the manager cannot distinguish a
+/// process wedged in the kernel from one the OS is still unwinding, and it
+/// leaves the PID file and child handle in place so a retry can escalate again.
 ///
 /// Args:
 ///     sink: Progress/log sink for `stop-started` and `stop-complete` events.
@@ -1204,56 +1303,68 @@ pub(crate) async fn stop_native_node_core(
 
     // Do the blocking kill work in a bounded thread so the async runtime
     // stays responsive and we can time out cleanly.
+    let note_sink = Arc::clone(&sink);
     let kill_result = tokio::time::timeout(
         NATIVE_STOP_DEADLINE,
         tokio::task::spawn_blocking(move || {
+            let note = move |level: &str, message: &str| note_sink.log(level, message);
             // Hand back a child that outlived the stop so the caller can
             // restore it. Dropping the handle would strand an unreaped zombie,
             // and every later liveness check reads a zombie as a live miner.
             let mut surviving_child = None;
             if let Some(mut child) = child_opt {
-                if !terminate_child(&mut child) {
+                if !terminate_child(&mut child, StopTiming::DEFAULT, &note) {
                     surviving_child = Some(child);
                 }
             }
-            let orphan_stopped = orphan_pid.map(terminate_orphan).unwrap_or(true);
-            (surviving_child.is_none() && orphan_stopped, surviving_child)
+            let orphan_stopped = orphan_pid
+                .map(|pid| terminate_orphan(pid, StopTiming::DEFAULT, &note))
+                .unwrap_or(true);
+            (surviving_child, orphan_stopped)
         }),
     )
     .await;
 
-    let (timed_out, stopped) = match kill_result {
-        Ok(Ok((stopped, surviving_child))) => {
+    // PIDs the manager could not account for, so the user can be told exactly
+    // what to kill rather than "manual kill required".
+    let mut stuck_pids: Vec<u32> = Vec::new();
+    let timed_out = match kill_result {
+        Ok(Ok((surviving_child, orphan_stopped))) => {
             if let Some(child) = surviving_child {
+                stuck_pids.push(child.id());
                 *state.child.lock().unwrap() = Some(child);
             }
-            (false, stopped)
+            if !orphan_stopped {
+                stuck_pids.extend(orphan_pid);
+            }
+            false
         }
         // The blocking task panicked, taking the child handle with it. We
-        // cannot vouch for the process, so report the stop as failed.
-        Ok(Err(_)) => (false, false),
-        Err(_) => (true, false),
+        // cannot vouch for either process, so report both as unaccounted for.
+        Ok(Err(_)) => {
+            stuck_pids.extend(child_pid);
+            stuck_pids.extend(orphan_pid);
+            false
+        }
+        Err(_) => {
+            stuck_pids.extend(child_pid);
+            stuck_pids.extend(orphan_pid);
+            true
+        }
     };
 
     // Keep the PID file when the miner survived. It is the only record a retry
     // has of what to signal — clearing it unconditionally made the next Stop
     // find nothing to do and report success over a still-running miner.
-    if stopped {
+    if stuck_pids.is_empty() {
         remove_pid();
+        sink.stop_complete(true, None);
+        return Ok(());
     }
 
-    if !stopped {
-        let msg = if timed_out {
-            "native stop exceeded deadline — process may still be running"
-        } else {
-            "native process still alive after SIGKILL — manual kill required"
-        };
-        sink.stop_complete(false, Some(msg));
-        return Err(msg.to_string());
-    }
-
-    sink.stop_complete(true, None);
-    Ok(())
+    let msg = stuck_message(timed_out, &stuck_pids);
+    sink.stop_complete(false, Some(&msg));
+    Err(msg)
 }
 
 #[tauri::command]
@@ -1367,6 +1478,99 @@ mod tests {
         child
     }
 
+    /// Production timings scaled down so the escalation path runs in under a
+    /// second. Only the durations change; the SIGTERM → poll → SIGKILL → poll
+    /// sequence under test is the same one the stop path runs.
+    #[cfg(unix)]
+    const FAST_TIMING: StopTiming = StopTiming {
+        grace: std::time::Duration::from_millis(300),
+        reap: std::time::Duration::from_millis(500),
+    };
+
+    #[cfg(unix)]
+    fn discard(_level: &str, _message: &str) {}
+
+    #[test]
+    fn stop_timings_give_two_minutes_and_a_deadline_that_clears_them() {
+        assert_eq!(
+            StopTiming::DEFAULT.total(),
+            std::time::Duration::from_secs(120),
+            "the stuck-miner message quotes this budget back to the user"
+        );
+        assert!(
+            NATIVE_STOP_DEADLINE >= StopTiming::DEFAULT.total() * 2,
+            "the outer deadline must clear a managed child plus an orphan, or \
+             it fires first and reports a slow-but-successful stop as a failure"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_does_not_take_is_hedged_and_names_the_kill_command() {
+        let msg = stuck_message(false, &[4321]);
+        assert!(
+            msg.contains("may be stuck"),
+            "the manager cannot prove the process is wedged, so it must not \
+             claim it is: {msg}"
+        );
+        assert!(
+            msg.contains(&force_kill_command(4321)),
+            "the user needs the command, not 'manual kill required': {msg}"
+        );
+        assert!(
+            msg.contains("120s"),
+            "say how long was allowed, so the wait is legible: {msg}"
+        );
+        assert_eq!(msg.lines().count(), 1, "the frontend echoes this verbatim");
+    }
+
+    #[test]
+    fn a_stop_that_leaves_two_processes_names_both() {
+        // A managed child and an orphan from a previous app session can both
+        // survive; telling the user about only one leaves a miner running.
+        let msg = stuck_message(true, &[111, 222]);
+        assert!(msg.contains(&force_kill_command(111)), "{msg}");
+        assert!(msg.contains(&force_kill_command(222)), "{msg}");
+    }
+
+    #[test]
+    fn force_kill_command_targets_the_whole_process_group() {
+        // The miner leads its own group and its workers sit in it. A hint that
+        // named the bare PID would strand them.
+        #[cfg(unix)]
+        assert_eq!(force_kill_command(4321), "kill -9 -4321");
+        #[cfg(windows)]
+        assert_eq!(force_kill_command(4321), "taskkill /PID 4321 /T /F");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_that_has_to_escalate_reports_each_step() {
+        // A legitimate stop can occupy the full grace period. Without a line
+        // when the wait starts and another when it escalates, the UI shows
+        // nothing for 100s and is indistinguishable from a hung app.
+        let notes = std::cell::RefCell::new(Vec::new());
+        let record = |level: &str, message: &str| {
+            notes
+                .borrow_mut()
+                .push((level.to_string(), message.to_string()));
+        };
+
+        let mut child = spawn_group_leader("trap '' TERM; ");
+        assert!(terminate_child(&mut child, FAST_TIMING, &record));
+
+        let notes = notes.borrow();
+        let levels: Vec<&str> = notes.iter().map(|(level, _)| level.as_str()).collect();
+        assert_eq!(
+            levels,
+            ["INFO", "WARN"],
+            "the wait is announced, then the escalation warns: {notes:?}"
+        );
+        assert!(
+            notes[1].1.contains(&child.id().to_string()),
+            "the escalation must name the PID the user may have to kill"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminate_child_stops_a_process_that_ignores_sigterm() {
@@ -1375,9 +1579,12 @@ mod tests {
         // unreaped zombie answers `kill(pid, 0)` and reads as a live miner.
         let mut child = spawn_group_leader("trap '' TERM; ");
         let start = std::time::Instant::now();
-        assert!(terminate_child(&mut child), "SIGKILL must finish the job");
         assert!(
-            start.elapsed() >= STOP_GRACE,
+            terminate_child(&mut child, FAST_TIMING, &discard),
+            "SIGKILL must finish the job"
+        );
+        assert!(
+            start.elapsed() >= FAST_TIMING.grace,
             "SIGTERM was ignored, so the stop must have waited out the grace \
              period before escalating; a faster exit means the test process \
              died on SIGTERM and never covered the SIGKILL path"
@@ -1391,13 +1598,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminate_child_returns_as_soon_as_sigterm_lands() {
-        // The previous implementation slept a flat 2s before escalating, so
-        // every ordinary stop cost the full grace period.
+        // The stop path used to sleep out its full grace period on every stop.
+        // At the production grace of 100s that would make an ordinary stop
+        // unusable, so returning on exit rather than on timeout is load-bearing.
         let mut child = spawn_group_leader("");
         let start = std::time::Instant::now();
-        assert!(terminate_child(&mut child));
+        assert!(terminate_child(&mut child, FAST_TIMING, &discard));
         assert!(
-            start.elapsed() < STOP_GRACE,
+            start.elapsed() < FAST_TIMING.grace,
             "a clean shutdown must not wait out the SIGKILL grace period"
         );
     }
