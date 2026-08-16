@@ -53,6 +53,18 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3-rc7
+
+- **The dashboard shows miner data in Native mode**: the miner listened on loopback only. The dashboard container reaches the miner through the Docker host gateway, which does not arrive on loopback. Every `/api/v1/*` request failed with a 502, and the dashboard stayed empty. The miner now listens on all interfaces in both run modes.
+
+- **Caddy writes readable log lines**: a single failed request used to fill twenty lines of JSON. Caddy now writes one line for each event, and the log pane colors it by level. That line no longer carries the request header dump, the duplicate client address, or the internal error id.
+
+- **Stop waits for the miner to shut down**: the app allowed two seconds, then told the user to stop the process by hand. The miner was often still shutting down. A second press appeared to work, because the first press had already discarded the record it needed for a retry. Stop now allows two minutes and reports each step. It keeps that record, so a second press still works.
+
+- **A stop that does not take names the command to run**: the message says the miner may be stuck and gives the exact `kill` command for it. A failed Docker stop gives the matching `docker kill` command.
+
+---
+
 ## v0.2.3-rc6
 
 - **The terminal UI reports a partly started stack**: it read only the miner, so a dead miner beside four running support containers showed as STOPPED. The desktop app called the same state PARTIAL. The terminal UI now reads the compose stack in both run modes and names the services that are up. An unhealthy stack no longer shows as STOPPED.
