@@ -53,6 +53,52 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.3
+
+- **The stack runs the v0.3 miner**: v0.3 replaced the per-backend miner images with one image for each accelerator, and each image carries a coordinator and every miner it supports. The manager now reads `quip-miner/v0.3/quip-miner` and `quip-miner/v0.3/quip-miner-cuda`. The image tag is the single version it tracks, because the miners inside move on their own cadence. A fresh install with no pinned tag asks for `v0.3.0-rc7`.
+
+- **Native mode installs the v0.3 macOS bundle**: it fetches `quip-miner-darwin-arm64.tar.gz` and extracts the coordinator with every darwin-arm64 miner. The coordinator is the supervised process and starts the miners itself. The install strips the quarantine attribute, which otherwise kills the ad-hoc signed binaries with no output. The generated `config.toml` names each miner by absolute path, because the coordinator resolves a bare name through PATH.
+
+- **Native mode requires an Apple Silicon Mac**: every other platform is pointed at Docker mode. The v0.3 images carry the CPU, D-Wave and CUDA miners, so the one capability Native mode adds is Metal, which reaches a GPU no container can.
+
+- **The miner serves its REST surface**: the manager wrote `rest_host` and `rest_port`, which the v0.3 coordinator does not read, so the dashboard had no data source. The manager now writes a `[dashboard]` section, which is where v0.3 takes the listen address and the attempt-log directory.
+
+- **The dashboard shows miner data in Native mode**: the miner listened on loopback only. The dashboard container reaches it through the Docker host gateway, which does not arrive on loopback. Every `/api/v1/*` request failed with a 502. The miner now listens on all interfaces in both run modes.
+
+- **The miner advertises a reachable public address**: `config.toml` omitted `public_port` unless an override existed, so peers had no advertised port. The `public_host` detection ran only in Docker mode, so a Native miner advertised nothing. Both now run on every start path, and `public_host` resolves through check.quip.network, the same service behind the `ip` row in the pre-flight checklist.
+
+- **The manager refuses to start when no peer can reach the resolved `public_host`**: it rejects loopback and unspecified addresses, RFC1918 private ranges, link-local, carrier-grade NAT, multicast, and reserved ranges. It also rejects IPv6 unique-local addresses, IPv6 link-local addresses, and mDNS `.local` names. A local network or air-gapped deployment that advertises a private address on purpose cannot start. No opt-in override exists yet.
+
+- **The stack recovers when Docker leaves a container off its network**: such a container runs but publishes none of its declared ports, and `docker compose up` does not repair it. In Native mode this hit the validator, which stopped publishing `127.0.0.1:9944`, so the miner never started. The manager now inspects every expected service after `up` and recreates a container that holds no network endpoint.
+
+- **Stop waits for the miner to shut down**: the app allowed two seconds, then told the user to stop the process by hand. The miner was often still shutting down. Stop now allows two minutes and reports each step. A stop that does not take says the miner may be stuck, and gives the exact command to force it.
+
+- **Caddy writes readable log lines**: a single failed request used to fill twenty lines of JSON. Caddy now writes one line for each event, and the log pane colors it by level.
+
+- **The terminal UI reports a partly started stack**: it read only the miner, so a dead miner beside four running support containers showed as STOPPED. It now reads the compose stack in both run modes and names the services that are up.
+
+- **The terminal UI gained the settings it lacked**: each GPU checkbox controls its own device. The GPU limit reaches a macOS Metal miner through the `[metal]` section. The storage directory accepts a new path, and the title bar shows the real version instead of v0.1.0.
+
+- **Release pages link to the released version**: the install commands on a release page pointed at the tip of `main`. They now point at the tag.
+
+- **CI checks Rust formatting**: a `lint` stage runs `cargo fmt --check` against `src-tauri`.
+
+- **Note for hand-edited configs**: a `config.toml` written for v0.2 does not start under v0.3. The coordinator requires a backend section, `public_host`, and `public_port`. Let the manager write the file, or copy the template the miner image ships at `/app/config.toml`.
+
+---
+
+## v0.2.3-rc7
+
+- **The dashboard shows miner data in Native mode**: the miner listened on loopback only. The dashboard container reaches the miner through the Docker host gateway, which does not arrive on loopback. Every `/api/v1/*` request failed with a 502, and the dashboard stayed empty. The miner now listens on all interfaces in both run modes.
+
+- **Caddy writes readable log lines**: a single failed request used to fill twenty lines of JSON. Caddy now writes one line for each event, and the log pane colors it by level. That line no longer carries the request header dump, the duplicate client address, or the internal error id.
+
+- **Stop waits for the miner to shut down**: the app allowed two seconds, then told the user to stop the process by hand. The miner was often still shutting down. A second press appeared to work, because the first press had already discarded the record it needed for a retry. Stop now allows two minutes and reports each step. It keeps that record, so a second press still works.
+
+- **A stop that does not take names the command to run**: the message says the miner may be stuck and gives the exact `kill` command for it. A failed Docker stop gives the matching `docker kill` command.
+
+---
+
 ## v0.2.3-rc6
 
 - **The terminal UI reports a partly started stack**: it read only the miner, so a dead miner beside four running support containers showed as STOPPED. The desktop app called the same state PARTIAL. The terminal UI now reads the compose stack in both run modes and names the services that are up. An unhealthy stack no longer shows as STOPPED.

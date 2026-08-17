@@ -15,7 +15,12 @@ pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 // upstream seed template, so it must render this key itself. Both run modes
 // target the public testnet.
 pub(crate) const FAUCET_URL: &str = "https://faucet.testnet.quip.network";
-pub(crate) const DOCKER_MINER_REST_HOST: &str = "0.0.0.0";
+// Bind address for the miner's REST/telemetry listener in BOTH run modes. The
+// consumer is always the dashboard container, which reaches the listener over
+// the compose network (Docker) or through the Docker host gateway (Native), so
+// neither mode can use loopback. See the `dashboard` field in
+// `ConfigToml::from_node_config`.
+pub(crate) const MINER_REST_HOST: &str = "0.0.0.0";
 // Container-internal miner REST port. Must match the upstream Caddyfile's
 // `reverse_proxy quip-miner:8086`; the miner publishes no host port.
 pub(crate) const DOCKER_MINER_REST_PORT: u16 = 8086;
@@ -293,16 +298,17 @@ impl ConfigToml {
             // network in Docker, `host.docker.internal:<native_rest_port>` in
             // Native.
             //
-            // Native stays on loopback. The Caddy container reaches it through
-            // Docker Desktop's host.docker.internal proxy, which originates the
-            // connection on the host, so binding wider would expose the miner's
-            // REST surface to the operator's LAN for nothing. Native is
-            // macOS-only, so no host-gateway Linux path has to work here.
+            // Native binds all interfaces too, not loopback. The connection
+            // from the Caddy container arrives on the host's Docker gateway
+            // address, not on 127.0.0.1, so a loopback bind refuses it and
+            // every `/api/v1/*` request 502s. Binding wider exposes nothing
+            // new: Caddy already proxies these same routes on the public API
+            // port, which compose publishes on all interfaces.
             dashboard: DashboardToml {
                 listen: if is_docker {
-                    format!("{DOCKER_MINER_REST_HOST}:{DOCKER_MINER_REST_PORT}")
+                    format!("{MINER_REST_HOST}:{DOCKER_MINER_REST_PORT}")
                 } else {
-                    format!("127.0.0.1:{}", native_rest_port(config))
+                    format!("{MINER_REST_HOST}:{}", native_rest_port(config))
                 },
                 data_dir: if is_docker {
                     DOCKER_ATTEMPTS_DIR.to_string()
@@ -556,9 +562,9 @@ mod tests {
     fn native_config_renders_host_local_miner_paths() {
         let cfg = NodeConfig {
             port: 21049,
-            // A non-loopback rest_host must be overridden to 127.0.0.1 by the
-            // renderer (native REST is loopback-only).
-            rest_host: "0.0.0.0".to_string(),
+            // rest_host is a v0.1 leftover; the renderer derives the bind
+            // address from the run mode and ignores whatever is set here.
+            rest_host: "127.0.0.1".to_string(),
             rest_insecure_port: 20123,
             ..NodeConfig::default()
         };
@@ -567,8 +573,22 @@ mod tests {
         assert!(toml.contains("validators = [\"ws://127.0.0.1:9944\"]"));
         assert!(toml.contains("signer_key = "));
         assert!(toml.contains("keystore.json"));
-        assert!(toml.contains("listen = \"127.0.0.1:20123\""));
+        assert!(toml.contains("listen = \"0.0.0.0:20123\""));
         assert!(toml.contains("attempts"));
+    }
+
+    /// The Caddy container reaches the native miner through the Docker host
+    /// gateway, which does not land on the host's loopback. A loopback bind
+    /// here refuses every `/api/v1/*` proxy attempt, which is silent in the
+    /// manager (the pane only shows Caddy's 502s) and empties the dashboard.
+    #[test]
+    fn native_miner_rest_binds_all_interfaces_for_the_dashboard_container() {
+        let toml = render_config_toml(&NodeConfig::default(), &RunMode::Native);
+        let port = native_rest_port(&NodeConfig::default());
+        assert!(
+            toml.contains(&format!("listen = \"0.0.0.0:{port}\"")),
+            "native listen must not be loopback: {toml}"
+        );
     }
 
     #[test]

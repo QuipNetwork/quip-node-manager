@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::config::{
-    DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_HOST, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY,
-    DOCKER_VALIDATOR_RPC, FAUCET_URL,
+    DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY, DOCKER_VALIDATOR_RPC,
+    FAUCET_URL, MINER_REST_HOST,
 };
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
@@ -441,7 +441,7 @@ fn default_signer_key(run_mode: &RunMode) -> String {
 
 fn default_rest_host(run_mode: &RunMode, global: &Table) -> String {
     match run_mode {
-        RunMode::Docker => DOCKER_MINER_REST_HOST.to_string(),
+        RunMode::Docker => MINER_REST_HOST.to_string(),
         RunMode::Native => string_from_table(global, "rest_host")
             .unwrap_or_else(|| NodeConfig::default().rest_host),
     }

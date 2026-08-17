@@ -83,10 +83,48 @@ fn kill_log_child(pid: u32) {
     }
 }
 
+/// Parse Caddy's console encoder output: tab-separated
+/// `ts<TAB>LEVEL<TAB>logger<TAB>message<TAB>{fields}`. The logger name and the
+/// field object are both optional, so everything past the level is kept as the
+/// message.
+///
+/// The stack pins `format console` in the Caddyfile's global `log` block
+/// (Caddy would otherwise emit JSON, because stderr is not a terminal under
+/// compose). Without this branch every Caddy line falls through to the
+/// plain-text case below and a 502 renders as INFO.
+fn parse_caddy_console_line(line: &str) -> Option<LogEntry> {
+    let mut parts = line.split('\t');
+    let timestamp = parts.next()?;
+    let level = match parts.next()? {
+        "DEBUG" => "DEBUG",
+        "INFO" => "INFO",
+        "WARN" => "WARN",
+        // PANIC and FATAL are terminal; the pane has no louder level than
+        // ERROR, so they land there rather than being dropped.
+        "ERROR" | "PANIC" | "FATAL" => "ERROR",
+        _ => return None,
+    };
+    let message = parts.collect::<Vec<_>>().join(" ");
+    if message.is_empty() {
+        return None;
+    }
+    Some(LogEntry {
+        timestamp: timestamp.to_string(),
+        level: level.to_string(),
+        message,
+        source: default_log_source(),
+    })
+}
+
 pub fn parse_log_line(line: &str) -> LogEntry {
     // Format: [file.py:123][node] 2026-01-01T12:00:00+00:00 LEVEL - message
+    // Or Caddy console: ts<TAB>LEVEL<TAB>logger<TAB>message<TAB>{fields}
     // Or Python: LEVEL:module:message
     // Otherwise: pass through verbatim.
+
+    if let Some(entry) = parse_caddy_console_line(line) {
+        return entry;
+    }
 
     // Try structured quip-protocol format
     if line.starts_with('[') {
@@ -619,6 +657,63 @@ mod tests {
         assert_eq!(e.message, "hello world");
         assert!(e.timestamp.is_empty());
         assert_eq!(e.source, "app");
+    }
+
+    /// A real 502 as Caddy's console encoder writes it, with the Caddyfile's
+    /// filter block already applied. Before this branch existed the whole line
+    /// fell through to the plain-text case and rendered as INFO, so proxy
+    /// failures were invisible to the pane's level colouring.
+    #[test]
+    fn parse_caddy_console_error() {
+        let e = parse_log_line(
+            "2026/08/16 05:22:02.881\tERROR\thttp.log.error\t\
+             dial tcp 192.168.107.3:9944: connect: connection refused\t\
+             {\"request\":{\"method\":\"GET\",\"host\":\"quip-caddy:8088\",\
+             \"uri\":\"/rpc\"},\"status\":502}",
+        );
+        assert_eq!(e.level, "ERROR");
+        assert_eq!(e.timestamp, "2026/08/16 05:22:02.881");
+        assert!(e
+            .message
+            .starts_with("http.log.error dial tcp 192.168.107.3:9944"));
+        assert!(e.message.ends_with("\"status\":502}"));
+    }
+
+    #[test]
+    fn parse_caddy_console_levels() {
+        for (raw, want) in [
+            ("INFO", "INFO"),
+            ("WARN", "WARN"),
+            ("DEBUG", "DEBUG"),
+            ("ERROR", "ERROR"),
+            ("PANIC", "ERROR"),
+            ("FATAL", "ERROR"),
+        ] {
+            let e = parse_log_line(&format!(
+                "2026/08/16 05:22:02.881\t{raw}\thttp\tserver running"
+            ));
+            assert_eq!(e.level, want, "level {raw} should map to {want}");
+            assert_eq!(e.message, "http server running");
+        }
+    }
+
+    /// Caddy emits its first two startup lines (`using config from file`,
+    /// `adapted config to JSON`) before the global `log` block takes effect, so
+    /// they stay JSON. They must still pass through rather than being dropped.
+    #[test]
+    fn parse_caddy_pre_config_json_falls_through_to_plain_text() {
+        let raw = "{\"level\":\"info\",\"ts\":1786887944.88,\"msg\":\"using config from file\"}";
+        let e = parse_log_line(raw);
+        assert_eq!(e.level, "INFO");
+        assert_eq!(e.message, raw);
+    }
+
+    /// A tab in a miner line must not be mistaken for the console encoder.
+    #[test]
+    fn parse_tabbed_non_caddy_line_is_not_treated_as_console() {
+        let e = parse_log_line("solution\t10448\tsubmitted");
+        assert_eq!(e.level, "INFO");
+        assert_eq!(e.message, "solution\t10448\tsubmitted");
     }
 
     #[test]
