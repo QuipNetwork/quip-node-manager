@@ -108,22 +108,36 @@ quip-node-manager/
 
 ## Docker Images
 
-Images are declared in `vendor/nodes.quip.network/docker-compose.yml` (with
-`${QUIP_*_TAG:-v0.2}` placeholders); the manager's authoritative image paths +
-tag live in `src-tauri/src/compose.rs` (`CPU_IMAGE`, `CUDA_IMAGE`,
-`VALIDATOR_IMAGE`, `DASHBOARD_IMAGE`, `COMPOSE_IMAGE_TAG = "v0.3.0-rc7"`), written into
-`.env` as `QUIP_MINER_TAG`/`QUIP_VALIDATOR_TAG`/`QUIP_DASHBOARD_TAG`:
+`vendor/nodes.quip.network/docker-compose.yml` declares the images, with
+`${QUIP_*_TAG:-…}` placeholders. The manager's authoritative image **paths**
+live in `src-tauri/src/compose.rs` (`CPU_IMAGE`, `CUDA_IMAGE`,
+`VALIDATOR_IMAGE`, `DASHBOARD_IMAGE`).
 
-- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner:v0.3.0-rc7`
-- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda:v0.3.0-rc7`
+The binary carries no default tag. Every start resolves a tag per image from
+that image's own GitLab container registry for the selected update channel
+(`resolve_channel_image_tags`) and writes the three results to `.env` as
+`QUIP_MINER_TAG`/`QUIP_VALIDATOR_TAG`/`QUIP_DASHBOARD_TAG`. The repositories
+advance on their own cadence, so the three tags often differ.
+
+When a registry does not answer, the manager holds the tag `.env` already pins,
+which keeps the stack on the version it runs instead of moving it backwards.
+When `.env` pins nothing either — a first start with no network — the start
+fails with a message. A compiled-in default tag cannot fill that gap: it ages
+into a tag the registry no longer carries, which converts a passing network
+fault into a permanent `pull` failure. Falling through to the compose file's own
+`:-latest` default is also forbidden, because the update monitor compares
+digests tag by tag, and `latest` moves under it.
+
+- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner`
+- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda`
 
   The v0.3 images are a **separate repository line**, not new tags on the v0.2
   paths, which stop at `v0.2.1-rc54`. The CPU image also dropped its `-cpu`
   suffix when the coordinator absorbed the miner binaries, so the two names are
   no longer symmetric. Pointing a v0.3 tag at a v0.2 path fails the pull with
   `not found`.
-- Validator: `registry.gitlab.com/quip.network/quip-validator/quip-network-node:v0.2`
-- Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network:v0.2`
+- Validator: `registry.gitlab.com/quip.network/quip-validator/quip-network-node`
+- Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network`
 - Postgres: `postgres:16` (Docker Hub)
 - Caddy: `caddy:2-alpine` (Docker Hub)
 

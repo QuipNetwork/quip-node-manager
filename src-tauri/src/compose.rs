@@ -231,28 +231,59 @@ pub(crate) struct ResolvedImageTags {
 }
 
 /// Resolve each image's tag from its own GitLab container registry for the
-/// settings' update channel (see `crate::registry`). Every image falls back
-/// independently to `COMPOSE_IMAGE_TAG` when its registry is unreachable or
-/// carries no canonical tag on the channel, so starting the stack never
-/// hard-fails on a network hiccup and one image's gap never blocks the others.
+/// settings' update channel (see `crate::registry`). Resolution runs per image
+/// so one repository's outage never blocks the other two.
 ///
-/// The fallback is what keeps the manager off the compose file's own
-/// `${QUIP_*_TAG:-latest}` defaults: `env_lines` writes all three keys on every
-/// start, so the `:-latest` branch is never taken and the running stack always
-/// names an explicit version.
-pub(crate) async fn resolve_channel_image_tags(settings: &AppSettings) -> ResolvedImageTags {
+/// When a registry lookup comes back empty, fall back to the tag `.env` already
+/// pins: the stack stays on the version it is running rather than moving to a
+/// version chosen elsewhere. A build-time default tag cannot serve this role,
+/// because it ages into a tag the registry no longer carries and turns a
+/// passing network fault into a permanent `pull` failure.
+///
+/// With neither source available — first start, no network — there is no honest
+/// answer, so this fails with a message the caller surfaces. Inventing a tag
+/// would either name an image that cannot be pulled or fall through to the
+/// compose file's own `${QUIP_*_TAG:-latest}` default, which the pinning policy
+/// forbids: a floating stack breaks the update monitor, which compares digests
+/// for a named tag.
+pub(crate) async fn resolve_channel_image_tags(
+    settings: &AppSettings,
+) -> Result<ResolvedImageTags, String> {
     let ch = settings.update_channel;
     let (miner, validator, dashboard) = tokio::join!(
         crate::registry::resolve_image_channel_tag(image_for_tag(settings.image_tag), ch),
         crate::registry::resolve_image_channel_tag(VALIDATOR_IMAGE, ch),
         crate::registry::resolve_image_channel_tag(DASHBOARD_IMAGE, ch),
     );
-    let fallback = || COMPOSE_IMAGE_TAG.to_string();
-    ResolvedImageTags {
-        miner: miner.unwrap_or_else(fallback),
-        validator: validator.unwrap_or_else(fallback),
-        dashboard: dashboard.unwrap_or_else(fallback),
-    }
+    Ok(ResolvedImageTags {
+        miner: pin_tag("miner", miner, current_pinned_tag("QUIP_MINER_TAG"))?,
+        validator: pin_tag(
+            "validator",
+            validator,
+            current_pinned_tag("QUIP_VALIDATOR_TAG"),
+        )?,
+        dashboard: pin_tag(
+            "dashboard",
+            dashboard,
+            current_pinned_tag("QUIP_DASHBOARD_TAG"),
+        )?,
+    })
+}
+
+/// Pick the tag to pin for one image: the channel-resolved tag when the
+/// registry answered, else the tag `.env` already carries.
+fn pin_tag(
+    label: &str,
+    resolved: Option<String>,
+    pinned: Option<String>,
+) -> Result<String, String> {
+    resolved.or(pinned).ok_or_else(|| {
+        format!(
+            "Cannot determine which {label} image version to run: the container registry \
+             did not answer and no previous version is pinned in .env. Check the network \
+             connection and start again."
+        )
+    })
 }
 
 /// Value of `key` (e.g. `QUIP_MINER_TAG`) currently pinned in `<data_dir>/.env`,
@@ -520,7 +551,6 @@ pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/q
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-validator/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
-pub const COMPOSE_IMAGE_TAG: &str = "v0.3.0-rc7";
 
 /// Image path (without tag) for a given `ImageTag`. D-Wave mining rides on
 /// the CPU image via config.toml's `[dwave]` section, so there's no Qpu
@@ -595,7 +625,7 @@ pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Res
     // Write .env too: without it compose substitutes the compose.yml
     // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
     // start sequence) would silently fetch the wrong tag.
-    let tags = resolve_channel_image_tags(&settings).await;
+    let tags = resolve_channel_image_tags(&settings).await?;
     write_env_file(&settings, &tags)?;
 
     pull_compose_images_for_settings(sink, &settings).await
@@ -787,7 +817,7 @@ pub(crate) async fn start_stack_core(
     )?;
 
     // (5) .env — pin each QUIP_*_TAG to its image's channel-resolved tag.
-    let tags = resolve_channel_image_tags(&settings).await;
+    let tags = resolve_channel_image_tags(&settings).await?;
     write_env_file(&settings, &tags)?;
 
     // (6) config.toml (host side, bind-mounted into the node container in
@@ -1352,9 +1382,11 @@ async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
 async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
-    // Match the tag the miner actually runs (channel-resolved, pinned in .env),
-    // falling back to the compose default when .env hasn't been written yet.
-    let tag = current_pinned_tag("QUIP_MINER_TAG").unwrap_or_else(|| COMPOSE_IMAGE_TAG.to_string());
+    // Match the tag the miner actually runs (channel-resolved, pinned in .env).
+    // No pin means the stack never started here, so there is nothing to sweep.
+    let Some(tag) = current_pinned_tag("QUIP_MINER_TAG") else {
+        return;
+    };
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
         let image_ref = format!("{image}:{tag}");
         let ps = tokio::task::spawn_blocking({
@@ -1722,7 +1754,31 @@ mod tests {
             DASHBOARD_IMAGE,
             "registry.gitlab.com/quip.network/dashboard.quip.network"
         );
-        assert_eq!(COMPOSE_IMAGE_TAG, "v0.3.0-rc7");
+    }
+
+    /// A silent registry must leave the stack on the version it already runs.
+    /// The previous build-time default moved it backwards instead, to a tag
+    /// that ages out of the registry and then cannot be pulled at all.
+    #[test]
+    fn pin_tag_prefers_the_registry_then_holds_the_pinned_version() {
+        assert_eq!(
+            pin_tag("miner", Some("v0.4.0".into()), Some("v0.3.0".into())).unwrap(),
+            "v0.4.0"
+        );
+        assert_eq!(
+            pin_tag("miner", None, Some("v0.3.0".into())).unwrap(),
+            "v0.3.0"
+        );
+    }
+
+    /// No registry and no pin is a first start with no network. There is no
+    /// version to name, so the start fails with a message rather than handing
+    /// compose a tag that cannot be pulled.
+    #[test]
+    fn pin_tag_fails_when_neither_the_registry_nor_env_names_a_version() {
+        let err = pin_tag("validator", None, None).unwrap_err();
+        assert!(err.contains("validator"), "{err}");
+        assert!(err.contains(".env"), "{err}");
     }
 
     /// Unset must stay unset. Writing an explicit default here would fork the
@@ -1822,7 +1878,7 @@ mod tests {
             501,
             1000,
             "pg",
-            &uniform_tags(COMPOSE_IMAGE_TAG),
+            &uniform_tags("v0.3.0"),
         )
         .join("\n");
 
