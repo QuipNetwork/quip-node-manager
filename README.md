@@ -24,14 +24,6 @@ Download the latest release from the [Releases page](https://gitlab.com/quip.net
 
 Download the `.dmg`, open it, and drag the app to `/Applications`.
 
-Because the app is not yet notarized, macOS will quarantine it. Open **Terminal** (Applications > Utilities > Terminal) and paste:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Quip\ Node\ Manager.app
-```
-
-Then launch the app from `/Applications`, not from the `.dmg` or Downloads folder.
-
 ### Linux
 
 The recommended format is **AppImage** (works on any distro):
