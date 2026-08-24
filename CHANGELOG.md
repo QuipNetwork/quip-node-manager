@@ -1,6 +1,9 @@
 # Changelog
 
-> **Note:** Because we are so new, we do not have Microsoft and Apple developer accounts activated yet so that you can install these apps without warnings from your Operating System. We are actively going through the identification for that now, and should have this resolved in the next month.
+> **Note:** The macOS builds are signed with an Apple Developer ID certificate
+> and notarized by Apple, so they install with no Gatekeeper warning and no
+> Terminal command. The Windows builds are not signed yet, so Windows shows a
+> SmartScreen warning on first run. Windows signing is tracked in QUI-347.
 
 ## Quick Install
 
@@ -21,14 +24,6 @@ irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install
 ### macOS
 
 Download the `.dmg`, open it, and drag the app to `/Applications`.
-
-Because the app is not yet notarized, macOS will quarantine it. Open **Terminal** (Applications > Utilities > Terminal) and paste:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Quip\ Node\ Manager.app
-```
-
-Then launch the app from `/Applications`, not from the `.dmg` or Downloads folder.
 
 ### Linux
 
@@ -52,6 +47,20 @@ Download the `.exe` and run it. Windows SmartScreen may show a warning because t
 Click **More info**, then **Run anyway**.
 
 ---
+
+## v0.2.4-rc1
+
+### Build
+
+- The macOS tag pipeline signs the application with a Developer ID Application
+  certificate and notarizes it.
+- `scripts/notarize-dmg.sh` notarizes and staples the disk image. Tauri signs
+  the disk image but does not notarize it.
+- `scripts/verify-macos-signing.sh` fails the pipeline when an artifact is not
+  signed, hardened, notarized, and stapled. A build with absent credentials
+  exits 0 and produces an unsigned application, so the pipeline checks the
+  result rather than the exit code.
+- `OSX.md` documents the signing flow that the repository uses.
 
 ## v0.2.3
 

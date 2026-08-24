@@ -73,8 +73,6 @@ case "$PLATFORM" in
     cp -R "$APP_NAME" /Applications/
     hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
     rm -f "$DEST"
-    info "Removing quarantine flag..."
-    xattr -dr com.apple.quarantine "/Applications/${BASENAME}" 2>/dev/null || true
     info "Installed to /Applications/${BASENAME}"
     info "Launch from Applications or run: open /Applications/${BASENAME}"
     ;;
