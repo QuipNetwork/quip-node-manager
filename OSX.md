@@ -9,11 +9,14 @@ Quip Node Manager Tauri app on macOS.
 
 - **Apple Developer Program** membership ($99/year) --
   [developer.apple.com/programs](https://developer.apple.com/programs/)
+- **Organization membership**, not individual. Individual membership puts the
+  personal legal name of the enrollee in the Gatekeeper prompt.
 - **Xcode CLI tools** installed: `xcode-select --install`
 - An **Apple ID** enrolled in the Developer Program
-- An **app-specific password** generated at
-  [appleid.apple.com](https://appleid.apple.com/) (under Sign-In and Security
-  > App-Specific Passwords)
+- An **App Store Connect API key**, created at
+  [appstoreconnect.apple.com](https://appstoreconnect.apple.com/access/integrations/api)
+  with the Developer role. Download the `.p8` file once, because Apple does
+  not offer it a second time. Record the Key ID and the Issuer ID with it.
 
 ## Step 1: Create a Developer ID Certificate
 
@@ -23,7 +26,7 @@ Quip Node Manager Tauri app on macOS.
 4. Generate a Certificate Signing Request (CSR) using Keychain Access:
    - Open Keychain Access > Certificate Assistant > Request a Certificate From
      a Certificate Authority.
-   - Enter your email, select "Saved to disk", and save the `.certSigningRequest`
+   - Enter your email, select "Saved to disk," and save the `.certSigningRequest`
      file.
 5. Upload the CSR and download the resulting `.cer` file.
 6. Double-click the `.cer` file to install it into your login keychain.
@@ -34,119 +37,77 @@ security find-identity -v -p codesigning
 # Should list: "Developer ID Application: TEAM_NAME (TEAM_ID)"
 ```
 
-## Step 2: Build the App
+## Step 2: Set the signing environment
 
-Build the Tauri app for release:
+Tauri signs, notarizes, and staples the application bundle during the build.
+Set these variables and Tauri signs the build. Nothing else calls
+`codesign`.
 
-```bash
-cd /path/to/quip-node-manager
-bun run build
-```
+| Variable | Value |
+|---|---|
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Quip Network (TEAMID)` |
+| `APPLE_API_KEY` | App Store Connect Key ID |
+| `APPLE_API_ISSUER` | App Store Connect Issuer ID |
+| `APPLE_API_KEY_PATH` | path to the downloaded `.p8` file |
 
-The built `.app` bundle is located at:
+On a machine that already holds the certificate in its login keychain,
+`APPLE_SIGNING_IDENTITY` is enough. In CI, set `APPLE_CERTIFICATE` to a base64
+`.p12` and `APPLE_CERTIFICATE_PASSWORD` to its export password instead. Tauri
+then creates a temporary keychain and imports the certificate. It deletes the
+keychain when the build ends.
 
-```
-src-tauri/target/release/bundle/macos/Quip Node Manager.app
-```
-
-## Step 3: Code Sign the App Bundle
-
-Sign the `.app` bundle with your Developer ID certificate:
-
-```bash
-codesign \
-  --deep \
-  --force \
-  --verify \
-  --verbose \
-  --sign "Developer ID Application: TEAM_NAME (TEAM_ID)" \
-  "src-tauri/target/release/bundle/macos/Quip Node Manager.app"
-```
-
-Verify the signature:
+## Step 3: Build
 
 ```bash
-codesign --verify --deep --strict --verbose=2 \
-  "src-tauri/target/release/bundle/macos/Quip Node Manager.app"
-
-spctl --assess --type execute --verbose \
-  "src-tauri/target/release/bundle/macos/Quip Node Manager.app"
+bun run tauri build --target universal-apple-darwin
 ```
 
-## Step 4: Create a DMG
+Tauri signs the bundle from the inside out and enables the hardened runtime.
+It then submits the bundle to Apple and staples the ticket that comes back.
 
-Package the signed app into a `.dmg` for distribution:
+The result is at:
+
+```
+src-tauri/target/universal-apple-darwin/release/bundle/macos/Quip Node Manager.app
+src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+```
+
+## Step 4: Notarize the DMG
+
+Tauri signs the DMG but does not notarize it. Run:
 
 ```bash
-hdiutil create -volname "Quip Node Manager" \
-  -srcfolder "src-tauri/target/release/bundle/macos/Quip Node Manager.app" \
-  -ov -format UDZO \
-  "Quip-Node-Manager.dmg"
+./scripts/notarize-dmg.sh dist/quip-node-manager-macos-universal.dmg
 ```
 
-Sign the DMG itself:
+## Step 5: Verify
+
+A build with no credentials still exits 0 and produces an unsigned
+application. Tauri logs `skipping app notarization` and continues. Check the
+result rather than trusting the exit code:
 
 ```bash
-codesign \
-  --force \
-  --sign "Developer ID Application: TEAM_NAME (TEAM_ID)" \
-  "Quip-Node-Manager.dmg"
+./scripts/verify-macos-signing.sh \
+  "src-tauri/target/universal-apple-darwin/release/bundle/macos/Quip Node Manager.app" \
+  dist/quip-node-manager-macos-universal.dmg
 ```
 
-## Step 5: Notarize the DMG
+The script fails when the signer is wrong, the hardened runtime is off, the
+timestamp is absent, Gatekeeper objects, or either ticket is missing.
 
-Submit the DMG to Apple for notarization:
+## Tauri configuration
 
-```bash
-xcrun notarytool submit "Quip-Node-Manager.dmg" \
-  --apple-id "your-email@example.com" \
-  --team-id "TEAM_ID" \
-  --password "APP_SPECIFIC_PASSWORD" \
-  --wait
-```
+`src-tauri/tauri.conf.json` needs no `bundle.macOS` block for this flow. The
+environment variables drive everything, and `hardenedRuntime` already defaults
+to `true`.
 
-The `--wait` flag blocks until notarization completes (typically 2--15 minutes).
+Add a block only for a specific need:
 
-Check notarization status if needed:
-
-```bash
-xcrun notarytool log <submission-id> \
-  --apple-id "your-email@example.com" \
-  --team-id "TEAM_ID" \
-  --password "APP_SPECIFIC_PASSWORD"
-```
-
-## Step 6: Staple the Notarization Ticket
-
-Attach the notarization ticket to the DMG so Gatekeeper can verify it offline:
-
-```bash
-xcrun stapler staple "Quip-Node-Manager.dmg"
-```
-
-Verify stapling:
-
-```bash
-xcrun stapler validate "Quip-Node-Manager.dmg"
-```
-
-## Tauri Configuration
-
-Add signing identity settings to `src-tauri/tauri.conf.json`:
-
-```json
-{
-  "bundle": {
-    "macOS": {
-      "signingIdentity": "Developer ID Application: TEAM_NAME (TEAM_ID)",
-      "providerShortName": "TEAM_ID"
-    }
-  }
-}
-```
-
-With this configuration, `bun run build` will automatically sign the app
-bundle during the build process.
+| Key | Use it when |
+|---|---|
+| `signingIdentity` | you want the build to reject a certificate that does not match |
+| `entitlements` | a verification run shows a specific hardened runtime denial |
+| `minimumSystemVersion` | the default `10.13` floor is wrong |
 
 ## Universal Binary (arm64 + x86_64)
 
@@ -180,83 +141,35 @@ lipo -create \
 
 4. Re-bundle and sign the universal binary using the steps above.
 
-## CI Setup (GitLab)
+## CI setup (GitLab)
 
-To sign builds in CI, import the signing certificate into a temporary
-keychain on the macOS runner:
+`.gitlab-ci.yml`, job `build-macos-universal`. The job sets the Apple
+variables only when `$CI_COMMIT_TAG` is set, then calls
+`scripts/notarize-dmg.sh` and `scripts/verify-macos-signing.sh`.
 
-```yaml
-build-macos:
-  tags: [macos]
-  variables:
-    KEYCHAIN_NAME: build.keychain
-    KEYCHAIN_PASSWORD: $CI_KEYCHAIN_PASSWORD
-  before_script:
-    # Decode the base64-encoded .p12 certificate from CI variable
-    - echo "$MACOS_CERTIFICATE_P12" | base64 --decode > certificate.p12
+The job creates no keychain. `Keychain::with_certificate` inside Tauri creates
+a temporary keychain, imports the certificate, sets the key partition list,
+and deletes the keychain when it drops.
 
-    # Create a temporary keychain
-    - security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-    - security default-keychain -s "$KEYCHAIN_NAME"
-    - security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-    - security set-keychain-settings -t 3600 -u "$KEYCHAIN_NAME"
+### Required CI/CD variables
 
-    # Import the certificate
-    - >
-      security import certificate.p12
-      -k "$KEYCHAIN_NAME"
-      -P "$MACOS_CERTIFICATE_PASSWORD"
-      -T /usr/bin/codesign
-      -T /usr/bin/security
+| Variable | Type | Description |
+|---|---|---|
+| `APPLE_CERTIFICATE` | Variable | base64 of the Developer ID Application `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | Variable | password used during the `.p12` export |
+| `APPLE_SIGNING_IDENTITY` | Variable | `Developer ID Application: Quip Network (TEAMID)` |
+| `APPLE_API_KEY` | Variable | App Store Connect Key ID |
+| `APPLE_API_ISSUER` | Variable | App Store Connect Issuer ID |
+| `APPLE_API_KEY_FILE` | File | the `.p8` private key |
 
-    # Allow codesign to access the keychain without prompting
-    - >
-      security set-key-partition-list
-      -S apple-tool:,apple:
-      -s -k "$KEYCHAIN_PASSWORD"
-      "$KEYCHAIN_NAME"
+Store all of these as **masked** and **protected**. Protected variables reach
+protected tags only, so confirm the release tag pattern is protected. An
+unprotected tag builds with empty credentials and produces an unsigned DMG.
 
-    # Verify the identity is available
-    - security find-identity -v -p codesigning "$KEYCHAIN_NAME"
+### Why this repository does not target the Mac App Store
 
-  script:
-    - bun install
-    - bun run build
-
-    # Notarize
-    - >
-      xcrun notarytool submit
-      "src-tauri/target/release/bundle/dmg/Quip Node Manager.dmg"
-      --apple-id "$APPLE_ID"
-      --team-id "$APPLE_TEAM_ID"
-      --password "$APPLE_APP_SPECIFIC_PASSWORD"
-      --wait
-
-    # Staple
-    - >
-      xcrun stapler staple
-      "src-tauri/target/release/bundle/dmg/Quip Node Manager.dmg"
-
-  after_script:
-    # Clean up the temporary keychain
-    - security delete-keychain "$KEYCHAIN_NAME"
-    - rm -f certificate.p12
-
-  artifacts:
-    paths:
-      - src-tauri/target/release/bundle/dmg/*.dmg
-    expire_in: 30 days
-```
-
-### Required CI/CD Variables
-
-| Variable | Description |
-|----------|-------------|
-| `MACOS_CERTIFICATE_P12` | Base64-encoded `.p12` export of the Developer ID certificate |
-| `MACOS_CERTIFICATE_PASSWORD` | Password for the `.p12` file |
-| `CI_KEYCHAIN_PASSWORD` | Arbitrary password for the temporary CI keychain |
-| `APPLE_ID` | Apple ID email address |
-| `APPLE_TEAM_ID` | 10-character Team ID from Apple Developer portal |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarytool |
-
-Store all of these as **masked, protected** CI/CD variables.
+The Mac App Store requires App Sandbox. Quip Node Manager runs
+`docker compose`, probes for a Docker daemon, and runs miner binaries that it
+downloads at run time. A sandboxed application cannot do any of that.
+Notarization removes the Gatekeeper warning, which is the part that affects
+users.
