@@ -45,7 +45,7 @@ Set these variables and Tauri signs the build. Nothing else calls
 
 | Variable | Value |
 |---|---|
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Quip Network (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Richard Carback (W64XX7HSTH)` |
 | `APPLE_API_KEY` | App Store Connect Key ID |
 | `APPLE_API_ISSUER` | App Store Connect Issuer ID |
 | `APPLE_API_KEY_PATH` | path to the downloaded `.p8` file |
@@ -157,7 +157,7 @@ and deletes the keychain when it drops.
 |---|---|---|
 | `APPLE_CERTIFICATE` | Variable | base64 of the Developer ID Application `.p12` |
 | `APPLE_CERTIFICATE_PASSWORD` | Variable | password used during the `.p12` export |
-| `APPLE_SIGNING_IDENTITY` | Variable | `Developer ID Application: Quip Network (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | Variable | `Developer ID Application: Richard Carback (W64XX7HSTH)` |
 | `APPLE_API_KEY` | Variable | App Store Connect Key ID |
 | `APPLE_API_ISSUER` | Variable | App Store Connect Issuer ID |
 | `APPLE_API_KEY_FILE` | File | the `.p8` private key |

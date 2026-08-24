@@ -13,7 +13,7 @@ set -euo pipefail
 # organization name as it appears on the Apple Developer Program enrollment.
 # Gatekeeper shows this string to the user, so a change here is a change to
 # what the user sees.
-EXPECTED_AUTHORITY='Developer ID Application: Quip Network'
+EXPECTED_AUTHORITY='Developer ID Application: Richard Carback'
 
 fail() {
     printf 'verify-macos-signing: %s\n' "$1" >&2
