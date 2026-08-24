@@ -53,6 +53,23 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.4-rc1
+
+### Build
+
+- The macOS tag pipeline signs the application with a Developer ID Application
+  certificate and notarizes it.
+- `scripts/notarize-dmg.sh` notarizes and staples the disk image. Tauri signs
+  the disk image but does not notarize it.
+- `scripts/verify-macos-signing.sh` fails the pipeline when an artifact is not
+  signed, hardened, notarized, and stapled. A build with absent credentials
+  exits 0 and produces an unsigned application, so the pipeline checks the
+  result rather than the exit code.
+- `OSX.md` documents the signing flow that the repository uses.
+
+The macOS install instructions above still apply. They change once a tag
+pipeline verifies a notarized build.
+
 ## v0.2.3
 
 - **The stack runs the v0.3 miner**: v0.3 replaced the per-backend miner images with one image for each accelerator, and each image carries a coordinator and every miner it supports. The manager now reads `quip-miner/v0.3/quip-miner` and `quip-miner/v0.3/quip-miner-cuda`. The image tag is the single version it tracks, because the miners inside move on their own cadence. A fresh install with no pinned tag asks for `v0.3.0-rc7`.
