@@ -85,9 +85,35 @@ build-macos-universal:
   script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - rm -rf src-tauri/target/universal-apple-darwin/release/bundle
+    # Tauri reads these itself. It creates a temporary keychain from
+    # APPLE_CERTIFICATE, signs the bundle inside out, notarizes it, staples
+    # the ticket, and deletes the keychain. The variables are protected, so a
+    # branch pipeline never sees them; the explicit unset covers the case
+    # where someone clears the protected flag by mistake.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export APPLE_API_KEY_PATH="$APPLE_API_KEY_FILE"
+      else
+        unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+        unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
+      fi
     - bun run tauri build --target universal-apple-darwin
     - mkdir -p dist
     - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
+    # Tauri does not notarize the DMG, and it treats absent credentials as a
+    # warning rather than an error, so a tag build proves nothing until these
+    # two scripts have run.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        APP=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+              -maxdepth 1 -name '*.app' | head -1)
+        if [ -z "$APP" ]; then
+          echo "no .app bundle found after the build" >&2
+          exit 1
+        fi
+        ./scripts/notarize-dmg.sh dist/quip-node-manager-macos-universal.dmg
+        ./scripts/verify-macos-signing.sh "$APP" dist/quip-node-manager-macos-universal.dmg
+      fi
   artifacts:
     paths:
       - dist/quip-node-manager-macos-universal.dmg
