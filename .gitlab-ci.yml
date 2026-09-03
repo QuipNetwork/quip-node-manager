@@ -78,17 +78,24 @@ build-macos-universal:
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
-    # Diagnostic only, runs on every build (not just tag builds): dumps the
-    # keychain state before anything else touches it, so a codesign failure
-    # can be compared against what the runner actually had in its search
-    # list at job start. Remove once the roman-mac-native codesign failure
-    # is root-caused.
+    # Tauri creates one temporary keychain per signed build and deletes it
+    # only when the build succeeds, so a failed signed build leaves an
+    # orphan behind. roman-mac-native had four piled up in its search list
+    # with no default keychain configured, and codesign reported "no
+    # identity found" for a certificate a fresh keychain had just reported
+    # imported. Delete anything that is not a real login keychain before
+    # this build creates its own, on every build so orphans never
+    # accumulate.
     - |
-      echo "--- keychain diagnostics ---"
-      security list-keychains -d user || true
-      security default-keychain -d user || true
-      security find-identity -v -p codesigning || true
-      echo "--- end keychain diagnostics ---"
+      for kc in $(security list-keychains -d user | tr -d '" '); do
+        case "$(basename "$kc")" in
+          login.keychain | login.keychain-db) ;;
+          *)
+            echo "removing stale keychain: $kc"
+            security delete-keychain "$kc" || true
+            ;;
+        esac
+      done
     # The [macos, arm64] tags match more than one runner, and they are not
     # provisioned alike: one carries rustup, another answers `command not
     # found` and fails the job at exit 127. Whichever runner picks up the job
@@ -116,13 +123,6 @@ build-macos-universal:
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         export APPLE_API_KEY_PATH="$APPLE_API_KEY_FILE"
-        # A keychain a prior job left in the search list can make codesign
-        # report "no identity found" for a certificate Tauri just imported
-        # into its own fresh temporary keychain, because codesign's identity
-        # search walks the whole list and a stale or locked entry can break
-        # it. Reset the list to the login keychain before each signed build
-        # so Tauri's temporary keychain is the only extra one in play.
-        security list-keychains -d user -s login.keychain
       else
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
         unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
