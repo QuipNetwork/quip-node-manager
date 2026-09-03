@@ -109,38 +109,6 @@ Add a block only for a specific need:
 | `entitlements` | a verification run shows a specific hardened runtime denial |
 | `minimumSystemVersion` | the default `10.13` floor is wrong |
 
-## Universal Binary (arm64 + x86_64)
-
-To produce a single binary that runs natively on both Apple Silicon and
-Intel Macs:
-
-1. Add both Rust targets:
-
-```bash
-rustup target add aarch64-apple-darwin
-rustup target add x86_64-apple-darwin
-```
-
-2. Build for each architecture:
-
-```bash
-cd src-tauri
-
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-```
-
-3. Combine with `lipo`:
-
-```bash
-lipo -create \
-  target/aarch64-apple-darwin/release/quip-node-manager \
-  target/x86_64-apple-darwin/release/quip-node-manager \
-  -output target/release/quip-node-manager-universal
-```
-
-4. Re-bundle and sign the universal binary using the steps above.
-
 ## CI setup (GitLab)
 
 `.gitlab-ci.yml`, job `build-macos-universal`. The job sets the Apple
@@ -148,8 +116,8 @@ variables only when `$CI_COMMIT_TAG` is set, then calls
 `scripts/notarize-dmg.sh` and `scripts/verify-macos-signing.sh`.
 
 The job creates no keychain. `Keychain::with_certificate` inside Tauri creates
-a temporary keychain, imports the certificate, sets the key partition list,
-and deletes the keychain when it drops.
+a temporary keychain and imports the certificate. It sets the key partition
+list, then deletes the keychain when it drops.
 
 ### Required CI/CD variables
 
@@ -169,7 +137,7 @@ unprotected tag builds with empty credentials and produces an unsigned DMG.
 ### Why this repository does not target the Mac App Store
 
 The Mac App Store requires App Sandbox. Quip Node Manager runs
-`docker compose`, probes for a Docker daemon, and runs miner binaries that it
-downloads at run time. A sandboxed application cannot do any of that.
+`docker compose` and probes for a Docker daemon. It also runs miner binaries
+that it downloads at run time. A sandboxed application cannot do any of that.
 Notarization removes the Gatekeeper warning, which is the part that affects
 users.
