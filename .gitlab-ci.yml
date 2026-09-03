@@ -78,6 +78,17 @@ build-macos-universal:
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    # Diagnostic only, runs on every build (not just tag builds): dumps the
+    # keychain state before anything else touches it, so a codesign failure
+    # can be compared against what the runner actually had in its search
+    # list at job start. Remove once the roman-mac-native codesign failure
+    # is root-caused.
+    - |
+      echo "--- keychain diagnostics ---"
+      security list-keychains -d user || true
+      security default-keychain -d user || true
+      security find-identity -v -p codesigning || true
+      echo "--- end keychain diagnostics ---"
     # The [macos, arm64] tags match more than one runner, and they are not
     # provisioned alike: one carries rustup, another answers `command not
     # found` and fails the job at exit 127. Whichever runner picks up the job
