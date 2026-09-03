@@ -78,6 +78,18 @@ build-macos-universal:
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    # The [macos, arm64] tags match more than one runner, and they are not
+    # provisioned alike: one carries rustup, another answers `command not
+    # found` and fails the job at exit 127. Whichever runner picks up the job
+    # decides whether the build starts, so install the toolchain when it is
+    # absent. rustup-init writes into CARGO_HOME, which the PATH above
+    # already covers.
+    - |
+      if ! command -v rustup >/dev/null 2>&1; then
+        echo "rustup not found on this runner, installing the stable toolchain"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+          sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+      fi
     - rustup default stable 2>/dev/null || true
     - rustup target add x86_64-apple-darwin
     - curl -fsSL https://bun.sh/install | bash || true
