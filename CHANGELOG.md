@@ -48,6 +48,26 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.4
+
+### Build
+
+- The macOS tag pipeline signs the application with a Developer ID Application
+  certificate and notarizes it.
+- `scripts/notarize-dmg.sh` notarizes and staples the disk image. Tauri signs
+  the disk image but does not notarize it.
+- `scripts/verify-macos-signing.sh` fails the pipeline when an artifact is not
+  signed, hardened, notarized, and stapled. A build with absent credentials
+  exits 0 and produces an unsigned application, so the pipeline checks the
+  result rather than the exit code.
+- `OSX.md` documents the signing flow that the repository uses, and no longer
+  covers the manual Intel and Apple Silicon universal-binary build. The
+  supported build target is Apple Silicon, M1 and newer, only.
+- The macOS build job installs rustup itself when the assigned runner does not
+  carry it, instead of failing with `command not found`.
+
+---
+
 ## v0.2.4-rc1
 
 ### Build
