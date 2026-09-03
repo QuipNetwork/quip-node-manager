@@ -78,6 +78,28 @@ build-macos-universal:
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
+    # Tauri creates one temporary keychain per signed build and deletes the
+    # file when the build succeeds, but never updates the search list, so a
+    # crashed or killed build (or, apparently, the OS reclaiming the file on
+    # its own) leaves a dangling path behind. roman-mac-native had four such
+    # entries with no default keychain configured, and codesign reported "no
+    # identity found" for a certificate a fresh keychain had just reported
+    # imported. `security delete-keychain` cannot clear these — the file is
+    # already gone, so it errors "could not be found" and leaves the search
+    # list untouched. Rebuild the list from only the entries whose file
+    # still exists, on every build so dangling entries never accumulate.
+    - |
+      keep=""
+      for kc in $(security list-keychains -d user | tr -d '" '); do
+        if [ -f "$kc" ]; then
+          keep="$keep $kc"
+        else
+          echo "dropping dangling keychain reference: $kc"
+        fi
+      done
+      # Each surviving path must be its own argument, hence no quotes.
+      # shellcheck disable=SC2086
+      security list-keychains -d user -s $keep
     # The [macos, arm64] tags match more than one runner, and they are not
     # provisioned alike: one carries rustup, another answers `command not
     # found` and fails the job at exit 127. Whichever runner picks up the job
