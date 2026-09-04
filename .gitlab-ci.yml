@@ -209,7 +209,6 @@ build-macos-universal:
             echo "note: $ca could not be downloaded" >&2
           fi
         done
-        rm -rf "$CERT_DIR_CA"
         security set-key-partition-list -S apple-tool:,apple:,codesign: \
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
@@ -220,22 +219,40 @@ build-macos-universal:
         security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
         security default-keychain -d user -s "$KEYCHAIN"
 
-        # Fail here, where the cause is obvious, rather than inside the bundler.
-        # On failure, separate the two things "0 valid identities" can mean.
-        # An identity is a certificate plus its private key, and -v further
-        # requires that the certificate validate, so counting certificates and
-        # identities separately says which half is missing.
-        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
-          echo "the signing identity is not usable from this runner's keychain" >&2
+        # Gate on the identity being present, not on macOS calling it valid.
+        #
+        # An identity is a certificate plus its private key. `-v` adds a full
+        # trust evaluation on top, and on roman-mac-native that evaluation
+        # returns 0 while the keychain holds the key and the whole chain:
+        #
+        #   certificates in keychain: 3
+        #   1) BFEE... "Developer ID Application: ..."   1 identities found
+        #   Valid identities only                        0 valid identities found
+        #
+        # Signing does not need that evaluation to pass, and gating on it
+        # blocked a runner that has everything signing requires. The real
+        # check is verify-macos-signing.sh after the build: it reads the
+        # notarization ticket and the authority chain off the finished DMG, so
+        # a chain that genuinely cannot be built fails there, on evidence,
+        # rather than here on a proxy for it.
+        if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
+          echo "the signing identity is not in this runner's keychain" >&2
           echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
           echo "certificates in keychain: $(security find-certificate -a "$KEYCHAIN" 2>/dev/null | grep -c '^keychain:')" >&2
-          echo "-- all identities (valid or not) --" >&2
           security find-identity -p codesigning "$KEYCHAIN" >&2 || true
-          echo "-- valid identities --" >&2
-          security find-identity -v -p codesigning "$KEYCHAIN" >&2 || true
-          echo "certificates present but no identity means the .p12 carried no private key;" >&2
-          echo "an identity present but not valid means the chain or the expiry is the problem." >&2
+          echo "certificates present but no identity means the .p12 carried no private key." >&2
           exit 1
+        fi
+        # Informational: record why the trust evaluation is unhappy, without
+        # blocking on it. Nothing here may fail the job.
+        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
+          echo "note: the identity is present but does not pass trust evaluation" >&2
+          security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" \
+            > "$CERT_DIR_CA/leaf.pem" 2>/dev/null || true
+          security verify-cert -c "$CERT_DIR_CA/leaf.pem" -p codeSign -k "$KEYCHAIN" >&2 2>&1 || true
+          openssl x509 -in "$CERT_DIR_CA/leaf.pem" -noout -dates -issuer >&2 2>/dev/null || true
+          security list-keychains >&2 2>&1 || true
+          echo "note: continuing; verify-macos-signing.sh gates the finished DMG" >&2
         fi
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
       else
