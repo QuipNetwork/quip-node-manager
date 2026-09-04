@@ -48,6 +48,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5-rc2
+
+- **The miner asks the right faucet for funds**: the rendered config named the testnet faucet on every channel. A node on Beta then requested funds from the network it does not run on, and its balance stayed at zero. Beta now uses the Aglais faucet. Release keeps the testnet faucet. An install upgrading from v0.1 gets the same correction.
+
+---
+
 ## v0.2.5-rc1
 
 - **The stack tracks the Aglais relaunch**: the bundled compose now uses the Aglais chain spec. It also adds a miner config template and a validator sync healthcheck, both of which the manager stages. The retired `quip-testnet.json` spec is gone.
