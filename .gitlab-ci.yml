@@ -30,13 +30,17 @@ variables:
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_TAG
+    # .gitlab-ci.yml is deliberately absent: a change to it rebuilt the whole
+    # app on all three runners for no result. The bundles a branch produces are
+    # unsigned and discarded, and the signing path is reached only under
+    # CI_COMMIT_TAG, so a branch build cannot exercise a change to it. Tags
+    # match the first rule and still build everything.
     - if: $CI_COMMIT_BRANCH
       changes:
         - src/**/*
         - src-tauri/**/*
         - package.json
         - bun.lock
-        - .gitlab-ci.yml
 
 # ---------------------------------------------------------------------------
 # Lint
@@ -144,12 +148,14 @@ build-macos-universal:
         KEYCHAIN="$HOME/Library/Keychains/quip-ci.keychain-db"
         KEYCHAIN_PW=$(openssl rand -base64 24)
         CERT_DIR=$(mktemp -d -t quip-cert)
+        CERT_DIR_CA=$(mktemp -d -t quip-ca)
         CERT_P12="$CERT_DIR/cert.p12"
-        trap 'rm -rf "$CERT_DIR"' EXIT
+        trap 'rm -rf "$CERT_DIR" "$CERT_DIR_CA"' EXIT
 
         security delete-keychain "$KEYCHAIN" 2>/dev/null || true
         security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-        # No auto-lock: a keychain that relocks mid-build fails the same way.
+        # 6h lock timeout, far longer than a build: a keychain that relocks
+        # mid-build fails the same way.
         security set-keychain-settings -lut 21600 "$KEYCHAIN"
         security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
 
@@ -175,6 +181,28 @@ build-macos-universal:
         security import "$CERT_P12" -f pkcs12 -k "$KEYCHAIN" \
           -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
         rm -rf "$CERT_DIR"
+
+        # A Developer ID leaf chains through Apple's Developer ID
+        # Certification Authority to the Apple Root CA. The root ships in
+        # System Roots, but the intermediate arrives with Xcode. A runner with
+        # only the Command Line Tools has no copy, so the chain cannot be
+        # built and the certificate counts as invalid however well it
+        # imported. That is the difference between the two runners: tesla-arm
+        # holds one in its login keychain, roman-mac-native holds nothing.
+        #
+        # Non-fatal: if the identity turns out to be usable anyway, the check
+        # below says so, and it gives the real verdict either way.
+        for ca in DeveloperIDG2CA DeveloperIDCA; do
+          if curl -fsS --max-time 30 -o "$CERT_DIR_CA/$ca.cer" \
+            "https://www.apple.com/certificateauthority/$ca.cer"; then
+            security add-certificates -k "$KEYCHAIN" "$CERT_DIR_CA/$ca.cer" 2>/dev/null \
+              || security import "$CERT_DIR_CA/$ca.cer" -k "$KEYCHAIN" 2>/dev/null \
+              || echo "note: $ca was not added" >&2
+          else
+            echo "note: $ca could not be downloaded" >&2
+          fi
+        done
+        rm -rf "$CERT_DIR_CA"
         security set-key-partition-list -S apple-tool:,apple:,codesign: \
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
@@ -186,9 +214,20 @@ build-macos-universal:
         security default-keychain -d user -s "$KEYCHAIN"
 
         # Fail here, where the cause is obvious, rather than inside the bundler.
+        # On failure, separate the two things "0 valid identities" can mean.
+        # An identity is a certificate plus its private key, and -v further
+        # requires that the certificate validate, so counting certificates and
+        # identities separately says which half is missing.
         if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
           echo "the signing identity is not usable from this runner's keychain" >&2
-          security find-identity -v -p codesigning "$KEYCHAIN" >&2
+          echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
+          echo "certificates in keychain: $(security find-certificate -a "$KEYCHAIN" 2>/dev/null | grep -c '^keychain:')" >&2
+          echo "-- all identities (valid or not) --" >&2
+          security find-identity -p codesigning "$KEYCHAIN" >&2 || true
+          echo "-- valid identities --" >&2
+          security find-identity -v -p codesigning "$KEYCHAIN" >&2 || true
+          echo "certificates present but no identity means the .p12 carried no private key;" >&2
+          echo "an identity present but not valid means the chain or the expiry is the problem." >&2
           exit 1
         fi
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
