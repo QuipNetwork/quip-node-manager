@@ -11,6 +11,19 @@ stages:
 # leave the submodule dir empty and fail the Tauri resource-path check.
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
+  # Keep the Rust build directory and the Cargo home across jobs.
+  #
+  # The default -ffdx deleted both at the start of every job, and a cache then
+  # spent the next 38s restoring what had just been deleted and 122s zipping it
+  # again at the end. On a 108s macOS build that was 160s of the 276s total, to
+  # rebuild state the runner had already had on disk. The cache never left the
+  # machine either ("Cache will be stored only locally"), so it carried nothing
+  # between runners and only paid to zip ~39,000 small files.
+  #
+  # Excluding these two paths from the clean removes both halves. Each build
+  # job clears its own output directory first, so a stale bundle cannot survive
+  # into a later run.
+  GIT_CLEAN_FLAGS: -ffdx -e src-tauri/target -e .cargo-cache
 
 # ---------------------------------------------------------------------------
 # Shared setup
@@ -18,12 +31,6 @@ variables:
 
 .tauri_build:
   stage: build
-  cache:
-    key: "${CI_JOB_NAME}"
-    paths:
-      - src-tauri/target
-      - .cargo-cache/registry
-      - .cargo-cache/git
   variables:
     CARGO_HOME: "${CI_PROJECT_DIR}/.cargo-cache"
   artifacts:
@@ -311,7 +318,6 @@ build-linux-x86_64:
 build-windows-x86_64:
   extends: .tauri_build
   tags: [windows, x86_64]
-  cache: {}
   variables:
     GIT_CONFIG_COUNT: "1"
     GIT_CONFIG_KEY_0: "core.longPaths"
@@ -326,6 +332,9 @@ build-windows-x86_64:
     - bun install
   script:
     - $env:Path = "C:\ProgramData\chocolatey\bin;C:\Program Files\NSIS;C:\Program Files\nodejs;$env:APPDATA\npm;$env:USERPROFILE\.bun\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
+    # target/ now survives between jobs, so drop the previous binary rather
+    # than risk copying it when a build produces nothing.
+    - Remove-Item -Force -ErrorAction SilentlyContinue src-tauri\target\release\quip-node-manager.exe
     - bun run tauri build -- --no-bundle
     - New-Item -ItemType Directory -Force -Path dist
     - Copy-Item src-tauri\target\release\quip-node-manager.exe dist\quip-node-manager-windows-x86_64.exe
