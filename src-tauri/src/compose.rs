@@ -222,68 +222,116 @@ pub const PGDATA_VOLUME: &str = "quip_pgdata";
 
 // ── .env generation ────────────────────────────────────────────────────────
 
-/// The channel-resolved tag for each stack image, decided **independently per
-/// repository** (miner / validator / dashboard advance on their own cadence).
-pub(crate) struct ResolvedImageTags {
-    pub miner: String,
-    pub validator: String,
-    pub dashboard: String,
+/// One image's tag on each channel, resolved from that image's own registry.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChannelPair {
+    /// Highest tag including `-rc` — upstream's BETA column.
+    pub beta: String,
+    /// Highest tag with no prerelease suffix — upstream's PROD column.
+    pub prod: String,
 }
 
-/// Resolve each image's tag from its own GitLab container registry for the
-/// settings' update channel (see `crate::registry`). Resolution runs per image
-/// so one repository's outage never blocks the other two.
+impl ChannelPair {
+    /// The tag this image runs on `channel`.
+    pub fn on(&self, channel: crate::settings::UpdateChannel) -> &str {
+        match channel {
+            crate::settings::UpdateChannel::Release => &self.prod,
+            crate::settings::UpdateChannel::Beta => &self.beta,
+        }
+    }
+}
+
+/// The channel-resolved tag for each stack image, decided independently per
+/// repository — miner, validator and dashboard advance on their own cadence.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedImageTags {
+    pub miner: ChannelPair,
+    pub validator: ChannelPair,
+    pub dashboard: ChannelPair,
+}
+
+/// Resolve both channels for every stack image from its own GitLab container
+/// registry. Each repository is fetched once and picked from twice, so this
+/// costs one round-trip per image rather than one per image per channel.
 ///
-/// When a registry lookup comes back empty, fall back to the tag `.env` already
-/// pins: the stack stays on the version it is running rather than moving to a
-/// version chosen elsewhere. A build-time default tag cannot serve this role,
-/// because it ages into a tag the registry no longer carries and turns a
-/// passing network fault into a permanent `pull` failure.
+/// The compose file offers a moving `:beta` / `:stable` tag as its own default,
+/// which is the right answer for a hand-run stack. The manager resolves an exact
+/// version instead and pins it, because the update monitor compares a named tag
+/// and cannot see a moving one change underneath it.
 ///
-/// With neither source available — first start, no network — there is no honest
-/// answer, so this fails with a message the caller surfaces. Inventing a tag
-/// would either name an image that cannot be pulled or fall through to the
-/// compose file's own `${QUIP_*_TAG:-latest}` default, which the pinning policy
-/// forbids: a floating stack breaks the update monitor, which compares digests
-/// for a named tag.
+/// A repository that does not answer falls back to the tag `.env` already pins,
+/// keeping the stack on the version it runs rather than moving it somewhere
+/// chosen elsewhere. With neither source there is no honest answer, so this
+/// fails and the caller surfaces it.
 pub(crate) async fn resolve_channel_image_tags(
     settings: &AppSettings,
 ) -> Result<ResolvedImageTags, String> {
-    let ch = settings.update_channel;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
     let (miner, validator, dashboard) = tokio::join!(
-        crate::registry::resolve_image_channel_tag(image_for_tag(settings.image_tag), ch),
-        crate::registry::resolve_image_channel_tag(VALIDATOR_IMAGE, ch),
-        crate::registry::resolve_image_channel_tag(DASHBOARD_IMAGE, ch),
+        resolve_pair(&client, image_for_tag(settings.image_tag), "QUIP_MINER_TAG"),
+        resolve_pair(&client, VALIDATOR_IMAGE, "QUIP_VALIDATOR_TAG"),
+        resolve_pair(&client, DASHBOARD_IMAGE, "QUIP_DASHBOARD_TAG"),
     );
+
     Ok(ResolvedImageTags {
-        miner: pin_tag("miner", miner, current_pinned_tag("QUIP_MINER_TAG"))?,
-        validator: pin_tag(
-            "validator",
-            validator,
-            current_pinned_tag("QUIP_VALIDATOR_TAG"),
+        miner: miner?,
+        validator: validator?,
+        dashboard: dashboard?,
+    })
+}
+
+/// Fetch one repository's tags once, then pick the newest for each channel.
+/// `env_key` names the `.env` pin used as the fallback when the registry is
+/// unreachable, which keeps the stack on the version it already runs.
+async fn resolve_pair(
+    client: &reqwest::Client,
+    image: &str,
+    env_key: &str,
+) -> Result<ChannelPair, String> {
+    use crate::settings::UpdateChannel;
+    let tags = crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image))
+        .await
+        .unwrap_or_default();
+
+    let pinned = current_pinned_tag(env_key);
+    Ok(ChannelPair {
+        beta: pin_tag(
+            image,
+            crate::registry::pick_channel_tag(&tags, UpdateChannel::Beta),
+            pinned.clone(),
         )?,
-        dashboard: pin_tag(
-            "dashboard",
-            dashboard,
-            current_pinned_tag("QUIP_DASHBOARD_TAG"),
+        prod: pin_tag(
+            image,
+            crate::registry::pick_channel_tag(&tags, UpdateChannel::Release),
+            pinned,
         )?,
     })
 }
 
-/// Pick the tag to pin for one image: the channel-resolved tag when the
-/// registry answered, else the tag `.env` already carries.
+/// Registry answer first, else whatever `.env` already pins.
 fn pin_tag(
-    label: &str,
+    image: &str,
     resolved: Option<String>,
-    pinned: Option<String>,
+    staged: Option<String>,
 ) -> Result<String, String> {
-    resolved.or(pinned).ok_or_else(|| {
+    resolved.or(staged).ok_or_else(|| {
         format!(
-            "Cannot determine which {label} image version to run: the container registry \
-             did not answer and no previous version is pinned in .env. Check the network \
-             connection and start again."
+            "Cannot determine which {image} version to run: the container registry did not \
+             answer and no previous version is staged. Check the network connection and \
+             start again."
         )
     })
+}
+
+/// The tag an image actually runs under. The manager pins every image in
+/// `.env`, which wins over the compose file's `${CHANNEL:-beta}` default, so
+/// the pin is the answer whenever the stack has been started once.
+pub(crate) fn effective_image_tag(env_key: &str) -> Option<String> {
+    current_pinned_tag(env_key)
 }
 
 /// Value of `key` (e.g. `QUIP_MINER_TAG`) currently pinned in `<data_dir>/.env`,
@@ -299,8 +347,12 @@ pub(crate) fn current_pinned_tag(key: &str) -> Option<String> {
 }
 
 /// Write `<data_dir>/.env` from AppSettings. Overwritten on every start —
-/// there is no merge with an existing file. `tags` holds the channel-resolved
-/// per-image tags (see `resolve_channel_image_tags`).
+/// there is no merge with an existing file.
+///
+/// Writes both `CHANNEL` and an exact tag per image. `CHANNEL` names the moving
+/// tag the compose file falls back to; the pins win over it, so the stack runs
+/// the version resolved at start rather than whatever the alias points at by the
+/// time the images are pulled.
 pub(crate) fn write_env_file(
     settings: &AppSettings,
     tags: &ResolvedImageTags,
@@ -330,6 +382,25 @@ fn cpu_set_for_config(cfg: &NodeConfig) -> String {
     }
 }
 
+/// The Leap region name inside a D-Wave SAPI endpoint, e.g. `na-west-1` from
+/// `https://na-west-1.cloud.dwavesys.com/sapi/v2/`.
+///
+/// Settings store the full endpoint URL, which is what the miner's `config.toml`
+/// takes, but `DWAVE_API_REGION` is the SDK's short region name. Anything that
+/// does not match the known host shape yields an empty value, which resolves
+/// identically to unset and lets the SDK choose.
+fn leap_region_from_url(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .and_then(|host| host.strip_suffix(".cloud.dwavesys.com"))
+        .filter(|region| !region.is_empty() && !region.contains('.'))
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn render_env_lines(
     settings: &AppSettings,
     puid: u32,
@@ -337,12 +408,8 @@ fn render_env_lines(
     pg_password: &str,
     tags: &ResolvedImageTags,
 ) -> Vec<String> {
-    let dwave_key = settings
-        .node_config
-        .dwave_config
-        .as_ref()
-        .map(|d| d.token.clone())
-        .unwrap_or_default();
+    let dwave = settings.node_config.dwave_config.as_ref();
+    let dwave_key = dwave.map(|d| d.token.clone()).unwrap_or_default();
     let hostname = crate::hostnames::resolved_caddy_hostname(
         &settings.node_config.public_host,
         &settings.hostname,
@@ -370,11 +437,38 @@ fn render_env_lines(
         format!("QUIP_HOSTNAME={hostname}"),
         format!("CERT_EMAIL={}", settings.cert_email),
         format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
+        // DWAVE_API_TOKEN is the name the miner and the Ocean SDK actually
+        // read. DWAVE_API_KEY is written too: the compose file maps it as a
+        // fallback, and an operator's existing .env may still carry it.
+        format!("DWAVE_API_TOKEN={dwave_key}"),
         format!("DWAVE_API_KEY={dwave_key}"),
+        // Pin the solver. Left empty the SDK picks the account default, which
+        // may not be the Advantage2 system the chain topology targets.
+        format!(
+            "DWAVE_API_SOLVER={}",
+            dwave.map(|d| d.solver.as_str()).unwrap_or_default()
+        ),
+        format!(
+            "DWAVE_API_REGION={}",
+            dwave
+                .map(|d| leap_region_from_url(&d.dwave_region_url))
+                .unwrap_or_default()
+        ),
         format!("POSTGRES_PASSWORD={pg_password}"),
-        format!("QUIP_MINER_TAG={}", tags.miner),
-        format!("QUIP_DASHBOARD_TAG={}", tags.dashboard),
-        format!("QUIP_VALIDATOR_TAG={}", tags.validator),
+        // CHANNEL names the moving tag the compose file falls back to. The
+        // pins below win over it: the manager resolves an exact version per
+        // image so the update monitor can compare a fixed tag, which a moving
+        // one makes impossible.
+        format!("CHANNEL={}", settings.update_channel.compose_channel()),
+        format!("QUIP_MINER_TAG={}", tags.miner.on(settings.update_channel)),
+        format!(
+            "QUIP_VALIDATOR_TAG={}",
+            tags.validator.on(settings.update_channel)
+        ),
+        format!(
+            "QUIP_DASHBOARD_TAG={}",
+            tags.dashboard.on(settings.update_channel)
+        ),
         format!(
             "QUIP_MINER_CPUSET={}",
             cpu_set_for_config(&settings.node_config)
@@ -622,9 +716,9 @@ pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Res
         crate::config::native_rest_port(&settings.node_config),
         settings.node_config.validator_rpc_port,
     )?;
-    // Write .env too: without it compose substitutes the compose.yml
-    // `${QUIP_*_TAG:-…}` defaults, so a standalone pull (outside the full
-    // start sequence) would silently fetch the wrong tag.
+    // Write .env too: without the pins compose falls back to its own
+    // `${CHANNEL:-beta}` default, so a standalone pull (outside the full start
+    // sequence) would silently fetch a moving tag instead of the resolved one.
     let tags = resolve_channel_image_tags(&settings).await?;
     write_env_file(&settings, &tags)?;
 
@@ -816,7 +910,7 @@ pub(crate) async fn start_stack_core(
         settings.node_config.validator_rpc_port,
     )?;
 
-    // (5) .env — pin each QUIP_*_TAG to its image's channel-resolved tag.
+    // (5) .env — pin each image to its channel-resolved tag.
     let tags = resolve_channel_image_tags(&settings).await?;
     write_env_file(&settings, &tags)?;
 
@@ -1382,9 +1476,10 @@ async fn force_remove_known_containers(sink: Arc<dyn ProgressSink>) {
 /// check is a sturdier stand-in for "lacks the compose project label"
 /// since `docker ps --filter label!=…` isn't portable.
 async fn sweep_orphan_node_containers(sink: Arc<dyn ProgressSink>) {
-    // Match the tag the miner actually runs (channel-resolved, pinned in .env).
-    // No pin means the stack never started here, so there is nothing to sweep.
-    let Some(tag) = current_pinned_tag("QUIP_MINER_TAG") else {
+    // Match the tag the miner actually runs, which the manager pinned in .env
+    // on the last start. No pin means the stack never started here, so there is
+    // nothing to sweep.
+    let Some(tag) = effective_image_tag("QUIP_MINER_TAG") else {
         return;
     };
     for image in &[CPU_IMAGE, CUDA_IMAGE] {
@@ -1630,13 +1725,17 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "-f").count(), 2);
     }
 
-    /// Same tag for all three images — most env tests don't exercise per-image
-    /// differences.
+    /// Same tag on both channels for every image — most env tests do not
+    /// exercise per-image or per-channel differences.
     fn uniform_tags(tag: &str) -> ResolvedImageTags {
+        let pair = ChannelPair {
+            beta: tag.to_string(),
+            prod: tag.to_string(),
+        };
         ResolvedImageTags {
-            miner: tag.to_string(),
-            validator: tag.to_string(),
-            dashboard: tag.to_string(),
+            miner: pair.clone(),
+            validator: pair.clone(),
+            dashboard: pair,
         }
     }
 
@@ -1756,31 +1855,6 @@ mod tests {
         );
     }
 
-    /// A silent registry must leave the stack on the version it already runs.
-    /// The previous build-time default moved it backwards instead, to a tag
-    /// that ages out of the registry and then cannot be pulled at all.
-    #[test]
-    fn pin_tag_prefers_the_registry_then_holds_the_pinned_version() {
-        assert_eq!(
-            pin_tag("miner", Some("v0.4.0".into()), Some("v0.3.0".into())).unwrap(),
-            "v0.4.0"
-        );
-        assert_eq!(
-            pin_tag("miner", None, Some("v0.3.0".into())).unwrap(),
-            "v0.3.0"
-        );
-    }
-
-    /// No registry and no pin is a first start with no network. There is no
-    /// version to name, so the start fails with a message rather than handing
-    /// compose a tag that cannot be pulled.
-    #[test]
-    fn pin_tag_fails_when_neither_the_registry_nor_env_names_a_version() {
-        let err = pin_tag("validator", None, None).unwrap_err();
-        assert!(err.contains("validator"), "{err}");
-        assert!(err.contains(".env"), "{err}");
-    }
-
     /// Unset must stay unset. Writing an explicit default here would fork the
     /// 16g default across .env and the compose file, so bumping one would
     /// silently leave the other behind.
@@ -1790,7 +1864,7 @@ mod tests {
             miner_mem_limit_gb: None,
             ..AppSettings::default()
         };
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
         assert!(!env.contains("QUIP_MINER_MEM_LIMIT"), "{env}");
     }
 
@@ -1800,7 +1874,7 @@ mod tests {
             miner_mem_limit_gb: Some(48),
             ..AppSettings::default()
         };
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("QUIP_MINER_MEM_LIMIT=48g"), "{env}");
     }
 
@@ -1821,7 +1895,7 @@ mod tests {
             501,
             1000,
             "postgres-secret",
-            &uniform_tags("v0.2"),
+            &uniform_tags("v0.3.0"),
         );
         let env = lines.join("\n");
 
@@ -1831,9 +1905,7 @@ mod tests {
         assert!(env.contains("CERT_EMAIL=ops@example.com"));
         assert!(env.contains("ZEROSSL_API_KEY=zero"));
         assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
-        assert!(env.contains("QUIP_MINER_TAG=v0.2"));
-        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2"));
-        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2"));
+        assert!(env.contains("CHANNEL=beta"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
         // QUIP_VALIDATORS is no longer written — the miner is config-driven and
@@ -1847,65 +1919,51 @@ mod tests {
         assert!(!env.contains("QUIP_FAUCET_URL"));
     }
 
+    /// The manager selects images by channel, not by pinning a tag per image.
+    /// Beta is upstream's live network (Aglais); Release is the older network
+    /// that still runs in parallel, which upstream keys as PROD.
     #[test]
-    fn env_lines_pin_all_image_tags_to_resolved_channel_tag() {
-        let settings = AppSettings {
+    fn env_lines_select_the_image_set_by_channel() {
+        let beta = AppSettings {
             run_mode: RunMode::Docker,
+            update_channel: crate::settings::UpdateChannel::Beta,
             ..AppSettings::default()
         };
-        // Each image pins to its OWN channel-resolved tag — repos advance
-        // independently, so the three QUIP_*_TAG lines can differ.
-        let tags = ResolvedImageTags {
-            miner: "v0.2.1-rc49".to_string(),
-            validator: "v0.2.1-rc13".to_string(),
-            dashboard: "v0.2.1-rc15".to_string(),
+        let env = render_env_lines(&beta, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        assert!(env.contains("CHANNEL=beta"));
+
+        let release = AppSettings {
+            update_channel: crate::settings::UpdateChannel::Release,
+            ..beta.clone()
         };
-        let env = render_env_lines(&settings, 501, 1000, "pg", &tags).join("\n");
-        assert!(env.contains("QUIP_MINER_TAG=v0.2.1-rc49"));
-        assert!(env.contains("QUIP_VALIDATOR_TAG=v0.2.1-rc13"));
-        assert!(env.contains("QUIP_DASHBOARD_TAG=v0.2.1-rc15"));
-    }
+        let env = render_env_lines(&release, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        assert!(env.contains("CHANNEL=stable"));
 
-    /// Upstream defaults every `${QUIP_*_TAG}` to `latest`. The manager must
-    /// never take that branch — a stack that floats to `latest` breaks both the
-    /// pinning policy and the update monitor, which compares digests for a
-    /// named tag. `.env` therefore has to define every tag variable the compose
-    /// file reads, including any added upstream later.
-    #[test]
-    fn env_lines_define_every_image_tag_variable_the_compose_file_reads() {
-        let env = render_env_lines(
-            &AppSettings::default(),
-            501,
-            1000,
-            "pg",
-            &uniform_tags("v0.3.0"),
-        )
-        .join("\n");
+        // The compose file falls back to the moving `${CHANNEL:-beta}` tag when
+        // nothing is pinned. The manager always pins, so a manager-driven stack
+        // runs an exact version and the update monitor has a fixed tag to
+        // compare. Only a hand-run compose stack takes the moving tag.
+        let tags = ResolvedImageTags {
+            miner: ChannelPair {
+                beta: "v0.3.1-rc7".into(),
+                prod: "v0.3.0".into(),
+            },
+            validator: ChannelPair {
+                beta: "v0.3.0-rc1".into(),
+                prod: "v0.2.2".into(),
+            },
+            dashboard: ChannelPair {
+                beta: "v0.2.2".into(),
+                prod: "v0.2.2".into(),
+            },
+        };
+        let beta_env = render_env_lines(&beta, 501, 1000, "pg", &tags).join("\n");
+        assert!(beta_env.contains("QUIP_MINER_TAG=v0.3.1-rc7"));
+        assert!(beta_env.contains("QUIP_VALIDATOR_TAG=v0.3.0-rc1"));
 
-        // The faucet sidecar sits behind a profile the manager never starts,
-        // and `stack_assets` strips its Caddy route, so its image is never
-        // pulled and its tag never has to be pinned.
-        const NOT_STARTED_BY_THE_MANAGER: [&str; 1] = ["QUIP_FAUCET_TAG"];
-
-        let mut checked = 0;
-        for chunk in crate::stack_assets::COMPOSE_YML.split("${").skip(1) {
-            let Some(expr) = chunk.split('}').next() else {
-                continue;
-            };
-            let name = expr.split(':').next().unwrap_or(expr);
-            if !name.ends_with("_TAG") || NOT_STARTED_BY_THE_MANAGER.contains(&name) {
-                continue;
-            }
-            checked += 1;
-            assert!(
-                env.contains(&format!("{name}=")),
-                ".env must pin {name}; the compose default is `latest`"
-            );
-        }
-        assert!(
-            checked >= 3,
-            "expected the compose file to read miner, validator, and dashboard tags"
-        );
+        let release_env = render_env_lines(&release, 501, 1000, "pg", &tags).join("\n");
+        assert!(release_env.contains("QUIP_MINER_TAG=v0.3.0"));
+        assert!(release_env.contains("QUIP_VALIDATOR_TAG=v0.2.2"));
     }
 
     #[test]
@@ -1914,7 +1972,7 @@ mod tests {
         settings.node_config.public_host = "node.example.com".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
     }
@@ -1925,7 +1983,7 @@ mod tests {
         settings.node_config.public_host = "203.0.113.9".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
     }
@@ -1938,7 +1996,7 @@ mod tests {
             ..crate::settings::DwaveConfig::default()
         });
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("DWAVE_API_KEY=dwave-token"));
     }
 
@@ -1950,7 +2008,7 @@ mod tests {
         };
         settings.node_config.node_name = "physical-miner-validator".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
 
         assert!(!env.contains("QUIP_VALIDATORS="));
         // Deferred to the compose default in both modes (see above).
@@ -1960,7 +2018,7 @@ mod tests {
     #[test]
     fn env_lines_default_validator_name_and_single_cpu_cpuset() {
         let settings = AppSettings::default();
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.2")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));

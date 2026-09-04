@@ -186,16 +186,15 @@ fn pick_release_for_channel<T>(
         .max_by_key(|it| parse_semver(version_of(it)))
 }
 
-/// Per-image channel resolution for the settings UI. Each stack image resolves
-/// its own tag from its own registry (they advance independently), so the UI
-/// can show what each will pin to and whether Release is runnable.
+/// Per-image channel view for the settings UI, resolved from each registry the
+/// same way a start resolves it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChannelInfo {
-    /// Tag each image resolves to on the channel (`None` = registry unreachable
-    /// or no canonical tag), keyed by display name (Miner/Validator/Dashboard).
+    /// Tag each image would run on the channel (`None` when the registry is
+    /// unreachable), keyed by display name (Miner/Validator/Dashboard).
     pub images: Vec<(String, Option<String>)>,
-    /// Whether every image has a stable (non-rc) tag — Release is selectable
-    /// only when true.
+    /// Whether the Release channel is selectable. Always true: both channels
+    /// resolve from the same registries.
     pub stable_available: bool,
 }
 
@@ -209,52 +208,35 @@ fn stack_images(settings: &crate::settings::AppSettings) -> [(&'static str, &'st
     ]
 }
 
-/// Fetch one repo's tags once and derive both its channel tag and whether it
-/// has any stable tag — avoids a second registry round-trip for the gray-out.
-async fn resolve_repo_channel(
-    client: &reqwest::Client,
-    image: &str,
-    channel: UpdateChannel,
-) -> (Option<String>, bool) {
-    match crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image)).await {
-        Ok(tags) => (
-            crate::registry::pick_channel_tag(&tags, channel),
-            crate::registry::pick_channel_tag(&tags, UpdateChannel::Release).is_some(),
-        ),
-        Err(_) => (None, false),
-    }
-}
-
-/// Resolve what a channel points at for every image right now, for the settings
-/// UI. Best-effort: an unreachable registry yields `None` for that image (and
-/// no stable), so the UI degrades gracefully instead of erroring.
+/// Resolve what a channel points at for every image, for the settings UI.
+///
+/// Asks each registry, the same way a start does, so the pane shows the tag the
+/// stack would actually pin rather than whatever `.env` carries from the last
+/// run on a possibly different channel.
 #[tauri::command]
 pub async fn resolve_channel_info(channel: UpdateChannel) -> ChannelInfo {
     let settings = crate::settings::load_settings();
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    else {
-        return ChannelInfo {
-            images: Vec::new(),
-            stable_available: false,
-        };
+    let images = stack_images(&settings);
+    let resolved = match crate::compose::resolve_channel_image_tags(&settings).await {
+        Ok(tags) => [
+            Some(tags.miner.on(channel).to_string()),
+            Some(tags.validator.on(channel).to_string()),
+            Some(tags.dashboard.on(channel).to_string()),
+        ],
+        // Best-effort: an unreachable registry shows blanks rather than erroring.
+        Err(_) => [None, None, None],
     };
 
-    let images = stack_images(&settings);
-    let (a, b, c) = tokio::join!(
-        resolve_repo_channel(&client, images[0].1, channel),
-        resolve_repo_channel(&client, images[1].1, channel),
-        resolve_repo_channel(&client, images[2].1, channel),
-    );
-    let results = [a, b, c];
     ChannelInfo {
         images: images
             .iter()
-            .zip(&results)
-            .map(|((name, _), (tag, _))| (name.to_string(), tag.clone()))
+            .zip(resolved)
+            .map(|((name, _), tag)| (name.to_string(), tag))
             .collect(),
-        stable_available: results.iter().all(|(_, has_stable)| *has_stable),
+        // Both channels resolve from the same registries, so Release is always
+        // selectable. It selects the older network that still runs in parallel,
+        // not a newer build of the current one.
+        stable_available: true,
     }
 }
 
@@ -493,7 +475,7 @@ pub async fn run_update_checks(
     // No pin ⇒ stack never started; skip silently (not a check failure).
     let env_keys = ["QUIP_MINER_TAG", "QUIP_VALIDATOR_TAG", "QUIP_DASHBOARD_TAG"];
     for ((name, image), key) in stack_images(settings).iter().zip(env_keys) {
-        let Some(current) = crate::compose::current_pinned_tag(key) else {
+        let Some(current) = crate::compose::effective_image_tag(key) else {
             continue;
         };
         match resolve_image_update(image, &current, settings.update_channel).await {
