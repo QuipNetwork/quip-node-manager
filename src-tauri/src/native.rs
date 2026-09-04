@@ -346,8 +346,9 @@ fn validator_rpc_http_probe_url(validator_url: &str) -> String {
 
 // The miner picks its own backends (cpu/gpu/qpu) from the config.toml
 // sections — the manager passes no subcommand and no per-key CLI overrides
-// (signer_key and faucet_url both live in [miner]; see config::FAUCET_URL —
-// the miner has no built-in faucet default, so the rendered config supplies it).
+// (signer_key and faucet_url both live in [miner]; see
+// UpdateChannel::faucet_url — the miner has no built-in faucet default, so the
+// rendered config supplies it, and which faucet depends on the channel).
 pub(crate) fn native_miner_args(config_path: &Path) -> Vec<String> {
     vec![
         "--config".to_string(),
@@ -1058,7 +1059,8 @@ pub(crate) async fn start_native_node_core(
     let settings = crate::settings::load_settings();
     let mut config = settings.node_config;
 
-    let migration = crate::migration_v2::migrate_for_run_mode(&RunMode::Native)?;
+    let migration =
+        crate::migration_v2::migrate_for_run_mode(&RunMode::Native, settings.update_channel)?;
     migration.promoted.apply_to_node_config(&mut config);
     crate::migration_v2::persist_promoted_settings(&migration.promoted)?;
     // emit_report emits node-log WARN lines for each migration warning.
@@ -1095,7 +1097,7 @@ pub(crate) async fn start_native_node_core(
     // bind address from the run mode (all interfaces, so the Caddy container
     // can reach it via host.docker.internal), so no rest_host override is
     // needed here.
-    crate::config::write_config_toml(&config, &RunMode::Native)?;
+    crate::config::write_config_toml(&config, &RunMode::Native, settings.update_channel)?;
 
     // Auto-provision the miner binary when it's missing — mirrors Docker
     // mode pulling images on start, so a fresh or relocated data dir doesn't

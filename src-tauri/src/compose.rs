@@ -847,7 +847,8 @@ pub(crate) async fn start_stack_core(
     // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
     // manager-owned files. Promoted fields keep hand-edited public host/port
     // values from being lost by the generated config.
-    let migration = crate::migration_v2::migrate_for_run_mode(&settings.run_mode)?;
+    let migration =
+        crate::migration_v2::migrate_for_run_mode(&settings.run_mode, settings.update_channel)?;
     migration
         .promoted
         .apply_to_node_config(&mut settings.node_config);
@@ -917,7 +918,11 @@ pub(crate) async fn start_stack_core(
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     sink.log("INFO", "$ Writing config.toml");
-    crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
+    crate::config::write_config_toml(
+        &settings.node_config,
+        &settings.run_mode,
+        settings.update_channel,
+    )?;
 
     let profile = compose_profile(settings.image_tag);
 

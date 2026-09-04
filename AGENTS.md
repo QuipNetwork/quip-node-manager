@@ -82,8 +82,9 @@ quip-node-manager/
   block-producing validator), `quip-dashboard`, `quip-postgres`, `quip-caddy`. The
   dashboard/Caddy reach the miner via the compose network alias `quip-miner`,
   and the validator via `quip-validator`. The miner self-bootstraps on first
-  start — it auto-funds via the testnet faucet and registers its keystore in
-  `QuantumPow.Miners`, so there is no separate one-shot bootstrap container.
+  start — it auto-funds via the faucet for the selected channel and registers
+  its keystore in `QuantumPow.Miners`, so there is no separate one-shot
+  bootstrap container.
   D-Wave QPU mining activates on top of
   the CPU image via `config.toml [dwave]` (no separate qpu service). The
   upstream compose also defines an optional `quip-faucet` service behind a
@@ -237,7 +238,9 @@ It stages the embedded compose.yml, Caddyfile, and chain spec
    directly. Docker mode does not publish it.
 
 4. **Caddyfile faucet strip** (always): the optional local faucet route block is
-   removed (the manager relies on the public testnet faucet).
+   removed. The manager uses the public faucet for the selected channel. Beta
+   uses the Aglais faucet. Release uses the testnet faucet. See
+   `UpdateChannel::faucet_url`.
 
 5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:8086` becomes
    `host.docker.internal:<native_rest_port>` so the dashboard container reaches

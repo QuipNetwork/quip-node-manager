@@ -57,6 +57,20 @@ impl UpdateChannel {
             UpdateChannel::Beta => "beta",
         }
     }
+
+    /// Faucet the miner asks for its startup balance. Each network runs its
+    /// own, and they do not share accounts, so this follows the same axis as
+    /// `compose_channel`: Beta is Aglais, Release is the older test network.
+    ///
+    /// Getting this wrong is quiet. The miner has no built-in default and
+    /// keeps retrying rather than exiting, so a request to the other network's
+    /// faucet reads as a slow faucet in the log while the balance stays at 0.
+    pub fn faucet_url(self) -> &'static str {
+        match self {
+            UpdateChannel::Release => "https://faucet.testnet.quip.network",
+            UpdateChannel::Beta => "https://faucet.aglais.quip.network",
+        }
+    }
 }
 
 // ─── GPU types ──────────────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use crate::config::{
     DEFAULT_NATIVE_REST_PORT, DOCKER_MINER_REST_PORT, DOCKER_SIGNER_KEY, DOCKER_VALIDATOR_RPC,
-    FAUCET_URL, MINER_REST_HOST,
+    MINER_REST_HOST,
 };
-use crate::settings::{data_dir, NodeConfig, RunMode};
+use crate::settings::{data_dir, NodeConfig, RunMode, UpdateChannel};
 use std::fs;
 use std::path::Path;
 use tauri::{AppHandle, Emitter};
@@ -103,7 +103,10 @@ struct ConfigMigration {
     warnings: Vec<String>,
 }
 
-pub fn migrate_for_run_mode(run_mode: &RunMode) -> Result<MigrationReport, String> {
+pub fn migrate_for_run_mode(
+    run_mode: &RunMode,
+    channel: UpdateChannel,
+) -> Result<MigrationReport, String> {
     let mut report = MigrationReport::default();
     let base = data_dir();
     let config_dir = match run_mode {
@@ -111,7 +114,7 @@ pub fn migrate_for_run_mode(run_mode: &RunMode) -> Result<MigrationReport, Strin
         RunMode::Native => base.clone(),
     };
 
-    report.merge(migrate_config_dir(&config_dir, run_mode)?);
+    report.merge(migrate_config_dir(&config_dir, run_mode, channel)?);
     report.merge(migrate_env_file(&base.join(".env"))?);
     Ok(report)
 }
@@ -144,7 +147,11 @@ fn emit_log(app: &AppHandle, level: &str, message: &str) {
     }
 }
 
-fn migrate_config_dir(config_dir: &Path, run_mode: &RunMode) -> Result<MigrationReport, String> {
+fn migrate_config_dir(
+    config_dir: &Path,
+    run_mode: &RunMode,
+    channel: UpdateChannel,
+) -> Result<MigrationReport, String> {
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
         return Ok(MigrationReport::default());
@@ -152,7 +159,7 @@ fn migrate_config_dir(config_dir: &Path, run_mode: &RunMode) -> Result<Migration
 
     let content = fs::read_to_string(&config_path)
         .map_err(|e| format!("read {}: {e}", config_path.display()))?;
-    let Some(migration) = migrate_config_content(&content, run_mode)? else {
+    let Some(migration) = migrate_config_content(&content, run_mode, channel)? else {
         return Ok(MigrationReport::default());
     };
 
@@ -309,11 +316,12 @@ fn is_validator_rpc_env_line(line: &str) -> bool {
 fn migrate_config_content(
     content: &str,
     run_mode: &RunMode,
+    channel: UpdateChannel,
 ) -> Result<Option<ConfigMigration>, String> {
     let mut root: Table = toml::from_str(content).map_err(|e| format!("parse config.toml: {e}"))?;
     match detect_schema(&root)? {
         ConfigSchema::V02 => Ok(None),
-        ConfigSchema::V01 => convert_v01_config(&mut root, run_mode).map(Some),
+        ConfigSchema::V01 => convert_v01_config(&mut root, run_mode, channel).map(Some),
     }
 }
 
@@ -328,7 +336,11 @@ fn detect_schema(root: &Table) -> Result<ConfigSchema, String> {
     }
 }
 
-fn convert_v01_config(root: &mut Table, run_mode: &RunMode) -> Result<ConfigMigration, String> {
+fn convert_v01_config(
+    root: &mut Table,
+    run_mode: &RunMode,
+    channel: UpdateChannel,
+) -> Result<ConfigMigration, String> {
     let Some(Value::Table(global)) = root.remove("global") else {
         return Err("config.toml [global] section is not a table".to_string());
     };
@@ -351,7 +363,7 @@ fn convert_v01_config(root: &mut Table, run_mode: &RunMode) -> Result<ConfigMigr
     // fails fast with `wallet-underfunded` (matches fresh config rendering).
     miner.insert(
         "faucet_url".to_string(),
-        Value::String(FAUCET_URL.to_string()),
+        Value::String(channel.faucet_url().to_string()),
     );
     miner.insert(
         "rest_host".to_string(),
@@ -539,7 +551,7 @@ solver = "Advantage2_System1.13"
 
     #[test]
     fn migrates_cpu_config_and_promotes_public_settings() {
-        let migration = migrate_config_content(CPU_V01, &RunMode::Docker)
+        let migration = migrate_config_content(CPU_V01, &RunMode::Docker, UpdateChannel::Beta)
             .unwrap()
             .expect("v0.1 config should migrate");
 
@@ -553,7 +565,7 @@ solver = "Advantage2_System1.13"
             .contains("signer_key = \"/data/keystore.json\""));
         assert!(migration
             .content
-            .contains("faucet_url = \"https://faucet.testnet.quip.network\""));
+            .contains("faucet_url = \"https://faucet.aglais.quip.network\""));
         assert!(migration.content.contains("rest_host = \"0.0.0.0\""));
         assert!(migration.content.contains("rest_port = 8086"));
         assert!(migration.content.contains("node_name = \"cpu-home\""));
@@ -574,7 +586,7 @@ solver = "Advantage2_System1.13"
 
     #[test]
     fn migrates_cuda_config_and_preserves_backend_tables() {
-        let migration = migrate_config_content(CUDA_V01, &RunMode::Docker)
+        let migration = migrate_config_content(CUDA_V01, &RunMode::Docker, UpdateChannel::Beta)
             .unwrap()
             .expect("v0.1 config should migrate");
 
@@ -587,7 +599,7 @@ solver = "Advantage2_System1.13"
 
     #[test]
     fn migrates_qpu_dwave_config() {
-        let migration = migrate_config_content(QPU_V01, &RunMode::Docker)
+        let migration = migrate_config_content(QPU_V01, &RunMode::Docker, UpdateChannel::Beta)
             .unwrap()
             .expect("v0.1 config should migrate");
 
@@ -599,7 +611,7 @@ solver = "Advantage2_System1.13"
 
     #[test]
     fn native_migration_uses_host_validator_rpc() {
-        let migration = migrate_config_content(CPU_V01, &RunMode::Native)
+        let migration = migrate_config_content(CPU_V01, &RunMode::Native, UpdateChannel::Beta)
             .unwrap()
             .expect("v0.1 config should migrate");
 
@@ -617,20 +629,32 @@ solver = "Advantage2_System1.13"
 validators = ["ws://quip-validator:9944"]
 signer_key = "/data/keystore.json"
 "#;
-        assert!(migrate_config_content(content, &RunMode::Docker)
-            .unwrap()
-            .is_none());
+        assert!(
+            migrate_config_content(content, &RunMode::Docker, UpdateChannel::Beta)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn ambiguous_config_is_refused() {
-        let err = migrate_config_content("[global]\n\n[miner]\n", &RunMode::Docker).unwrap_err();
+        let err = migrate_config_content(
+            "[global]\n\n[miner]\n",
+            &RunMode::Docker,
+            UpdateChannel::Beta,
+        )
+        .unwrap_err();
         assert!(err.contains("both [global] and [miner]"));
     }
 
     #[test]
     fn unknown_config_is_refused() {
-        let err = migrate_config_content("[cpu]\nnum_cpus = 1\n", &RunMode::Docker).unwrap_err();
+        let err = migrate_config_content(
+            "[cpu]\nnum_cpus = 1\n",
+            &RunMode::Docker,
+            UpdateChannel::Beta,
+        )
+        .unwrap_err();
         assert!(err.contains("neither [global] nor [miner]"));
     }
 
@@ -664,7 +688,7 @@ signer_key = "/data/keystore.json"
         fs::write(dir.join("config.toml"), CPU_V01).unwrap();
         fs::write(dir.join("node.log"), "old log").unwrap();
 
-        let report = migrate_config_dir(&dir, &RunMode::Docker).unwrap();
+        let report = migrate_config_dir(&dir, &RunMode::Docker, UpdateChannel::Beta).unwrap();
 
         assert!(report.changed);
         assert!(dir.join(BACKUP_DIR).join("config.toml").exists());
@@ -690,7 +714,7 @@ signer_key = "/data/keystore.json"
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::write(dir.join("bin").join("quip-network-node"), "binary").unwrap();
 
-        let report = migrate_config_dir(&dir, &RunMode::Native).unwrap();
+        let report = migrate_config_dir(&dir, &RunMode::Native, UpdateChannel::Beta).unwrap();
 
         assert!(report.changed);
         // Old node files are archived and the new config is written in place.
@@ -721,7 +745,7 @@ signer_key = "/data/keystore.json"
         fs::write(dir.join("config.toml"), CPU_V01).unwrap();
         fs::create_dir_all(dir.join(BACKUP_DIR)).unwrap();
 
-        let err = migrate_config_dir(&dir, &RunMode::Docker).unwrap_err();
+        let err = migrate_config_dir(&dir, &RunMode::Docker, UpdateChannel::Beta).unwrap_err();
         assert!(err.contains("already exists"), "unexpected error: {err}");
         // The original v0.1 config must be left untouched, not overwritten.
         assert!(fs::read_to_string(dir.join("config.toml"))
@@ -771,10 +795,13 @@ signer_key = "/data/keystore.json"
 
     #[test]
     fn malformed_v01_config_is_refused() {
-        let err = migrate_config_content("not = valid = toml", &RunMode::Docker).unwrap_err();
+        let err =
+            migrate_config_content("not = valid = toml", &RunMode::Docker, UpdateChannel::Beta)
+                .unwrap_err();
         assert!(err.contains("parse config.toml"), "unexpected error: {err}");
 
-        let err = migrate_config_content("global = 5\n", &RunMode::Docker).unwrap_err();
+        let err = migrate_config_content("global = 5\n", &RunMode::Docker, UpdateChannel::Beta)
+            .unwrap_err();
         assert!(
             err.contains("[global] section is not a table"),
             "unexpected error: {err}"
