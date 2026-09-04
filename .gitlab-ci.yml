@@ -156,9 +156,15 @@ build-macos-universal:
         # GNU's --decode, and with no decode flag it encodes instead of
         # decoding, silently, so `security import` was handed base64 of base64.
         printf '%s' "$APPLE_CERTIFICATE" | openssl base64 -d -A > "$CERT_P12"
-        if ! openssl pkcs12 -in "$CERT_P12" -passin env:APPLE_CERTIFICATE_PASSWORD -noout 2>/dev/null; then
-          echo "APPLE_CERTIFICATE did not decode to a PKCS#12 bundle ($(wc -c < "$CERT_P12") bytes)" >&2
-          echo "it must hold the base64 of the .p12 export, and the password must match" >&2
+        # A PKCS#12 is DER, so it opens with a SEQUENCE tag, 0x30. Decoding a
+        # value that was not base64 in the first place leaves ASCII here, which
+        # is exactly how the earlier double-encoding showed up. Checking the tag
+        # rather than parsing the bundle keeps this independent of OpenSSL's
+        # version: 3.x refuses Apple's legacy-encrypted exports without
+        # -legacy, so parsing rejects certificates that import perfectly well.
+        if [ "$(head -c 1 "$CERT_P12" | od -An -tx1 | tr -d '[:space:]')" != "30" ]; then
+          echo "APPLE_CERTIFICATE did not decode to DER ($(wc -c < "$CERT_P12") bytes)" >&2
+          echo "it must hold the base64 of the .p12 export" >&2
           exit 1
         fi
         security import "$CERT_P12" -k "$KEYCHAIN" \
