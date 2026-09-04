@@ -143,8 +143,9 @@ build-macos-universal:
 
         KEYCHAIN="$HOME/Library/Keychains/quip-ci.keychain-db"
         KEYCHAIN_PW=$(openssl rand -base64 24)
-        CERT_P12=$(mktemp -t quip-cert)
-        trap 'rm -f "$CERT_P12"' EXIT
+        CERT_DIR=$(mktemp -d -t quip-cert)
+        CERT_P12="$CERT_DIR/cert.p12"
+        trap 'rm -rf "$CERT_DIR"' EXIT
 
         security delete-keychain "$KEYCHAIN" 2>/dev/null || true
         security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
@@ -167,9 +168,13 @@ build-macos-universal:
           echo "it must hold the base64 of the .p12 export" >&2
           exit 1
         fi
-        security import "$CERT_P12" -k "$KEYCHAIN" \
+        # -f pkcs12 is required, not tidiness: with no -f, security picks the
+        # format from the file name, and a mktemp name ends in a random
+        # extension it does not know. It never looks at the bytes, so a valid
+        # bundle came back as "SecKeychainItemImport: Unknown format in import".
+        security import "$CERT_P12" -f pkcs12 -k "$KEYCHAIN" \
           -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
-        rm -f "$CERT_P12"
+        rm -rf "$CERT_DIR"
         security set-key-partition-list -S apple-tool:,apple:,codesign: \
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
