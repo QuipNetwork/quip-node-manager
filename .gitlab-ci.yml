@@ -152,7 +152,15 @@ build-macos-universal:
         security set-keychain-settings -lut 21600 "$KEYCHAIN"
         security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
 
-        printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_P12"
+        # openssl rather than base64(1): the BSD base64 on macOS does not take
+        # GNU's --decode, and with no decode flag it encodes instead of
+        # decoding, silently, so `security import` was handed base64 of base64.
+        printf '%s' "$APPLE_CERTIFICATE" | openssl base64 -d -A > "$CERT_P12"
+        if ! openssl pkcs12 -in "$CERT_P12" -passin env:APPLE_CERTIFICATE_PASSWORD -noout 2>/dev/null; then
+          echo "APPLE_CERTIFICATE did not decode to a PKCS#12 bundle ($(wc -c < "$CERT_P12") bytes)" >&2
+          echo "it must hold the base64 of the .p12 export, and the password must match" >&2
+          exit 1
+        fi
         security import "$CERT_P12" -k "$KEYCHAIN" \
           -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
         rm -f "$CERT_P12"
