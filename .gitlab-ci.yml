@@ -30,13 +30,17 @@ variables:
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_TAG
+    # .gitlab-ci.yml is deliberately absent: a change to it rebuilt the whole
+    # app on all three runners for no result. The bundles a branch produces are
+    # unsigned and discarded, and the signing path is reached only under
+    # CI_COMMIT_TAG, so a branch build cannot exercise a change to it. Tags
+    # match the first rule and still build everything.
     - if: $CI_COMMIT_BRANCH
       changes:
         - src/**/*
         - src-tauri/**/*
         - package.json
         - bun.lock
-        - .gitlab-ci.yml
 
 # ---------------------------------------------------------------------------
 # Lint
