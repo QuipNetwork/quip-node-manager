@@ -119,14 +119,60 @@ build-macos-universal:
   script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
     - rm -rf src-tauri/target/universal-apple-darwin/release/bundle
-    # Tauri reads these itself. It creates a temporary keychain from
-    # APPLE_CERTIFICATE, signs the bundle inside out, notarizes it, staples
-    # the ticket, and deletes the keychain. The variables are protected, so a
-    # branch pipeline never sees them; the explicit unset covers the case
-    # where someone clears the protected flag by mistake.
+    # Load the signing identity into a keychain this job owns, rather than
+    # letting Tauri build one from APPLE_CERTIFICATE.
+    #
+    # Tauri's own path works only on a runner that already has the Developer ID
+    # in its login keychain: it imports the certificate, reports "1 identity
+    # imported", and then `codesign` answers "no identity found" for that exact
+    # identity. roman-mac-native has no default keychain and no identity of its
+    # own, so it failed every signed build while tesla-arm passed. The
+    # difference was the runner's pre-existing setup, not the build.
+    #
+    # Doing it here makes both runners behave the same. The partition list must
+    # name codesign: explicitly — without it macOS wants to prompt for access to
+    # the private key, and a prompt nobody can answer surfaces as exactly the
+    # same "no identity found".
+    #
+    # APPLE_CERTIFICATE is then unset on purpose: Tauri only creates its
+    # temporary keychain when it is present, and with the identity already
+    # loaded that step has nothing left to do.
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         export APPLE_API_KEY_PATH="$APPLE_API_KEY_FILE"
+
+        KEYCHAIN="$HOME/Library/Keychains/quip-ci.keychain-db"
+        KEYCHAIN_PW=$(openssl rand -base64 24)
+        CERT_P12=$(mktemp -t quip-cert)
+        trap 'rm -f "$CERT_P12"' EXIT
+
+        security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+        security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+        # No auto-lock: a keychain that relocks mid-build fails the same way.
+        security set-keychain-settings -lut 21600 "$KEYCHAIN"
+        security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+
+        printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_P12"
+        security import "$CERT_P12" -k "$KEYCHAIN" \
+          -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+        rm -f "$CERT_P12"
+        security set-key-partition-list -S apple-tool:,apple:,codesign: \
+          -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+
+        # Both matter: codesign resolves an identity through the search list,
+        # and some lookups fall back to the default keychain. Each existing
+        # path has to stay its own argument, hence the unquoted expansion.
+        # shellcheck disable=SC2046
+        security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+        security default-keychain -d user -s "$KEYCHAIN"
+
+        # Fail here, where the cause is obvious, rather than inside the bundler.
+        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
+          echo "the signing identity is not usable from this runner's keychain" >&2
+          security find-identity -v -p codesigning "$KEYCHAIN" >&2
+          exit 1
+        fi
+        unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
       else
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
         unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
