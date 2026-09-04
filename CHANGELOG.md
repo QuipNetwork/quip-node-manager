@@ -48,6 +48,20 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5-rc1
+
+- **The stack tracks the Aglais relaunch**: the bundled compose now uses the Aglais chain spec. It also adds a miner config template and a validator sync healthcheck, both of which the manager stages. The retired `quip-testnet.json` spec is gone.
+
+- **Upgrading resyncs the validator and reindexes the dashboard**: the relaunch moved the validator data directory and renamed the Postgres volume, so the first start after this update replays the chain and rebuilds the dashboard index. The old directory and volume stay on disk until you delete them.
+
+- **The node no longer waits for the validator to sync**: the miner and dashboard now start alongside the validator, rather than hours later at the chain head. The miner retries in the meantime.
+
+- **Images are selected by channel**: the manager still resolves an exact version for each image from its own registry. It now records which channel it picked. A stack run by hand from the compose file follows a moving `beta` or `stable` tag instead. Beta is the default, because Release selects the older network that still runs in parallel.
+
+- **D-Wave settings reach the miner**: the manager writes the token under the name the miner and the Ocean SDK actually read. It also pins the solver and the Leap region. The previous name is still written, so existing setups keep working.
+
+---
+
 ## v0.2.4
 
 ### Build
