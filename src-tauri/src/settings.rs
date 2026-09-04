@@ -24,20 +24,39 @@ impl Default for RunMode {
 
 // ─── Update channel ─────────────────────────────────────────────────────────
 
-/// Which published tag line the stack tracks. Each image resolves its own tag
-/// independently from its own GitLab container registry by semver (see
-/// `crate::registry`):
-/// - `Release` → the highest tag with no `-rc` suffix (latest stable).
-/// - `Beta` → the highest tag overall, including `-rc` (bleeding edge).
+/// Which image set the stack runs. The manager writes this as `CHANNEL` in
+/// `.env`, and also pins an exact resolved tag per image, which wins over it.
 ///
-/// Defaults to `Release`; the UI grays it out and forces `Beta` unless every
-/// image has a stable tag to run.
+/// These name two different networks, not two freshness levels of one:
+/// - `Beta` → `CHANNEL=beta`, the live Aglais test network (runtime spec 117).
+/// - `Release` → `CHANNEL=stable`, the older network still running in parallel
+///   (runtime spec 116). A stable stack cannot join Aglais.
+///
+/// The app's own self-update still reads these as freshness levels — Release
+/// takes stable releases only, Beta also takes `-rc` builds. That is a separate
+/// axis from the image set and is handled in `crate::update`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateChannel {
-    #[default]
     Release,
+    /// The default. Beta runs the live Aglais test network; Release runs the
+    /// older network that still operates in parallel, so defaulting to Release
+    /// would put a fresh install on the wrong chain.
+    #[default]
     Beta,
+}
+
+impl UpdateChannel {
+    /// The `CHANNEL` value the compose file substitutes into every image
+    /// reference: `image: <repo>:${QUIP_*_TAG:-${CHANNEL:-beta}}`. These are
+    /// literal tag names, so they are lowercase and must match the moving tags
+    /// each image publishes.
+    pub fn compose_channel(self) -> &'static str {
+        match self {
+            UpdateChannel::Release => "stable",
+            UpdateChannel::Beta => "beta",
+        }
+    }
 }
 
 // ─── GPU types ──────────────────────────────────────────────────────────────

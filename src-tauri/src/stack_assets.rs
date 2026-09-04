@@ -2,11 +2,17 @@
 //! Stage the docker-compose stack files into the user's data dir so
 //! `docker compose` can run with `--project-directory`.
 //!
-//! The compose.yml, Caddyfile, and chain spec are embedded into the binary at
-//! compile time via `include_str!`. That avoids Tauri's resource-bundler path
-//! entirely, so a raw exe (e.g. Windows `--no-bundle` builds that ship
-//! just `quip-node-manager.exe` with no sibling resource folder) still
-//! has the files available at runtime.
+//! The compose.yml, Caddyfile, chain spec, miner config template,
+//! and validator healthcheck are embedded into the binary at compile time via
+//! `include_str!`. That avoids Tauri's resource-bundler path entirely, so a raw
+//! exe (e.g. Windows `--no-bundle` builds that ship just
+//! `quip-node-manager.exe` with no sibling resource folder) still has the files
+//! available at runtime.
+//!
+//! Everything the compose file bind-mounts must be staged here. Docker
+//! fabricates an empty *directory* for a missing bind-mount source, so an
+//! unstaged file does not fail loudly — it mounts a directory where a file was
+//! expected. `every_relative_bind_mount_has_a_staged_source` guards that.
 //!
 //! Runtime patches are applied before writing:
 //!   - compose.yml: Caddy's host-published public API port is rewritten
@@ -40,9 +46,22 @@ pub(crate) const COMPOSE_YML: &str =
 /// runtime for Native mode (see `sync_stack_assets`).
 const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Caddyfile");
 
-/// Canonical Quip testnet chain spec referenced by the v0.2 compose file.
+/// Aglais chain spec — the live Quip test network (runtime spec 117). Replaces
+/// the retired `quip-testnet.json`, which upstream deleted at the relaunch.
 const CHAIN_SPEC: &str =
-    include_str!("../../vendor/nodes.quip.network/chain-specs/quip-testnet.json");
+    include_str!("../../vendor/nodes.quip.network/chain-specs/aglais-network.json");
+
+/// First-run miner config template. The compose file bind-mounts this over the
+/// image's own `/app/config.toml`, which the entrypoint seeds `/data/config.toml`
+/// from. An absent source makes Docker fabricate a directory in its place.
+const MINER_CONFIG_TEMPLATE: &str =
+    include_str!("../../vendor/nodes.quip.network/config/quip-miner.toml");
+
+/// Validator sync gate, bind-mounted as the validator's healthcheck command.
+/// The miner, dashboard, and faucet all wait on `service_healthy`, so a missing
+/// or non-executable script leaves the whole stack permanently unstarted.
+const VALIDATOR_HEALTHCHECK: &str =
+    include_str!("../../vendor/nodes.quip.network/scripts/validator-healthcheck.sh");
 
 /// Public API port inside the Caddy container. The host side is configurable.
 const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
@@ -80,9 +99,20 @@ pub fn stack_caddyfile() -> PathBuf {
     data_dir().join("caddy").join("Caddyfile")
 }
 
-/// `<data_dir>/chain-specs/quip-testnet.json` — staged from embedded bytes.
+/// `<data_dir>/chain-specs/aglais-network.json` — staged from embedded bytes.
 pub fn stack_chain_spec_file() -> PathBuf {
-    data_dir().join("chain-specs").join("quip-testnet.json")
+    data_dir().join("chain-specs").join("aglais-network.json")
+}
+
+/// `<data_dir>/config/quip-miner.toml` — staged from embedded bytes.
+pub fn stack_miner_config_file() -> PathBuf {
+    data_dir().join("config").join("quip-miner.toml")
+}
+
+/// `<data_dir>/scripts/validator-healthcheck.sh` — staged from embedded bytes,
+/// written executable so the validator's `CMD` healthcheck can run it.
+pub fn stack_validator_healthcheck_file() -> PathBuf {
+    data_dir().join("scripts").join("validator-healthcheck.sh")
 }
 
 /// `--project-directory` for every `docker compose` invocation.
@@ -111,7 +141,14 @@ pub fn sync_stack_assets(
     validator_rpc_port: u16,
 ) -> Result<(), String> {
     let base = data_dir();
-    for sub in ["data", "dashboard-data", "caddy", "chain-specs"] {
+    for sub in [
+        "data",
+        "dashboard-data",
+        "caddy",
+        "chain-specs",
+        "config",
+        "scripts",
+    ] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
@@ -130,6 +167,30 @@ pub fn sync_stack_assets(
 
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
+    fs::write(stack_miner_config_file(), MINER_CONFIG_TEMPLATE)
+        .map_err(|e| format!("write miner config template: {e}"))?;
+
+    write_healthcheck_script()?;
+
+    Ok(())
+}
+
+/// Stage the validator healthcheck, executable. Compose runs it as the
+/// container's `CMD` healthcheck, and a non-executable file fails every probe,
+/// which keeps the validator `unhealthy` forever and blocks the miner and the
+/// dashboard behind their `service_healthy` conditions.
+fn write_healthcheck_script() -> Result<(), String> {
+    let path = stack_validator_healthcheck_file();
+    fs::write(&path, VALIDATOR_HEALTHCHECK)
+        .map_err(|e| format!("write validator healthcheck: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod validator healthcheck: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -143,7 +204,38 @@ fn patch_compose_file(
     let patched = patch_compose_ports(src, public_api_port, validator_port);
     let patched = expose_validator_rpc(&patched, validator_port, validator_rpc_port);
     let patched = patch_validator_public_addr(&patched, public_host, validator_port);
+    let patched = ungate_validator_dependents(&patched);
     strip_volume_names(&patched)
+}
+
+/// Start the miner, dashboard, and faucet as soon as the validator's container
+/// is up, rather than waiting for it to finish syncing.
+///
+/// Upstream gates them on `service_healthy`, where healthy means "synced to the
+/// chain head", with a 24h `start_period` to match. That is correct for the
+/// stack on its own — the miner's coordinator preflight reads the runtime at the
+/// validator's best block and exits if it is still at genesis — but it leaves a
+/// fresh install sitting with nothing but a validator for hours, which reads as
+/// a hung app.
+///
+/// The healthcheck itself is left in place: it still reports sync progress, and
+/// the container shows `health: starting` rather than `unhealthy` for the whole
+/// `start_period`. The tradeoff is that the miner now restart-loops against a
+/// syncing validator instead of waiting, which is visible in its logs.
+///
+/// Only the `quip-validator` dependencies are relaxed. The dashboard's
+/// dependency on `postgres` is also `service_healthy`, but that check passes in
+/// seconds and skipping it would race the database.
+fn ungate_validator_dependents(src: &str) -> String {
+    // Two indentation levels: the `x-dashboard` anchor and the services.
+    src.replace(
+        "    quip-validator:\n      condition: service_healthy",
+        "    quip-validator:\n      condition: service_started",
+    )
+    .replace(
+        "      quip-validator:\n        condition: service_healthy",
+        "      quip-validator:\n        condition: service_started",
+    )
 }
 
 /// Drop the fixed `name: quip-*` directives from the top-level `volumes:`
@@ -155,8 +247,13 @@ fn patch_compose_file(
 /// only applied when the data dir is first initialised, so a volume created by
 /// one stack keeps its original password and authentication fails for the
 /// other.
+/// Upstream renamed the Postgres volume `quip-pgdata` -> `aglais-pgdata` at the
+/// Aglais relaunch. These are literal matches, so an upstream rename silently
+/// stops stripping and reintroduces the collision this exists to prevent;
+/// `strip_volume_names_leaves_no_fixed_name` fails the build if that recurs.
 fn strip_volume_names(src: &str) -> String {
-    src.replace("\n    name: quip-pgdata", "")
+    src.replace("\n    name: aglais-pgdata", "")
+        .replace("\n    name: quip-pgdata", "")
         .replace("\n    name: quip-caddy-data", "")
         .replace("\n    name: quip-caddy-config", "")
 }
@@ -250,14 +347,26 @@ mod tests {
         assert!(!patched.contains("\"20049:20049\""));
     }
 
+    /// Asserts on the *shape* rather than on the three names we happen to know:
+    /// upstream renamed `quip-pgdata` to `aglais-pgdata` at the Aglais
+    /// relaunch, and a literal-list test kept passing while the renamed volume
+    /// went unstripped. Any `name:` under `volumes:` fails this.
     #[test]
-    fn strip_volume_names_removes_fixed_global_names() {
+    fn strip_volume_names_leaves_no_fixed_name() {
         let patched = strip_volume_names(COMPOSE_YML);
-        // No volume keeps a fixed global `name:` — compose now scopes them to
-        // the project (quip_pgdata, quip_caddy-data, quip_caddy-config).
-        assert!(!patched.contains("name: quip-pgdata"));
-        assert!(!patched.contains("name: quip-caddy-data"));
-        assert!(!patched.contains("name: quip-caddy-config"));
+        let volumes = patched
+            .split_once("\nvolumes:")
+            .expect("compose has a top-level volumes block")
+            .1;
+        let leftover: Vec<&str> = volumes
+            .lines()
+            .filter(|l| l.trim_start().starts_with("name:"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "these volumes keep a fixed global name, so they collide with any \
+             other Quip stack on the host: {leftover:?}"
+        );
         // The volume keys themselves are preserved.
         assert!(patched.contains("\n  pgdata:"));
         assert!(patched.contains("\n  caddy-data:"));
@@ -351,10 +460,73 @@ mod tests {
         );
     }
 
+    /// Upstream gates the miner, dashboard, and faucet on the validator being
+    /// *synced*, which is hours on a fresh install. Only those three relax to
+    /// `service_started`; the dashboard's postgres dependency must keep waiting
+    /// for health, since that check passes in seconds and skipping it races the
+    /// database.
     #[test]
-    fn embedded_chain_spec_is_quip_testnet_json() {
-        assert!(CHAIN_SPEC.contains("\"name\": \"Quip Testnet\""));
+    fn ungating_relaxes_only_the_validator_dependencies() {
+        let patched = ungate_validator_dependents(COMPOSE_YML);
+
+        assert!(
+            !patched.contains("quip-validator:\n        condition: service_healthy"),
+            "a service still waits for the validator to finish syncing"
+        );
+        assert!(
+            !patched.contains("quip-validator:\n      condition: service_healthy"),
+            "the dashboard anchor still waits for the validator to finish syncing"
+        );
+        assert!(
+            patched.contains("postgres:\n      condition: service_healthy"),
+            "the dashboard must still wait for postgres to be healthy"
+        );
+
+        // Every validator dependency upstream declares is accounted for.
+        assert_eq!(
+            COMPOSE_YML.matches("condition: service_healthy").count(),
+            patched.matches("condition: service_healthy").count()
+                + patched.matches("condition: service_started").count()
+                - COMPOSE_YML.matches("condition: service_started").count(),
+        );
+
+        // The healthcheck itself stays: it still reports sync progress.
+        assert!(patched.contains("test: [\"CMD\", \"validator-healthcheck\"]"));
+    }
+
+    #[test]
+    fn embedded_chain_spec_is_the_aglais_network() {
+        assert!(CHAIN_SPEC.contains("\"name\": \"AGLS (Quip Testnet)\""));
         assert!(CHAIN_SPEC.contains("\"bootNodes\""));
+    }
+
+    /// Every `./`-relative bind mount in the compose file needs a real source
+    /// staged under the data dir. Docker fabricates an empty *directory* for a
+    /// missing source, which is how a new upstream mount turns into a silent
+    /// runtime failure — the validator healthcheck mount is load-bearing, and
+    /// the miner, dashboard, and faucet all gate on it being healthy.
+    #[test]
+    fn every_relative_bind_mount_has_a_staged_source() {
+        let staged = [
+            "./data",
+            "./data/aglais-chain-db",
+            "./dashboard-data",
+            "./caddy/Caddyfile",
+            "./chain-specs/aglais-network.json",
+            "./config/quip-miner.toml",
+            "./scripts/validator-healthcheck.sh",
+        ];
+        for line in COMPOSE_YML.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("- ./") else {
+                continue;
+            };
+            let src = format!("./{}", rest.split(':').next().unwrap_or_default());
+            assert!(
+                staged.contains(&src.as_str()),
+                "compose bind-mounts {src}, which sync_stack_assets does not stage"
+            );
+        }
     }
 
     /// The Caddyfile upstream and the `[dashboard].listen` we render must name
@@ -369,12 +541,22 @@ mod tests {
         )));
     }
 
-    /// v0.3 images seed `/data/config.toml` from their own `/app/config.toml`,
-    /// so nothing bind-mounts a template any more. A reintroduced mount with no
-    /// staged source makes Docker fabricate an empty directory in its place.
+    /// Upstream reintroduced a miner config template mount at the Aglais
+    /// relaunch, because the image's own `/app/config.toml` still names the
+    /// retired testnet faucet. The mount is only safe while we stage the
+    /// source; the previous assertion here (that no such mount existed) named
+    /// the older `quip-miner.docker.toml` and so kept passing through the
+    /// rename without noticing.
     #[test]
-    fn compose_mounts_no_miner_config_template() {
-        assert!(!COMPOSE_YML.contains("quip-miner.docker.toml"));
+    fn miner_config_template_mount_is_staged() {
+        assert!(
+            COMPOSE_YML.contains("./config/quip-miner.toml:/app/config.toml"),
+            "upstream dropped the miner config mount — stop staging it"
+        );
+        assert!(
+            MINER_CONFIG_TEMPLATE.contains("[dashboard]"),
+            "staged template should be the miner config, not an empty file"
+        );
     }
 
     /// Caddy picks console vs JSON from whether stderr is a terminal, and under
