@@ -143,6 +143,14 @@ pub fn sync_stack_assets(
     let base = data_dir();
     for sub in [
         "data",
+        // The validator's base path. Aglais kept the chain id `quip_testnet`,
+        // so its database lands in the same `chains/quip_testnet` subdirectory
+        // the retired network used; a separate host directory is what keeps an
+        // Aglais node from opening the old network's database and failing with
+        // a GRANDPA decode error. Created here rather than left to Docker,
+        // which fabricates a missing bind-mount source owned by root while the
+        // validator runs as PUID/PGID.
+        "data/aglais-chain-db",
         "dashboard-data",
         "caddy",
         "chain-specs",
