@@ -131,6 +131,13 @@ build-toolchain-image:
   #
   # Each concrete job sets its own group, because the directory is shared per
   # platform, not across platforms.
+  #
+  # macOS was initially left out, on the grounds it clears a different bundle
+  # path and had never been seen to collide. It collides. Three jobs landed on
+  # tesla-arm inside two minutes while testing QUI-1295, and the third hung for
+  # the full hour in `get_sources` — a git fetch blocked on a sibling job's
+  # working copy, which never reaches before_script and so reports nothing more
+  # useful than a job timeout.
   artifacts:
     expire_in: 30 days
   rules:
@@ -184,6 +191,7 @@ rustfmt:
 
 build-macos-universal:
   extends: .tauri_build
+  resource_group: macos-build
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
