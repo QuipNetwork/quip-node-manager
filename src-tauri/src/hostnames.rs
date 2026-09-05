@@ -91,6 +91,24 @@ fn fallback_has_public_dns_host(fallback: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The DNS host Caddy holds a certificate for, or `None` when the site is
+/// port-only.
+///
+/// A port-only site (`:20049`) serves plain HTTP and matches any `Host`; a
+/// named site serves auto-TLS. Callers that dial the public API port from the
+/// host need to know which, because the plain-HTTP URL fails against a TLS
+/// listener. Derived from [`resolved_caddy_hostname`] so it cannot disagree
+/// with the site address actually rendered into the Caddyfile.
+pub(crate) fn caddy_tls_host(public_host: &str, fallback_hostname: &str) -> Option<String> {
+    let resolved = resolved_caddy_hostname(public_host, fallback_hostname);
+    if resolved.starts_with(':') {
+        return None;
+    }
+    // A named site is rendered as `host, host:20049`; either entry names the
+    // same host, so the first one answers the question.
+    public_host_name(resolved.split(',').next().unwrap_or("").trim())
+}
+
 pub(crate) fn is_public_dns_host(host: &str) -> bool {
     if host.parse::<IpAddr>().is_ok() {
         return false;

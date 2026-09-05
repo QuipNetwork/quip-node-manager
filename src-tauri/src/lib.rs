@@ -4,6 +4,7 @@ pub mod checklist;
 pub mod cmd;
 pub mod compose;
 pub mod config;
+pub mod coordinator_api;
 pub mod hardware;
 pub mod health;
 pub mod hostnames;
