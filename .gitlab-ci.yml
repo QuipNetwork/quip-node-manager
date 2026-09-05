@@ -367,6 +367,25 @@ build-macos-universal:
             | grep -q "$APPLE_SIGNING_IDENTITY"
         }
 
+        # Warn, do not fail, when the identity does not resolve.
+        #
+        # A hard exit here would name the real cause instead of letting Tauri
+        # run on to codesign's misleading "no identity found", which is what
+        # this check is for. It stays non-fatal because it has never been
+        # observed on a runner that goes on to sign successfully: tesla-arm was
+        # wedged throughout the QUI-1295 investigation, so the check ran only
+        # where signing was already broken. Failing the job on an unvalidated
+        # predicate risks breaking the one runner that can currently sign a
+        # release. Make it fatal once a green tag build has printed nothing
+        # here.
+        if ! identity_resolves; then
+          echo "WARNING: the signing identity does not resolve through the keychain search list" >&2
+          echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
+          echo "it IS present in the job keychain:" >&2
+          security find-identity -p codesigning "$KEYCHAIN" >&2 || true
+          echo "codesign will likely fail with errSecInternalComponent. See QUI-1295." >&2
+        fi
+
         # Gate on the identity being present, not on macOS calling it valid.
         #
         # An identity is a certificate plus its private key. `-v` adds a full
