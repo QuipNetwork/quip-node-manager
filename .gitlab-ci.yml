@@ -9,8 +9,16 @@ stages:
 # Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
 # as Tauri resources) before any job runs. Default is `none`, which would
 # leave the submodule dir empty and fail the Tauri resource-path check.
+# Toolchain image for build-linux-x86_64: docker.io/carback1/quip-tauri-builder
+# (built by hand from .gitlab/ci-toolchain.Dockerfile and pushed to Docker Hub
+# — see that file's header for the buildx command, or run `make builder-image`).
+# Rebuild and re-push locally when the toolchain Dockerfile changes, then bump
+# the digest below: CI resolves the digest, not the tag, so a re-push alone
+# changes nothing. The macOS and Windows jobs run on shell runners, which
+# ignore `image:` entirely, so they keep installing their own toolchains.
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
+  TOOLCHAIN_IMAGE: docker.io/carback1/quip-tauri-builder:latest
   # Keep the Rust build directory and the Cargo home across jobs.
   #
   # The default -ffdx deleted both at the start of every job, and a cache then
@@ -286,23 +294,17 @@ build-macos-universal:
 
 build-linux-x86_64:
   extends: .tauri_build
-  image: ubuntu:22.04
+  # The toolchain image carries the GTK/WebKit system libraries, Rust, and bun
+  # (see .gitlab/ci-toolchain.Dockerfile). They used to be installed per job on
+  # a stock ubuntu:22.04, which re-paid an apt-get of ~120 packages plus two
+  # installer downloads on every run — 40 minutes of it under contention, none
+  # of which GIT_CLEAN_FLAGS could preserve, since only the project directory
+  # survives a job and none of that setup lands there.
+  image: $TOOLCHAIN_IMAGE
   tags: [linux, x86_64]
   before_script:
-    # System deps for Tauri on Linux
-    - apt-get update && apt-get install -y --no-install-recommends
-        build-essential curl file git ca-certificates unzip
-        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-        librsvg2-dev patchelf pkg-config libssl-dev xdg-utils
-    # Install Rust via rustup (uses CARGO_HOME from CI variables)
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - export PATH="$CARGO_HOME/bin:$PATH"
-    # Install bun
-    - curl -fsSL https://bun.sh/install | bash
-    - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
-    - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
     - rm -rf src-tauri/target/release/bundle
     - bun run tauri build
     - mkdir -p dist
