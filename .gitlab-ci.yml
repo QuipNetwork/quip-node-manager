@@ -114,6 +114,23 @@ build-toolchain-image:
   stage: build
   variables:
     CARGO_HOME: "${CI_PROJECT_DIR}/.cargo-cache"
+  # Serialized per platform across every pipeline in the project. GIT_CLEAN_FLAGS
+  # deliberately preserves src-tauri/target between jobs, which is what keeps the
+  # compile warm — but a runner has one such directory, and each build job starts
+  # by clearing its own output from it. Two pipelines overlapping therefore had
+  # one job deleting a file the other held open:
+  #
+  #   $ Remove-Item -Force -ErrorAction SilentlyContinue src-tauri\target\release\quip-node-manager.exe
+  #   ERROR: Job failed: exit status 1
+  #
+  # -ErrorAction SilentlyContinue does not save it: the PowerShell executor fails
+  # the job on the error stream regardless. This failed the Windows job on both
+  # the v0.2.5-rc3 and v0.2.5-rc4 release tags, and merging an MR is enough to
+  # cause it — the merge starts a main pipeline, and a tag pushed after it adds a
+  # third. Overlapping pipelines now queue instead of corrupting each other.
+  #
+  # Each concrete job sets its own group, because the directory is shared per
+  # platform, not across platforms.
   artifacts:
     expire_in: 30 days
   rules:
@@ -367,6 +384,7 @@ build-macos-universal:
 
 build-linux-x86_64:
   extends: .tauri_build
+  resource_group: linux-build
   # The toolchain image carries the GTK/WebKit system libraries, Rust, and bun
   # (see .gitlab/ci-toolchain.Dockerfile). They used to be installed per job on
   # a stock ubuntu:22.04, which re-paid an apt-get of ~120 packages plus two
@@ -409,6 +427,7 @@ build-linux-x86_64:
 
 build-windows-x86_64:
   extends: .tauri_build
+  resource_group: windows-build
   tags: [windows, x86_64]
   variables:
     GIT_CONFIG_COUNT: "1"
