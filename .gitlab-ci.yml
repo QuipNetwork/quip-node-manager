@@ -2,6 +2,7 @@
 # Tauri v2 desktop app builds for macOS (universal), Linux, Windows
 
 stages:
+  - toolchain
   - lint
   - build
   - release
@@ -9,8 +10,25 @@ stages:
 # Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
 # as Tauri resources) before any job runs. Default is `none`, which would
 # leave the submodule dir empty and fail the Tauri resource-path check.
+# Toolchain image for build-linux-x86_64, built from
+# .gitlab/ci-toolchain.Dockerfile by the `build-toolchain-image` job below and
+# published to this project's own registry. Unlike the validator's toolchain
+# image — which lives on Docker Hub and must be pushed by hand, because no
+# Docker Hub credentials exist in CI — every job here is already authenticated
+# to $CI_REGISTRY through the job token, so CI builds and pushes it itself.
+#
+# TOOLCHAIN_IMAGE is pinned by digest, not by tag: a tag can be re-pushed to
+# point at different content, which would change what every Linux build runs
+# with no diff in this repo. Changing the Dockerfile is therefore two steps —
+# let `build-toolchain-image` publish, then bump the digest here. The job
+# prints the digest it pushed.
+#
+# The macOS and Windows jobs run on shell runners, which ignore `image:`
+# entirely, so they keep installing their own toolchains in before_script.
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
+  TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain@sha256:5188558d319c6300a7aba885b2db430e3b6d0b7ebdfddbd7a1d940d1feefc15b
+  TOOLCHAIN_CACHE_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain-buildcache
   # Keep the Rust build directory and the Cargo home across jobs.
   #
   # The default -ffdx deleted both at the start of every job, and a cache then
@@ -24,6 +42,69 @@ variables:
   # job clears its own output directory first, so a stale bundle cannot survive
   # into a later run.
   GIT_CLEAN_FLAGS: -ffdx -e src-tauri/target -e .cargo-cache
+
+# ---------------------------------------------------------------------------
+# Toolchain image
+# ---------------------------------------------------------------------------
+
+# Rebuilds the Linux build environment. Runs automatically only when the
+# Dockerfile changes, and is available as a manual job otherwise (to refresh
+# the pinned Rust or bun version, or to recover a deleted tag).
+#
+# Not a dependency of build-linux-x86_64, and deliberately so: that job
+# consumes a pinned digest, which by definition names an image that already
+# exists. Wiring them together in one pipeline would mean the consumer waits
+# on a rebuild it cannot use until the digest is bumped.
+build-toolchain-image:
+  stage: toolchain
+  needs: []
+  # `docker` pins this to a container executor, which honours `image:` and can
+  # run kaniko. lovelace, finney and watch all carry docker + amd64; the macOS
+  # shell runners ignore `image:` and cannot run it. The executor comes from
+  # the group's own digest-pinned mirror of the upstream kaniko image, which
+  # the validator maintains — the -debug flavor is required because GitLab's
+  # before_script needs a shell.
+  image:
+    name: registry.gitlab.com/quip.network/kaniko/executor:v1.25.17-debug@sha256:d53c54f94bf0a0733f0976a06b503814bf23f4ebc75a9b75ad683a3f528a366f
+    entrypoint: [""]
+  tags: [docker, amd64]
+  variables:
+    # The Dockerfile needs no repository content, so the context is .gitlab/
+    # rather than the whole checkout.
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - .gitlab/ci-toolchain.Dockerfile
+    - when: manual
+      allow_failure: true
+  before_script:
+    # lovelace and finney are NVIDIA GPU hosts that bind-mount host firmware
+    # into /lib, so kaniko must ignore that path; ignoring it drops the
+    # multilib directory, which this restores for the amd64 triplet. Copied
+    # from the validator, where the same three runners need the same fix.
+    - mkdir -p /lib && ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+        "$CI_REGISTRY" \
+        "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
+  script:
+    # :latest is what a human pulls to reproduce a build locally; the
+    # commit-tagged copy is what makes an old digest traceable to a source
+    # revision after :latest has moved on.
+    - |
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR/.gitlab" \
+        --dockerfile "$CI_PROJECT_DIR/.gitlab/ci-toolchain.Dockerfile" \
+        --destination "$CI_REGISTRY_IMAGE/ci-toolchain:latest" \
+        --destination "$CI_REGISTRY_IMAGE/ci-toolchain:$CI_COMMIT_SHORT_SHA" \
+        --cache=true \
+        --cache-repo "$TOOLCHAIN_CACHE_IMAGE" \
+        --ignore-path=/lib \
+        --digest-file=/tmp/digest
+    - echo "Pin this in TOOLCHAIN_IMAGE::$CI_REGISTRY_IMAGE/ci-toolchain@$(cat /tmp/digest)"
 
 # ---------------------------------------------------------------------------
 # Shared setup
@@ -286,23 +367,17 @@ build-macos-universal:
 
 build-linux-x86_64:
   extends: .tauri_build
-  image: ubuntu:22.04
+  # The toolchain image carries the GTK/WebKit system libraries, Rust, and bun
+  # (see .gitlab/ci-toolchain.Dockerfile). They used to be installed per job on
+  # a stock ubuntu:22.04, which re-paid an apt-get of ~120 packages plus two
+  # installer downloads on every run — 40 minutes of it under contention, none
+  # of which GIT_CLEAN_FLAGS could preserve, since only the project directory
+  # survives a job and none of that setup lands there.
+  image: $TOOLCHAIN_IMAGE
   tags: [linux, x86_64]
   before_script:
-    # System deps for Tauri on Linux
-    - apt-get update && apt-get install -y --no-install-recommends
-        build-essential curl file git ca-certificates unzip
-        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-        librsvg2-dev patchelf pkg-config libssl-dev xdg-utils
-    # Install Rust via rustup (uses CARGO_HOME from CI variables)
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - export PATH="$CARGO_HOME/bin:$PATH"
-    # Install bun
-    - curl -fsSL https://bun.sh/install | bash
-    - export PATH="$HOME/.bun/bin:$PATH"
     - bun install
   script:
-    - export PATH="$CARGO_HOME/bin:$HOME/.bun/bin:$PATH"
     - rm -rf src-tauri/target/release/bundle
     - bun run tauri build
     - mkdir -p dist
