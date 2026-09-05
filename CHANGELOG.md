@@ -48,6 +48,14 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5-rc4
+
+- **Participation health reads the account the node signs with**: the health check took the miner account from a field in `keystore.json` that nothing writes any more. It then queried an account that had never participated. A node that was mining normally showed `no participation marker on chain`. The account now comes from the running coordinator — the process that signs the extrinsics.
+
+- **v0.2.5-rc3 has no downloads**: the Linux bundle for that tag never built. Its release job timed out after an hour while installing build dependencies, so no release was published. This version carries the same fix.
+
+---
+
 ## v0.2.5-rc3
 
 - **Participation health reads the account the node signs with**: the health check took the miner account from a field in `keystore.json` that nothing writes any more. It then queried an account that had never participated. A node that was mining normally showed `no participation marker on chain`. The account now comes from the running coordinator — the process that signs the extrinsics.
