@@ -27,7 +27,7 @@ stages:
 # entirely, so they keep installing their own toolchains in before_script.
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
-  TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain:latest
+  TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain@sha256:5188558d319c6300a7aba885b2db430e3b6d0b7ebdfddbd7a1d940d1feefc15b
   TOOLCHAIN_CACHE_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain-buildcache
   # Keep the Rust build directory and the Cargo home across jobs.
   #
