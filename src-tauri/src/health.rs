@@ -231,7 +231,7 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
     // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
     let validator_url = crate::native::native_miner_validator_url(cfg);
     let rpc = crate::validator_rpc::ValidatorRpc::new(&validator_url);
-    let (chain, participation) = probe_chain_and_participation(&rpc, st).await;
+    let (chain, participation) = probe_chain_and_participation(&rpc, st, &settings).await;
 
     let candidate = roll_up(infra, chain, participation);
     let mut guard = st.lock().unwrap();
@@ -247,6 +247,7 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
 async fn probe_chain_and_participation(
     rpc: &crate::validator_rpc::ValidatorRpc,
     st: &Mutex<MonitorState>,
+    settings: &crate::settings::AppSettings,
 ) -> (DimensionStatus, DimensionStatus) {
     let now_block = match rpc.current_block().await {
         Ok(b) => b,
@@ -272,16 +273,22 @@ async fn probe_chain_and_participation(
         st.lock().unwrap().prev_block = Some(now_block);
     }
 
-    let participation = probe_participation(rpc, st).await;
+    let participation = probe_participation(rpc, st, settings).await;
     (chain, participation)
 }
 
+/// The account is read from the running coordinator, not from disk: the
+/// coordinator derives it from the hybrid keypair and is the only process that
+/// knows which account it signs with. Reading a stored field instead queries a
+/// map entry the node never wrote, which reads as "no participation marker" on
+/// a node that is participating normally.
 async fn probe_participation(
     rpc: &crate::validator_rpc::ValidatorRpc,
     st: &Mutex<MonitorState>,
+    settings: &crate::settings::AppSettings,
 ) -> DimensionStatus {
-    let keystore = crate::settings::data_dir().join("keystore.json");
-    let account = match crate::validator_rpc::read_account_id(&keystore) {
+    let endpoint = crate::coordinator_api::status_endpoint(settings);
+    let account = match crate::coordinator_api::fetch_account_id(&endpoint).await {
         Ok(a) => a,
         Err(e) => return status(DimensionState::Unknown, e),
     };
