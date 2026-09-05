@@ -3,27 +3,27 @@
 # CI toolchain image: ubuntu:22.04 plus everything `bun run tauri build` needs
 # on Linux — the GTK/WebKit system libraries, a pinned Rust toolchain, and bun.
 #
-# `build-linux-x86_64` in `.gitlab-ci.yml` pulls this image from
-# docker.io/carback1/quip-tauri-builder. Before it existed that job ran on a
-# stock ubuntu:22.04 and re-paid the whole setup on every run: an apt-get of
-# ~120 packages, a rustup install, and a bun install. `GIT_CLEAN_FLAGS` already
-# preserves src-tauri/target and .cargo-cache, so the compile was warm while
-# the setup was not — three concurrent pipelines spent over 40 minutes each in
-# apt without reaching a single crate.
+# `build-linux-x86_64` in `.gitlab-ci.yml` pulls this image from this project's
+# own registry. Before it existed that job ran on a stock ubuntu:22.04 and
+# re-paid the whole setup on every run: an apt-get of ~120 packages, a rustup
+# install, and a bun install. `GIT_CLEAN_FLAGS` already preserves
+# src-tauri/target and .cargo-cache, so the compile was warm while the setup
+# was not — three concurrent pipelines spent over 40 minutes each in apt
+# without reaching a single crate.
 #
-# Rebuild and push manually from a workstation when this Dockerfile changes —
-# there is no CI job that builds the image, because no Docker Hub credentials
-# exist in the project or group CI variables. `make builder-image` wraps this:
+# The `build-toolchain-image` job builds and pushes this with kaniko. It runs
+# automatically when this file changes and is manual otherwise. Unlike the
+# validator's toolchain image, which lives on Docker Hub and must be pushed
+# from a workstation because CI holds no Docker Hub credentials, every job
+# here is already authenticated to $CI_REGISTRY through the job token.
 #
-#   docker buildx build \
-#     --platform linux/amd64 \
-#     --file .gitlab/ci-toolchain.Dockerfile \
-#     --tag carback1/quip-tauri-builder:latest \
-#     --push \
-#     .gitlab/
+# After that job publishes, bump the pinned digest in TOOLCHAIN_IMAGE in
+# `.gitlab-ci.yml` — CI resolves the digest, not the tag, so a re-push alone
+# changes nothing. The job prints the digest it pushed.
 #
-# Then bump the pinned digest in TOOLCHAIN_IMAGE in `.gitlab-ci.yml` — CI
-# resolves the digest, not the tag, so a re-push alone changes nothing.
+# `make builder-image` builds and pushes the same image from a workstation.
+# That path is a fallback for when the runners are unavailable, and it needs a
+# `docker login registry.gitlab.com` first.
 #
 # Single-arch on purpose. `build-linux-x86_64` carries `tags: [linux, x86_64]`
 # and no arm64 Linux runner takes Tauri work, so the multi-arch manifest the
