@@ -311,11 +311,53 @@ build-macos-universal:
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
         # Both matter: codesign resolves an identity through the search list,
+        # Route 1: make sure the user domain has a login keychain to hold a
+        # search list at all.
+        #
+        # `security list-keychains -d user -s` writes a preference for the
+        # user; on a runner that has never had a login keychain the write has
+        # nothing to attach to and the domain stays empty. That is how
+        # roman-mac-native reached codesign with an effective search list of
+        # only System.keychain, and why the identity was "not found" there
+        # while sitting in a keychain this job had just created. Creating one
+        # is idempotent and needs no root.
+        if [ ! -f "$HOME/Library/Keychains/login.keychain-db" ]; then
+          echo "no login keychain on this runner; creating one" >&2
+          LOGIN_PW=$(openssl rand -base64 24)
+          security create-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
+          security set-keychain-settings -lut 21600 login.keychain 2>/dev/null || true
+          security unlock-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
+        fi
+
         # and some lookups fall back to the default keychain. Each existing
         # path has to stay its own argument, hence the unquoted expansion.
         # shellcheck disable=SC2046
         security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
         security default-keychain -d user -s "$KEYCHAIN"
+
+        # Read the search list back before trusting it.
+        #
+        # These two commands answer different questions, and the gap between
+        # them is the whole diagnosis:
+        #
+        #   security list-keychains -d user   what got stored as a preference
+        #   security list-keychains           what this process actually resolves
+        #
+        # Stored but unresolved means the write landed and the process reads a
+        # different domain, which is a session problem. Empty in both means the
+        # write itself went nowhere. The earlier script printed only the second
+        # form, so neither could be told apart from a bare "no identity found".
+        echo "keychain search list (stored):  $(security list-keychains -d user | tr -d '\n')" >&2
+        echo "keychain search list (in use):  $(security list-keychains | tr -d '\n')" >&2
+
+        # The real test is whether the identity resolves the way codesign
+        # resolves it: through the search list, with no keychain argument.
+        # The old gate passed a keychain explicitly, which is why it reported
+        # success on a runner where signing then failed.
+        identity_resolves() {
+          security find-identity -p codesigning 2>/dev/null \
+            | grep -q "$APPLE_SIGNING_IDENTITY"
+        }
 
         # Gate on the identity being present, not on macOS calling it valid.
         #
