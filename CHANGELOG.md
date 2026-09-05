@@ -48,6 +48,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5-rc3
+
+- **Participation health reads the account the node signs with**: the health check took the miner account from a field in `keystore.json` that nothing writes any more. It then queried an account that had never participated. A node that was mining normally showed `no participation marker on chain`. The account now comes from the running coordinator — the process that signs the extrinsics.
+
+---
+
 ## v0.2.5-rc2
 
 - **The miner asks the right faucet for funds**: the rendered config named the testnet faucet on every channel. A node on Beta then requested funds from the network it does not run on, and its balance stayed at zero. Beta now uses the Aglais faucet. Release keeps the testnet faucet. An install upgrading from v0.1 gets the same correction.
