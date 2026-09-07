@@ -193,8 +193,10 @@ pub struct ChannelInfo {
     /// Tag each image would run on the channel (`None` when the registry is
     /// unreachable), keyed by display name (Miner/Validator/Dashboard).
     pub images: Vec<(String, Option<String>)>,
-    /// Whether the Release channel is selectable. Always true: both channels
-    /// resolve from the same registries.
+    /// Whether the Release channel is selectable — that is, whether a stable
+    /// validator exists that can run the embedded chain spec. False while the
+    /// only compatible builds are `-rc`, which grays Release out and moves the
+    /// selection to Beta.
     pub stable_available: bool,
 }
 
@@ -217,14 +219,17 @@ fn stack_images(settings: &crate::settings::AppSettings) -> [(&'static str, &'st
 pub async fn resolve_channel_info(channel: UpdateChannel) -> ChannelInfo {
     let settings = crate::settings::load_settings();
     let images = stack_images(&settings);
-    let resolved = match crate::compose::resolve_channel_image_tags(&settings).await {
-        Ok(tags) => [
-            Some(tags.miner.on(channel).to_string()),
-            Some(tags.validator.on(channel).to_string()),
-            Some(tags.dashboard.on(channel).to_string()),
+    // Best-effort: an unreachable registry shows blanks rather than erroring.
+    let tags = crate::compose::resolve_channel_image_tags(&settings)
+        .await
+        .ok();
+    let resolved = match &tags {
+        Some(t) => [
+            Some(t.miner.on(channel).to_string()),
+            Some(t.validator.on(channel).to_string()),
+            Some(t.dashboard.on(channel).to_string()),
         ],
-        // Best-effort: an unreachable registry shows blanks rather than erroring.
-        Err(_) => [None, None, None],
+        None => [None, None, None],
     };
 
     ChannelInfo {
@@ -233,10 +238,16 @@ pub async fn resolve_channel_info(channel: UpdateChannel) -> ChannelInfo {
             .zip(resolved)
             .map(|((name, _), tag)| (name.to_string(), tag))
             .collect(),
-        // Both channels resolve from the same registries, so Release is always
-        // selectable. It selects the older network that still runs in parallel,
-        // not a newer build of the current one.
-        stable_available: true,
+        // Release is offered only when its validator slot holds a real stable
+        // build. Below the chain spec's floor `resolve_pair` substitutes the
+        // newest compatible tag, so an `-rc` sitting in the Release slot is the
+        // signal that no stable build can join this network yet. An unreachable
+        // registry is not evidence either way, so it leaves Release alone
+        // rather than flipping the operator's channel on a network blip.
+        stable_available: match &tags {
+            Some(t) => !t.validator.prod.contains("-rc"),
+            None => true,
+        },
     }
 }
 

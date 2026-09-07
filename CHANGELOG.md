@@ -48,6 +48,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5
+
+- **The miner asks the faucet for the network it actually runs**: the faucet URL followed the update channel, which was correct only while the two channels ran two different networks. With the Aglais images on the stable branches, both channels join Aglais, and a stack on Release kept asking the retired network's faucet. That failure is quiet: the miner has no built-in default and retries instead of exiting, so the balance stays at zero and the log reads like a slow faucet. The URL now follows the embedded chain specification, which is the thing that decides the network.
+
+- **The validator no longer starts on a pre-Aglais image**: an operator upgrading from the pre-reset testnet got a validator that crash-looped with `GRANDPA DB is corrupted: Could not decode ... Public.0`, on a database it had just created. The Release channel took the newest tag with no `-rc` suffix, which for the validator was `v0.2.2` — a build that predates the relaunch and cannot decode the authority keys the Aglais genesis pins. The chain specification now carries a minimum validator version, and no channel resolves below it, including a tag pinned by an earlier run.
+
+- **The update channel names build freshness, not a network**: Release takes stable tags and Beta also takes release candidates. Both join the network the embedded chain specification names. The retired testnet is no longer selectable, because the app carries no specification that can join it.
+
+---
+
 ## v0.2.5-rc4
 
 - **Participation health reads the account the node signs with**: the health check took the miner account from a field in `keystore.json` that nothing writes any more. It then queried an account that had never participated. A node that was mining normally showed `no participation marker on chain`. The account now comes from the running coordinator — the process that signs the extrinsics.

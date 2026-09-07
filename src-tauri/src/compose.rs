@@ -272,9 +272,20 @@ pub(crate) async fn resolve_channel_image_tags(
         .map_err(|e| e.to_string())?;
 
     let (miner, validator, dashboard) = tokio::join!(
-        resolve_pair(&client, image_for_tag(settings.image_tag), "QUIP_MINER_TAG"),
-        resolve_pair(&client, VALIDATOR_IMAGE, "QUIP_VALIDATOR_TAG"),
-        resolve_pair(&client, DASHBOARD_IMAGE, "QUIP_DASHBOARD_TAG"),
+        resolve_pair(
+            &client,
+            image_for_tag(settings.image_tag),
+            "QUIP_MINER_TAG",
+            None
+        ),
+        // The validator is the one image the embedded chain spec constrains.
+        resolve_pair(
+            &client,
+            VALIDATOR_IMAGE,
+            "QUIP_VALIDATOR_TAG",
+            Some(crate::stack_assets::MIN_VALIDATOR_TAG)
+        ),
+        resolve_pair(&client, DASHBOARD_IMAGE, "QUIP_DASHBOARD_TAG", None),
     );
 
     Ok(ResolvedImageTags {
@@ -287,29 +298,58 @@ pub(crate) async fn resolve_channel_image_tags(
 /// Fetch one repository's tags once, then pick the newest for each channel.
 /// `env_key` names the `.env` pin used as the fallback when the registry is
 /// unreachable, which keeps the stack on the version it already runs.
+///
+/// `min_tag`, when set, is a compatibility floor: tags below it are dropped
+/// before either channel is picked, and the `.env` fallback is held to it too.
+/// See `stack_assets::MIN_VALIDATOR_TAG`.
 async fn resolve_pair(
     client: &reqwest::Client,
     image: &str,
     env_key: &str,
+    min_tag: Option<&str>,
 ) -> Result<ChannelPair, String> {
     use crate::settings::UpdateChannel;
-    let tags = crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image))
+    let mut tags = crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image))
         .await
         .unwrap_or_default();
+    tags.retain(|t| tag_meets_floor(t, min_tag));
 
-    let pinned = current_pinned_tag(env_key);
+    // A pin written by an older manager can name an image this chain spec
+    // rejects, so the fallback is held to the floor as well. Without this a
+    // machine that upgraded from the retired network keeps re-pinning the
+    // image that cannot run the current one.
+    let pinned = current_pinned_tag(env_key).filter(|t| tag_meets_floor(t, min_tag));
+
+    let beta = crate::registry::pick_channel_tag(&tags, UpdateChannel::Beta);
+    let mut prod = crate::registry::pick_channel_tag(&tags, UpdateChannel::Release);
+    // A floored image can run out of stable tags entirely: upstream has not cut
+    // a stable release above the floor yet, and the stable tags below it are the
+    // ones that crash-loop. Take the newest compatible tag rather than leave the
+    // Release slot to a `.env` pin that may itself predate the floor.
+    // `ChannelInfo` reports the substitution, and the settings pane grays
+    // Release out and moves the selection to Beta. Unfloored images keep the
+    // original behaviour, where an absent stable tag falls through to the pin.
+    if prod.is_none() && min_tag.is_some() {
+        prod = beta.clone();
+    }
+
     Ok(ChannelPair {
-        beta: pin_tag(
-            image,
-            crate::registry::pick_channel_tag(&tags, UpdateChannel::Beta),
-            pinned.clone(),
-        )?,
-        prod: pin_tag(
-            image,
-            crate::registry::pick_channel_tag(&tags, UpdateChannel::Release),
-            pinned,
-        )?,
+        beta: pin_tag(image, beta, pinned.clone())?,
+        prod: pin_tag(image, prod, pinned)?,
     })
+}
+
+/// Whether `tag` is at or above the compatibility floor `min_tag` names.
+/// `None` means the image has no floor and every tag qualifies.
+///
+/// Ordering comes from `parse_semver`, whose prerelease slot is `u64::MAX` for
+/// a final release, so a floor may itself be an `-rc`: `v0.3.0-rc1` admits
+/// `v0.3.0-rc2` and `v0.3.0` while rejecting the stable `v0.2.2`.
+fn tag_meets_floor(tag: &str, min_tag: Option<&str>) -> bool {
+    match min_tag {
+        None => true,
+        Some(min) => crate::update::parse_semver(tag) >= crate::update::parse_semver(min),
+    }
 }
 
 /// Registry answer first, else whatever `.env` already pins.
@@ -847,8 +887,7 @@ pub(crate) async fn start_stack_core(
     // (1) Migrate any v0.1 config/env artifacts before writing fresh v0.2
     // manager-owned files. Promoted fields keep hand-edited public host/port
     // values from being lost by the generated config.
-    let migration =
-        crate::migration_v2::migrate_for_run_mode(&settings.run_mode, settings.update_channel)?;
+    let migration = crate::migration_v2::migrate_for_run_mode(&settings.run_mode)?;
     migration
         .promoted
         .apply_to_node_config(&mut settings.node_config);
@@ -918,11 +957,7 @@ pub(crate) async fn start_stack_core(
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     sink.log("INFO", "$ Writing config.toml");
-    crate::config::write_config_toml(
-        &settings.node_config,
-        &settings.run_mode,
-        settings.update_channel,
-    )?;
+    crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);
 
@@ -1924,9 +1959,9 @@ mod tests {
         assert!(!env.contains("QUIP_FAUCET_URL"));
     }
 
-    /// The manager selects images by channel, not by pinning a tag per image.
-    /// Beta is upstream's live network (Aglais); Release is the older network
-    /// that still runs in parallel, which upstream keys as PROD.
+    /// `CHANNEL` names the freshness each image tracks, which upstream keys as
+    /// BETA and PROD. Both channels join the network the embedded chain
+    /// specification names, so this selects a build, not a chain.
     #[test]
     fn env_lines_select_the_image_set_by_channel() {
         let beta = AppSettings {
@@ -2127,5 +2162,35 @@ mod tests {
             unpublished: vec!["9944/tcp".into()],
         };
         assert!(!is_wiring_broken(&w));
+    }
+
+    /// The pre-Aglais validator is the image the bug report saw crash-looping:
+    /// `v0.2.2` is the newest *stable* tag in the validator registry, so before
+    /// the floor existed the Release channel resolved straight to it while the
+    /// compose file mounted the Aglais spec regardless.
+    #[test]
+    fn validator_floor_rejects_pre_aglais_tags() {
+        let floor = Some(crate::stack_assets::MIN_VALIDATOR_TAG);
+        for tag in ["v0.2.0", "v0.2.1", "v0.2.2", "v0.2.2-rc7", "v0.1.9"] {
+            assert!(
+                !tag_meets_floor(tag, floor),
+                "{tag} predates the Aglais genesis and must not be pinned"
+            );
+        }
+        // The floor is itself an `-rc`, so it and everything after it qualify.
+        for tag in ["v0.3.0-rc1", "v0.3.0-rc2", "v0.3.0", "v0.4.0"] {
+            assert!(tag_meets_floor(tag, floor), "{tag} can run the Aglais spec");
+        }
+        // Registry noise (`latest`, `sha-…`) parses to (0,0,0,_) and drops out.
+        assert!(!tag_meets_floor("latest", floor));
+        assert!(!tag_meets_floor("sha-0dc1e809", floor));
+    }
+
+    /// Images with no chain-spec constraint keep resolving every tag.
+    #[test]
+    fn absent_floor_admits_every_tag() {
+        for tag in ["v0.1.0", "v9.9.9-rc1", "latest"] {
+            assert!(tag_meets_floor(tag, None));
+        }
     }
 }

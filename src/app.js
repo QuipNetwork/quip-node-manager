@@ -769,7 +769,10 @@ function populateForm(settings) {
   document.getElementById('http-log').value = c.http_log ?? '';
 
   // Stack Configuration (image_tag is auto-derived, no UI control)
-  settings.update_channel = settings.update_channel ?? 'release';
+  // Beta, matching UpdateChannel's Rust default. The channel names a network,
+  // not a freshness level: Release is the retired testnet, and only Beta can
+  // join Aglais, which is the one chain spec the app embeds.
+  settings.update_channel = settings.update_channel ?? 'beta';
   updateChannelButtons();
   refreshChannelInfo();
   document.getElementById('tls-enabled').checked =

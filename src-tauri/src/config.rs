@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode, UpdateChannel};
+use crate::settings::{data_dir, GpuBackend, NodeConfig, RunMode};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,9 +14,9 @@ pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 // `wallet-underfunded`. The manager writes its own config.toml, bypassing the
 // upstream seed template, so it must render this key itself.
 //
-// The URL is not fixed. Each network runs its own faucet, so it comes from
-// the update channel, which is what selects the network. See
-// `UpdateChannel::faucet_url`.
+// Which faucet follows the embedded chain spec, not the update channel: the
+// app embeds one spec, so both channels join one network. See
+// `stack_assets::FAUCET_URL`.
 // Bind address for the miner's REST/telemetry listener in BOTH run modes. The
 // consumer is always the dashboard container, which reaches the listener over
 // the compose network (Docker) or through the Docker host gateway (Native), so
@@ -185,7 +185,7 @@ struct ConfigToml {
 }
 
 impl ConfigToml {
-    fn from_node_config(config: &NodeConfig, run_mode: &RunMode, channel: UpdateChannel) -> Self {
+    fn from_node_config(config: &NodeConfig, run_mode: &RunMode) -> Self {
         let is_docker = *run_mode == RunMode::Docker;
         let miner = MinerToml {
             validators: if is_docker {
@@ -198,7 +198,7 @@ impl ConfigToml {
             } else {
                 native_signer_key()
             },
-            faucet_url: channel.faucet_url().to_string(),
+            faucet_url: crate::stack_assets::FAUCET_URL.to_string(),
             node_name: config.node_name.clone(),
             public_host: config.public_host.clone(),
             // Always emitted. Peers need an advertised port, and an omitted
@@ -332,18 +332,14 @@ impl ConfigToml {
     }
 }
 
-fn render_config_toml(config: &NodeConfig, run_mode: &RunMode, channel: UpdateChannel) -> String {
-    let config_toml = ConfigToml::from_node_config(config, run_mode, channel);
+fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
+    let config_toml = ConfigToml::from_node_config(config, run_mode);
     toml::to_string_pretty(&config_toml).expect("config TOML serialization should not fail")
 }
 
-pub fn write_config_toml(
-    config: &NodeConfig,
-    run_mode: &RunMode,
-    channel: UpdateChannel,
-) -> Result<(), String> {
+pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
     crate::settings::ensure_data_dir()?;
-    let content = render_config_toml(config, run_mode, channel);
+    let content = render_config_toml(config, run_mode);
     // Docker mode: compose bind-mounts `./data:/data` (relative to the
     // project-directory), so the container sees `/data/config.toml` as
     // `<data_dir>/data/config.toml` on the host. Writing to the bare
@@ -362,11 +358,7 @@ pub fn write_config_toml(
 
 #[tauri::command]
 pub async fn generate_config_toml(config: NodeConfig, run_mode: RunMode) -> Result<String, String> {
-    // The channel is a global setting rather than part of NodeConfig, so the
-    // preview reads it instead of taking it as an argument. That keeps the
-    // preview equal to what `write_config_toml` would produce.
-    let channel = crate::settings::load_settings().update_channel;
-    Ok(render_config_toml(&config, &run_mode, channel))
+    Ok(render_config_toml(&config, &run_mode))
 }
 
 #[cfg(test)]
@@ -384,22 +376,17 @@ mod tests {
 
     /// The miner has no built-in faucet default: without faucet_url a fresh
     /// wallet fails fast with `wallet-underfunded`, so both run modes must
-    /// render the key. Which faucet follows the channel, because the channel
-    /// picks the network. Beta is Aglais, Release is the older test network,
-    /// and an account funded on one is unknown to the other.
+    /// render the key. It names the network the embedded chain spec joins.
+    /// Asking the retired network's faucet is the quieter failure: the miner
+    /// retries forever while the balance stays at zero.
     #[test]
-    fn faucet_url_follows_the_channel() {
+    fn faucet_url_names_the_embedded_network() {
         let cfg = NodeConfig::default();
         for mode in [RunMode::Docker, RunMode::Native] {
-            let beta = render_config_toml(&cfg, &mode, UpdateChannel::Beta);
+            let rendered = render_config_toml(&cfg, &mode);
             assert!(
-                beta.contains("faucet_url = \"https://faucet.aglais.quip.network\""),
-                "beta should use the Aglais faucet, got:\n{beta}"
-            );
-            let release = render_config_toml(&cfg, &mode, UpdateChannel::Release);
-            assert!(
-                release.contains("faucet_url = \"https://faucet.testnet.quip.network\""),
-                "release should use the testnet faucet, got:\n{release}"
+                rendered.contains("faucet_url = \"https://faucet.aglais.quip.network\""),
+                "every run mode should use the Aglais faucet, got:\n{rendered}"
             );
         }
     }
@@ -418,7 +405,7 @@ mod tests {
             }),
             ..NodeConfig::default()
         };
-        let rendered = render_config_toml(&cfg, &RunMode::Native, UpdateChannel::Beta);
+        let rendered = render_config_toml(&cfg, &RunMode::Native);
         let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
 
         for (section, binary) in [
@@ -449,7 +436,7 @@ mod tests {
             }),
             ..NodeConfig::default()
         };
-        let rendered = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let rendered = render_config_toml(&cfg, &RunMode::Docker);
         let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
 
         assert!(parsed["cpu"].get("binary").is_none());
@@ -478,7 +465,7 @@ mod tests {
             telemetry_dir: "telemetry-old".to_string(),
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
 
         assert!(toml.contains("[miner]\n"));
         assert!(!toml.contains("[global]"));
@@ -540,7 +527,7 @@ mod tests {
             node_log: "/data/logs/miner.log".to_string(),
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
 
         assert!(toml.contains("node_name = \"validator-home\""));
         assert!(toml.contains("public_host = \"node.example.com\""));
@@ -557,7 +544,7 @@ mod tests {
                 public_port: None,
                 ..NodeConfig::default()
             };
-            let toml = render_config_toml(&cfg, &mode, UpdateChannel::Beta);
+            let toml = render_config_toml(&cfg, &mode);
             assert!(
                 toml.contains("public_port = 21000"),
                 "{mode:?} omitted public_port: {toml}"
@@ -572,7 +559,7 @@ mod tests {
         // operator has not set a value.
         for mode in [RunMode::Docker, RunMode::Native] {
             let empty = NodeConfig::default();
-            let toml = render_config_toml(&empty, &mode, UpdateChannel::Beta);
+            let toml = render_config_toml(&empty, &mode);
             assert!(
                 toml.contains("public_host"),
                 "{mode:?} omitted public_host: {toml}"
@@ -582,7 +569,7 @@ mod tests {
                 public_host: "node.example.com".to_string(),
                 ..NodeConfig::default()
             };
-            let set_toml = render_config_toml(&set, &mode, UpdateChannel::Beta);
+            let set_toml = render_config_toml(&set, &mode);
             assert!(
                 set_toml.contains("public_host = \"node.example.com\""),
                 "{mode:?} dropped a set public_host: {set_toml}"
@@ -600,7 +587,7 @@ mod tests {
             rest_insecure_port: 20123,
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Native, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Native);
 
         assert!(toml.contains("validators = [\"ws://127.0.0.1:9944\"]"));
         assert!(toml.contains("signer_key = "));
@@ -615,11 +602,7 @@ mod tests {
     /// manager (the pane only shows Caddy's 502s) and empties the dashboard.
     #[test]
     fn native_miner_rest_binds_all_interfaces_for_the_dashboard_container() {
-        let toml = render_config_toml(
-            &NodeConfig::default(),
-            &RunMode::Native,
-            UpdateChannel::Beta,
-        );
+        let toml = render_config_toml(&NodeConfig::default(), &RunMode::Native);
         let port = native_rest_port(&NodeConfig::default());
         assert!(
             toml.contains(&format!("listen = \"0.0.0.0:{port}\"")),
@@ -642,7 +625,7 @@ mod tests {
             },
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Native, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Native);
         let metal = toml.find("[metal]").expect("[metal] section missing");
         assert!(
             !toml.contains("[gpu]"),
@@ -674,7 +657,7 @@ mod tests {
             },
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Native, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Native);
         let metal = toml.find("[metal]").expect("[metal] section missing");
         assert!(!toml.contains("[gpu]"));
         assert!(toml[metal..].contains("utilization = 42"));
@@ -691,7 +674,7 @@ mod tests {
                 yielding: false,
             }],
         );
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
         assert!(toml.contains("[gpu]\nutilization = 80\nyielding = false"));
         assert!(toml.contains("[modal]"));
     }
@@ -715,7 +698,7 @@ mod tests {
                 },
             ],
         );
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
         let cuda0 = toml.find("[cuda.0]").unwrap();
         let cuda1 = toml.find("[cuda.1]").unwrap();
         // [cuda.0] matches globals → no overrides
@@ -729,7 +712,7 @@ mod tests {
     #[test]
     fn mps_without_devices_skips_gpu_section() {
         let cfg = cfg_with_gpu(GpuBackend::Mps, vec![]);
-        let toml = render_config_toml(&cfg, &RunMode::Native, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Native);
         assert!(!toml.contains("[gpu]"));
         assert!(toml.contains("[metal]"));
     }
@@ -740,7 +723,7 @@ mod tests {
             num_cpus: 8,
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
         assert!(toml.contains("[cpu]\n"));
         assert!(toml.contains("num_cpus = 8"));
     }
@@ -753,7 +736,7 @@ mod tests {
             ..NodeConfig::default()
         };
         for mode in [RunMode::Docker, RunMode::Native] {
-            let toml = render_config_toml(&cfg, &mode, UpdateChannel::Beta);
+            let toml = render_config_toml(&cfg, &mode);
             assert!(
                 !toml.contains("[cpu]"),
                 "{mode:?}: [cpu] rendered while disabled"
@@ -775,7 +758,7 @@ mod tests {
             }),
             ..NodeConfig::default()
         };
-        let toml = render_config_toml(&cfg, &RunMode::Docker, UpdateChannel::Beta);
+        let toml = render_config_toml(&cfg, &RunMode::Docker);
 
         assert!(toml.contains("[qpu]\n"));
         assert!(toml.contains("[dwave]\n"));
