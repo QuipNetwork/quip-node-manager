@@ -131,6 +131,13 @@ build-toolchain-image:
   #
   # Each concrete job sets its own group, because the directory is shared per
   # platform, not across platforms.
+  #
+  # macOS was initially left out, on the grounds it clears a different bundle
+  # path and had never been seen to collide. It collides. Three jobs landed on
+  # tesla-arm inside two minutes while testing QUI-1295, and the third hung for
+  # the full hour in `get_sources` — a git fetch blocked on a sibling job's
+  # working copy, which never reaches before_script and so reports nothing more
+  # useful than a job timeout.
   artifacts:
     expire_in: 30 days
   rules:
@@ -184,6 +191,7 @@ rustfmt:
 
 build-macos-universal:
   extends: .tauri_build
+  resource_group: macos-build
   tags: [macos, arm64]
   before_script:
     - export PATH="$HOME/.homebrew/opt/rustup/bin:$HOME/.homebrew/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.bun/bin:$CARGO_HOME/bin:$PATH"
@@ -311,11 +319,72 @@ build-macos-universal:
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
         # Both matter: codesign resolves an identity through the search list,
+        # Route 1: make sure the user domain has a login keychain to hold a
+        # search list at all.
+        #
+        # `security list-keychains -d user -s` writes a preference for the
+        # user; on a runner that has never had a login keychain the write has
+        # nothing to attach to and the domain stays empty. That is how
+        # roman-mac-native reached codesign with an effective search list of
+        # only System.keychain, and why the identity was "not found" there
+        # while sitting in a keychain this job had just created. Creating one
+        # is idempotent and needs no root.
+        if [ ! -f "$HOME/Library/Keychains/login.keychain-db" ]; then
+          echo "no login keychain on this runner; creating one" >&2
+          LOGIN_PW=$(openssl rand -base64 24)
+          security create-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
+          security set-keychain-settings -lut 21600 login.keychain 2>/dev/null || true
+          security unlock-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
+        fi
+
         # and some lookups fall back to the default keychain. Each existing
         # path has to stay its own argument, hence the unquoted expansion.
         # shellcheck disable=SC2046
         security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
         security default-keychain -d user -s "$KEYCHAIN"
+
+        # Read the search list back before trusting it.
+        #
+        # These two commands answer different questions, and the gap between
+        # them is the whole diagnosis:
+        #
+        #   security list-keychains -d user   what got stored as a preference
+        #   security list-keychains           what this process actually resolves
+        #
+        # Stored but unresolved means the write landed and the process reads a
+        # different domain, which is a session problem. Empty in both means the
+        # write itself went nowhere. The earlier script printed only the second
+        # form, so neither could be told apart from a bare "no identity found".
+        echo "keychain search list (stored):  $(security list-keychains -d user | tr -d '\n')" >&2
+        echo "keychain search list (in use):  $(security list-keychains | tr -d '\n')" >&2
+
+        # The real test is whether the identity resolves the way codesign
+        # resolves it: through the search list, with no keychain argument.
+        # The old gate passed a keychain explicitly, which is why it reported
+        # success on a runner where signing then failed.
+        identity_resolves() {
+          security find-identity -p codesigning 2>/dev/null \
+            | grep -q "$APPLE_SIGNING_IDENTITY"
+        }
+
+        # Warn, do not fail, when the identity does not resolve.
+        #
+        # A hard exit here would name the real cause instead of letting Tauri
+        # run on to codesign's misleading "no identity found", which is what
+        # this check is for. It stays non-fatal because it has never been
+        # observed on a runner that goes on to sign successfully: tesla-arm was
+        # wedged throughout the QUI-1295 investigation, so the check ran only
+        # where signing was already broken. Failing the job on an unvalidated
+        # predicate risks breaking the one runner that can currently sign a
+        # release. Make it fatal once a green tag build has printed nothing
+        # here.
+        if ! identity_resolves; then
+          echo "WARNING: the signing identity does not resolve through the keychain search list" >&2
+          echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
+          echo "it IS present in the job keychain:" >&2
+          security find-identity -p codesigning "$KEYCHAIN" >&2 || true
+          echo "codesign will likely fail with errSecInternalComponent. See QUI-1295." >&2
+        fi
 
         # Gate on the identity being present, not on macOS calling it valid.
         #
