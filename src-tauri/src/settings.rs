@@ -24,24 +24,27 @@ impl Default for RunMode {
 
 // ─── Update channel ─────────────────────────────────────────────────────────
 
-/// Which image set the stack runs. The manager writes this as `CHANNEL` in
-/// `.env`, and also pins an exact resolved tag per image, which wins over it.
+/// How fresh a build each image tracks. The manager writes this as `CHANNEL`
+/// in `.env`, and also pins an exact resolved tag per image, which wins over
+/// it.
 ///
-/// These name two different networks, not two freshness levels of one:
-/// - `Beta` → `CHANNEL=beta`, the live Aglais test network (runtime spec 117).
-/// - `Release` → `CHANNEL=stable`, the older network still running in parallel
-///   (runtime spec 116). A stable stack cannot join Aglais.
+/// - `Beta` → `CHANNEL=beta`, newest tag including `-rc`.
+/// - `Release` → `CHANNEL=stable`, newest tag with no prerelease suffix.
 ///
-/// The app's own self-update still reads these as freshness levels — Release
-/// takes stable releases only, Beta also takes `-rc` builds. That is a separate
-/// axis from the image set and is handled in `crate::update`.
+/// Both join the same network. The app embeds one chain spec, so the network
+/// is not a choice, and the faucet follows the spec rather than this enum
+/// (see `stack_assets::FAUCET_URL`). Between the Aglais relaunch and the first
+/// stable Aglais images this enum did name two networks, which put every
+/// upgraded install on a validator that could not decode the new genesis.
+///
+/// The app's own self-update reads the same axis — Release takes stable
+/// releases only, Beta also takes `-rc` builds — in `crate::update`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateChannel {
     Release,
-    /// The default. Beta runs the live Aglais test network; Release runs the
-    /// older network that still operates in parallel, so defaulting to Release
-    /// would put a fresh install on the wrong chain.
+    /// The default, so a fresh install tracks release candidates until an
+    /// operator opts into stable-only builds.
     #[default]
     Beta,
 }
@@ -55,20 +58,6 @@ impl UpdateChannel {
         match self {
             UpdateChannel::Release => "stable",
             UpdateChannel::Beta => "beta",
-        }
-    }
-
-    /// Faucet the miner asks for its startup balance. Each network runs its
-    /// own, and they do not share accounts, so this follows the same axis as
-    /// `compose_channel`: Beta is Aglais, Release is the older test network.
-    ///
-    /// Getting this wrong is quiet. The miner has no built-in default and
-    /// keeps retrying rather than exiting, so a request to the other network's
-    /// faucet reads as a slow faucet in the log while the balance stays at 0.
-    pub fn faucet_url(self) -> &'static str {
-        match self {
-            UpdateChannel::Release => "https://faucet.testnet.quip.network",
-            UpdateChannel::Beta => "https://faucet.aglais.quip.network",
         }
     }
 }

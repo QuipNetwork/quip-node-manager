@@ -24,7 +24,7 @@
 //!     a matching `--public-addr=<multiaddr>` using the public validator port.
 //!   - Caddyfile: the optional local faucet route is stripped; the manager
 //!     points the miner at the public faucet for its channel directly via
-//!     `UpdateChannel::faucet_url` in the rendered config.toml.
+//!     `FAUCET_URL` in the rendered config.toml.
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:8086` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
@@ -63,6 +63,16 @@ const CHAIN_SPEC: &str =
 /// Lives beside `CHAIN_SPEC` because the two move together: re-point the spec
 /// at a new network and this floor is what stops the old images coming with it.
 pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.3.0-rc1";
+
+/// Faucet for the network `CHAIN_SPEC` names.
+///
+/// The miner ships no built-in default: without `faucet_url` a fresh wallet
+/// fails fast with `wallet-underfunded`, and a request to the wrong network's
+/// faucet is quieter still — the miner keeps retrying while the balance stays
+/// at zero. This tracks the embedded chain spec rather than the update
+/// channel. The app embeds one spec, so both channels join one network and
+/// share its faucet.
+pub(crate) const FAUCET_URL: &str = "https://faucet.aglais.quip.network";
 
 /// First-run miner config template. The compose file bind-mounts this over the
 /// image's own `/app/config.toml`, which the entrypoint seeds `/data/config.toml`
