@@ -48,6 +48,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.5-rc5
+
+- **The validator no longer starts on a pre-Aglais image**: an operator upgrading from the pre-reset testnet got a validator that crash-looped with `GRANDPA DB is corrupted: Could not decode ... Public.0`, on a database it had just created. The Release channel takes the newest tag with no `-rc` suffix. For the validator that is `v0.2.2`, a build that predates the relaunch. It cannot decode the authority keys the Aglais genesis pins. The chain specification now carries a minimum validator version, and no channel resolves below it.
+
+- **Why fresh installs were fine**: they default to Beta, which already resolved a working validator. An install made before the relaunch kept the Release value written into its settings file at the time, and that value survived the upgrade.
+
+- **Release is offered only when a stable build can join the network**: the settings pane advertised Release whatever the registry held. While the only compatible validator builds carry an `-rc` suffix, the pane now grays Release out and moves the selection to Beta. That also puts the miner back on the Aglais faucet.
+
+---
+
 ## v0.2.5-rc4
 
 - **Participation health reads the account the node signs with**: the health check took the miner account from a field in `keystore.json` that nothing writes any more. It then queried an account that had never participated. A node that was mining normally showed `no participation marker on chain`. The account now comes from the running coordinator — the process that signs the extrinsics.
