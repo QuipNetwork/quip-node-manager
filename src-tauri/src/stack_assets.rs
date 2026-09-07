@@ -51,6 +51,19 @@ const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Cadd
 const CHAIN_SPEC: &str =
     include_str!("../../vendor/nodes.quip.network/chain-specs/aglais-network.json");
 
+/// Oldest validator image that can run `CHAIN_SPEC`.
+///
+/// Aglais rotated the GRANDPA authorities to hybrid FN-DSA keys, which a
+/// pre-Aglais node cannot decode: it opens the genesis authority set, fails on
+/// `Public.0`, and reports `GRANDPA DB is corrupted` on a database it just
+/// created. Nothing in the compose file selects a spec per channel — the
+/// validator always mounts `CHAIN_SPEC` — so an image below this floor is
+/// never a usable answer, on any channel.
+///
+/// Lives beside `CHAIN_SPEC` because the two move together: re-point the spec
+/// at a new network and this floor is what stops the old images coming with it.
+pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.3.0-rc1";
+
 /// First-run miner config template. The compose file bind-mounts this over the
 /// image's own `/app/config.toml`, which the entrypoint seeds `/data/config.toml`
 /// from. An absent source makes Docker fabricate a directory in its place.
