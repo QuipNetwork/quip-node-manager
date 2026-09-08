@@ -5,6 +5,7 @@ stages:
   - toolchain
   - lint
   - build
+  - sign
   - release
 
 # Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
@@ -523,6 +524,67 @@ build-windows-x86_64:
       - dist/quip-node-manager-windows-x86_64.exe
 
 # ---------------------------------------------------------------------------
+# Windows signing (SSL.com eSigner)
+# ---------------------------------------------------------------------------
+
+# Signs the Windows binary from a Linux job. eSigner keeps the key in SSL.com's
+# HSM and CodeSignTool only ever sends it a hash, so nothing about signing a PE
+# needs Windows, and a Linux container is easier to make reproducible than the
+# shell runner's global state.
+#
+# ESIGNER_ENV selects the SSL.com sandbox (TEST) or the real service (PROD).
+# TEST signs with a demo certificate under a "- Development" root that no
+# Windows machine trusts; it exists so the pipeline can be exercised before
+# the certificate order is issued. A release tag therefore refuses TEST — the
+# result would look signed on the release page and be rejected on the desktop.
+# Tags carrying -rc are allowed through so a candidate can prove the path.
+#
+# Manual on branches: it costs a round trip to SSL.com and there is nothing to
+# gain from signing every branch build, but a change to the signing scripts
+# can only be tested by running them.
+sign-windows-x86_64:
+  stage: sign
+  # Not the toolchain image: it carries no Java. Pinned by digest like
+  # TOOLCHAIN_IMAGE, because this job handles the signing credentials.
+  image: eclipse-temurin@sha256:5726444f65e67c407bac4ff1e036b475051f50bb3840273e81814e77c6fa8ee3
+  tags: [linux, x86_64]
+  needs:
+    - build-windows-x86_64
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends osslsigncode curl unzip ca-certificates openssl
+  script:
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ] && [ "$ESIGNER_ENV" != "PROD" ]; then
+        case "$CI_COMMIT_TAG" in
+          *-rc*) echo "release candidate: signing with ESIGNER_ENV=$ESIGNER_ENV" ;;
+          *) echo "release tag $CI_COMMIT_TAG requires ESIGNER_ENV=PROD, got $ESIGNER_ENV" >&2; exit 1 ;;
+        esac
+      fi
+    - ./scripts/sign-windows.sh dist/quip-node-manager-windows-x86_64.exe
+    - ./scripts/verify-windows-signing.sh dist/quip-node-manager-windows-x86_64.exe
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - dist/quip-node-manager-windows-x86_64.exe
+  rules:
+    - if: $CI_COMMIT_TAG
+    # Same trigger set as .tauri_build, so `needs` always finds the build job,
+    # plus the scripts this job runs.
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - scripts/sign-windows.sh
+        - scripts/verify-windows-signing.sh
+      when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
 # Release (tags only)
 # ---------------------------------------------------------------------------
 
@@ -532,7 +594,7 @@ release-binaries:
   needs:
     - build-macos-universal
     - build-linux-x86_64
-    - build-windows-x86_64
+    - sign-windows-x86_64
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -556,4 +618,4 @@ release-binaries:
         --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
-        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64","link_type":"package"}'
+        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=sign-windows-x86_64","link_type":"package"}'
