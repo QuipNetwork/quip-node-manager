@@ -570,6 +570,13 @@ sign-windows-x86_64:
     - export DEBIAN_FRONTEND=noninteractive
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends osslsigncode curl unzip ca-certificates openssl
   script:
+    # Protected variables are withheld on unprotected branches, and the
+    # script's own "not set" message does not say why.
+    - |
+      if [ -z "${ESIGNER_ENV:-}" ]; then
+        echo "ESIGNER_ENV is not set. If the ESIGNER_* variables are protected, this ref must be protected too." >&2
+        exit 1
+      fi
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ] && [ "$ESIGNER_ENV" != "PROD" ]; then
         case "$CI_COMMIT_TAG" in

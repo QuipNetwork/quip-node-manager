@@ -45,8 +45,10 @@ scripts can be tested without a tag.
 
 ### CI/CD Variables
 
-Store all of these as **protected** variables. Mask every one except
-`ESIGNER_ENV`.
+Mask every one except `ESIGNER_ENV`. Protect all of them once they hold the
+production values. GitLab withholds protected variables from unprotected
+branches, so the manual branch job then fails with `ESIGNER_ENV is not set`.
+The sandbox values are public, so they stay unprotected.
 
 | Variable | Description |
 |----------|-------------|
