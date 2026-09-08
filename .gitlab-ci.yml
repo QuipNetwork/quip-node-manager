@@ -522,6 +522,20 @@ build-windows-x86_64:
   artifacts:
     paths:
       - dist/quip-node-manager-windows-x86_64.exe
+  # .tauri_build's rules plus the signing scripts: sign-windows-x86_64 needs
+  # this job's artifact, and a branch that changes only a script would
+  # otherwise schedule the sign job with nothing to sign, which GitLab
+  # rejects at pipeline creation ("needs job not in pipeline").
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - scripts/sign-windows.sh
+        - scripts/verify-windows-signing.sh
 
 # ---------------------------------------------------------------------------
 # Windows signing (SSL.com eSigner)
@@ -571,8 +585,7 @@ sign-windows-x86_64:
       - dist/quip-node-manager-windows-x86_64.exe
   rules:
     - if: $CI_COMMIT_TAG
-    # Same trigger set as .tauri_build, so `needs` always finds the build job,
-    # plus the scripts this job runs.
+    # Same trigger set as build-windows-x86_64, so `needs` always finds it.
     - if: $CI_COMMIT_BRANCH
       changes:
         - src/**/*
