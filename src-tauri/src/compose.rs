@@ -748,14 +748,7 @@ pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Res
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
-    sync_stack_assets(
-        &settings.run_mode,
-        settings.node_config.port,
-        settings.node_config.validator_port,
-        &settings.node_config.public_host,
-        crate::config::native_rest_port(&settings.node_config),
-        settings.node_config.validator_rpc_port,
-    )?;
+    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
     // Write .env too: without the pins compose falls back to its own
     // `${CHANNEL:-beta}` default, so a standalone pull (outside the full start
     // sequence) would silently fetch a moving tag instead of the resolved one.
@@ -864,6 +857,10 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 ///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
+    crate::log_stream::start_log_stream_for_app(
+        app.clone(),
+        vec![crate::log_stream::StreamSource::ComposeAll],
+    );
     start_stack_core(Arc::new(TauriSink::new(app))).await
 }
 
@@ -936,19 +933,12 @@ pub(crate) async fn start_stack_core(
     // staged Caddyfile both publish the same port. (rest_host is forced to
     // loopback inside the config renderer.)
     if settings.run_mode == RunMode::Native {
-        settings.node_config.rest_insecure_port = rest_port as i16;
+        settings.node_config.rest_insecure_port = i32::from(rest_port);
     }
 
     // (4) Stage assets after migration/auto-detection so public_host can drive
     // the validator's public address.
-    sync_stack_assets(
-        &settings.run_mode,
-        settings.node_config.port,
-        settings.node_config.validator_port,
-        &settings.node_config.public_host,
-        rest_port,
-        settings.node_config.validator_rpc_port,
-    )?;
+    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
 
     // (5) .env — pin each image to its channel-resolved tag.
     let tags = resolve_channel_image_tags(&settings).await?;
@@ -1413,12 +1403,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
-    // Kill the log-streamer child first — same ordering as the old
-    // stop_node_container sequence, so `docker compose logs -f` unblocks
-    // before we stop the containers.
-    let log_state = app.state::<LogStreamState>();
-    log_state.kill_child();
-    *log_state.stop_flag.lock().unwrap() = true;
+    app.state::<LogStreamState>().stop();
 
     stop_stack_core(Arc::new(TauriSink::new(app))).await
 }

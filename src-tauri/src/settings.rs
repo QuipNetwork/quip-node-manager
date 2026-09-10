@@ -193,6 +193,9 @@ fn default_validator_port() -> u16 {
 fn default_validator_rpc_port() -> u16 {
     9944
 }
+fn default_publication_enabled() -> bool {
+    true
+}
 fn default_listen() -> String {
     "::".to_string()
 }
@@ -226,7 +229,7 @@ fn default_trust_db() -> String {
 fn default_rest_host() -> String {
     "127.0.0.1".to_string()
 }
-fn default_rest_port() -> i16 {
+fn default_rest_port() -> i32 {
     -1
 }
 fn default_telemetry_enabled() -> bool {
@@ -249,10 +252,17 @@ pub struct NodeConfig {
     // host publish is a 1:1 mapping unless the user overrides it.
     #[serde(default = "default_validator_port")]
     pub validator_port: u16,
-    // v0.2 (Native mode): host port the validator's JSON-RPC (container 9944)
-    // is published on, and that the host-side miner connects to.
+    // Host RPC port. Optional in Docker; always published in Native mode.
     #[serde(default = "default_validator_rpc_port")]
     pub validator_rpc_port: u16,
+    #[serde(default = "default_publication_enabled")]
+    pub public_api_enabled: bool,
+    #[serde(default = "default_publication_enabled")]
+    pub validator_p2p_enabled: bool,
+    #[serde(default)]
+    pub validator_rpc_enabled: bool,
+    #[serde(default)]
+    pub service_ports: crate::service_ports::ServicePorts,
     // v0.1 legacy fields kept for app-settings.json compatibility.
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -291,9 +301,9 @@ pub struct NodeConfig {
     #[serde(default = "default_rest_host")]
     pub rest_host: String,
     #[serde(default = "default_rest_port")]
-    pub rest_port: i16,
+    pub rest_port: i32,
     #[serde(default = "default_rest_port")]
-    pub rest_insecure_port: i16,
+    pub rest_insecure_port: i32,
 
     // Telemetry
     #[serde(default = "default_telemetry_enabled")]
@@ -345,6 +355,10 @@ impl Default for NodeConfig {
             port: 20049,
             validator_port: 30333,
             validator_rpc_port: 9944,
+            public_api_enabled: true,
+            validator_p2p_enabled: true,
+            validator_rpc_enabled: false,
+            service_ports: crate::service_ports::ServicePorts::default(),
             listen: "::".to_string(),
             public_host: String::new(),
             public_port: None,
@@ -576,6 +590,7 @@ pub fn load_settings() -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
+    crate::service_ports::validate(&settings.node_config, &settings.run_mode)?;
     ensure_data_dir()?;
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), content).map_err(|e| e.to_string())

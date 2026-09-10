@@ -38,9 +38,24 @@ impl LogEntry {
 /// line — critical because Docker stop isn't visible to the streamer
 /// until the daemon closes the pipe.
 pub struct LogStreamState {
-    pub handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-    pub stop_flag: Arc<Mutex<bool>>,
-    pub child_pid: Arc<Mutex<Option<u32>>>,
+    session: Mutex<Option<LogSession>>,
+}
+
+struct LogSession {
+    stop: Arc<Mutex<bool>>,
+    child_pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl LogSession {
+    fn stop(&self) {
+        // Same lock order as child registration: cancellation wins even if
+        // Docker is spawning when the user stops or replaces this session.
+        let mut stop = self.stop.lock().unwrap();
+        *stop = true;
+        if let Some(pid) = self.child_pid.lock().unwrap().take() {
+            kill_log_child(pid);
+        }
+    }
 }
 
 impl Default for LogStreamState {
@@ -52,18 +67,37 @@ impl Default for LogStreamState {
 impl LogStreamState {
     pub fn new() -> Self {
         LogStreamState {
-            handle: Arc::new(Mutex::new(None)),
-            stop_flag: Arc::new(Mutex::new(false)),
-            child_pid: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
         }
     }
 
-    /// Kill the in-flight `docker compose logs` child (if any) and clear the PID.
-    /// Safe to call when no child is running.
-    pub fn kill_child(&self) {
-        if let Some(pid) = self.child_pid.lock().unwrap().take() {
-            kill_log_child(pid);
+    /// Cancel the current follower and prevent it from reconnecting.
+    pub fn stop(&self) {
+        if let Some(session) = self.session.lock().unwrap().take() {
+            session.stop();
         }
+    }
+
+    fn start<F>(&self, sources: Vec<StreamSource>, emit: F)
+    where
+        F: Fn(LogEntry) -> bool + Send + Sync + 'static,
+    {
+        let mut current = self.session.lock().unwrap();
+        if let Some(previous) = current.take() {
+            previous.stop();
+        }
+        let stop = Arc::new(Mutex::new(false));
+        let child_pid = Arc::new(Mutex::new(None));
+        *current = Some(LogSession {
+            stop: Arc::clone(&stop),
+            child_pid: Arc::clone(&child_pid),
+        });
+        std::thread::spawn(move || {
+            let cancelled = Arc::clone(&stop);
+            stream_multiplexed(sources, stop, child_pid, move |entry| {
+                !*cancelled.lock().unwrap() && emit(entry)
+            });
+        });
     }
 }
 
@@ -211,6 +245,15 @@ pub fn parse_compose_prefix(line: &str) -> Option<(&str, &str)> {
 /// Map a compose service name (YAML key) to a UI `source` tag.
 /// `cpu`/`cuda` both map to `miner`. Unknown services return `None`.
 pub fn map_compose_service_to_source(service: &str) -> Option<&'static str> {
+    // Compose adds a replica number when container_name is not specified.
+    let service = match service.rsplit_once('-') {
+        Some((name, replica))
+            if !replica.is_empty() && replica.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => service,
+    };
     match service {
         "cpu" | "cuda" | "quip-cpu" | "quip-cuda" => Some("miner"),
         "quip-validator" | "validator" => Some("validator"),
@@ -391,18 +434,77 @@ where
     // at all — not an error, just silence. Passing cpu *and* cuda covers the
     // stack whichever miner flavour is active, and the support services come
     // along with either.
-    let mut child = match crate::compose::compose_cmd()
-        .args(["--profile", "cpu", "--profile", "cuda"])
-        .args(["logs", "-f", "--tail", "100"])
+    stream_compose_with_command(stop, child_pid, emit, || {
+        if !crate::stack_assets::stack_compose_file().exists() {
+            return None;
+        }
+        let mut command = crate::compose::compose_cmd();
+        command
+            .args(["--profile", "cpu", "--profile", "cuda"])
+            .args(["logs", "-f", "--tail", "100"]);
+        Some(command)
+    });
+}
+
+fn stream_compose_with_command<F, C>(
+    stop: &Arc<Mutex<bool>>,
+    child_pid: &Arc<Mutex<Option<u32>>>,
+    emit: Arc<F>,
+    build: C,
+) where
+    F: Fn(LogEntry) -> bool + Send + Sync + 'static,
+    C: Fn() -> Option<std::process::Command>,
+{
+    while !*stop.lock().unwrap() {
+        if let Some(command) = build() {
+            stream_compose_once(stop, child_pid, Arc::clone(&emit), command);
+        }
+        // A fresh install may not have a Compose file yet. Docker can also
+        // disconnect while containers are being recreated. Retry until Stop.
+        for _ in 0..20 {
+            if *stop.lock().unwrap() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+fn stream_compose_once<F>(
+    stop: &Arc<Mutex<bool>>,
+    child_pid: &Arc<Mutex<Option<u32>>>,
+    emit: Arc<F>,
+    mut command: std::process::Command,
+) where
+    F: Fn(LogEntry) -> bool + Send + Sync + 'static,
+{
+    let mut child = match command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(c) => c,
-        Err(_) => return,
+        Ok(child) => child,
+        Err(error) => {
+            if !emit(LogEntry {
+                timestamp: String::new(),
+                level: "ERROR".into(),
+                message: format!("Could not follow Docker logs: {error}. Retrying in two seconds."),
+                source: "app".into(),
+            }) {
+                *stop.lock().unwrap() = true;
+            }
+            return;
+        }
     };
-
-    *child_pid.lock().unwrap() = Some(child.id());
+    {
+        let cancelled = stop.lock().unwrap();
+        if *cancelled {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        *child_pid.lock().unwrap() = Some(child.id());
+    }
 
     let stdout = match child.stdout.take() {
         Some(s) => s,
@@ -417,6 +519,7 @@ where
     // last-source for continuation lines without a recognizable prefix.
     let stop_err = Arc::clone(stop);
     let emit_err = Arc::clone(&emit);
+    let pid_err = Arc::clone(child_pid);
     let stderr_thread = std::thread::spawn(move || {
         let mut last_source = String::new();
         for line in BufReader::new(stderr).lines() {
@@ -425,6 +528,10 @@ where
             }
             if let Ok(line) = line {
                 if !emit_err(entry_from_compose_line(&line, &mut last_source)) {
+                    *stop_err.lock().unwrap() = true;
+                    if let Some(pid) = *pid_err.lock().unwrap() {
+                        kill_log_child(pid);
+                    }
                     break;
                 }
             }
@@ -438,28 +545,49 @@ where
         }
         if let Ok(line) = line {
             if !emit(entry_from_compose_line(&line, &mut last_source)) {
+                *stop.lock().unwrap() = true;
                 break;
             }
         }
     }
-    let _ = child.kill();
-    *child_pid.lock().unwrap() = None;
+    let status = {
+        // Stop cannot signal a PID after wait() makes it available for reuse.
+        let mut registered = child_pid.lock().unwrap();
+        let _ = child.kill();
+        let status = child.wait();
+        *registered = None;
+        status
+    };
     let _ = stderr_thread.join();
+    if !*stop.lock().unwrap() {
+        let message = match status {
+            Ok(status) => {
+                format!("Docker log follower exited ({status}). Reconnecting in two seconds.")
+            }
+            Err(error) => {
+                format!("Could not reap Docker log follower: {error}. Reconnecting in two seconds.")
+            }
+        };
+        if !emit(LogEntry {
+            timestamp: String::new(),
+            level: "WARN".into(),
+            message,
+            source: "app".into(),
+        }) {
+            *stop.lock().unwrap() = true;
+        }
+    }
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Spawn a thread that streams logs to the Tauri app from the given sources.
-pub fn start_log_stream_for_app(
-    app: tauri::AppHandle,
-    stop: Arc<Mutex<bool>>,
-    child_pid: Arc<Mutex<Option<u32>>>,
-    sources: Vec<StreamSource>,
-) {
-    std::thread::spawn(move || {
-        stream_multiplexed(sources, stop, child_pid, move |entry| {
-            app.emit("node-log", &entry).is_ok()
-        });
+pub fn start_log_stream_for_app(app: tauri::AppHandle, sources: Vec<StreamSource>) {
+    use tauri::Manager;
+    let state = app.state::<LogStreamState>();
+    let emitter = app.clone();
+    state.start(sources, move |entry| {
+        emitter.emit("node-log", &entry).is_ok()
     });
 }
 
@@ -493,35 +621,220 @@ pub async fn start_log_stream(
             "source": "app",
         }),
     );
-    // Stop any existing streamer first, including killing its child.
-    state.kill_child();
-    *state.stop_flag.lock().unwrap() = true;
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    *state.stop_flag.lock().unwrap() = false;
-
-    let stop_flag = Arc::clone(&state.stop_flag);
-    let child_pid = Arc::clone(&state.child_pid);
-    let handle = std::thread::spawn(move || {
-        stream_multiplexed(sources, stop_flag, child_pid, move |entry| {
-            app.emit("node-log", &entry).is_ok()
-        });
+    let emitter = app.clone();
+    state.start(sources, move |entry| {
+        emitter.emit("node-log", &entry).is_ok()
     });
-
-    *state.handle.lock().unwrap() = Some(handle);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn stop_log_stream(state: tauri::State<'_, LogStreamState>) -> Result<(), String> {
-    // Kill the child FIRST so BufReader::lines() unblocks immediately.
-    state.kill_child();
-    *state.stop_flag.lock().unwrap() = true;
+    state.stop();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_session_never_resets_previous_cancellation_or_child_ownership() {
+        let state = LogStreamState::new();
+        state.start(vec![], |_| true);
+        let (old_stop, old_pid) = {
+            let session = state.session.lock().unwrap();
+            let session = session.as_ref().unwrap();
+            (Arc::clone(&session.stop), Arc::clone(&session.child_pid))
+        };
+        state.start(vec![], |_| true);
+        assert!(*old_stop.lock().unwrap());
+        {
+            let session = state.session.lock().unwrap();
+            let session = session.as_ref().unwrap();
+            assert!(!*session.stop.lock().unwrap());
+            assert!(!Arc::ptr_eq(&session.child_pid, &old_pid));
+        }
+        state.stop();
+        assert!(state.session.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follower_waits_for_staging_and_retries_a_failed_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let stop = Arc::new(Mutex::new(false));
+        let child_pid = Arc::new(Mutex::new(None));
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&entries);
+        stream_compose_with_command(
+            &stop,
+            &child_pid,
+            Arc::new(move |entry: LogEntry| {
+                let done = entry.message == "ready";
+                recorded.lock().unwrap().push(entry);
+                !done
+            }),
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return None;
+                }
+                let mut command = std::process::Command::new("bash");
+                command.args([
+                    "-c",
+                    if attempt == 1 {
+                        "exit 3"
+                    } else {
+                        "printf 'quip-validator | ready\\n'"
+                    },
+                ]);
+                Some(command)
+            },
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.message.contains("exit status: 3")));
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.last().unwrap().source, "validator");
+        assert_eq!(entries.last().unwrap().message, "ready");
+        assert!(child_pid.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_unblocks_a_silent_follower_and_prevents_reconnect() {
+        let stop = Arc::new(Mutex::new(false));
+        let child_pid = Arc::new(Mutex::new(None));
+        let session = LogSession {
+            stop: Arc::clone(&stop),
+            child_pid: Arc::clone(&child_pid),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            stream_compose_with_command(&stop, &child_pid, Arc::new(|_| true), || {
+                let mut command = std::process::Command::new("sleep");
+                command.arg("30");
+                Some(command)
+            });
+            done_tx.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while session.child_pid.lock().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        session.stop();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(session.child_pid.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "Requires Docker, Compose, and a cached alpine:3 image"]
+    fn docker_follower_attaches_before_services_exist_and_tracks_later_starts() {
+        let project = format!("quip-log-test-{}", std::process::id());
+        let directory = std::env::temp_dir().join(&project);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("compose.yml");
+        let stop = Arc::new(Mutex::new(false));
+        let pid = Arc::new(Mutex::new(None));
+        let session = LogSession {
+            stop: Arc::clone(&stop),
+            child_pid: Arc::clone(&pid),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let file = path.clone();
+        let name = project.clone();
+        let follower = std::thread::spawn(move || {
+            stream_compose_with_command(
+                &stop,
+                &pid,
+                Arc::new(move |entry| tx.send(entry).is_ok()),
+                || {
+                    if !file.exists() {
+                        let _ = waiting_tx.send(());
+                        return None;
+                    }
+                    let mut command = crate::cmd::new("docker");
+                    command
+                        .args(["compose", "--project-name", &name, "-f"])
+                        .arg(&file)
+                        .args(["logs", "-f", "--tail", "100"]);
+                    Some(command)
+                },
+            );
+        });
+        let result = std::panic::catch_unwind(|| {
+            waiting_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            std::fs::write(
+                &path,
+                r#"services:
+  quip-validator:
+    image: alpine:3
+    command: [sh, -c, 'echo validator-ready; exec sleep 60']
+  dashboard:
+    image: alpine:3
+    command: [sh, -c, 'echo dashboard-ready; exec sleep 60']
+"#,
+            )
+            .unwrap();
+            for (service, expected, source) in [
+                ("quip-validator", "validator-ready", "validator"),
+                ("dashboard", "dashboard-ready", "dashboard"),
+            ] {
+                let output = crate::cmd::new("docker")
+                    .args(["compose", "--project-name", &project, "-f"])
+                    .arg(&path)
+                    .args(["up", "-d", "--pull", "never", service])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let entry = rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap();
+                    if entry.message.contains(expected) {
+                        assert_eq!(entry.source, source);
+                        break;
+                    }
+                }
+            }
+        });
+        session.stop();
+        follower.join().unwrap();
+        let cleanup = crate::cmd::new("docker")
+            .args(["compose", "--project-name", &project, "-f"])
+            .arg(&path)
+            .args(["down", "--remove-orphans"])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            cleanup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cleanup.stderr)
+        );
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
 
     // ── parse_compose_prefix ───────────────────────────────────────────────
 

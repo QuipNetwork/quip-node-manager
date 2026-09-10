@@ -1150,3 +1150,61 @@ button.check-action:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
+/* Service port controls in advanced settings. */
+.service-port-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.service-port-group legend {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.service-port-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.service-port-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.service-port-row input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.service-port-row input[type='number'] {
+  width: 100px;
+  flex-shrink: 0;
+}
+
+.service-port-note {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin: 6px 0;
+}
+
+.service-port-public-access {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.service-port-public-access input {
+  width: 16px;
+  height: 16px;
+}

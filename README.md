@@ -115,7 +115,18 @@ the desktop app.
 - **Config**: TOML generation matching quip-protocol format; `.env` generated from settings on every Start.
 - **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files.
 
-> **Native mode note (macOS):** the node's REST API binds to `127.0.0.1:20100`. Docker Desktop's vpnkit forwards container traffic from `host.docker.internal` through to the host's loopback, so the REST port is not exposed to the LAN.
+Advanced settings in both interfaces group host ports by service. Each port has
+an on/off switch and a host port field. Internal Docker addresses stay fixed,
+including `quip-validator:9944`, `postgres:5432`, and `quip-miner:8086`.
+
+Native mode requires validator RPC on a host port, which defaults to 9944.
+It stays on loopback unless you select public access. The native miner REST API
+binds to `0.0.0.0:20100` by default so Caddy can reach it through the Docker host gateway.
+Its host port is also editable in advanced settings.
+
+Container logs attach before stack startup. Logs remain visible if startup fails or waits
+for another service. The follower retries if the Compose file is not ready yet.
+
 
 ### Overriding the bundled stack
 
