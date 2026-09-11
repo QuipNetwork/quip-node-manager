@@ -211,7 +211,7 @@ impl ConfigToml {
         };
 
         // [gpu] holds global defaults inherited by every backend section
-        // ([cuda.N], [metal], [modal]). See quip-protocol/quip-miner.example.toml.
+        // ([cuda.N], [metal], [modal]). See quip-miner/quip-miner.example.toml.
         //
         // Metal is unavailable in Linux containers regardless of what the Mac
         // host reports. In Docker mode we suppress Mps.

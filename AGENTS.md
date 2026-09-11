@@ -21,7 +21,7 @@ quip-node-manager/
 ├── vendor/
 │   └── nodes.quip.network/        # git submodule — upstream compose stack
 │                                  # (docker-compose.yml, caddy/Caddyfile,
-│                                  # chain-specs/quip-testnet.json). Embedded into
+│                                  # chain-specs/aglais-network.json). Embedded into
 │                                  # the binary via include_str! in stack_assets.rs
 │                                  # at compile time (NOT Tauri's bundle.resources),
 │                                  # then staged + patched into ~/quip-data on
@@ -179,7 +179,7 @@ starts.
 | `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
 | `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
-| `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
+| `chain-specs/aglais-network.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
 | `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
 | `dashboard-data/` | bind-mount target for the dashboard | Dashboard auxiliary state |
@@ -209,7 +209,7 @@ makes the staged files travel as `&'static str` in `.rodata`.
 `start_stack` and `pull_compose_images` call
 `stack_assets::sync_stack_assets(run_mode, config)` before invoking Docker Compose.
 It stages the embedded compose.yml, Caddyfile, and chain spec
-(`chain-specs/quip-testnet.json`), always overwriting — no merge. Patches:
+(`chain-specs/aglais-network.json`), always overwriting — no merge. Patches:
 
 1. **Compose host publications**: rebuild each managed service's `ports` list
    from `service_ports::PORT_SPECS` and the saved enable switches and host ports.
@@ -453,7 +453,7 @@ bun install
 
 ## Versioning & Release Tags
 
-Canonical spec: `quip-protocol/docs/VERSIONING.md`. This repo follows the same
+Canonical spec: `quip-miner/docs/VERSIONING.md`. This repo follows the same
 cross-repo standard so `update.rs::parse_semver` orders release candidates
 correctly — it splits the pre-release on `-`, so a no-hyphen `v0.2.1rc18` loses
 *both* the patch and the rc number and collapses every rc to one value, which
@@ -472,7 +472,7 @@ Rules:
   tag and the package version; only the separator may differ.
 - CI: pre-release tags publish `:<tag>` + the rolling `:vMAJOR.MINOR` and MUST
   NOT move `:latest`; only `main` / a stable `vX.Y.Z` tag moves `:latest`. The
-  `:latest` rule binds on image-publishing repos (quip-protocol); this repo ships
+  `:latest` rule binds on image-publishing repos (quip-miner); this repo ships
   desktop binaries via a per-tag GitLab Release and has no `:latest` to gate.
 
 ## Code Standards
