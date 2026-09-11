@@ -265,22 +265,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         Span::styled(channel_note, Style::default().fg(DIM)),
     ]));
 
-    // Public API port
-    lines.push(field_line(
-        app,
-        &FocusId::Port,
-        "Public API",
-        &field_value(app, &FocusId::Port, &app.form.port),
-    ));
-
-    // Validator P2P port
-    lines.push(field_line(
-        app,
-        &FocusId::ValidatorPort,
-        "Validator P2P",
-        &field_value(app, &FocusId::ValidatorPort, &app.form.validator_port),
-    ));
-
     // Node Secret
     let secret_display = if app.secret_visible {
         app.node_secret.clone()
@@ -315,6 +299,61 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     )));
 
     if app.custom_expanded {
+        let mut service = "";
+        for spec in crate::service_ports::PORT_SPECS {
+            if service != spec.service {
+                service = spec.service;
+                lines.push(Line::from(Span::styled(
+                    format!("      -- {service} --"),
+                    Style::default().fg(ACCENT),
+                )));
+            }
+            let enabled = app.form.service_port_enabled(spec.id);
+            let required = spec.id.required(&app.form.run_mode());
+            let check = if enabled { "[x]" } else { "[ ]" };
+            let suffix = if required {
+                " (required in Native mode)"
+            } else {
+                ""
+            };
+            let listener = if spec.id == crate::service_ports::PortId::MinerRest && required {
+                "native".to_string()
+            } else {
+                spec.container_port.to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "      {check} {} ({}/{}){suffix}",
+                    spec.label,
+                    listener,
+                    spec.protocols.join("+")
+                ),
+                focus_style(app, &FocusId::ServicePortEnable(spec.id)),
+            )));
+            if enabled {
+                let focus = FocusId::ServicePortNumber(spec.id);
+                lines.push(field_line(
+                    app,
+                    &focus,
+                    "  Host port",
+                    &field_value(app, &focus, app.form.service_port_value(spec.id)),
+                ));
+            }
+            if spec.id == crate::service_ports::PortId::CaddyAdmin {
+                lines.push(Line::from(Span::styled(
+                    "      Admin API changes Caddy config. Use a trusted network.",
+                    Style::default().fg(DIM),
+                )));
+            }
+            if spec.id == crate::service_ports::PortId::ValidatorRpc && required {
+                let public = app.form.service_ports[&spec.id].0;
+                let check = if public { "[x]" } else { "[ ]" };
+                lines.push(Line::from(Span::styled(
+                    format!("      {check} Allow public access (otherwise local only)"),
+                    focus_style(app, &FocusId::NativeRpcPublic),
+                )));
+            }
+        }
         let ph_check = if app.form.public_host_enabled {
             "[x]"
         } else {
@@ -534,7 +573,7 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 
 fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Span::styled(
-        " [↑↓/Tab] Navigate   [Enter] Select/Edit   [Space] Toggle   [l] Logs   [q] Quit ",
+        " [↑↓/Tab] Move [Enter] Edit [Space] Toggle [PgUp/Dn] Scroll [l] Logs [q] Quit ",
         Style::default().fg(Color::Black).bg(ACCENT),
     ));
     frame.render_widget(para, area);

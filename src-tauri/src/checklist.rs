@@ -126,6 +126,8 @@ pub struct CheckCtx {
     pub port: u16,
     /// Host-exposed validator libp2p port. The container still binds 30333.
     pub validator_port: u16,
+    pub public_api_enabled: bool,
+    pub validator_p2p_enabled: bool,
     pub public_host: String,
     /// `true` iff the user has a [dwave] block in their NodeConfig (i.e.
     /// they're intending QPU mining). Controls visibility of `dwave-key`.
@@ -154,6 +156,8 @@ impl CheckCtx {
             image_tag: settings.image_tag,
             port: settings.node_config.port,
             validator_port: settings.node_config.validator_port,
+            public_api_enabled: settings.node_config.public_api_enabled,
+            validator_p2p_enabled: settings.node_config.validator_p2p_enabled,
             public_host: settings.node_config.public_host,
             has_dwave_config,
             dwave_token_set,
@@ -1018,6 +1022,11 @@ fn port_probe_state_label(result: PortProbeResult, noun: &str, port: u16) -> (Ch
 
 async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port", ctx);
+    if !ctx.public_api_enabled {
+        return base
+            .with_state(CheckState::Warn)
+            .with_label("Public API port publishing is disabled");
+    }
     let result = probe_port_forwarding_with_ctx(ctx, ctx.port).await;
     let (state, label) = port_probe_state_label(result, "Public API", ctx.port);
     base.with_state(state).with_label(label)
@@ -1025,6 +1034,11 @@ async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
 
 async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
     let base = idle_item("port-validator", ctx);
+    if !ctx.validator_p2p_enabled {
+        return base
+            .with_state(CheckState::Warn)
+            .with_label("Validator P2P port publishing is disabled");
+    }
     let result = probe_port_forwarding_with_ctx(ctx, ctx.validator_port).await;
     let (state, label) = port_probe_state_label(result, "Validator P2P", ctx.validator_port);
     base.with_state(state).with_label(label)
@@ -1255,6 +1269,8 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
         image_tag: settings.image_tag,
         port: settings.node_config.port,
         validator_port: settings.node_config.validator_port,
+        public_api_enabled: settings.node_config.public_api_enabled,
+        validator_p2p_enabled: settings.node_config.validator_p2p_enabled,
         public_host: settings.node_config.public_host,
         has_dwave_config,
         dwave_token_set,
@@ -1287,12 +1303,29 @@ mod tests {
             image_tag: ImageTag::Cpu,
             port: 20049,
             validator_port: 30333,
+            public_api_enabled: true,
+            validator_p2p_enabled: true,
             public_host: String::new(),
             has_dwave_config: false,
             dwave_token_set: false,
             app: None,
             public_ip: OnceCell::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn unpublished_ports_warn_without_requesting_an_external_probe() {
+        let mut ctx = test_ctx();
+        ctx.public_api_enabled = false;
+        ctx.validator_p2p_enabled = false;
+        for check in [
+            run_check_port(&ctx).await,
+            run_check_port_validator(&ctx).await,
+        ] {
+            assert_eq!(check.state, CheckState::Warn);
+            assert!(check.label.contains("publishing is disabled"));
+        }
+        assert!(ctx.public_ip.get().is_none());
     }
 
     #[test]

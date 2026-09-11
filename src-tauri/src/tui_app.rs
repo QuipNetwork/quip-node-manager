@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Stdout;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,7 @@ use ratatui::Terminal;
 
 use crate::checklist::{CheckItem, CheckState};
 use crate::log_stream::LogEntry;
+use crate::service_ports::{PortBinding, PortId, PORT_SPECS};
 use crate::settings::{AppSettings, DwaveConfig, ImageTag, RunMode, StackHealth};
 
 /// Headline state shown at the top of the TUI, mirroring the GUI status pill
@@ -112,8 +113,9 @@ pub enum FocusId {
     DataDir,
     RunMode,
     UpdateChannel,
-    Port,
-    ValidatorPort,
+    ServicePortEnable(PortId),
+    ServicePortNumber(PortId),
+    NativeRpcPublic,
     SecretShow,
     SecretRegenerate,
     NodeName,
@@ -169,8 +171,8 @@ pub struct FormState {
     /// and only takes effect after a restart, so it is applied separately from
     /// the rest of the form.
     pub data_dir: String,
-    pub port: String,
-    pub validator_port: String,
+    pub service_ports: BTreeMap<PortId, (bool, String)>,
+    pub native_rest_port: String,
     pub node_name: String,
     pub auto_mine: bool,
     pub run_mode_idx: usize,       // 0=Docker, 1=Native
@@ -195,7 +197,6 @@ pub struct FormState {
     pub tls_key_file: String,
     pub rest_host: String,
     pub rest_port: String,
-    pub rest_insecure_port: String,
     pub telemetry_enabled: bool,
     pub telemetry_dir: String,
     pub node_log: String,
@@ -228,8 +229,14 @@ impl FormState {
         };
         FormState {
             data_dir: crate::settings::data_dir().display().to_string(),
-            port: nc.port.to_string(),
-            validator_port: nc.validator_port.to_string(),
+            service_ports: PORT_SPECS
+                .iter()
+                .map(|spec| {
+                    let binding = spec.id.binding(nc, &RunMode::Docker);
+                    (spec.id, (binding.enabled, binding.host_port.to_string()))
+                })
+                .collect(),
+            native_rest_port: crate::config::native_rest_port(nc).to_string(),
             node_name: nc.node_name.clone(),
             auto_mine: nc.auto_mine,
             run_mode_idx,
@@ -253,7 +260,6 @@ impl FormState {
             tls_key_file: nc.tls_key_file.clone(),
             rest_host: nc.rest_host.clone(),
             rest_port: nc.rest_port.to_string(),
-            rest_insecure_port: nc.rest_insecure_port.to_string(),
             telemetry_enabled: nc.telemetry_enabled,
             telemetry_dir: nc.telemetry_dir.clone(),
             node_log: nc.node_log.clone(),
@@ -270,6 +276,34 @@ impl FormState {
         }
     }
 
+    pub fn service_port_value(&self, id: PortId) -> &str {
+        if id == PortId::MinerRest && self.run_mode() == RunMode::Native {
+            &self.native_rest_port
+        } else {
+            &self.service_ports[&id].1
+        }
+    }
+
+    pub fn set_service_port_value(&mut self, id: PortId, value: String) {
+        if id == PortId::MinerRest && self.run_mode() == RunMode::Native {
+            self.native_rest_port = value;
+        } else if let Some(binding) = self.service_ports.get_mut(&id) {
+            binding.1 = value;
+        }
+    }
+
+    pub fn service_port_enabled(&self, id: PortId) -> bool {
+        id.required(&self.run_mode()) || self.service_ports[&id].0
+    }
+
+    pub fn toggle_service_port(&mut self, id: PortId) {
+        if !id.required(&self.run_mode()) {
+            if let Some(binding) = self.service_ports.get_mut(&id) {
+                binding.0 = !binding.0;
+            }
+        }
+    }
+
     pub fn update_channel(&self) -> crate::settings::UpdateChannel {
         if self.update_channel_idx == 1 {
             crate::settings::UpdateChannel::Beta
@@ -283,8 +317,16 @@ impl FormState {
         base: &crate::settings::NodeConfig,
     ) -> crate::settings::NodeConfig {
         let mut nc = base.clone();
-        nc.port = self.port.parse().unwrap_or(20049);
-        nc.validator_port = self.validator_port.parse().unwrap_or(30333);
+        for (id, (enabled, port)) in &self.service_ports {
+            id.set_binding(
+                &mut nc,
+                &RunMode::Docker,
+                PortBinding {
+                    enabled: *enabled,
+                    host_port: port.parse().unwrap_or(0),
+                },
+            );
+        }
         nc.node_name = self.node_name.clone();
         nc.auto_mine = self.auto_mine;
         nc.public_host = if self.public_host_enabled {
@@ -340,7 +382,7 @@ impl FormState {
         nc.tls_key_file = self.tls_key_file.clone();
         nc.rest_host = self.rest_host.clone();
         nc.rest_port = self.rest_port.parse().unwrap_or(-1);
-        nc.rest_insecure_port = self.rest_insecure_port.parse().unwrap_or(-1);
+        nc.rest_insecure_port = self.native_rest_port.parse().unwrap_or(0);
         nc.telemetry_enabled = self.telemetry_enabled;
         nc.telemetry_dir = self.telemetry_dir.clone();
         nc.node_log = self.node_log.clone();
@@ -628,7 +670,7 @@ impl TuiApp {
         }
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
+    pub(crate) fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), Instant::now()));
     }
 
@@ -939,13 +981,22 @@ impl TuiApp {
             list.push(FocusId::DataDir);
             list.push(FocusId::RunMode);
             list.push(FocusId::UpdateChannel);
-            list.push(FocusId::Port);
-            list.push(FocusId::ValidatorPort);
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
             list.push(FocusId::NodeName);
             list.push(FocusId::CustomToggle);
             if self.custom_expanded {
+                for spec in PORT_SPECS {
+                    if !spec.id.required(&self.form.run_mode()) {
+                        list.push(FocusId::ServicePortEnable(spec.id));
+                    }
+                    if self.form.service_port_enabled(spec.id) {
+                        list.push(FocusId::ServicePortNumber(spec.id));
+                    }
+                    if spec.id == PortId::ValidatorRpc && self.form.run_mode() == RunMode::Native {
+                        list.push(FocusId::NativeRpcPublic);
+                    }
+                }
                 list.push(FocusId::PublicHostEnable);
                 if self.form.public_host_enabled {
                     list.push(FocusId::PublicHostInput);
@@ -1099,6 +1150,39 @@ fn merge_surveyed_gpus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_form_round_trips_edits_and_keeps_native_ports_required() {
+        let settings = AppSettings {
+            run_mode: RunMode::Docker,
+            ..AppSettings::default()
+        };
+        let mut form = FormState::from_settings(&settings);
+        assert!(!form.service_port_enabled(PortId::ValidatorRpc));
+        form.toggle_service_port(PortId::ValidatorRpc);
+        form.set_service_port_value(PortId::ValidatorRpc, "29944".into());
+        form.toggle_service_port(PortId::Postgres);
+        form.set_service_port_value(PortId::Postgres, "25432".into());
+        form.set_service_port_value(PortId::MinerRest, "28086".into());
+        let config = form.to_node_config(&settings.node_config);
+        assert_eq!(config.validator_rpc_port, 29944);
+        assert!(config.validator_rpc_enabled);
+        assert_eq!(config.service_ports.postgres.host_port, 25432);
+        assert!(config.service_ports.postgres.enabled);
+
+        form.toggle_service_port(PortId::ValidatorRpc);
+        form.run_mode_idx = 1;
+        assert!(form.service_port_enabled(PortId::ValidatorRpc));
+        form.toggle_service_port(PortId::ValidatorRpc);
+        assert!(form.service_port_enabled(PortId::ValidatorRpc));
+        form.set_service_port_value(PortId::MinerRest, "50000".into());
+        let config = form.to_node_config(&settings.node_config);
+        assert_eq!(crate::config::native_rest_port(&config), 50000);
+        assert_eq!(config.service_ports.miner_rest.host_port, 28086);
+        form.run_mode_idx = 0;
+        assert!(!form.service_port_enabled(PortId::ValidatorRpc));
+        assert_eq!(form.service_port_value(PortId::MinerRest), "28086");
+    }
 
     /// NodeConfig with `n` GPU devices, all set to `enabled`.
     fn nc_with_gpus(n: u32, enabled: bool) -> crate::settings::NodeConfig {

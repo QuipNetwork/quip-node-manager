@@ -118,7 +118,9 @@ fn activate(app: &mut TuiApp) -> Action {
 
         // Run Mode — cycle Docker/Native
         FocusId::RunMode => {
-            app.form.run_mode_idx = (app.form.run_mode_idx + 1) % 2;
+            if cfg!(target_os = "macos") {
+                app.form.run_mode_idx = (app.form.run_mode_idx + 1) % 2;
+            }
             app.dirty = true;
             Action::None
         }
@@ -136,6 +138,22 @@ fn activate(app: &mut TuiApp) -> Action {
         }
 
         // Checkboxes — toggle on Enter too
+        FocusId::NativeRpcPublic => {
+            if let Some(binding) = app
+                .form
+                .service_ports
+                .get_mut(&crate::service_ports::PortId::ValidatorRpc)
+            {
+                binding.0 = !binding.0;
+            }
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::ServicePortEnable(id) => {
+            app.form.toggle_service_port(id);
+            app.dirty = true;
+            Action::None
+        }
         FocusId::PublicHostEnable => {
             app.form.public_host_enabled = !app.form.public_host_enabled;
             app.dirty = true;
@@ -180,8 +198,7 @@ fn activate(app: &mut TuiApp) -> Action {
 
         // Text fields — enter edit mode
         FocusId::DataDir
-        | FocusId::Port
-        | FocusId::ValidatorPort
+        | FocusId::ServicePortNumber(_)
         | FocusId::NodeName
         | FocusId::PublicHostInput
         | FocusId::PublicPortInput
@@ -207,8 +224,7 @@ fn toggle_or_activate(app: &mut TuiApp) -> Action {
 fn start_edit(app: &mut TuiApp) {
     let current = match &app.focus {
         FocusId::DataDir => app.form.data_dir.clone(),
-        FocusId::Port => app.form.port.clone(),
-        FocusId::ValidatorPort => app.form.validator_port.clone(),
+        FocusId::ServicePortNumber(id) => app.form.service_port_value(*id).to_string(),
         FocusId::NodeName => app.form.node_name.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
         FocusId::PublicPortInput => app.form.public_port.clone(),
@@ -225,11 +241,16 @@ fn start_edit(app: &mut TuiApp) {
 
 fn commit_edit(app: &mut TuiApp) {
     let buf = app.form.edit_buf.clone();
+    if let EditMode::EditingField(FocusId::ServicePortNumber(_)) = &app.edit_mode {
+        if buf.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+            app.set_status("Choose a host port from 1 to 65535");
+            return;
+        }
+    }
     match &app.edit_mode {
         EditMode::EditingField(id) => match id {
             FocusId::DataDir => app.form.data_dir = buf,
-            FocusId::Port => app.form.port = buf,
-            FocusId::ValidatorPort => app.form.validator_port = buf,
+            FocusId::ServicePortNumber(id) => app.form.set_service_port_value(*id, buf),
             FocusId::NodeName => app.form.node_name = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
             FocusId::PublicPortInput => app.form.public_port = buf,

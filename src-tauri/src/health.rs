@@ -228,9 +228,13 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
     }
     let infra = check_infra(stack, miner_up);
 
-    // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
-    let validator_url = crate::native::native_miner_validator_url(cfg);
-    let rpc = crate::validator_rpc::ValidatorRpc::new(&validator_url);
+    // Docker probes run inside the stack even when every host publication is off.
+    let rpc = match run_mode {
+        RunMode::Docker => crate::validator_rpc::ValidatorRpc::docker(),
+        RunMode::Native => {
+            crate::validator_rpc::ValidatorRpc::new(&crate::config::native_validator_rpc_url(cfg))
+        }
+    };
     let (chain, participation) = probe_chain_and_participation(&rpc, st, &settings).await;
 
     let candidate = roll_up(infra, chain, participation);

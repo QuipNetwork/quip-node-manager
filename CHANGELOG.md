@@ -48,6 +48,24 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+<!-- Release tags use literal version spelling. -->
+<!-- vale Google.Headings = NO -->
+## v0.2.6-rc1
+<!-- vale Google.Headings = YES -->
+
+- Show container logs during stack startup. Keep logs visible through waits and failed starts.
+  Retry the log connection while Compose files are staging or Docker reconnects.
+  Replacing a log session permanently stops its previous follower.
+- Remove the loopback RPC fallback from the staged Docker miner template.
+  The miner uses `quip-validator:9944` regardless of public host port settings.
+- Add host port switches and port fields grouped by service in both interfaces.
+  These cover validator P2P, RPC and metrics, miner REST, dashboard HTTP,
+  PostgreSQL, and Caddy listeners. Internal container ports stay fixed.
+- Keep Native validator RPC required, with port 9944 as the default.
+  Public RPC access is optional. Native miner REST has a separate editable host port.
+- Check Docker service health through the internal network when public ports are off.
+  Reject conflicting host ports and keep the previous mode when a mode change fails.
+
 ## v0.2.5
 
 - **The miner asks the faucet for the network it actually runs**: the faucet URL followed the update channel, which was correct only while the two channels ran two different networks. With the Aglais images on the stable branches, both channels join Aglais, and a stack on Release kept asking the retired network's faucet. That failure is quiet: the miner has no built-in default and retries instead of exiting, so the balance stays at zero and the log reads like a slow faucet. The URL now follows the embedded chain specification, which is the thing that decides the network.

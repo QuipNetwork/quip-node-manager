@@ -28,11 +28,11 @@
 //!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
 //!     from `quip-miner:8086` (compose network alias, absent when the miner
 //!     is on the host) to `host.docker.internal:<native_rest_port>`.
-//!   - compose.yml (both modes): the validator's JSON-RPC port is published
-//!     on the host loopback (127.0.0.1:9944) so the host health monitor and
-//!     the host-side miner (Native) can reach `ws://127.0.0.1:9944` directly.
+//!   - compose.yml: each enabled service port is published on its configured
+//!     host port. Native RPC is mandatory so the host miner can reach it.
+//!     Docker health probes run inside the stack without public mappings.
 
-use crate::settings::{data_dir, RunMode};
+use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
 use std::path::PathBuf;
 
@@ -86,17 +86,6 @@ const MINER_CONFIG_TEMPLATE: &str =
 const VALIDATOR_HEALTHCHECK: &str =
     include_str!("../../vendor/nodes.quip.network/scripts/validator-healthcheck.sh");
 
-/// Public API port inside the Caddy container. The host side is configurable.
-const CONTAINER_PUBLIC_API_PORT: u16 = 20049;
-/// Validator libp2p port inside the validator container. The host side
-/// defaults to the same 30333 and is also used for generated
-/// `--public-addr` values.
-const CONTAINER_VALIDATOR_PORT: u16 = 30333;
-/// Validator JSON-RPC port inside the container. In Native mode it's published
-/// on the host loopback (on a configurable host port, default 9944) so the
-/// host-side miner can connect directly rather than via Caddy's `/rpc` route.
-const CONTAINER_VALIDATOR_RPC_PORT: u16 = 9944;
-
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
 pub fn stack_compose_file() -> PathBuf {
     data_dir().join("docker-compose.yml")
@@ -147,22 +136,14 @@ pub fn stack_project_dir() -> PathBuf {
 /// `<data_dir>/`, and create the subdirectories compose bind-mounts.
 /// Idempotent — always overwrites.
 ///
-/// `public_api_port` replaces Caddy's upstream host-side `20049`.
-/// `validator_port` replaces the validator's upstream host-side `30333`
-/// while preserving the container-internal `30333`.
-/// `public_host`, when set, is converted into a Substrate public multiaddr
-/// using `validator_port`.
+/// The port settings control only host publications. All internal ports stay fixed.
+/// `config.public_host`, when set and P2P publishing is enabled, is converted
+/// into a Substrate public multiaddr using `config.validator_port`.
 ///
 /// In Native mode the Caddyfile's upstream for `/api/v1/*` is also
 /// rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>`.
-pub fn sync_stack_assets(
-    run_mode: &RunMode,
-    public_api_port: u16,
-    validator_port: u16,
-    public_host: &str,
-    native_rest_port: u16,
-    validator_rpc_port: u16,
-) -> Result<(), String> {
+pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), String> {
+    crate::service_ports::validate(config, run_mode)?;
     let base = data_dir();
     for sub in [
         "data",
@@ -183,27 +164,140 @@ pub fn sync_stack_assets(
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
-    let compose_out = patch_compose_file(
-        COMPOSE_YML,
-        public_api_port,
-        validator_port,
-        public_host,
-        validator_rpc_port,
-    );
+    let compose_out = patch_compose_file(COMPOSE_YML, config, run_mode)?;
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
 
-    let caddy_out = patch_caddyfile(run_mode, CADDYFILE, native_rest_port);
+    let caddy_out = patch_caddyfile(run_mode, CADDYFILE, crate::config::native_rest_port(config));
+    let caddy_out = configure_caddy_admin(&caddy_out, config.service_ports.caddy_admin.enabled)?;
     fs::write(stack_caddyfile(), caddy_out).map_err(|e| format!("write Caddyfile: {e}"))?;
 
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
-    fs::write(stack_miner_config_file(), MINER_CONFIG_TEMPLATE)
+    fs::write(stack_miner_config_file(), miner_config_template()?)
         .map_err(|e| format!("write miner config template: {e}"))?;
 
     write_healthcheck_script()?;
 
     Ok(())
+}
+
+fn miner_config_template() -> Result<String, String> {
+    let mut template: toml::Value = toml::from_str(MINER_CONFIG_TEMPLATE)
+        .map_err(|e| format!("parse embedded miner template: {e}"))?;
+    let miner = template
+        .get_mut("miner")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or("embedded miner template has no [miner] table")?;
+    miner.insert(
+        "validators".into(),
+        toml::Value::Array(vec![toml::Value::String(
+            crate::config::DOCKER_VALIDATOR_RPC.into(),
+        )]),
+    );
+    toml::to_string_pretty(&template).map_err(|e| format!("render miner template: {e}"))
+}
+
+fn apply_port_publications(
+    src: &str,
+    config: &NodeConfig,
+    mode: &RunMode,
+) -> Result<String, String> {
+    use crate::service_ports::{PortId, PORT_SPECS};
+    crate::service_ports::validate(config, mode)?;
+    let mut output = src.to_string();
+    for (service, name) in [
+        ("quip-validator", "quip-validator"),
+        ("cpu", "quip-miner"),
+        ("cuda", "quip-miner"),
+        ("dashboard", "quip-dashboard"),
+        ("postgres", "quip-postgres"),
+        ("caddy", "quip-caddy"),
+    ] {
+        let mut mappings = Vec::new();
+        for spec in PORT_SPECS.iter().filter(|spec| spec.service == name) {
+            if spec.id == PortId::MinerRest && *mode == RunMode::Native {
+                continue; // The miner binds directly on the host in Native mode.
+            }
+            let binding = spec.id.binding(config, mode);
+            if binding.enabled || spec.id.required(mode) {
+                let address = if spec.id == PortId::ValidatorRpc
+                    && *mode == RunMode::Native
+                    && !binding.enabled
+                {
+                    "127.0.0.1:"
+                } else {
+                    ""
+                };
+                for protocol in spec.protocols {
+                    mappings.push(format!(
+                        "{address}{}:{}/{protocol}",
+                        binding.host_port, spec.container_port
+                    ));
+                }
+            }
+        }
+        output = replace_service_ports(&output, service, &mappings)?;
+    }
+    Ok(output)
+}
+
+/// Replace one service's complete ports block, preserving its other YAML fields.
+/// Fail if the embedded service layout changes instead of silently omitting a mapping.
+fn replace_service_ports(src: &str, service: &str, mappings: &[String]) -> Result<String, String> {
+    let header = format!("  {service}:");
+    let mut found = false;
+    let mut in_service = false;
+    let mut in_ports = false;
+    let mut output = String::new();
+    for line in src.lines() {
+        if line == header {
+            if found {
+                return Err(format!("duplicate {service} service in embedded compose"));
+            }
+            found = true;
+            in_service = true;
+            output.push_str(line);
+            output.push('\n');
+            if !mappings.is_empty() {
+                output.push_str("    ports:\n");
+                for mapping in mappings {
+                    output.push_str(&format!("      - \"{mapping}\"\n"));
+                }
+            }
+            continue;
+        }
+        if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            if !line.starts_with("    ") {
+                in_service = false;
+            }
+            if !line.starts_with("      ") {
+                in_ports = false;
+            }
+        }
+        if in_service && line == "    ports:" {
+            in_ports = true;
+            continue;
+        }
+        if !in_ports {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !found {
+        return Err(format!("missing {service} service in embedded compose"));
+    }
+    Ok(output)
+}
+
+fn configure_caddy_admin(src: &str, enabled: bool) -> Result<String, String> {
+    if !enabled {
+        return Ok(src.to_string());
+    }
+    if !src.contains("\n{\n") {
+        return Err("embedded Caddyfile has no global options block".into());
+    }
+    Ok(src.replacen("\n{\n", "\n{\n\tadmin :2019\n", 1))
 }
 
 /// Stage the validator healthcheck, executable. Compose runs it as the
@@ -225,18 +319,16 @@ fn write_healthcheck_script() -> Result<(), String> {
     Ok(())
 }
 
-fn patch_compose_file(
-    src: &str,
-    public_api_port: u16,
-    validator_port: u16,
-    public_host: &str,
-    validator_rpc_port: u16,
-) -> String {
-    let patched = patch_compose_ports(src, public_api_port, validator_port);
-    let patched = expose_validator_rpc(&patched, validator_port, validator_rpc_port);
-    let patched = patch_validator_public_addr(&patched, public_host, validator_port);
+fn patch_compose_file(src: &str, config: &NodeConfig, mode: &RunMode) -> Result<String, String> {
+    let patched = apply_port_publications(src, config, mode)?;
+    let public_host = if config.validator_p2p_enabled {
+        &config.public_host
+    } else {
+        ""
+    };
+    let patched = patch_validator_public_addr(&patched, public_host, config.validator_port);
     let patched = ungate_validator_dependents(&patched);
-    strip_volume_names(&patched)
+    Ok(strip_volume_names(&patched))
 }
 
 /// Start the miner, dashboard, and faucet as soon as the validator's container
@@ -289,35 +381,6 @@ fn strip_volume_names(src: &str) -> String {
         .replace("\n    name: quip-caddy-config", "")
 }
 
-/// Publish the validator's JSON-RPC port on the host loopback
-/// (`127.0.0.1:<validator_rpc_port>`) in both run modes so the host health
-/// monitor can reach `ws://127.0.0.1:<validator_rpc_port>` directly.
-/// In Native mode the host-side miner also uses this binding.
-fn expose_validator_rpc(src: &str, validator_port: u16, validator_rpc_port: u16) -> String {
-    // Anchor on the (already port-patched) validator UDP mapping so the RPC
-    // mapping lands inside the quip-validator service's `ports:` list.
-    let udp_line = format!("      - \"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\"\n");
-    let rpc_line =
-        format!("      - \"127.0.0.1:{validator_rpc_port}:{CONTAINER_VALIDATOR_RPC_PORT}\"\n");
-    src.replacen(&udp_line, &format!("{udp_line}{rpc_line}"), 1)
-}
-
-/// Remap host sides of canonical upstream `HOST:CONTAINER` port directives.
-fn patch_compose_ports(src: &str, public_api_port: u16, validator_port: u16) -> String {
-    src.replace(
-        &format!("\"{CONTAINER_PUBLIC_API_PORT}:{CONTAINER_PUBLIC_API_PORT}\""),
-        &format!("\"{public_api_port}:{CONTAINER_PUBLIC_API_PORT}\""),
-    )
-    .replace(
-        &format!("\"{CONTAINER_VALIDATOR_PORT}:{CONTAINER_VALIDATOR_PORT}/tcp\""),
-        &format!("\"{validator_port}:{CONTAINER_VALIDATOR_PORT}/tcp\""),
-    )
-    .replace(
-        &format!("\"{CONTAINER_VALIDATOR_PORT}:{CONTAINER_VALIDATOR_PORT}/udp\""),
-        &format!("\"{validator_port}:{CONTAINER_VALIDATOR_PORT}/udp\""),
-    )
-}
-
 fn patch_validator_public_addr(src: &str, public_host: &str, validator_port: u16) -> String {
     let Some(public_addr) = crate::hostnames::validator_public_addr(public_host, validator_port)
     else {
@@ -362,20 +425,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn patch_compose_ports_noop_for_upstream_defaults() {
-        let patched = patch_compose_ports(
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            CONTAINER_VALIDATOR_PORT,
+    fn staged_miner_template_has_no_container_loopback_fallback() {
+        let template: toml::Value = toml::from_str(&miner_config_template().unwrap()).unwrap();
+        assert_eq!(
+            template["miner"]["validators"].as_array().unwrap(),
+            &[toml::Value::String("ws://quip-validator:9944".into())]
         );
-        assert_eq!(patched, COMPOSE_YML);
     }
 
     #[test]
-    fn patch_compose_ports_remaps_public_api_port() {
-        let patched = patch_compose_ports(COMPOSE_YML, 20052, CONTAINER_VALIDATOR_PORT);
-        assert!(patched.contains("\"20052:20049\""));
-        assert!(!patched.contains("\"20049:20049\""));
+    fn unpublished_docker_rpc_has_no_host_binding() {
+        let output =
+            apply_port_publications(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+        assert!(!output.contains(":9944\""));
+        assert!(output.contains("\"20049:20049/tcp\""));
+    }
+
+    #[test]
+    fn native_rpc_is_required_and_keeps_the_container_port() {
+        let config = NodeConfig {
+            validator_rpc_port: 29944,
+            ..NodeConfig::default()
+        };
+        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Native).unwrap();
+        assert!(output.contains("\"127.0.0.1:29944:9944/tcp\""));
+        assert!(!output.contains(":8086/tcp\""));
+    }
+
+    #[test]
+    fn native_rpc_public_access_requires_an_explicit_choice() {
+        let config = NodeConfig {
+            validator_rpc_enabled: true,
+            validator_rpc_port: 29944,
+            ..NodeConfig::default()
+        };
+        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Native).unwrap();
+        assert!(output.contains("\"29944:9944/tcp\""));
+        assert!(!output.contains("0.0.0.0:"));
+        assert!(!output.contains("127.0.0.1:29944"));
+    }
+
+    #[test]
+    fn every_service_port_can_be_published_and_remapped() {
+        use crate::service_ports::{PortBinding, PORT_SPECS};
+        let mut config = NodeConfig::default();
+        for (index, spec) in PORT_SPECS.iter().enumerate() {
+            spec.id.set_binding(
+                &mut config,
+                &RunMode::Docker,
+                PortBinding {
+                    enabled: true,
+                    host_port: 40000 + index as u16,
+                },
+            );
+        }
+        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        for expected in [
+            "40000:30333/tcp",
+            "40000:30333/udp",
+            "40001:9944/tcp",
+            "40002:9615/tcp",
+            "40003:8086/tcp",
+            "40004:3001/tcp",
+            "40005:5432/tcp",
+            "40006:20049/tcp",
+            "40007:80/tcp",
+            "40008:443/tcp",
+            "40009:443/udp",
+            "40010:8088/tcp",
+            "40011:2019/tcp",
+            "40012:20049/udp",
+        ] {
+            assert!(output.contains(expected), "missing mapping {expected}");
+        }
+        assert_eq!(output.matches("40003:8086/tcp").count(), 2, "CPU and CUDA");
+        assert!(output.contains("@postgres:5432/"));
+        assert!(output.contains("ws://quip-caddy:8088/rpc"));
+        assert!(output.contains("--rpc-port=9944"));
+    }
+
+    #[test]
+    fn all_host_publications_can_be_disabled_in_docker() {
+        use crate::service_ports::PORT_SPECS;
+        let mut config = NodeConfig::default();
+        for spec in PORT_SPECS {
+            let mut binding = spec.id.binding(&config, &RunMode::Docker);
+            binding.enabled = false;
+            spec.id.set_binding(&mut config, &RunMode::Docker, binding);
+        }
+        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        assert!(!output.lines().any(|line| line.trim() == "ports:"));
+        assert!(output.contains("--rpc-port=9944"));
+    }
+
+    #[test]
+    fn admin_listener_is_reachable_only_when_requested() {
+        assert_eq!(configure_caddy_admin(CADDYFILE, false).unwrap(), CADDYFILE);
+        let enabled = configure_caddy_admin(CADDYFILE, true).unwrap();
+        assert!(enabled.contains("admin :2019"));
     }
 
     /// Asserts on the *shape* rather than on the three names we happen to know:
@@ -414,81 +561,40 @@ mod tests {
     }
 
     #[test]
-    fn patch_compose_ports_remaps_validator_tcp_and_udp() {
-        let patched = patch_compose_ports(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033);
-        assert!(patched.contains("\"30033:30333/tcp\""));
-        assert!(patched.contains("\"30033:30333/udp\""));
-        assert!(!patched.contains("\"30333:30333/tcp\""));
-        assert!(!patched.contains("\"30333:30333/udp\""));
-    }
-
-    #[test]
-    fn patch_compose_ports_uses_manager_validator_default() {
-        let patched = patch_compose_ports(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033);
-        assert!(patched.contains("\"20049:20049\""));
-        assert!(patched.contains("\"30033:30333/tcp\""));
-        assert!(patched.contains("\"30033:30333/udp\""));
-    }
-
-    #[test]
     fn patch_compose_file_adds_public_addr_from_dns_public_host() {
-        let patched = patch_compose_file(
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "node.example.com",
-            9944,
-        );
+        let config = NodeConfig {
+            validator_port: 30033,
+            public_host: "node.example.com".into(),
+            ..NodeConfig::default()
+        };
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
         assert!(patched.contains("      - --public-addr=/dns4/node.example.com/tcp/30033\n"));
     }
 
     #[test]
     fn patch_compose_file_adds_public_addr_from_ip_public_host() {
-        let patched = patch_compose_file(
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "1.2.3.4",
-            9944,
-        );
+        let config = NodeConfig {
+            validator_port: 30033,
+            public_host: "1.2.3.4".into(),
+            ..NodeConfig::default()
+        };
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
-        let patched = patch_compose_file(
-            COMPOSE_YML,
-            CONTAINER_PUBLIC_API_PORT,
-            30033,
-            "[2001:db8::1]",
-            9944,
-        );
+        let config = NodeConfig {
+            validator_port: 30033,
+            public_host: "[2001:db8::1]".into(),
+            ..NodeConfig::default()
+        };
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
         assert!(patched.contains("      - --public-addr=/ip6/2001:db8::1/tcp/30033\n"));
     }
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
-        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
+        let patched =
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
         assert!(!patched.contains("--public-addr"));
-    }
-
-    #[test]
-    fn both_modes_publish_validator_rpc_on_configured_host_port() {
-        let patched = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9944);
-        assert!(patched.contains("      - \"127.0.0.1:9944:9944\"\n"));
-        // Inserted right after the validator's UDP mapping, inside its ports.
-        assert!(patched.contains("\"30033:30333/udp\"\n      - \"127.0.0.1:9944:9944\""));
-
-        // The host side honours the configured port; the container side is
-        // always the validator's fixed 9944.
-        let custom = patch_compose_file(COMPOSE_YML, CONTAINER_PUBLIC_API_PORT, 30033, "", 9955);
-        assert!(custom.contains("      - \"127.0.0.1:9955:9944\"\n"));
-    }
-
-    #[test]
-    fn docker_mode_also_publishes_validator_rpc_to_host() {
-        let out = expose_validator_rpc(COMPOSE_YML, 30333, 9944);
-        assert!(
-            out.contains("127.0.0.1:9944:9944"),
-            "Docker mode must publish validator RPC to host loopback for the health monitor"
-        );
     }
 
     /// Upstream gates the miner, dashboard, and faucet on the validator being
@@ -498,7 +604,8 @@ mod tests {
     /// database.
     #[test]
     fn ungating_relaxes_only_the_validator_dependencies() {
-        let patched = ungate_validator_dependents(COMPOSE_YML);
+        let patched =
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
 
         assert!(
             !patched.contains("quip-validator:\n        condition: service_healthy"),

@@ -77,12 +77,21 @@ fn rpc_base_url(url: &str) -> String {
 
 pub struct ValidatorRpc {
     base: String,
+    docker: bool,
 }
 
 impl ValidatorRpc {
     pub fn new(url: &str) -> Self {
         ValidatorRpc {
             base: rpc_base_url(url),
+            docker: false,
+        }
+    }
+
+    pub(crate) fn docker() -> Self {
+        Self {
+            base: String::new(),
+            docker: true,
         }
     }
 
@@ -97,17 +106,33 @@ impl ValidatorRpc {
             "method": method,
             "params": params,
         });
-        let resp = reqwest::Client::new()
-            .post(&self.base)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|e| format!("{method} request failed: {e}"))?;
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("{method} bad json: {e}"))?;
+        let v: serde_json::Value = if self.docker {
+            let response = crate::container_http::request(
+                "quip-validator",
+                9944,
+                "POST",
+                "/",
+                &body.to_string(),
+            )
+            .await?;
+            serde_json::from_str(&response).map_err(|e| format!("{method} bad json: {e}"))?
+        } else {
+            reqwest::Client::new()
+                .post(&self.base)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| format!("{method} request failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("{method} HTTP error: {e}"))?
+                .json()
+                .await
+                .map_err(|e| format!("{method} bad json: {e}"))?
+        };
+        if let Some(error) = v.get("error") {
+            return Err(format!("{method} RPC error: {error}"));
+        }
         v.get("result")
             .cloned()
             .ok_or_else(|| format!("{method}: no result field"))

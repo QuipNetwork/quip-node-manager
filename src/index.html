@@ -116,16 +116,6 @@
               </div>
               <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Changes will create a new directory. The previous directory will not be removed.</div>
             </div>
-            <div class="mining-config-grid">
-              <div class="form-group">
-                <label for="port">Public API Port</label>
-                <input type="number" id="port" min="1024" max="65535" value="20049" />
-              </div>
-              <div class="form-group">
-                <label for="validator-port">Validator P2P Port</label>
-                <input type="number" id="validator-port" min="1024" max="65535" value="30333" />
-              </div>
-            </div>
             <div class="form-group">
               <label>Node Secret</label>
               <div class="secret-row">
@@ -164,11 +154,8 @@
                   </div>
                   <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
-                <div class="form-group" style="max-width:220px;">
-                  <label for="validator-rpc-port">Validator RPC Port <span style="color:var(--text-faint);font-weight:400;">(native mode)</span></label>
-                  <input type="number" id="validator-rpc-port" min="1024" max="65535" value="9944" />
-                  <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Host port the local miner uses to reach the validator's JSON-RPC.</div>
-                </div>
+                <p class="service-port-note">Enable a port to publish it on this host. Internal service addresses stay fixed.</p>
+                <div id="service-port-controls"></div>
                 <div class="mining-config-grid">
                   <div class="form-group">
                     <label for="log-level">Log Level</label>
@@ -367,6 +354,6 @@
     </div>
 
   </div>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

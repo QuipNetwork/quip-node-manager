@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { applyPortEdits, collectPortEdits, renderPortControls } from './service-ports.js';
 
 // Tauri IPC bridge
 const invoke =
@@ -17,6 +18,7 @@ const openUrl = (url) =>
 // App state
 const state = {
   settings: null,
+  servicePortControls: [],
   containerRunning: false,
   nativeRunning: false,
   // Full StackStatus returned by get_stack_status:
@@ -197,7 +199,7 @@ async function refreshChannelInfo() {
     info = await invoke('resolve_channel_info', {
       channel: state.settings.update_channel,
     });
-  } catch (e) {
+  } catch {
     if (caption) caption.textContent = 'Could not reach the release feed.';
     return;
   }
@@ -398,25 +400,6 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   list.style.display = expanded ? 'none' : '';
 });
 
-// ─── Port change → re-run port-related checks ────────────────────────────────
-document.getElementById('port').addEventListener('change', async () => {
-  const port = parseInt(document.getElementById('port').value) || 20049;
-  if (state.settings) {
-    state.settings.node_config.port = port;
-    await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port'] }).catch(console.error);
-  }
-});
-
-document.getElementById('validator-port').addEventListener('change', async () => {
-  const port = parseInt(document.getElementById('validator-port').value) || 30333;
-  if (state.settings) {
-    state.settings.node_config.validator_port = port;
-    await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port-validator'] }).catch(console.error);
-  }
-});
-
 // ─── Custom settings toggle ───────────────────────────────────────────────────
 document.getElementById('btn-custom-toggle').addEventListener('click', () => {
   const btn = document.getElementById('btn-custom-toggle');
@@ -460,8 +443,22 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
 /// binary check).
 async function setMetalEnabled(enabled) {
   if (!state.settings) return;
-  state.settings.run_mode = enabled ? 'native' : 'docker';
-  await invoke('update_settings', { settings: state.settings }).catch(console.error);
+  try {
+    const proposed = { ...state.settings, node_config: collectConfig(),
+      run_mode: enabled ? 'native' : 'docker' };
+    const controls = await invoke('get_service_ports', {
+      config: proposed.node_config, runMode: proposed.run_mode,
+    });
+    await invoke('update_settings', { settings: proposed });
+    state.settings = proposed;
+    state.servicePortControls = controls;
+    renderPortControls(document.getElementById('service-port-controls'), controls);
+  } catch (error) {
+    document.getElementById('apply-status').textContent = `Mode change failed: ${error}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Mode change failed: ${error}` });
+    renderGpuDevices();
+    return;
+  }
   // Mode change invalidates the whole cache — backend reseeds and reruns.
   state.checks.clear();
   await invoke('recheck').catch(console.error);
@@ -678,11 +675,11 @@ function collectConfig() {
     : null;
 
   const base = state.settings?.node_config ?? {};
+  const portConfig = applyPortEdits(base, state.servicePortControls,
+    collectPortEdits(document.getElementById('service-port-controls'), state.servicePortControls));
 
   return {
-    port: parseInt(document.getElementById('port').value) || 20049,
-    validator_port: parseInt(document.getElementById('validator-port').value) || 30333,
-    validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
+    ...portConfig,
     listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
@@ -702,7 +699,7 @@ function collectConfig() {
     verify_tls: base.verify_tls ?? false,
     rest_host: base.rest_host ?? '127.0.0.1',
     rest_port: base.rest_port ?? -1,
-    rest_insecure_port: base.rest_insecure_port ?? -1,
+    rest_insecure_port: portConfig.rest_insecure_port ?? -1,
     telemetry_enabled: base.telemetry_enabled ?? true,
     telemetry_dir: base.telemetry_dir ?? 'telemetry',
     log_level: document.getElementById('log-level')?.value || 'info',
@@ -745,13 +742,19 @@ function applyFormToSettings() {
 }
 
 // ─── Populate form from settings ─────────────────────────────────────────────
-function populateForm(settings) {
+async function refreshServicePortControls() {
+  const controls = await invoke('get_service_ports', {
+    config: state.settings.node_config, runMode: state.settings.run_mode,
+  });
+  state.servicePortControls = controls;
+  renderPortControls(document.getElementById('service-port-controls'), controls);
+}
+
+async function populateForm(settings) {
+  await refreshServicePortControls();
   const c = settings.node_config;
 
   // Validator / miner configuration
-  document.getElementById('port').value = c.port ?? 20049;
-  document.getElementById('validator-port').value = c.validator_port ?? 30333;
-  document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
 
   // Custom settings
@@ -1659,7 +1662,6 @@ async function runRestartToUpdate() {
 async function startNode() {
   if (isDockerMode()) {
     await invoke('start_stack');
-    await invoke('start_log_stream');
   } else {
     // Native mode: run the binary on the host + the compose stack's
     // non-node services so the user still gets the dashboard UI.
@@ -1762,10 +1764,10 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
 
 // ─── Save ─────────────────────────────────────────────────────────────────────
 document.getElementById('btn-save').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
   applyStatus.textContent = 'Saving\u2026';
   try {
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     applyStatus.textContent = 'Settings saved.';
     setTimeout(() => { applyStatus.textContent = ''; }, 3000);
@@ -2128,7 +2130,7 @@ async function init() {
   try {
     const settings = await invoke('get_settings');
     state.settings = settings;
-    populateForm(settings);
+    await populateForm(settings);
     // The Metal toggle (rendered once the hardware survey lands) reflects
     // run_mode; there is no separate run-mode control to seed here.
     if (settings.active_tab && settings.active_tab !== 'status') {
@@ -2220,7 +2222,7 @@ async function init() {
   // Fallback health poll — the health-changed event is the primary path;
   // this catches any missed events (e.g. listener registered after first emit).
   setInterval(async () => {
-    try { renderHealth(await invoke('get_health')); } catch (_) { /* transient — backend may not have sampled yet */ }
+    try { renderHealth(await invoke('get_health')); } catch { /* transient — backend may not have sampled yet */ }
   }, 15_000);
 }
 

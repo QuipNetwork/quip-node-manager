@@ -4,6 +4,7 @@ pub mod checklist;
 pub mod cmd;
 pub mod compose;
 pub mod config;
+mod container_http;
 pub mod coordinator_api;
 pub mod hardware;
 pub mod health;
@@ -15,6 +16,7 @@ pub mod network;
 pub mod progress;
 pub mod registry;
 pub mod secret;
+pub mod service_ports;
 pub mod settings;
 pub mod stack_assets;
 pub mod tui_app;
@@ -74,6 +76,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             settings::get_settings,
+            service_ports::get_service_ports,
             settings::update_settings,
             settings::is_first_boot,
             settings::get_default_data_dir,
