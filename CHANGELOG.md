@@ -50,6 +50,25 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc2
+<!-- vale Google.Headings = YES -->
+
+- Repair the container health probes in the Windows builds, which failed on
+  every call. The Windows build machine checked out the embedded shell scripts
+  with carriage-return line endings, so bash rejected `set -euo pipefail` and
+  exited before it opened a socket. The staged validator healthcheck carried
+  the same fault, which held the validator at unhealthy and kept the miner and
+  the dashboard waiting behind their `service_healthy` conditions.
+- Report an initial chain sync as SYNCING instead of DEGRADED. The status pill
+  shows a progress bar and the block counts read from `system_syncState`.
+  A syncing node no longer counts as unhealthy for missing a participation
+  marker it cannot yet have.
+- Add solver selectors for the CPU, CUDA, and Metal backends in both interfaces.
+  Each selector reads its list from the miner image or the native bundle at
+  runtime, so the options match what the coordinator can start. Entries carry
+  the algorithm name and the production or experimental track. A selector left
+  at Default keeps the binary that the image chooses.
+
 ## v0.2.6-rc1
 <!-- vale Google.Headings = YES -->
 

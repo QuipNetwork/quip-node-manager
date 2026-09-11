@@ -1,0 +1,5 @@
+# Shell scripts are embedded into the binary with include_str! and run by bash
+# inside the Compose containers. A Windows checkout with core.autocrlf=true
+# rewrites them to CRLF, which bakes `set -euo pipefail\r` into the release and
+# makes every container probe fail. Pin them to LF on every platform.
+*.sh text eol=lf

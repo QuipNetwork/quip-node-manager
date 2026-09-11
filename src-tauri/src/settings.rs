@@ -325,6 +325,18 @@ pub struct NodeConfig {
     pub cpu_enabled: bool,
     #[serde(default = "default_num_cpus")]
     pub num_cpus: u32,
+    /// `quip-cpu-*` binary the coordinator spawns for `[cpu]`. `None` means the
+    /// image's own default, so an operator who never touches this keeps
+    /// whatever the image ships rather than being pinned to a name this app
+    /// compiled in. Same for the GPU solvers below.
+    #[serde(default)]
+    pub cpu_solver: Option<String>,
+    /// `quip-cuda-*` binary for every enabled `[cuda.N]` device.
+    #[serde(default)]
+    pub cuda_solver: Option<String>,
+    /// `quip-metal-*` binary for `[metal]` (macOS Native only).
+    #[serde(default)]
+    pub metal_solver: Option<String>,
 
     // GPU mining
     #[serde(default)]
@@ -382,6 +394,9 @@ impl Default for NodeConfig {
             http_log: String::new(),
             cpu_enabled: true,
             num_cpus: 1,
+            cpu_solver: None,
+            cuda_solver: None,
+            metal_solver: None,
             gpu_backend: GpuBackend::Local,
             gpu_device_configs: vec![],
             metal_config: MetalConfig::default(),
@@ -495,6 +510,10 @@ pub enum StackHealth {
     Running,
     /// ≥1 service running, ≥1 not running
     Degraded,
+    /// Services are up, but the validator is still replaying the chain. Only
+    /// the health monitor produces this — the Compose roll-up cannot see it,
+    /// since a syncing validator is a running container like any other.
+    Syncing,
     /// ≥1 healthcheck reports unhealthy
     Unhealthy,
     /// no services running (or all exited)

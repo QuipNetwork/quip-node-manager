@@ -15,6 +15,7 @@ const DIM: Color = Color::DarkGray;
 const PASS: Color = Color::Green;
 const FAIL: Color = Color::Red;
 const WARN_COLOR: Color = Color::Yellow;
+const SYNC_COLOR: Color = Color::Blue;
 
 pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
@@ -77,6 +78,8 @@ fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
     let (symbol, label) = kind.display();
     let state_color = match kind {
         StatusKind::Running => PASS,
+        // Blue, not amber: syncing is expected progress, not a fault.
+        StatusKind::Syncing => SYNC_COLOR,
         StatusKind::Degraded | StatusKind::Unhealthy | StatusKind::Partial => WARN_COLOR,
         StatusKind::Stopped => FAIL,
     };
@@ -290,6 +293,37 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         "Node Name",
         &field_value(app, &FocusId::NodeName, &app.form.node_name),
     ));
+
+    // Solver pickers, one per backend this machine can actually run. Empty
+    // means that backend's own default, which is what an operator who has never
+    // opened the field is running.
+    for backend in app.selectable_solver_backends() {
+        let selected = app.form.solver(backend);
+        let display = if selected.is_empty() {
+            format!("default ({})", backend.default_solver())
+        } else {
+            let track = app
+                .solvers
+                .get(&backend)
+                .and_then(|list| list.iter().find(|s| s.binary == selected))
+                .filter(|s| s.track != crate::solvers::Track::Unknown)
+                .map(|s| format!("  ({:?})", s.track).to_lowercase())
+                .unwrap_or_default();
+            format!("{selected}{track}")
+        };
+        let label = match backend {
+            crate::solvers::Backend::Cpu => "CPU Solver",
+            crate::solvers::Backend::Cuda => "CUDA Solver",
+            crate::solvers::Backend::Metal => "Metal Solver",
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!("{label:<16} {display}"),
+                focus_style(app, &FocusId::Solver(backend)),
+            ),
+        ]));
+    }
 
     // Custom Settings toggle
     let cs_arrow = if app.custom_expanded { "▼" } else { "▶" };

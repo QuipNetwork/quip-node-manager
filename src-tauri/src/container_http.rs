@@ -3,6 +3,16 @@
 
 const HTTP_SCRIPT: &str = include_str!("../../scripts/container-http.sh");
 
+/// The probe script is embedded at compile time, so the build machine's
+/// checkout decides what every user runs. A Windows runner with
+/// `core.autocrlf=true` turns line 3 into `set -euo pipefail\r`, bash reads the
+/// option name as `pipefail\r`, and the shell exits 2 before opening a socket.
+/// `.gitattributes` pins the checkout to LF; this undoes the rewrite for
+/// binaries built from a working tree that already has CRLF.
+fn script() -> String {
+    HTTP_SCRIPT.replace("\r\n", "\n")
+}
+
 pub(crate) async fn request(
     host: &str,
     port: u16,
@@ -19,7 +29,7 @@ pub(crate) async fn request(
         "5",
         "bash",
         "-c",
-        HTTP_SCRIPT,
+        &script(),
         "--",
         host,
         &port.to_string(),
@@ -94,16 +104,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_script_sends_a_request_and_reads_the_actual_http_response() {
-        check_probe_request("GET", "/api/v1/status", "");
+        check_probe_request(script(), "GET", "/api/v1/status", "");
         check_probe_request(
+            script(),
             "POST",
             "/",
             r#"{"jsonrpc":"2.0","method":"system_health","params":["λ;$(false)"],"id":1}"#,
         );
     }
 
+    /// A Windows build machine with `core.autocrlf=true` embeds the script with
+    /// CRLF, which makes bash reject `pipefail\r` and exit 2 before it reaches
+    /// the socket. Run the mangled form through real bash to prove the probe
+    /// survives it.
     #[cfg(unix)]
-    fn check_probe_request(method: &'static str, path: &'static str, body: &'static str) {
+    #[test]
+    fn probe_script_survives_a_crlf_checkout() {
+        let crlf = HTTP_SCRIPT.replace('\n', "\r\n");
+        assert!(crlf.contains("set -euo pipefail\r\n"));
+        check_probe_request(crlf.replace("\r\n", "\n"), "POST", "/", "{}");
+    }
+
+    #[cfg(unix)]
+    fn check_probe_request(
+        script: String,
+        method: &'static str,
+        path: &'static str,
+        body: &'static str,
+    ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -132,7 +160,7 @@ mod tests {
         let output = std::process::Command::new("bash")
             .args([
                 "-c",
-                HTTP_SCRIPT,
+                &script,
                 "--",
                 "127.0.0.1",
                 &port.to_string(),
@@ -142,12 +170,15 @@ mod tests {
             ])
             .output()
             .unwrap();
-        server.join().unwrap();
+        // Assert before joining: a shell that dies before connecting (the CRLF
+        // case) leaves the server blocked in accept(), so joining first would
+        // hang instead of reporting bash's error.
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        server.join().unwrap();
         assert_eq!(parse_response(&output.stdout).unwrap(), r#"{"ok":true}"#);
     }
 }

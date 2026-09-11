@@ -707,6 +707,11 @@ function collectConfig() {
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
     cpu_enabled: document.getElementById('cpu-enabled')?.checked ?? true,
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
+    // Empty means "no choice" — the backend then leaves the section's `binary`
+    // key out in Docker so the image's own default applies. Never send "".
+    cpu_solver: document.getElementById('cpu-solver')?.value || null,
+    cuda_solver: document.getElementById('cuda-solver')?.value || null,
+    metal_solver: document.getElementById('metal-solver')?.value || null,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
     metal_config: metalConfig,
@@ -801,6 +806,7 @@ async function populateForm(settings) {
   // CPU Miner
   document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  renderSolverPickers(c);
   updateCpuUiVisibility();
 
   // GPU Miner — for Metal, utilization/yielding come from metal_config;
@@ -883,6 +889,13 @@ function setStatus(stateStr) {
     text.classList.add('status-running');
     text.textContent = 'RUNNING';
     sub.textContent = 'Node is running';
+  } else if (stateStr === 'syncing') {
+    // Blue, not amber: replaying the chain is expected work on a fresh node,
+    // not a fault. The bar below carries the actual progress.
+    dot.classList.add('status-syncing', 'active');
+    text.classList.add('status-syncing');
+    text.textContent = 'SYNCING';
+    sub.textContent = syncSubtext();
   } else if (stateStr === 'degraded') {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
@@ -906,6 +919,7 @@ function setStatus(stateStr) {
     text.textContent = 'STOPPED';
     sub.textContent = 'Node not running';
   }
+  renderSyncProgress(stateStr);
 }
 
 // ─── Checklist render (FSM) ──────────────────────────────────────────────────
@@ -1811,6 +1825,99 @@ function partialSubtext() {
   return `Miner not running; ${up.length} support service${
     up.length === 1 ? '' : 's'
   } up (${up.join(', ')})`;
+}
+
+// Build one flat solver list per backend, each entry tagged with its track.
+// The list comes from the miner image (or the Native bundle), so it is exactly
+// what the coordinator can spawn — a name it does not carry fails minutes
+// later, after the chain connect and funding, with nothing in the error
+// pointing back at the solver choice.
+//
+// `selected` is the saved setting, or null for "backend default". A saved
+// solver the image no longer carries is kept as an entry, so switching images
+// cannot silently rewrite the operator's choice to something else.
+async function renderSolverPicker(backend, selected) {
+  const el = document.getElementById(`${backend}-solver`);
+  const note = document.getElementById(`${backend}-solver-note`);
+  if (!el) return;
+
+  let catalog;
+  try {
+    catalog = await invoke('list_solvers', { backend });
+  } catch (e) {
+    catalog = { solvers: [], unavailable: String(e) };
+  }
+
+  const solvers = [...(catalog.solvers ?? [])];
+  if (selected && !solvers.some((s) => s.binary === selected)) {
+    solvers.push({ binary: selected, algorithm: '', track: 'unknown' });
+  }
+
+  const label = (s) => {
+    const track = s.track && s.track !== 'unknown' ? ` — ${s.track}` : '';
+    return s.algorithm ? `${s.binary} — ${s.algorithm}${track}` : `${s.binary}${track}`;
+  };
+
+  // Option text is built with textContent below; nothing here parses HTML.
+  el.replaceChildren();
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = `Default (${catalog.default_solver ?? `quip-${backend}-sa`})`;
+  el.appendChild(def);
+  for (const s of solvers) {
+    const opt = document.createElement('option');
+    opt.value = s.binary;
+    opt.textContent = label(s);
+    el.appendChild(opt);
+  }
+  el.value = selected ?? '';
+
+  if (note) {
+    note.textContent = catalog.unavailable
+      ? `Could not list solvers (${catalog.unavailable}). Start the node once so the miner image is available.`
+      : '';
+  }
+}
+
+// Show only the GPU picker matching the detected backend — offering a CUDA
+// solver on a Mac, or Metal on Linux, would offer a binary that cannot run.
+function renderSolverPickers(config) {
+  const gpu = state.hardwareSurvey?.gpu_backend;
+  const cudaGroup = document.getElementById('cuda-solver-group');
+  const metalGroup = document.getElementById('metal-solver-group');
+  if (cudaGroup) cudaGroup.style.display = gpu === 'cuda' ? '' : 'none';
+  if (metalGroup) metalGroup.style.display = gpu === 'metal' ? '' : 'none';
+
+  renderSolverPicker('cpu', config.cpu_solver ?? null);
+  if (gpu === 'cuda') renderSolverPicker('cuda', config.cuda_solver ?? null);
+  if (gpu === 'metal') renderSolverPicker('metal', config.metal_solver ?? null);
+}
+
+// Subtext for the SYNCING pill. The health monitor only sets `sync` while the
+// validator reports an unfinished replay, so a missing field means the numbers
+// were not readable this poll — say so rather than showing a stale bar.
+function syncSubtext() {
+  const s = state.health?.sync;
+  if (!s) return 'Validator is catching up to the chain';
+  return `Catching up: block ${s.current_block.toLocaleString()} of ${
+    s.highest_block.toLocaleString()
+  } — ${s.behind.toLocaleString()} behind`;
+}
+
+// Paint the initial-sync bar. Hidden unless the pill is SYNCING and the monitor
+// reported progress, so it never lingers at a stale percentage after the node
+// reaches the head.
+function renderSyncProgress(stateStr) {
+  const bar = document.getElementById('sync-progress');
+  const fill = document.getElementById('sync-progress-fill');
+  if (!bar || !fill) return;
+  const s = stateStr === 'syncing' ? state.health?.sync : null;
+  bar.hidden = !s;
+  if (!s) return;
+  const pct = Math.max(0, Math.min(100, s.fraction * 100));
+  fill.style.width = `${pct}%`;
+  bar.setAttribute('aria-valuenow', String(Math.round(pct)));
+  bar.title = `${pct.toFixed(1)}% of this sync complete`;
 }
 
 // Map the stack roll-up + miner state to the status pill. The miner (container
