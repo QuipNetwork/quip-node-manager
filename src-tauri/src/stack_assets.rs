@@ -304,9 +304,15 @@ fn configure_caddy_admin(src: &str, enabled: bool) -> Result<String, String> {
 /// container's `CMD` healthcheck, and a non-executable file fails every probe,
 /// which keeps the validator `unhealthy` forever and blocks the miner and the
 /// dashboard behind their `service_healthy` conditions.
+///
+/// CRLF is the other way to fail every probe. The script is embedded at compile
+/// time from `vendor/`, which is its own git repo and so is not covered by this
+/// repo's `.gitattributes`; a Windows build machine with `core.autocrlf=true`
+/// bakes in `set -euo pipefail\r`, which bash rejects before the script opens a
+/// socket. The container runs Linux whatever the host is, so write LF.
 fn write_healthcheck_script() -> Result<(), String> {
     let path = stack_validator_healthcheck_file();
-    fs::write(&path, VALIDATOR_HEALTHCHECK)
+    fs::write(&path, VALIDATOR_HEALTHCHECK.replace("\r\n", "\n"))
         .map_err(|e| format!("write validator healthcheck: {e}"))?;
 
     #[cfg(unix)]
@@ -423,6 +429,22 @@ fn strip_local_faucet_route(src: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CRLF healthcheck exits 2 on `set -euo pipefail` before it opens a
+    /// socket, so the validator never goes healthy and the miner and dashboard
+    /// wait behind `service_healthy` forever. The `vendor/` scripts live in a
+    /// separate git repo, so this repo's `.gitattributes` cannot pin them —
+    /// normalizing at the write is what keeps a Windows build working.
+    #[test]
+    fn staged_healthcheck_is_lf_whatever_the_build_machine_checked_out() {
+        let crlf = VALIDATOR_HEALTHCHECK.replace('\n', "\r\n");
+        assert!(crlf.contains("set -euo pipefail\r\n"));
+        let staged = crlf.replace("\r\n", "\n");
+        assert!(!staged.contains('\r'));
+        assert!(staged.contains("set -euo pipefail\n"));
+        // The embedded copy on a normal checkout is already LF and unchanged.
+        assert_eq!(VALIDATOR_HEALTHCHECK.replace("\r\n", "\n"), staged);
+    }
 
     #[test]
     fn staged_miner_template_has_no_container_loopback_fallback() {

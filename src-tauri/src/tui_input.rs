@@ -116,6 +116,33 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::SecretRegenerate => Action::RegenerateSecret,
         FocusId::ApplyRestart => Action::ApplyRestart,
 
+        // Solver pickers — cycle the default plus whatever that backend ships.
+        // The list is read on first use; a failed read leaves it empty, so the
+        // field then only offers the default and says so in the status line.
+        FocusId::Solver(backend) => {
+            if !app.solvers.contains_key(&backend) {
+                let catalog = tokio::runtime::Runtime::new()
+                    .ok()
+                    .map(|rt| rt.block_on(crate::solvers::list_solvers(backend)));
+                match catalog {
+                    Some(c) => {
+                        if let Some(reason) = &c.unavailable {
+                            app.set_status(format!("could not list solvers: {reason}"));
+                        }
+                        app.solvers.insert(backend, c.solvers);
+                    }
+                    None => {
+                        app.solvers.insert(backend, Vec::new());
+                    }
+                }
+            }
+            let available = app.solvers.get(&backend).cloned().unwrap_or_default();
+            let next = crate::tui_app::next_solver(app.form.solver(backend), &available);
+            app.form.set_solver(backend, next);
+            app.dirty = true;
+            Action::None
+        }
+
         // Run Mode — cycle Docker/Native
         FocusId::RunMode => {
             if cfg!(target_os = "macos") {

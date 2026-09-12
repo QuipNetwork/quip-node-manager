@@ -223,6 +223,11 @@ body {
   background-color: var(--warning);
 }
 
+/* Blue, not amber: an initial sync is expected work, not a fault. */
+.status-dot.status-syncing {
+  background-color: var(--accent);
+}
+
 .status-dot.status-stopped {
   background-color: var(--error);
 }
@@ -237,6 +242,10 @@ body {
 
 .status-dot.status-degraded.active {
   animation: pulse-yellow 2s infinite;
+}
+
+.status-dot.status-syncing.active {
+  animation: pulse-blue 2s infinite;
 }
 
 .status-dot.status-stopped.active {
@@ -277,6 +286,21 @@ body {
   }
 }
 
+@keyframes pulse-blue {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.5);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 8px rgba(59, 130, 246, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+}
+
 @keyframes pulse-red {
   0% {
     transform: scale(1);
@@ -306,8 +330,31 @@ body {
   color: var(--warning);
 }
 
+.status-text.status-syncing {
+  color: var(--accent);
+}
+
 .status-text.status-stopped {
   color: var(--error);
+}
+
+/* Initial-sync bar under the status pill. Sized to the subtext, not the pill,
+   so it reads as detail rather than a second headline. */
+.sync-progress {
+  width: 220px;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 3px;
+  background-color: var(--border-input);
+  overflow: hidden;
+}
+
+.sync-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background-color: var(--accent);
+  transition: width 0.4s ease;
 }
 
 .status-text.status-unhealthy {

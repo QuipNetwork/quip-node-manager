@@ -18,6 +18,7 @@ pub mod registry;
 pub mod secret;
 pub mod service_ports;
 pub mod settings;
+pub mod solvers;
 pub mod stack_assets;
 pub mod tui_app;
 pub mod tui_input;
@@ -86,6 +87,7 @@ pub fn run() {
             secret::get_node_secret,
             secret::generate_node_secret,
             config::generate_config_toml,
+            solvers::list_solvers,
             // Compose stack
             compose::check_docker_installed,
             compose::check_docker_hello_world,

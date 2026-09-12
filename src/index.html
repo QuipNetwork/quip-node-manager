@@ -53,6 +53,11 @@
           <div>
             <div id="status-text" class="status-text status-stopped">STOPPED</div>
             <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Node not running</div>
+            <!-- Initial-sync progress. Shown only while overall is 'syncing'. -->
+            <div id="sync-progress" class="sync-progress" hidden
+              role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Initial sync">
+              <div id="sync-progress-fill" class="sync-progress-fill"></div>
+            </div>
             <span id="update-badge" title="A node update is available — Restart to Update"
               style="display:none;margin-left:8px;padding:2px 8px;border-radius:10px;
               background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Update</span>
@@ -223,9 +228,16 @@
               <label for="cpu-enabled" style="margin:0;cursor:pointer;">Enable CPU mining</label>
             </div>
             <div id="cpu-subsettings" style="margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
-              <div class="form-group" style="max-width:160px;margin-bottom:0;">
+              <div class="form-group" style="max-width:160px;">
                 <label for="num-cpus">CPU Cores</label>
                 <input type="number" id="num-cpus" min="1" max="64" value="1" />
+              </div>
+              <!-- Populated from the miner image at runtime, not from a list
+                   compiled into the app — see solvers::list_solvers. -->
+              <div class="form-group" style="max-width:420px;margin-bottom:0;">
+                <label for="cpu-solver">CPU Solver</label>
+                <select id="cpu-solver"></select>
+                <div id="cpu-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
               </div>
             </div>
           </div>
@@ -248,6 +260,19 @@
                 <span class="gpu-yielding-flag">&#127987;&#65039;</span>
                 <span>Yielding &#8212; GPU will yield to other applications when under load</span>
               </label>
+              <!-- CUDA / Metal solver pickers. Only the one matching the
+                   detected GPU backend is shown; both are populated from the
+                   image or bundle at runtime. -->
+              <div id="cuda-solver-group" class="form-group" style="display:none;max-width:420px;margin-top:12px;margin-bottom:0;">
+                <label for="cuda-solver">CUDA Solver</label>
+                <select id="cuda-solver"></select>
+                <div id="cuda-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
+              </div>
+              <div id="metal-solver-group" class="form-group" style="display:none;max-width:420px;margin-top:12px;margin-bottom:0;">
+                <label for="metal-solver">Metal Solver</label>
+                <select id="metal-solver"></select>
+                <div id="metal-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
+              </div>
               <!-- Metal-only adaptive-cap knobs (shown when the GPU backend is Apple Metal) -->
               <div id="metal-extra-settings" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
                 <div style="font-size:12px;color:var(--text-faint);margin-bottom:10px;">

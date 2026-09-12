@@ -111,6 +111,47 @@ fn native_binary(run_mode: &RunMode, name: &str) -> String {
     }
 }
 
+/// A backend section's `binary` for the chosen solver.
+///
+/// Docker mode leaves the key out when nothing is chosen, so the image's own
+/// `/app/config.toml` stays authoritative and a future image can change its
+/// default without this app pinning the old name. Once the operator picks one,
+/// the bare name is written — `/usr/local/bin` is on the container's PATH.
+///
+/// Native mode has no PATH to fall back on: the coordinator resolves a bare
+/// name through PATH, and the bundle's bin dir is not on it, so every solver
+/// must be named by absolute path.
+///
+/// Verified against quip-miner v0.3.3: the supervisor spawns exactly the name
+/// this key carries, per section and per CUDA device.
+fn solver_binary(
+    run_mode: &RunMode,
+    backend: crate::solvers::Backend,
+    selected: Option<&str>,
+) -> String {
+    match run_mode {
+        RunMode::Docker => selected.unwrap_or_default().to_string(),
+        RunMode::Native => native_binary(run_mode, selected.unwrap_or(backend.default_solver())),
+    }
+}
+
+/// Same, for a section that has never carried a `binary` key.
+///
+/// `[cuda.N]` is the only one: rendering a default there would change what an
+/// existing Native CUDA miner spawns, from the coordinator's own choice to a
+/// bundle path this app picked. An operator who has not chosen keeps exactly
+/// what they run today.
+fn optional_solver_binary(
+    run_mode: &RunMode,
+    backend: crate::solvers::Backend,
+    selected: Option<&str>,
+) -> String {
+    match selected {
+        None => String::new(),
+        Some(_) => solver_binary(run_mode, backend, selected),
+    }
+}
+
 #[derive(Serialize)]
 struct CpuToml {
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -126,6 +167,12 @@ struct GpuToml {
 
 #[derive(Default, Serialize)]
 struct CudaDeviceToml {
+    /// Per-device, because that is where the coordinator reads it — there is no
+    /// `[gpu]` backend section in v0.3. The picker sets one solver for every
+    /// device, matching how utilization and yielding are already global in both
+    /// front ends.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    binary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     utilization: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +305,11 @@ impl ConfigToml {
                         cuda.insert(
                             dev.index.to_string(),
                             CudaDeviceToml {
+                                binary: optional_solver_binary(
+                                    run_mode,
+                                    crate::solvers::Backend::Cuda,
+                                    config.cuda_solver.as_deref(),
+                                ),
                                 utilization: (dev.utilization != gpu_util)
                                     .then_some(dev.utilization),
                                 yielding: (dev.yielding != gpu_yield).then_some(dev.yielding),
@@ -268,7 +320,11 @@ impl ConfigToml {
             }
             Some(GpuBackend::Mps) => {
                 metal = Some(MetalToml {
-                    binary: native_binary(run_mode, "quip-metal-sa"),
+                    binary: solver_binary(
+                        run_mode,
+                        crate::solvers::Backend::Metal,
+                        config.metal_solver.as_deref(),
+                    ),
                     utilization: config.metal_config.utilization,
                     yielding: config.metal_config.yielding,
                     active_util: config.metal_config.active_util,
@@ -319,7 +375,11 @@ impl ConfigToml {
                 },
             },
             cpu: config.cpu_enabled.then_some(CpuToml {
-                binary: native_binary(run_mode, "quip-cpu-sa"),
+                binary: solver_binary(
+                    run_mode,
+                    crate::solvers::Backend::Cpu,
+                    config.cpu_solver.as_deref(),
+                ),
                 num_cpus: config.num_cpus,
             }),
             gpu,
@@ -441,6 +501,132 @@ mod tests {
 
         assert!(parsed["cpu"].get("binary").is_none());
         assert!(parsed["dwave"].get("binary").is_none());
+    }
+
+    /// Choosing a solver has to reach the coordinator, and in Docker that means
+    /// writing the key the app otherwise omits. Without this the picker would
+    /// change a setting that never leaves the app.
+    #[test]
+    fn chosen_solver_is_written_as_a_bare_name_in_docker() {
+        let cfg = NodeConfig {
+            cpu_solver: Some("quip-cpu-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        assert_eq!(parsed["cpu"]["binary"].as_str(), Some("quip-cpu-mps"));
+    }
+
+    /// Native has no PATH to fall back on, so the choice must come out as an
+    /// absolute path to that solver — not to the default.
+    #[test]
+    fn chosen_solver_is_an_absolute_path_in_native() {
+        let cfg = NodeConfig {
+            cpu_solver: Some("quip-cpu-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        let got = parsed["cpu"]["binary"].as_str().expect("binary key");
+        let path = std::path::Path::new(got);
+        assert!(path.is_absolute(), "{got} is not absolute");
+        assert!(path.ends_with("quip-cpu-mps"), "{got}");
+    }
+
+    /// Not choosing must stay exactly as it was, in both modes: no key in
+    /// Docker, the default path in Native.
+    #[test]
+    fn unset_solver_keeps_the_previous_rendering() {
+        let cfg = NodeConfig::default();
+        assert!(cfg.cpu_solver.is_none());
+
+        let docker: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        assert!(docker["cpu"].get("binary").is_none());
+
+        let native: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        assert!(native["cpu"]["binary"]
+            .as_str()
+            .expect("binary key")
+            .ends_with(crate::solvers::Backend::Cpu.default_solver()));
+    }
+
+    /// The CUDA solver goes in `[cuda.N]`, per device — verified against
+    /// v0.3.3, where the supervisor spawned exactly the name this key carried.
+    /// There is no `[gpu]` backend section to put it in.
+    #[test]
+    fn chosen_cuda_solver_reaches_every_enabled_device() {
+        let cfg = NodeConfig {
+            cuda_solver: Some("quip-cuda-gibbs".to_string()),
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![
+                    GpuDeviceConfig {
+                        index: 0,
+                        enabled: true,
+                        utilization: 80,
+                        yielding: false,
+                    },
+                    GpuDeviceConfig {
+                        index: 1,
+                        enabled: true,
+                        utilization: 80,
+                        yielding: false,
+                    },
+                ],
+            )
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        for device in ["0", "1"] {
+            assert_eq!(
+                parsed["cuda"][device]["binary"].as_str(),
+                Some("quip-cuda-gibbs"),
+                "device {device}"
+            );
+        }
+        assert!(parsed.get("gpu").is_none() || parsed["gpu"].get("binary").is_none());
+    }
+
+    /// `[cuda.N]` never carried a binary key before. An operator who has not
+    /// chosen must keep the coordinator's own default in both modes, or this
+    /// change would silently repoint existing Native CUDA miners.
+    #[test]
+    fn unset_cuda_solver_writes_no_binary_key_in_either_mode() {
+        let cfg = cfg_with_gpu(
+            GpuBackend::Local,
+            vec![GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 80,
+                yielding: false,
+            }],
+        );
+        assert!(cfg.cuda_solver.is_none());
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let parsed: toml::Value =
+                toml::from_str(&render_config_toml(&cfg, &mode)).expect("valid toml");
+            assert!(
+                parsed["cuda"]["0"].get("binary").is_none(),
+                "{mode:?} rendered a cuda binary that was never chosen"
+            );
+        }
+    }
+
+    /// Metal is macOS Native, so its choice must come out as an absolute path.
+    #[test]
+    fn chosen_metal_solver_is_an_absolute_path() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_solver: Some("quip-metal-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        let got = parsed["metal"]["binary"].as_str().expect("binary key");
+        assert!(std::path::Path::new(got).is_absolute(), "{got}");
+        assert!(got.ends_with("quip-metal-mps"), "{got}");
     }
 
     #[test]

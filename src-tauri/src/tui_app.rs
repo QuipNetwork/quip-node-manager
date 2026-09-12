@@ -24,6 +24,9 @@ pub enum StatusKind {
     Running,
     /// Miner up, at least one expected support service down.
     Degraded,
+    /// Miner up, validator still replaying the chain. Not a fault — the node is
+    /// doing exactly what a fresh install has to do for its first few hours.
+    Syncing,
     /// Miner up, at least one healthcheck reports unhealthy.
     Unhealthy,
     /// Miner down, but part of the stack is still up.
@@ -37,6 +40,7 @@ impl StatusKind {
         match self {
             StatusKind::Running => ("●", "RUNNING"),
             StatusKind::Degraded => ("◐", "DEGRADED"),
+            StatusKind::Syncing => ("◐", "SYNCING"),
             StatusKind::Unhealthy => ("◐", "UNHEALTHY"),
             StatusKind::Partial => ("◐", "PARTIAL"),
             StatusKind::Stopped => ("○", "STOPPED"),
@@ -49,7 +53,10 @@ impl StatusKind {
     pub fn miner_running(self) -> bool {
         matches!(
             self,
-            StatusKind::Running | StatusKind::Degraded | StatusKind::Unhealthy
+            StatusKind::Running
+                | StatusKind::Degraded
+                | StatusKind::Syncing
+                | StatusKind::Unhealthy
         )
     }
 
@@ -57,6 +64,29 @@ impl StatusKind {
     /// stack instead of leaving the operator with no way to shut it down.
     pub fn anything_running(self) -> bool {
         !matches!(self, StatusKind::Stopped)
+    }
+}
+
+/// Next entry in the solver cycle. The cycle is `""` (image default) followed
+/// by each available solver, so the operator can always get back to the default
+/// without knowing which binary it is.
+///
+/// A `current` that is not in `available` — a solver saved against an image
+/// that no longer ships it — cycles forward to the default rather than sticking,
+/// which would leave the field unchangeable from the TUI.
+pub fn next_solver(current: &str, available: &[crate::solvers::Solver]) -> String {
+    if current.is_empty() {
+        return available
+            .first()
+            .map(|s| s.binary.clone())
+            .unwrap_or_default();
+    }
+    match available.iter().position(|s| s.binary == current) {
+        Some(i) => available
+            .get(i + 1)
+            .map(|s| s.binary.clone())
+            .unwrap_or_default(),
+        None => String::new(),
     }
 }
 
@@ -83,6 +113,7 @@ pub fn derive_status(
         Some(StackHealth::Running) | None => StatusKind::Running,
         Some(StackHealth::Unhealthy) => StatusKind::Unhealthy,
         Some(StackHealth::Degraded) => StatusKind::Degraded,
+        Some(StackHealth::Syncing) => StatusKind::Syncing,
         // The miner is up, so an overall Stopped roll-up means the support
         // services are not there. That is degraded, not stopped.
         Some(StackHealth::Stopped) => StatusKind::Degraded,
@@ -113,6 +144,8 @@ pub enum FocusId {
     DataDir,
     RunMode,
     UpdateChannel,
+    /// Solver pickers, each cycled through whatever the image or bundle ships.
+    Solver(crate::solvers::Backend),
     ServicePortEnable(PortId),
     ServicePortNumber(PortId),
     NativeRpcPublic,
@@ -182,6 +215,15 @@ pub struct FormState {
     pub public_port: String,
     pub peers: String,
     pub cpu_cores: String,
+    /// Chosen solver per backend, empty for the image default. Held as the
+    /// binary name rather than an index into the available list: that list is
+    /// read from the image and can change under the form, and a stale index
+    /// would silently repoint the operator's choice at a different solver.
+    pub cpu_solver: String,
+    pub cuda_solver: String,
+    pub metal_solver: String,
+    // Accessors live on FormState so the render and input paths address a
+    // backend's field the same way, without a match at each call site.
     pub gpu_utilization: u8,
     pub gpu_yielding: bool,
     pub qpu_api_key: String,
@@ -246,6 +288,9 @@ impl FormState {
             public_port: nc.public_port.map(|p| p.to_string()).unwrap_or_default(),
             peers: nc.peers.join("\n"),
             cpu_cores: nc.num_cpus.to_string(),
+            cpu_solver: nc.cpu_solver.clone().unwrap_or_default(),
+            cuda_solver: nc.cuda_solver.clone().unwrap_or_default(),
+            metal_solver: nc.metal_solver.clone().unwrap_or_default(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
             gpu_yielding: first_gpu.map(|d| d.yielding).unwrap_or(false),
             qpu_api_key: dw.token,
@@ -265,6 +310,25 @@ impl FormState {
             node_log: nc.node_log.clone(),
             http_log: nc.http_log.clone(),
             edit_buf: String::new(),
+        }
+    }
+
+    /// Current selection for a backend, empty for the image default.
+    pub fn solver(&self, backend: crate::solvers::Backend) -> &str {
+        use crate::solvers::Backend;
+        match backend {
+            Backend::Cpu => &self.cpu_solver,
+            Backend::Cuda => &self.cuda_solver,
+            Backend::Metal => &self.metal_solver,
+        }
+    }
+
+    pub fn set_solver(&mut self, backend: crate::solvers::Backend, binary: String) {
+        use crate::solvers::Backend;
+        match backend {
+            Backend::Cpu => self.cpu_solver = binary,
+            Backend::Cuda => self.cuda_solver = binary,
+            Backend::Metal => self.metal_solver = binary,
         }
     }
 
@@ -347,6 +411,12 @@ impl FormState {
             .map(str::to_string)
             .collect();
         nc.num_cpus = self.cpu_cores.parse().unwrap_or(1);
+        // Empty is "no choice", which must persist as None rather than as an
+        // empty binary name the coordinator would try to spawn.
+        let chosen = |s: &String| (!s.is_empty()).then(|| s.clone());
+        nc.cpu_solver = chosen(&self.cpu_solver);
+        nc.cuda_solver = chosen(&self.cuda_solver);
+        nc.metal_solver = chosen(&self.metal_solver);
         // GPU: utilization and yielding are global in both front ends, so they
         // go to every device. Per-device enable is edited directly on
         // `settings.node_config` and must not be touched here.
@@ -418,6 +488,11 @@ pub struct TuiApp {
     /// Set when the storage directory changed. It is read once at startup, so
     /// the footer keeps saying so until the operator relaunches.
     pub restart_required: bool,
+    /// Solvers available per backend, in the order the picker cycles them.
+    /// A backend is absent until the operator first touches its field —
+    /// enumerating costs a `docker exec`, which is not worth paying on every
+    /// status tick for knobs most runs never change.
+    pub solvers: std::collections::HashMap<crate::solvers::Backend, Vec<crate::solvers::Solver>>,
     pub form: FormState,
     pub node_secret: String,
     pub secret_visible: bool,
@@ -488,6 +563,7 @@ impl TuiApp {
                 status_text: "unknown".to_string(),
             },
             restart_required: false,
+            solvers: std::collections::HashMap::new(),
             checks: vec![],
             checklist_running: false,
             checklist_rx: None,
@@ -692,6 +768,37 @@ impl TuiApp {
         self.status = self.stack_status_for_tui(native, miner_running);
     }
 
+    /// Read initial-sync progress from the validator, or `None` when it is at
+    /// the head or cannot be reached. A probe failure is not an error here: the
+    /// Compose roll-up below still decides the status on its own.
+    ///
+    /// The refresh that calls this is synchronous, and in Docker mode each RPC
+    /// goes through `docker exec` with its own multi-second timeout. The whole
+    /// probe is capped so a sick Docker costs the status line a couple of
+    /// seconds, not the fifteen the two calls could take on their own.
+    async fn probe_sync(&self, native: bool) -> Option<crate::health::SyncProgress> {
+        const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+        let rpc = if native {
+            crate::validator_rpc::ValidatorRpc::new(&crate::config::native_validator_rpc_url(
+                &self.settings.node_config,
+            ))
+        } else {
+            crate::validator_rpc::ValidatorRpc::docker()
+        };
+        tokio::time::timeout(PROBE_BUDGET, async {
+            if !rpc.system_health().await.ok()?.is_syncing {
+                return None;
+            }
+            rpc.system_sync_state()
+                .await
+                .ok()
+                .map(|s| crate::health::SyncProgress::from(&s))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Build the status line from `docker compose ps` plus, in Native mode, the
     /// host miner's PID.
     fn stack_status_for_tui(&self, native: bool, native_miner_running: bool) -> ContainerStatus {
@@ -727,27 +834,52 @@ impl TuiApp {
                 .any(|s| s.service == miner_service && s.running)
         };
         let any_running = stack.services.iter().any(|s| s.running);
-        let kind = derive_status(miner_running, Some(stack.overall), any_running);
 
-        // Name the running support services on a Partial stack so the operator
-        // can see the miner is the missing piece, matching the GUI subtext.
-        let status_text = match kind {
-            StatusKind::Partial => {
-                let up: Vec<&str> = stack
+        // Compose cannot see an initial sync — a replaying validator is a
+        // running container like any other — so ask the node directly. The GUI
+        // gets this from the health monitor, which the TUI does not run.
+        let sync = if miner_running {
+            rt.block_on(self.probe_sync(native))
+        } else {
+            None
+        };
+        let kind = match &sync {
+            Some(_) => StatusKind::Syncing,
+            None => derive_status(miner_running, Some(stack.overall), any_running),
+        };
+
+        // Sync progress is the whole status line when there is one. Matching on
+        // `sync` rather than on `kind` keeps the two in step without a partial
+        // case that could panic.
+        //
+        // Otherwise: name the running support services on a Partial stack so the
+        // operator can see the miner is the missing piece, matching the GUI.
+        let status_text = match sync.as_ref() {
+            Some(s) => format!(
+                "block {} of {} ({} behind, {:.1}%)",
+                s.current_block,
+                s.highest_block,
+                s.behind,
+                s.fraction * 100.0
+            ),
+            None => match kind {
+                StatusKind::Partial => {
+                    let up: Vec<&str> = stack
+                        .services
+                        .iter()
+                        .filter(|s| s.running)
+                        .map(|s| s.service.as_str())
+                        .collect();
+                    format!("miner not running; {} up", up.join(", "))
+                }
+                _ if native => format!("{:?} (native miner)", stack.overall),
+                _ => stack
                     .services
                     .iter()
-                    .filter(|s| s.running)
-                    .map(|s| s.service.as_str())
-                    .collect();
-                format!("miner not running; {} up", up.join(", "))
-            }
-            _ if native => format!("{:?} (native miner)", stack.overall),
-            _ => stack
-                .services
-                .iter()
-                .find(|s| s.service == miner_service)
-                .map(|s| format!("{} ({:?})", s.status_text, stack.overall))
-                .unwrap_or_else(|| format!("{:?}", stack.overall)),
+                    .find(|s| s.service == miner_service)
+                    .map(|s| format!("{} ({:?})", s.status_text, stack.overall))
+                    .unwrap_or_else(|| format!("{:?}", stack.overall)),
+            },
         };
 
         // Identify by the miner in Docker mode. In Native mode the miner is a
@@ -862,6 +994,22 @@ impl TuiApp {
     /// (`compose::compose_services` excludes cpu/cuda for `RunMode::Native`).
     fn derive_image_tag(&self, config: &crate::settings::NodeConfig) -> (ImageTag, Option<String>) {
         derive_image_tag(config, &self.gpu_backend, self.form.run_mode())
+    }
+
+    /// Backends worth showing a solver picker for on this machine.
+    ///
+    /// CPU is always selectable. The GPU pickers follow the hardware survey, so
+    /// a box with no NVIDIA GPU is never offered a CUDA solver it cannot run,
+    /// and a Linux box is never offered Metal.
+    pub(crate) fn selectable_solver_backends(&self) -> Vec<crate::solvers::Backend> {
+        use crate::solvers::Backend;
+        let mut list = vec![Backend::Cpu];
+        match self.gpu_backend.as_str() {
+            "cuda" => list.push(Backend::Cuda),
+            "metal" => list.push(Backend::Metal),
+            _ => {}
+        }
+        list
     }
 
     fn apply_and_restart(&mut self) {
@@ -984,6 +1132,9 @@ impl TuiApp {
             list.push(FocusId::SecretShow);
             list.push(FocusId::SecretRegenerate);
             list.push(FocusId::NodeName);
+            for backend in self.selectable_solver_backends() {
+                list.push(FocusId::Solver(backend));
+            }
             list.push(FocusId::CustomToggle);
             if self.custom_expanded {
                 for spec in PORT_SPECS {
@@ -1322,6 +1473,69 @@ mod tests {
         assert_eq!(kind, StatusKind::Unhealthy);
         assert_ne!(kind, StatusKind::Stopped);
         assert!(kind.miner_running());
+    }
+
+    fn solver_list(names: &[&str]) -> Vec<crate::solvers::Solver> {
+        crate::solvers::solvers_from_listing(crate::solvers::Backend::Cpu, &names.join("\n"))
+    }
+
+    #[test]
+    fn solver_cycle_starts_at_the_default_and_wraps_back_to_it() {
+        let available = solver_list(&["quip-cpu-sa", "quip-cpu-gibbs"]);
+        let order: Vec<String> = available.iter().map(|s| s.binary.clone()).collect();
+        assert_eq!(order, ["quip-cpu-gibbs", "quip-cpu-sa"]);
+
+        // "" is the image default, and cycling returns to it after the last.
+        let first = next_solver("", &available);
+        assert_eq!(first, "quip-cpu-gibbs");
+        let second = next_solver(&first, &available);
+        assert_eq!(second, "quip-cpu-sa");
+        assert_eq!(next_solver(&second, &available), "");
+    }
+
+    /// Switching to an image without the saved solver must leave the field
+    /// usable. Sticking on an entry that is not in the cycle would make the
+    /// setting unchangeable from the TUI.
+    #[test]
+    fn solver_cycle_escapes_a_solver_the_image_no_longer_ships() {
+        let available = solver_list(&["quip-cpu-sa"]);
+        assert_eq!(next_solver("quip-cpu-mps", &available), "");
+    }
+
+    /// An unreadable image leaves the list empty; the field must still resolve
+    /// to the default rather than to an empty binary name.
+    #[test]
+    fn solver_cycle_with_nothing_available_stays_on_the_default() {
+        assert_eq!(next_solver("", &[]), "");
+        assert_eq!(next_solver("quip-cpu-sa", &[]), "");
+    }
+
+    /// Each backend keeps its own selection. Sharing one field would let a CUDA
+    /// pick overwrite the CPU one, and `[cpu].binary` would then name a
+    /// `quip-cuda-*` binary.
+    #[test]
+    fn solver_selections_are_independent_per_backend() {
+        use crate::solvers::Backend;
+        let mut form = FormState::from_settings(&AppSettings::default());
+        form.set_solver(Backend::Cpu, "quip-cpu-mps".to_string());
+        form.set_solver(Backend::Cuda, "quip-cuda-gibbs".to_string());
+        assert_eq!(form.solver(Backend::Cpu), "quip-cpu-mps");
+        assert_eq!(form.solver(Backend::Cuda), "quip-cuda-gibbs");
+        assert_eq!(form.solver(Backend::Metal), "");
+    }
+
+    /// A replaying validator reports SYNCING rather than DEGRADED, and still
+    /// counts as running: Start/Stop key off `miner_running()`, so treating a
+    /// syncing node as down would leave Stop disabled for the whole first sync.
+    #[test]
+    fn syncing_stack_is_distinct_from_degraded_and_still_running() {
+        assert_eq!(
+            derive_status(true, Some(StackHealth::Syncing), true),
+            StatusKind::Syncing
+        );
+        assert_eq!(StatusKind::Syncing.display().1, "SYNCING");
+        assert!(StatusKind::Syncing.miner_running());
+        assert!(StatusKind::Syncing.anything_running());
     }
 
     #[test]
