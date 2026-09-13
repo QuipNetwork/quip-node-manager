@@ -143,21 +143,28 @@
               </button>
               <div id="custom-settings-section" style="display:none;">
                 <div class="form-group">
-                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-                    <input type="checkbox" id="public-host-enable" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-                    <label for="public-host" style="margin:0;cursor:pointer;">Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advanced external address)</span></label>
-                  </div>
-                  <div class="mining-config-grid">
-                    <div class="form-group" style="margin-bottom:0;">
-                      <label for="public-host">Host / IP</label>
-                      <input type="text" id="public-host" placeholder="1.2.3.4 or myhostname.com" disabled />
+                  <label class="toggle-row" style="margin-bottom:6px;">
+                    <span class="toggle-switch"><input type="checkbox" id="public-host-enable" /><span class="toggle-slider"></span></span>
+                    <span>Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advanced external address)</span></span>
+                  </label>
+                  <!-- Off: the node advertises the detected public IP and the
+                       Public API port; that pair is shown here so the operator
+                       can see what peers will be told. On: the fields appear,
+                       seeded with those values, and the entry replaces them. -->
+                  <div id="public-host-detected" style="font-size:12px;color:var(--text-faint);">Advertising the detected address: <span id="public-host-detected-value">detecting…</span></div>
+                  <div id="public-host-fields" style="display:none;">
+                    <div class="mining-config-grid">
+                      <div class="form-group" style="margin-bottom:0;">
+                        <label for="public-host">Host / IP</label>
+                        <input type="text" id="public-host" placeholder="1.2.3.4 or myhostname.com" />
+                      </div>
+                      <div class="form-group" style="margin-bottom:0;">
+                        <label for="public-port">Port</label>
+                        <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" />
+                      </div>
                     </div>
-                    <div class="form-group" style="margin-bottom:0;">
-                      <label for="public-port">Port</label>
-                      <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" disabled />
-                    </div>
+                    <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                   </div>
-                  <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                 </div>
                 <p class="service-port-note">Enable a port to publish it on this host. Internal service addresses stay fixed.</p>
                 <div id="service-port-controls"></div>
@@ -196,9 +203,11 @@
               </div>
               <div id="channel-caption" style="font-size:11px;color:var(--text-faint);margin-top:4px;">&nbsp;</div>
             </div>
-            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
-              <input type="checkbox" id="tls-enabled" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-              <label for="tls-enabled" style="margin:0;cursor:pointer;">Enable TLS/Caddy <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></label>
+            <div class="form-group">
+              <label class="toggle-row">
+                <span class="toggle-switch"><input type="checkbox" id="tls-enabled" /><span class="toggle-slider"></span></span>
+                <span>Enable TLS <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></span>
+              </label>
             </div>
             <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
               <div class="form-group">
@@ -223,9 +232,11 @@
           <!-- CPU Miner Configuration -->
           <div class="config-section-divider">
             <div class="section-heading">CPU Miner Configuration</div>
-            <div class="form-group" style="display:flex;align-items:center;gap:10px;">
-              <input type="checkbox" id="cpu-enabled" checked style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;" />
-              <label for="cpu-enabled" style="margin:0;cursor:pointer;">Enable CPU mining</label>
+            <div class="form-group">
+              <label class="toggle-row">
+                <span class="toggle-switch"><input type="checkbox" id="cpu-enabled" checked /><span class="toggle-slider"></span></span>
+                <span>Enable CPU mining</span>
+              </label>
             </div>
             <div id="cpu-subsettings" style="margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
               <div class="form-group" style="max-width:160px;">

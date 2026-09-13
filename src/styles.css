@@ -1113,8 +1113,8 @@ button.check-action:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-/* ─── GPU Device Toggle Switch ──────────────────────────────────────────── */
-.gpu-toggle-switch {
+/* ─── Toggle Switch (sliders for on/off settings) ──────────────────────── */
+.toggle-switch {
   position: relative;
   display: inline-block;
   width: 36px;
@@ -1123,13 +1123,13 @@ button.check-action:disabled {
   cursor: pointer;
 }
 
-.gpu-toggle-switch input {
+.toggle-switch input {
   opacity: 0;
   width: 0;
   height: 0;
 }
 
-.gpu-toggle-slider {
+.toggle-slider {
   position: absolute;
   inset: 0;
   background: var(--bg-elevated);
@@ -1137,7 +1137,7 @@ button.check-action:disabled {
   transition: background 0.2s;
 }
 
-.gpu-toggle-slider::before {
+.toggle-slider::before {
   content: "";
   position: absolute;
   height: 14px;
@@ -1149,13 +1149,22 @@ button.check-action:disabled {
   transition: transform 0.2s, background 0.2s;
 }
 
-.gpu-toggle-switch input:checked + .gpu-toggle-slider {
+.toggle-switch input:checked + .toggle-slider {
   background: var(--accent);
 }
 
-.gpu-toggle-switch input:checked + .gpu-toggle-slider::before {
+.toggle-switch input:checked + .toggle-slider::before {
   transform: translateX(16px);
   background: #fff;
+}
+
+/* A slider with its caption, used for the settings-panel on/off rows. */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  margin: 0;
 }
 
 /* ─── Update Banner ─────────────────────────────────────────────────────── */
@@ -1245,13 +1254,13 @@ button.check-action:disabled {
 }
 
 .service-port-public-access {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
+  margin: 8px 0;
 }
 
-.service-port-public-access input {
-  width: 16px;
-  height: 16px;
+.service-port-public-access .toggle-row {
+  font-size: 12px;
+}
+
+.service-port-public-access .service-port-note {
+  margin: 4px 0 0;
 }

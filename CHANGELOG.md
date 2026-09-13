@@ -50,6 +50,27 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc4
+<!-- vale Google.Headings = YES -->
+
+- Refuse to start when no mining backend is on. The miner rejects a
+  config with no `[cpu]`, `[cuda.N]`, `[metal]`, or `[dwave]` table, and its
+  error blames the v0.2 config format because `faucet_url` is present. The
+  manager now names the cause before it writes the file: turn on CPU mining or
+  enable a GPU.
+- Keep the saved GPU list when the hardware survey has not answered. The GUI
+  rebuilt the list from the toggles on the page, so a Start before the survey
+  landed dropped every GPU from config.toml.
+- Restore the GPU Yielding switch after a restart on macOS. The form read the
+  CUDA slot before the hardware survey reported Metal, so the switch showed off
+  and the next Save wrote that into the Metal tuning.
+- Settings sliders: TLS (renamed from "Enable TLS/Caddy"), CPU mining, the
+  public host override, and the validator RPC public-access choice are sliders.
+  The override shows the detected address and the Public API port while off
+  and reveals the fields when on. The public-access slider sits before the
+  port and explains loopback versus all interfaces.
+
+<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc3
 <!-- vale Google.Headings = YES -->
 
