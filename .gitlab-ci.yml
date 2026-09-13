@@ -204,19 +204,23 @@ build-macos-universal:
     # imported. `security delete-keychain` cannot clear these — the file is
     # already gone, so it errors "could not be found" and leaves the search
     # list untouched. Rebuild the list from only the entries whose file
-    # still exists, on every build so dangling entries never accumulate.
+    # still exists, so dangling entries never accumulate. The list is a
+    # per-account preference, so it is rewritten only when an entry was
+    # actually dropped; a clean runner sees no write at all.
     - |
       keep=""
+      dropped=0
       for kc in $(security list-keychains -d user | tr -d '" '); do
         if [ -f "$kc" ]; then
           keep="$keep $kc"
         else
           echo "dropping dangling keychain reference: $kc"
+          dropped=1
         fi
       done
       # Each surviving path must be its own argument, hence no quotes.
       # shellcheck disable=SC2086
-      security list-keychains -d user -s $keep
+      [ "$dropped" -eq 0 ] || security list-keychains -d user -s $keep
     # The [macos, arm64] tags match more than one runner, and they are not
     # provisioned alike: one carries rustup, another answers `command not
     # found` and fails the job at exit 127. Whichever runner picks up the job
@@ -254,6 +258,14 @@ build-macos-universal:
     # APPLE_CERTIFICATE is then unset on purpose: Tauri only creates its
     # temporary keychain when it is present, and with the identity already
     # loaded that step has nothing left to do.
+    #
+    # The job keychain is never made the default keychain and never added to
+    # the user's search list. Both are per-account preferences that outlive
+    # the job, and an earlier version of this block set both and restored
+    # neither, so every developer machine acting as a runner was left with
+    # quip-ci as its default keychain. Every `security` call below names the
+    # keychain with -k; codesign is covered by the wrapper in CODESIGN_WRAPPER
+    # (see the build step), which passes --keychain on every invocation.
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         export APPLE_API_KEY_PATH="$APPLE_API_KEY_FILE"
@@ -262,8 +274,9 @@ build-macos-universal:
         KEYCHAIN_PW=$(openssl rand -base64 24)
         CERT_DIR=$(mktemp -d -t quip-cert)
         CERT_DIR_CA=$(mktemp -d -t quip-ca)
+        CODESIGN_WRAPPER=$(mktemp -d -t quip-codesign)
         CERT_P12="$CERT_DIR/cert.p12"
-        trap 'rm -rf "$CERT_DIR" "$CERT_DIR_CA"' EXIT
+        trap 'rm -rf "$CERT_DIR" "$CERT_DIR_CA" "$CODESIGN_WRAPPER"' EXIT
 
         security delete-keychain "$KEYCHAIN" 2>/dev/null || true
         security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
@@ -318,73 +331,23 @@ build-macos-universal:
         security set-key-partition-list -S apple-tool:,apple:,codesign: \
           -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
 
-        # Both matter: codesign resolves an identity through the search list,
-        # Route 1: make sure the user domain has a login keychain to hold a
-        # search list at all.
+        # Point codesign at the job keychain explicitly.
         #
-        # `security list-keychains -d user -s` writes a preference for the
-        # user; on a runner that has never had a login keychain the write has
-        # nothing to attach to and the domain stays empty. That is how
-        # roman-mac-native reached codesign with an effective search list of
-        # only System.keychain, and why the identity was "not found" there
-        # while sitting in a keychain this job had just created. Creating one
-        # is idempotent and needs no root.
-        if [ ! -f "$HOME/Library/Keychains/login.keychain-db" ]; then
-          echo "no login keychain on this runner; creating one" >&2
-          LOGIN_PW=$(openssl rand -base64 24)
-          security create-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
-          security set-keychain-settings -lut 21600 login.keychain 2>/dev/null || true
-          security unlock-keychain -p "$LOGIN_PW" login.keychain 2>/dev/null || true
-        fi
-
-        # and some lookups fall back to the default keychain. Each existing
-        # path has to stay its own argument, hence the unquoted expansion.
-        # shellcheck disable=SC2046
-        security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-        security default-keychain -d user -s "$KEYCHAIN"
-
-        # Read the search list back before trusting it.
-        #
-        # These two commands answer different questions, and the gap between
-        # them is the whole diagnosis:
-        #
-        #   security list-keychains -d user   what got stored as a preference
-        #   security list-keychains           what this process actually resolves
-        #
-        # Stored but unresolved means the write landed and the process reads a
-        # different domain, which is a session problem. Empty in both means the
-        # write itself went nowhere. The earlier script printed only the second
-        # form, so neither could be told apart from a bare "no identity found".
-        echo "keychain search list (stored):  $(security list-keychains -d user | tr -d '\n')" >&2
-        echo "keychain search list (in use):  $(security list-keychains | tr -d '\n')" >&2
-
-        # The real test is whether the identity resolves the way codesign
-        # resolves it: through the search list, with no keychain argument.
-        # The old gate passed a keychain explicitly, which is why it reported
-        # success on a runner where signing then failed.
-        identity_resolves() {
-          security find-identity -p codesigning 2>/dev/null \
-            | grep -q "$APPLE_SIGNING_IDENTITY"
-        }
-
-        # Warn, do not fail, when the identity does not resolve.
-        #
-        # A hard exit here would name the real cause instead of letting Tauri
-        # run on to codesign's misleading "no identity found", which is what
-        # this check is for. It stays non-fatal because it has never been
-        # observed on a runner that goes on to sign successfully: tesla-arm was
-        # wedged throughout the QUI-1295 investigation, so the check ran only
-        # where signing was already broken. Failing the job on an unvalidated
-        # predicate risks breaking the one runner that can currently sign a
-        # release. Make it fatal once a green tag build has printed nothing
-        # here.
-        if ! identity_resolves; then
-          echo "WARNING: the signing identity does not resolve through the keychain search list" >&2
-          echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
-          echo "it IS present in the job keychain:" >&2
-          security find-identity -p codesigning "$KEYCHAIN" >&2 || true
-          echo "codesign will likely fail with errSecInternalComponent. See QUI-1295." >&2
-        fi
+        # Tauri passes --keychain to codesign only when it built the keychain
+        # itself from APPLE_CERTIFICATE. On the identity-only path used here
+        # it runs a bare `codesign -s <identity>`, which resolves the identity
+        # through the user's keychain search list. Registering the job
+        # keychain there is a per-account preference write, and the one thing
+        # this job must not do. Tauri spawns `codesign` by name through PATH,
+        # so a wrapper ahead of it on PATH adds --keychain to every call and
+        # hands off to the real binary. The exec keeps the keychain's access
+        # control intact: the ACL set by `security import -T` names
+        # /usr/bin/codesign, and that is still the process that touches the
+        # key. The wrapper is on PATH only for the build step; the signing
+        # verification that follows uses the stock binary.
+        printf '#!/bin/sh\nexec /usr/bin/codesign --keychain "%s" "$@"\n' "$KEYCHAIN" \
+          > "$CODESIGN_WRAPPER/codesign"
+        chmod +x "$CODESIGN_WRAPPER/codesign"
 
         # Gate on the identity being present, not on macOS calling it valid.
         #
@@ -426,7 +389,9 @@ build-macos-universal:
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
         unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
       fi
-    - bun run tauri build --target universal-apple-darwin
+    # CODESIGN_WRAPPER is set only on a tag build; the expansion is empty
+    # otherwise and PATH is unchanged.
+    - PATH="${CODESIGN_WRAPPER:+$CODESIGN_WRAPPER:}$PATH" bun run tauri build --target universal-apple-darwin
     - mkdir -p dist
     - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
     # Tauri does not notarize the DMG, and it treats absent credentials as a
@@ -443,6 +408,11 @@ build-macos-universal:
         ./scripts/notarize-dmg.sh dist/quip-node-manager-macos-universal.dmg
         ./scripts/verify-macos-signing.sh "$APP" dist/quip-node-manager-macos-universal.dmg
       fi
+  # Runs after success, failure, and cancellation. The job keychain holds the
+  # private key from APPLE_CERTIFICATE, so it must not outlive the job; an
+  # untagged build never created it and the delete is a no-op.
+  after_script:
+    - security delete-keychain "$HOME/Library/Keychains/quip-ci.keychain-db" 2>/dev/null || true
   artifacts:
     paths:
       - dist/quip-node-manager-macos-universal.dmg

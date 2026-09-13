@@ -70,7 +70,7 @@ quip-node-manager/
 
 - **Tauri version**: v2
 - **JS tooling**: Bun
-- **App version**: 0.2.6-rc6
+- **App version**: 0.2.6-rc7
 - **Window size**: 900×700
 - **Data directory**: `~/quip-data/` by default (bind-mount root for the compose
   stack). Overridable via `set_data_dir` → the `data_dir` key in
