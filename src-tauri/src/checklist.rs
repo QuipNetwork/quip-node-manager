@@ -1253,30 +1253,18 @@ pub async fn trigger_recheck_auto(app: AppHandle, ids: Vec<String>) {
 // port probe. These are thin wrappers over the same per-check functions
 // the GUI uses, so there's no separate code path for the TUI to drift on.
 
+/// Check context for a caller without an app handle, built from the saved
+/// settings but with the run mode the caller's form currently shows.
+fn context_for(run_mode: &RunMode) -> CheckCtx {
+    let mut ctx = CheckCtx::from_settings(None);
+    ctx.run_mode = run_mode.clone();
+    ctx
+}
+
 /// Run every check visible for `run_mode` sequentially and return the
 /// final CheckItems. For non-Tauri callers (TUI).
 pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
-    let settings = crate::settings::load_settings();
-    let dwave_token_set = settings
-        .node_config
-        .dwave_config
-        .as_ref()
-        .map(|d| !d.token.trim().is_empty())
-        .unwrap_or(false);
-    let has_dwave_config = settings.node_config.dwave_config.is_some();
-    let ctx = CheckCtx {
-        run_mode: run_mode.clone(),
-        image_tag: settings.image_tag,
-        port: settings.node_config.port,
-        validator_port: settings.node_config.validator_port,
-        public_api_enabled: settings.node_config.public_api_enabled,
-        validator_p2p_enabled: settings.node_config.validator_p2p_enabled,
-        public_host: settings.node_config.public_host,
-        has_dwave_config,
-        dwave_token_set,
-        app: None,
-        public_ip: OnceCell::new(),
-    };
+    let ctx = context_for(run_mode);
     let mut results = Vec::new();
     for id in visible_ids(&ctx) {
         // TUI "run everything" is user-initiated (auto = false). It never has an
@@ -1286,10 +1274,12 @@ pub async fn run_all_checks(run_mode: &RunMode) -> Vec<CheckItem> {
     results
 }
 
-/// Convenience for the TUI public API port recheck. Returns a plain bool since
-/// the TUI doesn't render the richer diagnostic the GUI uses.
-pub async fn probe_public_api_port_with_default_ip(port: u16) -> bool {
-    probe_port_forwarding(port).await.is_externally_reachable()
+/// Re-run one check for a non-Tauri caller. This is the operator's Retry, so
+/// the port-probe cache is cleared first, as `recheck` does for the GUI.
+pub async fn run_check(id: &str, run_mode: &RunMode) -> CheckItem {
+    clear_port_probe_cache();
+    let ctx = context_for(run_mode);
+    run_check_by_id(id, &ctx, false).await
 }
 
 #[cfg(test)]

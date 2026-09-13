@@ -98,6 +98,14 @@ fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
         shorten_image(&app.status.image)
     };
 
+    // Native mode knows the installed miner version; Docker mode does not,
+    // for the reason given on `update::get_node_version`.
+    let version_part = app
+        .node_version
+        .as_ref()
+        .map(|v| format!("   miner v{v}"))
+        .unwrap_or_default();
+
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -110,17 +118,61 @@ fn render_status_section(app: &TuiApp, lines: &mut Vec<Line>) {
         Span::styled(id_part, Style::default().fg(DIM)),
         Span::raw("   "),
         Span::styled(img_part, Style::default().fg(DIM)),
+        Span::styled(version_part, Style::default().fg(DIM)),
     ]));
 
-    // Start / Stop buttons
+    // The three health dimensions the GUI's panel shows, while the miner is up.
+    if let Some(report) = app.health.as_ref().filter(|_| kind.miner_running()) {
+        for (name, dim) in [
+            ("infra", &report.infra),
+            ("chain", &report.chain),
+            ("participation", &report.participation),
+        ] {
+            let (sym, col) = match dim.state {
+                crate::health::DimensionState::Ok => ("✓", PASS),
+                crate::health::DimensionState::Warn => ("⚠", WARN_COLOR),
+                crate::health::DimensionState::Fail => ("✗", FAIL),
+                crate::health::DimensionState::Unknown => ("○", DIM),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(sym, Style::default().fg(col)),
+                Span::raw(format!("  {name:<14} ")),
+                Span::styled(dim.detail.clone(), Style::default().fg(DIM)),
+            ]));
+        }
+    }
+
+    // Start / Stop / update buttons
     let start_style = focus_style(app, &FocusId::StartNode);
     let stop_style = focus_style(app, &FocusId::StopNode);
-    lines.push(Line::from(vec![
+    let mut buttons = vec![
         Span::raw("  "),
         btn_span("[ Start Node ]", start_style),
         Span::raw("   "),
         btn_span("[ Stop Node ]", stop_style),
-    ]));
+        Span::raw("   "),
+        btn_span(
+            if app.update_checking {
+                "[ Checking… ]"
+            } else {
+                "[ Check Updates ]"
+            },
+            focus_style(app, &FocusId::CheckUpdates),
+        ),
+    ];
+    if app.restart_applies_update() {
+        buttons.push(Span::raw("   "));
+        buttons.push(btn_span(
+            if app.updating {
+                "[ Updating… ]"
+            } else {
+                "[ Update & Restart ]"
+            },
+            focus_style(app, &FocusId::UpdateRestart),
+        ));
+    }
+    lines.push(Line::from(buttons));
 
     // Status message
     if let Some((msg, _)) = &app.status_message {
@@ -172,27 +224,30 @@ fn render_requirements_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 crate::checklist::CheckState::Idle => ("○", Color::DarkGray),
                 crate::checklist::CheckState::Fail => ("✗", FAIL),
             };
-            if check.id == "port" {
-                // Port item gets an inline Recheck button.
-                let recheck_style = focus_style(app, &FocusId::CheckPort);
-                let btn = if app.port_checking {
-                    "[ Checking… ]"
-                } else {
-                    "[ Recheck ]"
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(sym, Style::default().fg(col)),
-                    Span::raw(format!("  {}  ", check.label)),
-                    btn_span(btn, recheck_style),
-                ]));
+            // Every item retries on its own, like the GUI's Retry button. The
+            // Docker install fix names its URL, since a terminal cannot open it.
+            let retry = if app.retrying.contains(&check.id) {
+                "[ Checking… ]"
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(sym, Style::default().fg(col)),
-                    Span::raw(format!("  {}", check.label)),
-                ]));
+                "[ Retry ]"
+            };
+            let mut spans = vec![
+                Span::raw("     "),
+                Span::styled(sym, Style::default().fg(col)),
+                Span::raw(format!("  {}  ", check.label)),
+                btn_span(
+                    retry,
+                    focus_style(app, &FocusId::CheckRetry(check.id.clone())),
+                ),
+            ];
+            if app.check_has_fix_button(check) {
+                spans.push(Span::raw("  "));
+                spans.push(btn_span(
+                    "[ Install Docker ]",
+                    focus_style(app, &FocusId::CheckFix(check.id.clone())),
+                ));
             }
+            lines.push(Line::from(spans));
         }
         let run_style = focus_style(app, &FocusId::RunChecklist);
         let label = if app.checklist_running {
@@ -267,6 +322,42 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ),
         Span::styled(channel_note, Style::default().fg(DIM)),
     ]));
+
+    // TLS: Caddy's certificate settings, shown only while TLS is on.
+    let tls_check = if app.form.tls_enabled { "[x]" } else { "[ ]" };
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{tls_check} Enable TLS"),
+            focus_style(app, &FocusId::TlsEnable),
+        ),
+        Span::styled("  (ports 80 + 443 required)", Style::default().fg(DIM)),
+    ]));
+    if app.form.tls_enabled {
+        lines.push(field_line(
+            app,
+            &FocusId::TlsHostname,
+            "  Hostname",
+            &field_value(app, &FocusId::TlsHostname, &app.form.hostname),
+        ));
+        lines.push(field_line(
+            app,
+            &FocusId::TlsCertEmail,
+            "  ACME Email",
+            &field_value(app, &FocusId::TlsCertEmail, &app.form.cert_email),
+        ));
+        let masked_key = if app.form.zerossl_api_key.is_empty() {
+            "(none, Let's Encrypt)".to_string()
+        } else {
+            "●".repeat(app.form.zerossl_api_key.len().min(32))
+        };
+        lines.push(field_line(
+            app,
+            &FocusId::TlsZerosslKey,
+            "  ZeroSSL Key",
+            &field_value(app, &FocusId::TlsZerosslKey, &masked_key),
+        ));
+    }
 
     // Node Secret
     let secret_display = if app.secret_visible {
@@ -463,13 +554,23 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ));
     }
 
-    // CPU Cores
-    lines.push(field_line(
-        app,
-        &FocusId::CpuCores,
-        "CPU Cores",
-        &field_value(app, &FocusId::CpuCores, &app.form.cpu_cores),
-    ));
+    // CPU mining, with its core count while it is on.
+    let cpu_check = if app.form.cpu_enabled { "[x]" } else { "[ ]" };
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{cpu_check} CPU Mining"),
+            focus_style(app, &FocusId::CpuEnable),
+        ),
+    ]));
+    if app.form.cpu_enabled {
+        lines.push(field_line(
+            app,
+            &FocusId::CpuCores,
+            "  CPU Cores",
+            &field_value(app, &FocusId::CpuCores, &app.form.cpu_cores),
+        ));
+    }
 
     // GPU Devices
     let gpu_devices = &app.settings.node_config.gpu_device_configs;
@@ -505,6 +606,25 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 focus_style(app, &FocusId::GpuYielding),
             ),
         ]));
+        // Metal adaptive cap, on the machines whose miner reads it.
+        if app.metal_knobs_apply() {
+            lines.push(Line::from(Span::styled(
+                "      Metal adaptive cap: active only while Yielding is on",
+                Style::default().fg(DIM),
+            )));
+            lines.push(field_line(
+                app,
+                &FocusId::MetalActiveUtil,
+                "  Active util",
+                &format!("{}%", app.form.metal_active_util),
+            ));
+            lines.push(field_line(
+                app,
+                &FocusId::MetalIdleAfter,
+                "  Idle after (s)",
+                &field_value(app, &FocusId::MetalIdleAfter, &app.form.metal_idle_after),
+            ));
+        }
     }
 
     // D-Wave mining toggle
@@ -543,14 +663,26 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ));
     }
 
-    // Apply & Restart
+    // Save / Apply & Restart / Reset Dashboard DB
     let dirty_marker = if app.dirty { " *" } else { "" };
+    let reset_label = if app.reset_armed.is_some() {
+        "[ Reset Dashboard DB: press again to confirm ]"
+    } else {
+        "[ Reset Dashboard DB ]"
+    };
     lines.push(Line::from(vec![
         Span::raw("    "),
+        btn_span(
+            &format!("[ Save{} ]", dirty_marker),
+            focus_style(app, &FocusId::Save),
+        ),
+        Span::raw("   "),
         btn_span(
             &format!("[ Apply & Restart{} ]", dirty_marker),
             focus_style(app, &FocusId::ApplyRestart),
         ),
+        Span::raw("   "),
+        btn_span(reset_label, focus_style(app, &FocusId::ResetDashboardDb)),
     ]));
     lines.push(Line::raw(""));
 }
@@ -559,19 +691,36 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
 
 fn render_log_panel(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize; // borders
-    let lines: Vec<Line> = app
+    let needle = app.log_filter.to_lowercase();
+    // Newest first, so the filter walks only as far back as the panel shows.
+    let mut lines: Vec<Line> = app
         .log_buf
         .iter()
         .rev()
+        .filter(|e| needle.is_empty() || e.message.to_lowercase().contains(&needle))
         .take(inner_height)
-        .rev()
         .map(|e| log_line(e))
         .collect();
+    lines.reverse();
 
     let arrow = if app.log_expanded { "▼" } else { "▶" };
+    let editing = matches!(&app.edit_mode, EditMode::EditingField(FocusId::LogFilter));
+    let filter = if editing {
+        format!(" filter: {}█", app.form.edit_buf)
+    } else if app.log_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" filter: {}", app.log_filter)
+    };
     let title = Span::styled(
-        format!(" {} Logs [l] ", arrow),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        format!(" {} Logs [l]{} ", arrow, filter),
+        if editing || app.focus == FocusId::LogFilter {
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        },
     );
     let block = Block::bordered().title(title);
     let text = Text::from(lines);
@@ -607,7 +756,7 @@ fn log_line(entry: &LogEntry) -> Line<'static> {
 
 fn render_footer(frame: &mut Frame, area: Rect) {
     let para = Paragraph::new(Span::styled(
-        " [↑↓/Tab] Move [Enter] Edit [Space] Toggle [PgUp/Dn] Scroll [l] Logs [q] Quit ",
+        " [↑↓/Tab] Move [Enter] Edit [Space] Toggle [PgUp/Dn] Scroll [l] Logs [/] Filter [c] Clear [q] Quit ",
         Style::default().fg(Color::Black).bg(ACCENT),
     ));
     frame.render_widget(para, area);

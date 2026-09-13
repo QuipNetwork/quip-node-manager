@@ -35,6 +35,13 @@ fn handle_key_main(app: &mut TuiApp, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('l') => Action::ToggleLogs,
+        KeyCode::Char('c') => Action::ClearLogs,
+        // Jump straight into the log filter from anywhere.
+        KeyCode::Char('/') => {
+            app.focus = FocusId::LogFilter;
+            start_edit(app);
+            Action::None
+        }
 
         // Navigation
         KeyCode::Up | KeyCode::BackTab => {
@@ -91,15 +98,23 @@ fn handle_key_edit(app: &mut TuiApp, key: KeyEvent) -> Action {
 // ─── Activation ───────────────────────────────────────────────────────────────
 
 fn activate(app: &mut TuiApp) -> Action {
-    match app.focus {
+    // Cloned: the check ids carry a String, so matching the field in place
+    // would move out of it.
+    let focus = app.focus.clone();
+    match focus {
         FocusId::StartNode => Action::StartNode,
         FocusId::StopNode => Action::StopNode,
+        FocusId::CheckUpdates => Action::CheckUpdates,
+        FocusId::UpdateRestart => Action::UpdateRestart,
         FocusId::ChecklistToggle => {
             app.checklist_expanded = !app.checklist_expanded;
             Action::None
         }
         FocusId::RunChecklist => Action::RunChecklist,
-        FocusId::CheckPort => Action::CheckPort,
+        FocusId::CheckRetry(id) => Action::RetryCheck(id),
+        FocusId::CheckFix(id) => Action::FixCheck(id),
+        FocusId::Save => Action::Save,
+        FocusId::ResetDashboardDb => Action::ResetDashboardDb,
         FocusId::ConfigToggle => {
             app.config_expanded = !app.config_expanded;
             Action::None
@@ -186,6 +201,26 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
+        FocusId::TlsEnable => {
+            app.form.tls_enabled = !app.form.tls_enabled;
+            app.dirty = true;
+            Action::None
+        }
+        FocusId::CpuEnable => {
+            app.form.cpu_enabled = !app.form.cpu_enabled;
+            app.dirty = true;
+            Action::None
+        }
+        // Same stepping as the utilization cap, and the same 1-100 range.
+        FocusId::MetalActiveUtil => {
+            app.form.metal_active_util = if app.form.metal_active_util >= 100 {
+                10
+            } else {
+                app.form.metal_active_util + 10
+            };
+            app.dirty = true;
+            Action::None
+        }
         FocusId::GpuDevice(index) => {
             crate::tui_app::toggle_gpu_device(
                 &mut app.settings.node_config.gpu_device_configs,
@@ -227,13 +262,18 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::DataDir
         | FocusId::ServicePortNumber(_)
         | FocusId::NodeName
+        | FocusId::TlsHostname
+        | FocusId::TlsCertEmail
+        | FocusId::TlsZerosslKey
         | FocusId::PublicHostInput
         | FocusId::PublicPortInput
         | FocusId::CpuCores
+        | FocusId::MetalIdleAfter
         | FocusId::QpuApiKey
         | FocusId::QpuDailyBudget
         | FocusId::NodeLog
-        | FocusId::HttpLog => {
+        | FocusId::HttpLog
+        | FocusId::LogFilter => {
             start_edit(app);
             Action::None
         }
@@ -253,13 +293,18 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::DataDir => app.form.data_dir.clone(),
         FocusId::ServicePortNumber(id) => app.form.service_port_value(*id).to_string(),
         FocusId::NodeName => app.form.node_name.clone(),
+        FocusId::TlsHostname => app.form.hostname.clone(),
+        FocusId::TlsCertEmail => app.form.cert_email.clone(),
+        FocusId::TlsZerosslKey => app.form.zerossl_api_key.clone(),
         FocusId::PublicHostInput => app.form.public_host.clone(),
         FocusId::PublicPortInput => app.form.public_port.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
+        FocusId::MetalIdleAfter => app.form.metal_idle_after.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
         FocusId::QpuDailyBudget => app.form.qpu_daily_budget.clone(),
         FocusId::NodeLog => app.form.node_log.clone(),
         FocusId::HttpLog => app.form.http_log.clone(),
+        FocusId::LogFilter => app.log_filter.clone(),
         _ => return,
     };
     app.form.edit_buf = current;
@@ -274,14 +319,25 @@ fn commit_edit(app: &mut TuiApp) {
             return;
         }
     }
+    // The log filter is view state, not a setting: it never dirties the form.
+    if let EditMode::EditingField(FocusId::LogFilter) = &app.edit_mode {
+        app.log_filter = buf;
+        app.form.edit_buf.clear();
+        app.edit_mode = EditMode::None;
+        return;
+    }
     match &app.edit_mode {
         EditMode::EditingField(id) => match id {
             FocusId::DataDir => app.form.data_dir = buf,
             FocusId::ServicePortNumber(id) => app.form.set_service_port_value(*id, buf),
             FocusId::NodeName => app.form.node_name = buf,
+            FocusId::TlsHostname => app.form.hostname = buf,
+            FocusId::TlsCertEmail => app.form.cert_email = buf,
+            FocusId::TlsZerosslKey => app.form.zerossl_api_key = buf,
             FocusId::PublicHostInput => app.form.public_host = buf,
             FocusId::PublicPortInput => app.form.public_port = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
+            FocusId::MetalIdleAfter => app.form.metal_idle_after = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
             FocusId::QpuDailyBudget => app.form.qpu_daily_budget = buf,
             FocusId::NodeLog => app.form.node_log = buf,
