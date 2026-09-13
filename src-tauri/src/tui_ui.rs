@@ -509,6 +509,10 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 "  Port",
                 &field_value(app, &FocusId::PublicPortInput, &port_display),
             ));
+            lines.push(Line::from(Span::styled(
+                "        Only the address peers dial. To move the listening port, edit Public API above.",
+                Style::default().fg(DIM),
+            )));
         }
         let log_levels = ["info", "debug", "warn", "error"];
         let ll_display = if log_levels.contains(&app.form.log_level.as_str()) {
