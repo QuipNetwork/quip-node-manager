@@ -115,9 +115,15 @@ Add a block only for a specific need:
 variables only when `$CI_COMMIT_TAG` is set, then calls
 `scripts/notarize-dmg.sh` and `scripts/verify-macos-signing.sh`.
 
-The job creates no keychain. `Keychain::with_certificate` inside Tauri creates
-a temporary keychain and imports the certificate. It sets the key partition
-list, then deletes the keychain when it drops.
+On a tag build the job imports the certificate into its own keychain,
+`~/Library/Keychains/quip-ci.keychain-db`, and unsets `APPLE_CERTIFICATE` so
+Tauri does not build a second one. The job never makes that keychain the
+default and never adds it to the user search list, because both are account
+preferences that outlive the job. Every `security` call names the keychain
+with `-k`. Tauri runs `codesign` without `--keychain` on this path, so the
+job puts a wrapper first on `PATH` for the build step that adds
+`--keychain quip-ci.keychain-db` to each call. `after_script` deletes the
+keychain when the job ends, on success or failure.
 
 ### Required CI/CD variables
 

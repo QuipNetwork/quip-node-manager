@@ -50,6 +50,18 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc7
+<!-- vale Google.Headings = YES -->
+
+- Stop the macOS release build from changing the runner's keychain
+  configuration. The tag build made its job keychain the default keychain
+  and added it to the user search list, and never put either back, so a
+  developer Mac acting as a runner was left with `quip-ci` as its default
+  keychain. The build now names its keychain on every `security` call and
+  routes `codesign` through a wrapper that passes `--keychain`, writes no
+  keychain preference, and deletes the keychain when the job ends.
+
+<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc6
 <!-- vale Google.Headings = YES -->
 
