@@ -392,12 +392,41 @@ impl ConfigToml {
     }
 }
 
+impl ConfigToml {
+    /// Whether the coordinator would launch at least one miner from this
+    /// config. Only `[cpu]`, `[cuda.N]`, `[metal]`, and `[dwave]` count: the
+    /// v0.3 coordinator reads `[qpu]` solely as a fallback for `[dwave]`, and
+    /// `[gpu]` and `[modal]` not at all.
+    fn declares_mining_backend(&self) -> bool {
+        self.cpu.is_some() || !self.cuda.is_empty() || self.metal.is_some() || self.dwave.is_some()
+    }
+}
+
+/// Refuse a config the coordinator would reject for having nothing to launch.
+///
+/// The coordinator's own error for that case blames the v0.2 schema whenever
+/// `faucet_url` is present, and every config this app writes carries
+/// `faucet_url`. An operator who turned CPU mining off on a box with no enabled
+/// GPU would be told to reformat a file that is already v0.3. Name the setting
+/// that actually caused it, before anything is written or started.
+pub(crate) fn check_mining_backend(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
+    if ConfigToml::from_node_config(config, run_mode).declares_mining_backend() {
+        return Ok(());
+    }
+    Err(
+        "No mining backend is enabled, so the miner would refuse to start. \
+         Turn on CPU mining or enable at least one GPU in Settings, then start again."
+            .to_string(),
+    )
+}
+
 fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
     let config_toml = ConfigToml::from_node_config(config, run_mode);
     toml::to_string_pretty(&config_toml).expect("config TOML serialization should not fail")
 }
 
 pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
+    check_mining_backend(config, run_mode)?;
     crate::settings::ensure_data_dir()?;
     let content = render_config_toml(config, run_mode);
     // Docker mode: compose bind-mounts `./data:/data` (relative to the
@@ -895,6 +924,84 @@ mod tests {
         assert!(toml[cuda1..].contains("yielding = true"));
     }
 
+    /// The settings file and config.toml are two representations of the same
+    /// GPU tuning. Parse the rendered file back and compare it against the
+    /// `NodeConfig` it came from, so a rename or a dropped key on either side
+    /// fails here instead of surfacing as a setting that silently stops
+    /// reaching the miner.
+    #[test]
+    fn rendered_gpu_tuning_round_trips_from_node_config() {
+        let cuda = cfg_with_gpu(
+            GpuBackend::Local,
+            vec![
+                GpuDeviceConfig {
+                    index: 0,
+                    enabled: true,
+                    utilization: 65,
+                    yielding: true,
+                },
+                GpuDeviceConfig {
+                    index: 1,
+                    enabled: true,
+                    utilization: 30,
+                    yielding: false,
+                },
+                GpuDeviceConfig {
+                    index: 2,
+                    enabled: false,
+                    utilization: 90,
+                    yielding: true,
+                },
+            ],
+        );
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cuda, &RunMode::Docker)).expect("valid toml");
+        // [gpu] carries the shared defaults; a [cuda.N] key overrides them.
+        let shared = &parsed["gpu"];
+        for dev in cuda.gpu_device_configs.iter().filter(|d| d.enabled) {
+            let section = &parsed["cuda"][dev.index.to_string()];
+            let utilization = section
+                .get("utilization")
+                .or_else(|| shared.get("utilization"))
+                .and_then(toml::Value::as_integer)
+                .expect("utilization");
+            let yielding = section
+                .get("yielding")
+                .or_else(|| shared.get("yielding"))
+                .and_then(toml::Value::as_bool)
+                .expect("yielding");
+            assert_eq!(
+                utilization,
+                i64::from(dev.utilization),
+                "device {}",
+                dev.index
+            );
+            assert_eq!(yielding, dev.yielding, "device {}", dev.index);
+        }
+        assert!(
+            parsed["cuda"].get("2").is_none(),
+            "a disabled device must not reach the miner"
+        );
+
+        let metal = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_config: MetalConfig {
+                utilization: 45,
+                yielding: true,
+                active_util: 70,
+                idle_after_s: 120,
+            },
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&metal, &RunMode::Native)).expect("valid toml");
+        let section = &parsed["metal"];
+        assert_eq!(section["utilization"].as_integer(), Some(45));
+        assert_eq!(section["yielding"].as_bool(), Some(true));
+        assert_eq!(section["active_util"].as_integer(), Some(70));
+        assert_eq!(section["idle_after_s"].as_integer(), Some(120));
+    }
+
     #[test]
     fn mps_without_devices_skips_gpu_section() {
         let cfg = cfg_with_gpu(GpuBackend::Mps, vec![]);
@@ -912,6 +1019,78 @@ mod tests {
         let toml = render_config_toml(&cfg, &RunMode::Docker);
         assert!(toml.contains("[cpu]\n"));
         assert!(toml.contains("num_cpus = 8"));
+    }
+
+    /// The coordinator refuses a config with no backend table, and its error
+    /// blames the v0.2 schema whenever `faucet_url` is present, which every
+    /// config this app writes carries. An operator who turned CPU mining off
+    /// on a box with no enabled GPU is then told to reformat a file that is
+    /// already v0.3. Catch the empty launch plan here and name the setting.
+    #[test]
+    fn start_is_refused_when_no_mining_backend_is_enabled() {
+        let cfg = NodeConfig {
+            cpu_enabled: false,
+            ..NodeConfig::default()
+        };
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let err = check_mining_backend(&cfg, &mode)
+                .expect_err("no backend enabled must refuse the start");
+            assert!(err.contains("CPU mining"), "{mode:?}: {err}");
+        }
+
+        // Metal is suppressed in Docker, so a Mac profile with CPU mining off
+        // is empty in Docker mode and fine in Native mode.
+        let cfg = NodeConfig {
+            cpu_enabled: false,
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+        assert!(check_mining_backend(&cfg, &RunMode::Docker).is_err());
+        assert!(check_mining_backend(&cfg, &RunMode::Native).is_ok());
+    }
+
+    #[test]
+    fn any_launchable_backend_satisfies_the_guard() {
+        assert!(check_mining_backend(&NodeConfig::default(), &RunMode::Docker).is_ok());
+
+        let cuda_only = NodeConfig {
+            cpu_enabled: false,
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![GpuDeviceConfig {
+                    index: 0,
+                    enabled: true,
+                    utilization: 80,
+                    yielding: false,
+                }],
+            )
+        };
+        assert!(check_mining_backend(&cuda_only, &RunMode::Docker).is_ok());
+
+        // A device that is present but switched off launches nothing.
+        let cuda_off = NodeConfig {
+            cpu_enabled: false,
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![GpuDeviceConfig {
+                    index: 0,
+                    enabled: false,
+                    utilization: 80,
+                    yielding: false,
+                }],
+            )
+        };
+        assert!(check_mining_backend(&cuda_off, &RunMode::Docker).is_err());
+
+        let dwave_only = NodeConfig {
+            cpu_enabled: false,
+            dwave_config: Some(DwaveConfig {
+                token: "tok".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        assert!(check_mining_backend(&dwave_only, &RunMode::Docker).is_ok());
     }
 
     #[test]

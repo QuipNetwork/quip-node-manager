@@ -56,6 +56,9 @@ export function renderPortControls(container, controls) {
     const portLabel =
       control.id === "miner_rest" && control.required ? "native" : control.container_port;
     name.textContent = `${control.label} (${portLabel}/${control.protocols.join("+")})`;
+    if (control.required) {
+      name.textContent += " (required in Native mode; this is a host port)";
+    }
     label.append(toggle, name);
     const input = document.createElement("input");
     input.type = "number";
@@ -71,26 +74,12 @@ export function renderPortControls(container, controls) {
       input.disabled = !toggle.checked;
     });
     row.append(label, input);
-    group.append(row);
-    if (control.required) {
-      const note = document.createElement("p");
-      note.className = "service-port-note";
-      note.textContent = "Required in Native mode. This is a host port.";
-      group.append(note);
-    }
+    // The access choice comes first: it decides who can reach the port, and
+    // the port number below it only matters once that is settled.
     if (control.public_access_optional) {
-      const access = document.createElement("label");
-      access.className = "service-port-public-access";
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.id = `public-${control.id}`;
-      checkbox.checked = control.binding.enabled;
-      access.append(
-        checkbox,
-        document.createTextNode(" Allow public access (otherwise local only)"),
-      );
-      group.append(access);
+      group.append(renderPublicAccessToggle(control));
     }
+    group.append(row);
     if (control.id === "caddy_admin") {
       const note = document.createElement("p");
       note.className = "service-port-note";
@@ -99,6 +88,36 @@ export function renderPortControls(container, controls) {
       group.append(note);
     }
   }
+}
+
+// Native mode publishes the validator RPC on the host so the host miner can
+// reach it. This slider chooses the bind address: loopback keeps it to this
+// computer, all interfaces opens it to the network.
+function renderPublicAccessToggle(control) {
+  const access = document.createElement("div");
+  access.className = "service-port-public-access";
+  const row = document.createElement("label");
+  row.className = "toggle-row";
+  const toggle = document.createElement("span");
+  toggle.className = "toggle-switch";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.id = `public-${control.id}`;
+  checkbox.checked = control.binding.enabled;
+  const slider = document.createElement("span");
+  slider.className = "toggle-slider";
+  toggle.append(checkbox, slider);
+  const caption = document.createElement("span");
+  caption.textContent = "Allow public access";
+  row.append(toggle, caption);
+  const note = document.createElement("p");
+  note.className = "service-port-note";
+  note.textContent =
+    "On: the port listens on every network interface, so other machines can " +
+    "reach it. Off: it listens on 127.0.0.1 only, so only programs on this " +
+    "computer can reach it. The native miner reaches it either way.";
+  access.append(row, note);
+  return access;
 }
 
 export function collectPortEdits(container, controls) {

@@ -522,11 +522,11 @@ function renderGpuDevices() {
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
 
     const label = document.createElement('label');
-    label.className = 'gpu-toggle-switch';
+    label.className = 'toggle-switch';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     const slider = document.createElement('span');
-    slider.className = 'gpu-toggle-slider';
+    slider.className = 'toggle-slider';
 
     if (isMetal) {
       // Metal is a single implicit GPU only reachable from the native miner,
@@ -600,15 +600,42 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
   }
 });
 
-// ─── Public host enable toggle ────────────────────────────────────────────────
-document.getElementById('public-host-enable').addEventListener('change', () => {
+// ─── Public host override ─────────────────────────────────────────────────────
+//
+// With the override off the node advertises the detected public IP and the
+// Public API port, and the panel shows that pair. Turning the override on
+// reveals the fields, seeded with the same pair so the operator edits from
+// what is advertised today rather than from a blank.
+function advertisedPublicAddress() {
+  const host = state.detectedPublicIp || '';
+  const port = state.settings?.node_config?.port ?? CADDY_PUBLIC_API_PORT;
+  return { host, port };
+}
+
+function updatePublicHostUi() {
   const enabled = document.getElementById('public-host-enable').checked;
-  document.getElementById('public-host').disabled = !enabled;
-  document.getElementById('public-port').disabled = !enabled;
-  if (!enabled) {
+  document.getElementById('public-host-fields').style.display = enabled ? '' : 'none';
+  document.getElementById('public-host-detected').style.display = enabled ? 'none' : '';
+
+  const { host, port } = advertisedPublicAddress();
+  document.getElementById('public-host-detected-value').textContent = host
+    ? `${host}:${port}`
+    : (state.detectedPublicIp === null ? 'not detected' : 'detecting…');
+
+  if (enabled) {
+    const hostEl = document.getElementById('public-host');
+    const portEl = document.getElementById('public-port');
+    if (!hostEl.value) hostEl.value = host;
+    if (!portEl.value) portEl.value = port;
+  }
+}
+
+document.getElementById('public-host-enable').addEventListener('change', () => {
+  if (!document.getElementById('public-host-enable').checked) {
     document.getElementById('public-host').value = '';
     document.getElementById('public-port').value = '';
   }
+  updatePublicHostUi();
 });
 
 // ─── D-Wave section toggle ───────────────────────────────────────────────────
@@ -641,8 +668,15 @@ function collectConfig() {
   const survey = state.hardwareSurvey;
   const gpuBackend = survey?.gpu_backend === 'metal' ? 'mps' : 'local';
 
-  // Build per-device configs from toggle checkboxes
+  // Build per-device configs from the toggle checkboxes. Those only exist
+  // once the hardware survey has answered, so until then (or for good, when
+  // the survey failed) keep the saved list. Rebuilding from an empty page
+  // would drop every GPU from config.toml on a Start in that window, and
+  // with CPU mining off the miner then has nothing to launch.
   const gpuDeviceConfigs = [];
+  if (!survey) {
+    gpuDeviceConfigs.push(...(state.settings?.node_config?.gpu_device_configs || []));
+  }
   document.querySelectorAll('.gpu-device-toggle').forEach((cb) => {
     gpuDeviceConfigs.push({
       index: parseInt(cb.dataset.index),
@@ -755,6 +789,30 @@ async function refreshServicePortControls() {
   renderPortControls(document.getElementById('service-port-controls'), controls);
 }
 
+// GPU tuning: for Metal, utilization/yielding come from metal_config; for
+// CUDA, from the first enabled device (or defaults). Which of the two applies
+// is only known once the hardware survey has answered, and the form is
+// populated before that, so this runs again when the survey lands. Reading
+// the CUDA slot on a Mac before then showed Yielding off on every restart,
+// and the next Save wrote that back into metal_config.
+function populateGpuTuning(c) {
+  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
+  const metalCfg = c.metal_config ?? {};
+  const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
+  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
+  document.getElementById('gpu-utilization').value = savedUtil;
+  document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
+  document.getElementById('gpu-yielding').checked = isMetal
+    ? (metalCfg.yielding ?? true)
+    : (gpuCfg?.yielding ?? false);
+
+  // Metal-only adaptive-cap knobs
+  const activeUtil = metalCfg.active_util ?? 85;
+  document.getElementById('metal-active-util').value = activeUtil;
+  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
+  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
+}
+
 async function populateForm(settings) {
   await refreshServicePortControls();
   const c = settings.node_config;
@@ -768,10 +826,9 @@ async function populateForm(settings) {
   const publicPort = c.public_port ?? null;
   const publicOverrideEnabled = !!(publicHost || publicPort);
   document.getElementById('public-host-enable').checked = publicOverrideEnabled;
-  document.getElementById('public-host').disabled = !publicOverrideEnabled;
-  document.getElementById('public-port').disabled = !publicOverrideEnabled;
   document.getElementById('public-host').value = publicHost;
   document.getElementById('public-port').value = publicPort ?? '';
+  updatePublicHostUi();
   document.getElementById('log-level').value = c.log_level ?? 'info';
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
@@ -809,23 +866,7 @@ async function populateForm(settings) {
   renderSolverPickers(c);
   updateCpuUiVisibility();
 
-  // GPU Miner — for Metal, utilization/yielding come from metal_config;
-  // for CUDA, from the first enabled device (or defaults).
-  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
-  const metalCfg = c.metal_config ?? {};
-  const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
-  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
-  document.getElementById('gpu-utilization').value = savedUtil;
-  document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
-  document.getElementById('gpu-yielding').checked = isMetal
-    ? (metalCfg.yielding ?? true)
-    : (gpuCfg?.yielding ?? false);
-
-  // Metal-only adaptive-cap knobs
-  const activeUtil = metalCfg.active_util ?? 85;
-  document.getElementById('metal-active-util').value = activeUtil;
-  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
-  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
+  populateGpuTuning(c);
 
   // D-Wave
   const dw = c.dwave_config;
@@ -2281,8 +2322,23 @@ async function init() {
       // state reflects run_mode). gpu_backend itself is derived from the
       // survey in collectConfig, so there's nothing to seed here.
       updateRunModeUI();
+      // The survey decides whether the tuning row reads metal_config or the
+      // CUDA device list, so re-seed it now that the answer is known.
+      if (state.settings) populateGpuTuning(state.settings.node_config);
     })
     .catch(() => {});
+
+  // The override panel shows what the node advertises when no override is
+  // set, which is this address plus the Public API port.
+  invoke('detect_public_ip')
+    .then((ip) => {
+      state.detectedPublicIp = ip;
+      updatePublicHostUi();
+    })
+    .catch(() => {
+      state.detectedPublicIp = null;
+      updatePublicHostUi();
+    });
 
   // Seed placeholders from the cache, then kick off a full recheck.
   invoke('get_checklist')
