@@ -106,7 +106,17 @@ pub fn compose_profile(image_tag: ImageTag) -> &'static str {
 pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     match run_mode {
         RunMode::Docker => &[],
-        RunMode::Native => &["quip-validator", "dashboard", "postgres", "caddy"],
+        // quip-syslog is named explicitly, not left to the profile: Native
+        // passes a service list, and compose starts only what that list names.
+        // Without it every service here forwards stdout to a port nothing is
+        // listening on, and the merged log is never written.
+        RunMode::Native => &[
+            "quip-syslog",
+            "quip-validator",
+            "dashboard",
+            "postgres",
+            "caddy",
+        ],
     }
 }
 
@@ -119,6 +129,7 @@ pub fn expected_services(run_mode: &RunMode, image_tag: ImageTag) -> Vec<&'stati
     match run_mode {
         RunMode::Docker => vec![
             image_tag.service(),
+            "quip-syslog",
             "quip-validator",
             "dashboard",
             "postgres",
@@ -859,7 +870,7 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
     crate::log_stream::start_log_stream_for_app(
         app.clone(),
-        vec![crate::log_stream::StreamSource::ComposeAll],
+        crate::log_stream::sources_for_run_mode(&crate::settings::load_settings().run_mode),
     );
     start_stack_core(Arc::new(TauriSink::new(app))).await
 }
@@ -1465,6 +1476,7 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
+    "quip-syslog",
     // Removed in v0.2 — the cpu/cuda miners self-bootstrap (faucet + miner +
     // descriptor registration), so the one-shot bootstrap container is gone.
     "quip-bootstrap",
@@ -1782,6 +1794,7 @@ mod tests {
         let services = vec![
             svc("cpu", false, None),
             svc("cuda", true, None),
+            svc("quip-syslog", true, None),
             svc("quip-validator", true, None),
             svc("dashboard", true, Some("healthy")),
             svc("postgres", true, Some("healthy")),
@@ -1798,8 +1811,10 @@ mod tests {
     #[test]
     fn missing_expected_service_is_degraded() {
         // Dashboard container never created — the stack is not fully Running.
+        // Everything else is present so the dashboard is the only thing missing.
         let services = vec![
             svc("cpu", true, None),
+            svc("quip-syslog", true, None),
             svc("quip-validator", true, None),
             svc("postgres", true, Some("healthy")),
             svc("caddy", true, None),
@@ -1845,11 +1860,30 @@ mod tests {
         let services = compose_services(&RunMode::Native);
         assert_eq!(
             services,
-            ["quip-validator", "dashboard", "postgres", "caddy"]
+            [
+                "quip-syslog",
+                "quip-validator",
+                "dashboard",
+                "postgres",
+                "caddy"
+            ]
         );
         assert!(!services.contains(&"cpu"));
         assert!(!services.contains(&"cuda"));
         assert!(!services.contains(&"quip-bootstrap"));
+    }
+
+    /// Native names its services explicitly, so compose starts only what the
+    /// list holds. Dropping the collector would leave every service forwarding
+    /// stdout to a port nothing listens on, and quip-node.log would stay empty
+    /// with no error anywhere — UDP does not report a missing receiver.
+    #[test]
+    fn the_log_collector_starts_in_both_run_modes() {
+        assert!(compose_services(&RunMode::Native).contains(&"quip-syslog"));
+        for tag in [ImageTag::Cpu, ImageTag::Cuda] {
+            assert!(expected_services(&RunMode::Docker, tag).contains(&"quip-syslog"));
+            assert!(expected_services(&RunMode::Native, tag).contains(&"quip-syslog"));
+        }
     }
 
     #[test]
