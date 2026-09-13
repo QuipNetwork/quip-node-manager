@@ -50,6 +50,24 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc3
+<!-- vale Google.Headings = YES -->
+
+- Read the stack log from one merged file. Every container now writes through a
+  collector into `data/logs/quip-node.log`, and the log pane tails that file
+  instead of merging the output of `docker compose logs` itself. The merged file
+  outlives a container replacement, which the per-container logs did not.
+- Start the collector in both run modes, and stage the two files it mounts.
+  Without the collector, every service sends its output to a port that has no
+  listener. Nothing reports an error, so the file simply stays empty.
+- Keep the merged file readable. The collector rewrote every `/` and every tab
+  to `_`, which mangled each address and path the stack logs and hid the level
+  on Caddy error lines. Both survive now.
+- Follow the merged file across a rotation. The reader compared file length
+  alone, so after the collector rotated at 10 MB it could keep reading the
+  renamed file and show nothing further until the next restart.
+
+<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc2
 <!-- vale Google.Headings = YES -->
 

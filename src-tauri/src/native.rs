@@ -1178,8 +1178,8 @@ pub(crate) async fn start_native_node_core(
     Ok(format!("Native miner started (PID {})", pid))
 }
 
-/// Tail native-mode logs: host `node-output.log` (miner) plus compose logs
-/// for the containerized support services (validator/dashboard/postgres/caddy).
+/// Tail native-mode logs: host `node-output.log` (miner) plus the collector's
+/// merged log for the containerized support services.
 fn start_log_tail(app: tauri::AppHandle) {
     use crate::log_stream::{sources_for_run_mode, start_log_stream_for_app};
     use crate::settings::RunMode;
@@ -1190,7 +1190,7 @@ fn start_log_tail(app: tauri::AppHandle) {
             "timestamp": "",
             "level": "INFO",
             "message": format!(
-                "[log-stream] native hybrid: tail {} + compose logs -f",
+                "[log-stream] native hybrid: tail {} + the merged stack log",
                 path.display()
             ),
             "source": "app",

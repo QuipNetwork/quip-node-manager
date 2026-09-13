@@ -86,6 +86,19 @@ const MINER_CONFIG_TEMPLATE: &str =
 const VALIDATOR_HEALTHCHECK: &str =
     include_str!("../../vendor/nodes.quip.network/scripts/validator-healthcheck.sh");
 
+/// syslog-ng configuration for the merged stack log. Every service forwards
+/// stdout through the Docker syslog driver to the colocated collector, which
+/// writes one host-readable file at `data/logs/quip-node.log`.
+const SYSLOG_CONF: &str = include_str!("../../vendor/nodes.quip.network/syslog-ng/syslog-ng.conf");
+
+/// The collector's PID 1. It supervises syslog-ng and rotates the merged log,
+/// because syslog-ng OSE has no size-based rotation and the custom entrypoint
+/// bypasses the image's own supervisor. Staged executable for the same reason
+/// as the validator healthcheck: a non-executable entrypoint stops the
+/// container, and every other service gates on it through `depends_on`.
+const SYSLOG_ENTRYPOINT: &str =
+    include_str!("../../vendor/nodes.quip.network/syslog-ng/entrypoint.sh");
+
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
 pub fn stack_compose_file() -> PathBuf {
     data_dir().join("docker-compose.yml")
@@ -160,6 +173,12 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
         "chain-specs",
         "config",
         "scripts",
+        "syslog-ng",
+        // Destination of the merged stack log. Created here for the same
+        // reason as the validator database above: Docker would fabricate the
+        // missing bind-mount source owned by root, and the collector writes as
+        // PUID/PGID, so it could not create quip-node.log inside it.
+        "data/logs",
     ] {
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
@@ -178,6 +197,50 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
         .map_err(|e| format!("write miner config template: {e}"))?;
 
     write_healthcheck_script()?;
+    write_syslog_assets()?;
+
+    Ok(())
+}
+
+/// `<data_dir>/syslog-ng/syslog-ng.conf` — staged from the embedded bytes.
+pub fn stack_syslog_conf_file() -> PathBuf {
+    data_dir().join("syslog-ng").join("syslog-ng.conf")
+}
+
+/// `<data_dir>/syslog-ng/entrypoint.sh` — staged executable.
+pub fn stack_syslog_entrypoint_file() -> PathBuf {
+    data_dir().join("syslog-ng").join("entrypoint.sh")
+}
+
+/// `<data_dir>/data/logs/quip-node.log` — the merged stack log the collector
+/// writes, and the single source the log pane tails. Nothing here creates it;
+/// the collector does, on its first received line.
+pub fn merged_log_file() -> PathBuf {
+    data_dir().join("data").join("logs").join("quip-node.log")
+}
+
+/// Stage the collector's config and entrypoint.
+///
+/// Both are written with LF endings. The entrypoint is a shell script embedded
+/// at compile time from `vendor/`, which is its own git repo and so is not
+/// covered by this repo's `.gitattributes`; a Windows build machine with
+/// `core.autocrlf=true` would bake in `set -eu\r`, which `/bin/sh` rejects, and
+/// would turn the `LOG=/logs/quip-node.log` assignment into a path ending in a
+/// carriage return. The container runs Linux whatever the host is.
+fn write_syslog_assets() -> Result<(), String> {
+    fs::write(stack_syslog_conf_file(), SYSLOG_CONF.replace("\r\n", "\n"))
+        .map_err(|e| format!("write syslog-ng.conf: {e}"))?;
+
+    let path = stack_syslog_entrypoint_file();
+    fs::write(&path, SYSLOG_ENTRYPOINT.replace("\r\n", "\n"))
+        .map_err(|e| format!("write syslog-ng entrypoint: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod syslog-ng entrypoint: {e}"))?;
+    }
 
     Ok(())
 }
@@ -430,6 +493,62 @@ fn strip_local_faucet_route(src: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The collector is the service every other service gates on through
+    /// `depends_on`, so a CRLF entrypoint stops the whole stack rather than
+    /// only the log. A carriage return would also land in the `LOG=` path and
+    /// name the file with a trailing return.
+    #[test]
+    fn staged_syslog_assets_are_lf_whatever_the_build_machine_checked_out() {
+        for embedded in [SYSLOG_ENTRYPOINT, SYSLOG_CONF] {
+            let crlf = embedded.replace('\n', "\r\n");
+            let staged = crlf.replace("\r\n", "\n");
+            assert!(!staged.contains('\r'));
+            assert_eq!(embedded.replace("\r\n", "\n"), staged);
+        }
+        assert!(SYSLOG_ENTRYPOINT
+            .replace("\r\n", "\n")
+            .contains("set -eu\n"));
+        assert!(SYSLOG_ENTRYPOINT.contains("LOG=/logs/quip-node.log"));
+    }
+
+    /// The path the collector writes, the directory compose mounts, and the
+    /// directory `sync_stack_assets` creates all have to name the same place,
+    /// or the app stages a directory that nothing ever writes into.
+    #[test]
+    fn collector_writes_into_the_mounted_log_directory() {
+        assert!(COMPOSE_YML.contains("- ./data/logs:/logs"));
+        assert!(SYSLOG_CONF.contains("/logs/quip-node.log"));
+        assert!(SYSLOG_ENTRYPOINT.contains("LOG=/logs/quip-node.log"));
+    }
+
+    /// The log pane depends on the collector preserving the message it relays.
+    ///
+    /// A bare `$(sanitize ${MESSAGE})` rewrites `/` and every control character
+    /// to `_`. That mangles every URL the stack logs and collapses Caddy's
+    /// tab-delimited console format, so a 502 renders as INFO. It degrades the
+    /// pane silently — every line still arrives, just wrong — which is why this
+    /// is pinned here, against the embedded config, rather than trusted to stay
+    /// fixed upstream (nodes.quip.network!28).
+    #[test]
+    fn collector_template_keeps_slashes_and_tabs() {
+        assert!(
+            SYSLOG_CONF.contains(r"$(sanitize --no-ctrl-chars --invalid-chars '\n\r' ${MESSAGE})"),
+            "the merged-log template lost its narrowed sanitize options"
+        );
+    }
+
+    /// Dual logging is what keeps `docker compose logs` — and so the app's log
+    /// panel — working under the syslog driver. Setting `cache-disabled` would
+    /// take the panel dark with nothing else failing.
+    #[test]
+    fn compose_keeps_the_docker_log_cache_enabled() {
+        assert!(COMPOSE_YML.contains("driver: syslog"));
+        // The literal appears in a comment warning against it, so match the key.
+        assert!(!COMPOSE_YML
+            .lines()
+            .any(|l| l.trim().starts_with("cache-disabled:")));
+    }
+
     /// A CRLF healthcheck exits 2 on `set -euo pipefail` before it opens a
     /// socket, so the validator never goes healthy and the miner and dashboard
     /// wait behind `service_healthy` forever. The `vendor/` scripts live in a
@@ -675,6 +794,9 @@ mod tests {
             "./chain-specs/aglais-network.json",
             "./config/quip-miner.toml",
             "./scripts/validator-healthcheck.sh",
+            "./syslog-ng/syslog-ng.conf",
+            "./syslog-ng/entrypoint.sh",
+            "./data/logs",
         ];
         for line in COMPOSE_YML.lines() {
             let t = line.trim();
