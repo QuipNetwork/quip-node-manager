@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Monotonic id stamped on every `pull-progress` / `pull-complete` event of a
 /// single pull. The frontend uses it to ignore stale events delivered out of
@@ -28,40 +28,6 @@ use tauri::{AppHandle, Emitter, Manager};
 static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // ── logging helpers (moved verbatim from docker.rs) ────────────────────────
-
-fn log_cmd(app: &AppHandle, cmd: &str) {
-    let entry = serde_json::json!({
-        "timestamp": "",
-        "level": "INFO",
-        "message": format!("$ {}", cmd),
-        "source": "app",
-    });
-    let _ = app.emit("node-log", entry);
-}
-
-fn log_output(app: &AppHandle, text: &str) {
-    for line in text.lines() {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "INFO",
-            "message": line,
-            "source": "app",
-        });
-        let _ = app.emit("node-log", entry);
-    }
-}
-
-fn log_err(app: &AppHandle, text: &str) {
-    for line in text.lines() {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "ERROR",
-            "message": line,
-            "source": "app",
-        });
-        let _ = app.emit("node-log", entry);
-    }
-}
 
 // ── host uid/gid (moved verbatim from docker.rs) ───────────────────────────
 
@@ -1343,12 +1309,18 @@ fn probe_postgres_auth(password: &str) -> PgAuthProbe {
 /// folder is unused but cleared for good measure.
 #[tauri::command]
 pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
-    log_cmd(&app, "Resetting dashboard database");
+    reset_dashboard_database_core(Arc::new(TauriSink::new(app))).await
+}
+
+pub(crate) async fn reset_dashboard_database_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<(), String> {
+    sink.log("INFO", "$ Resetting dashboard database");
 
     // Force-remove only the dashboard + Postgres containers (by fixed name) so
     // the data volume is free to delete. Best-effort: missing containers just
     // error per-name, which we ignore. Deliberately no `compose up`.
-    log_cmd(&app, "docker rm -f quip-postgres quip-dashboard");
+    sink.log("INFO", "$ docker rm -f quip-postgres quip-dashboard");
     let _ = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
             .args(["rm", "-f", PG_CONTAINER, "quip-dashboard"])
@@ -1358,7 +1330,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 
     // Delete the Postgres data volume (the database + indexer state, including
     // the cached self identity).
-    log_cmd(&app, &format!("docker volume rm {PGDATA_VOLUME}"));
+    sink.log("INFO", &format!("$ docker volume rm {PGDATA_VOLUME}"));
     let rm = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
             .args(["volume", "rm", PGDATA_VOLUME])
@@ -1384,16 +1356,16 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     let dash_data = crate::settings::data_dir().join("dashboard-data");
     if let Err(e) = std::fs::remove_dir_all(&dash_data) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            log_err(
-                &app,
+            sink.log(
+                "ERROR",
                 &format!("Warning: clearing {} failed: {e}", dash_data.display()),
             );
         }
     }
     let _ = std::fs::create_dir_all(&dash_data);
 
-    log_output(
-        &app,
+    sink.log(
+        "INFO",
         "Dashboard database cleared. Start the node to bring the dashboard back up.",
     );
     Ok(())

@@ -239,7 +239,7 @@ pub fn debounce(
 }
 
 #[derive(Default)]
-struct MonitorState {
+pub(crate) struct MonitorState {
     prev_block: Option<u64>,
     consecutive_fails: u32,
     prev_overall: Option<StackHealth>,
@@ -250,6 +250,20 @@ struct MonitorState {
 
 /// One measurement of all three dimensions, rolled up and debounced.
 async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
+    // get_native_node_status is an async #[tauri::command] over managed
+    // NativeProcessState; fetch that state and call it directly.
+    let native_state = app.state::<crate::native::NativeProcessState>();
+    let native_miner_up = crate::native::get_native_node_status(native_state)
+        .await
+        .map(|s| s.running)
+        .unwrap_or(false);
+    sample_with(st, native_miner_up).await
+}
+
+/// The measurement itself, for callers that know their own host-miner state:
+/// the GUI reads it from `NativeProcessState`, the TUI from `node.pid`. Only
+/// Native mode consults `native_miner_up`.
+pub(crate) async fn sample_with(st: &Mutex<MonitorState>, native_miner_up: bool) -> HealthReport {
     let settings = crate::settings::load_settings();
     let run_mode = settings.run_mode.clone();
     let cfg = &settings.node_config;
@@ -260,15 +274,7 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
         .map(|s| s.overall)
         .unwrap_or(StackHealth::Unhealthy);
     let miner_up = match run_mode {
-        RunMode::Native => {
-            // get_native_node_status is an async #[tauri::command] over managed
-            // NativeProcessState; fetch that state and call it directly.
-            let native_state = app.state::<crate::native::NativeProcessState>();
-            crate::native::get_native_node_status(native_state)
-                .await
-                .map(|s| s.running)
-                .unwrap_or(false)
-        }
+        RunMode::Native => native_miner_up,
         RunMode::Docker => !matches!(stack, StackHealth::Stopped),
     };
 

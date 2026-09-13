@@ -89,6 +89,36 @@ pub async fn restart_to_update(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The same stop → apply → start plan for a caller without an app handle,
+/// driven through the orchestration cores the TUI already uses for Start and
+/// Stop. Bails on the first failing step, like the command above.
+pub(crate) async fn restart_to_update_core(
+    sink: std::sync::Arc<dyn crate::progress::ProgressSink>,
+    native_state: &NativeProcessState,
+) -> Result<(), String> {
+    let mode = crate::settings::load_settings().run_mode;
+    let binary_update_pending = matches!(crate::native::check_binary_update().await, Ok(Some(_)));
+    for step in update_restart_steps(&mode, binary_update_pending) {
+        match step {
+            UpdateStep::StopNative => {
+                crate::native::stop_native_node_core(sink.clone(), native_state).await?;
+            }
+            UpdateStep::StopStack => crate::compose::stop_stack_core(sink.clone()).await?,
+            UpdateStep::DownloadBinary => {
+                crate::native::download_native_binary_core(sink.clone()).await?;
+            }
+            UpdateStep::PullImages => {
+                crate::compose::pull_compose_images_core(sink.clone()).await?
+            }
+            UpdateStep::StartStack => crate::compose::start_stack_core(sink.clone()).await?,
+            UpdateStep::StartNative => {
+                crate::native::start_native_node_core(sink.clone(), native_state).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
     pub version: String,
@@ -461,6 +491,29 @@ pub async fn run_update_checks(
     app: &tauri::AppHandle,
     settings: &crate::settings::AppSettings,
 ) -> UpdateCheckOutcome {
+    let outcome = check_updates(settings).await;
+    if let Some(info) = &outcome.app_update {
+        let _ = app.emit("app-update-available", info);
+        crate::set_tray_update(
+            app,
+            true,
+            &format!("Quip Node Manager — v{} available", info.version),
+        );
+    }
+    for img in &outcome.image_updates {
+        let _ = app.emit(
+            "image-update-available",
+            serde_json::json!({ "image": img.image, "version": img.version }),
+        );
+    }
+    if let Some(info) = &outcome.binary_update {
+        let _ = app.emit("binary-update-available", info);
+    }
+    outcome
+}
+
+/// The update sweep without the GUI's events, for callers with no app handle.
+pub(crate) async fn check_updates(settings: &crate::settings::AppSettings) -> UpdateCheckOutcome {
     let mut errors: Vec<String> = Vec::new();
     let mut app_update: Option<UpdateInfo> = None;
     let mut image_updates: Vec<ImageUpdateInfo> = Vec::new();
@@ -468,15 +521,7 @@ pub async fn run_update_checks(
 
     // App release (node-manager itself).
     match check_app_update().await {
-        Ok(Some(info)) => {
-            let _ = app.emit("app-update-available", &info);
-            crate::set_tray_update(
-                app,
-                true,
-                &format!("Quip Node Manager — v{} available", info.version),
-            );
-            app_update = Some(info);
-        }
+        Ok(Some(info)) => app_update = Some(info),
         Ok(None) => {}
         Err(e) => errors.push(format!("app release: {e}")),
     }
@@ -490,16 +535,10 @@ pub async fn run_update_checks(
             continue;
         };
         match resolve_image_update(image, &current, settings.update_channel).await {
-            Ok(Some(target)) => {
-                let _ = app.emit(
-                    "image-update-available",
-                    serde_json::json!({ "image": name, "version": target }),
-                );
-                image_updates.push(ImageUpdateInfo {
-                    image: name.to_string(),
-                    version: target,
-                });
-            }
+            Ok(Some(target)) => image_updates.push(ImageUpdateInfo {
+                image: name.to_string(),
+                version: target,
+            }),
             Ok(None) => {}
             Err(e) => errors.push(format!("{name} image: {e}")),
         }
@@ -508,10 +547,7 @@ pub async fn run_update_checks(
     // Native binary lives on GitLab Releases, not the container registry.
     if settings.run_mode == crate::settings::RunMode::Native {
         match crate::native::check_binary_update().await {
-            Ok(Some(info)) => {
-                let _ = app.emit("binary-update-available", &info);
-                binary_update = Some(info);
-            }
+            Ok(Some(info)) => binary_update = Some(info),
             Ok(None) => {}
             Err(e) => errors.push(format!("native binary: {e}")),
         }

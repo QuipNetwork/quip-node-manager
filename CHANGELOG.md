@@ -50,6 +50,24 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc5
+<!-- vale Google.Headings = YES -->
+
+- Bring the headless TUI to parity with the GUI. Settings: a CPU mining
+  switch, the TLS fields (hostname, ACME email, ZeroSSL key), the Metal
+  adaptive-cap knobs, and a Save button that does not restart the stack.
+  Checks: a Retry button on every item plus the Docker install fix. Status:
+  the three health dimensions under the status line and the installed miner
+  version. Actions: Check Updates with Update & Restart, and Reset Dashboard
+  DB behind a two-press confirmation. Logs: a filter (`/`) and clear (`c`).
+- Fix the TUI never writing the GPU backend it detected. A Metal Mac that only
+  ever used the TUI kept the CUDA default, so config.toml got a `[cuda.N]`
+  section for its GPU instead of `[metal]`. Start and Apply now set it from the
+  hardware survey, as the GUI does.
+- Generate the node secret through the same function in both front ends. The
+  TUI had its own copy of the logic.
+
+<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc4
 <!-- vale Google.Headings = YES -->
 
