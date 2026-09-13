@@ -50,7 +50,7 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
-## Unreleased
+## v0.2.6-rc5
 <!-- vale Google.Headings = YES -->
 
 - Bring the headless TUI to parity with the GUI. Settings: a CPU mining
