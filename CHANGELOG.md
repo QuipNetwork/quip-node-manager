@@ -50,6 +50,21 @@ Click **More info**, then **Run anyway**.
 
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
+## v0.2.6-rc6
+<!-- vale Google.Headings = YES -->
+
+- Make the Public API reachability check probe the port peers are told to
+  dial. With "Override Public Host & Port" set, the check named and probed
+  the Service Ports host port instead of the override, so a router that
+  remaps the external port always reported "not reachable". The check now
+  targets the advertised port, keeps its temporary listener on the host
+  port, and shows both when they differ.
+- Explain what the override port and the Caddy hostname port do. The
+  override changes only the address peers dial, and the Caddy port is fixed
+  at 20049 inside the container. Both fields now point to Service Ports as
+  the place that moves the listening port. The TUI shows the same hint.
+
+<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc5
 <!-- vale Google.Headings = YES -->
 

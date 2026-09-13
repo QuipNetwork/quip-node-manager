@@ -163,6 +163,7 @@
                         <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" />
                       </div>
                     </div>
+                    <div style="font-size:12px;color:var(--text-faint);margin-top:4px;">This changes only the address peers are told to dial. Use it when your router forwards a different external port to this machine. To change the port the node itself listens on, edit Public API under Service Ports.</div>
                     <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
                   </div>
                 </div>
@@ -216,6 +217,7 @@
                 <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">
                   <code>:20049</code> for local HTTP, or
                   <code>example.com, example.com:20049</code> for public TLS.
+                  The port here is always 20049 inside the container and cannot be changed. To move the public port, edit Public API under Service Ports.
                 </div>
               </div>
               <div class="form-group">

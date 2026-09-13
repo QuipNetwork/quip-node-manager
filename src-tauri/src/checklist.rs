@@ -124,6 +124,12 @@ pub struct CheckCtx {
     pub image_tag: crate::settings::ImageTag,
     /// Public Caddy/API host port. In v0.2 this is HTTP/WebSocket over TCP.
     pub port: u16,
+    /// Port peers are told to reach the Public API on: the "Override Public
+    /// Host & Port" value, or `port` when there is no override. Differs from
+    /// `port` only when a router remaps the external port to the host port,
+    /// and it is the port the external probe must target — the same value
+    /// `write_config_toml` emits as `public_port`.
+    pub advertised_port: u16,
     /// Host-exposed validator libp2p port. The container still binds 30333.
     pub validator_port: u16,
     pub public_api_enabled: bool,
@@ -155,6 +161,10 @@ impl CheckCtx {
             run_mode: settings.run_mode,
             image_tag: settings.image_tag,
             port: settings.node_config.port,
+            advertised_port: settings
+                .node_config
+                .public_port
+                .unwrap_or(settings.node_config.port),
             validator_port: settings.node_config.validator_port,
             public_api_enabled: settings.node_config.public_api_enabled,
             validator_p2p_enabled: settings.node_config.validator_p2p_enabled,
@@ -404,32 +414,57 @@ pub(crate) fn clear_port_probe_cache() {
 /// Cached front door for the port probe: serve a <5-minute-old result if we
 /// have one, otherwise probe and store. A user Retry clears the cache first
 /// (see `run_recheck`), so it always re-probes.
-async fn probe_port_forwarding_with_ctx(ctx: &CheckCtx, port: u16) -> PortProbeResult {
-    if let Some(cached) = cached_port_probe(port) {
+///
+/// `host_port` is what this machine listens on (and what the temp listener
+/// binds when nothing is running). `external_port` is what check.quip.network
+/// connects to from outside. They differ only when the operator's router
+/// remaps the external port to the host port; the cache is keyed on the
+/// external port because that is the address being verified.
+async fn probe_port_forwarding_with_ctx(
+    ctx: &CheckCtx,
+    host_port: u16,
+    external_port: u16,
+) -> PortProbeResult {
+    if let Some(cached) = cached_port_probe(external_port) {
         ctx.log_probe(
             "INFO",
-            format!("port {port} \u{2014} using cached check.quip.network result (<5m old)"),
+            format!(
+                "port {external_port} \u{2014} using cached check.quip.network result (<5m old)"
+            ),
         );
         return cached;
     }
-    let result = probe_port_forwarding_uncached(ctx, port).await;
-    store_port_probe(port, result);
+    let result = probe_port_forwarding_uncached(ctx, host_port, external_port).await;
+    store_port_probe(external_port, result);
     result
 }
 
-async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeResult {
+async fn probe_port_forwarding_uncached(
+    ctx: &CheckCtx,
+    host_port: u16,
+    external_port: u16,
+) -> PortProbeResult {
     use tokio::net::TcpListener;
 
-    match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+    if host_port != external_port {
+        ctx.log_probe(
+            "INFO",
+            format!(
+                "public port override: probing external port {external_port}, \
+                 expected to forward to host port {host_port}"
+            ),
+        );
+    }
+    match TcpListener::bind(format!("0.0.0.0:{}", host_port)).await {
         Err(e) => {
             ctx.log_probe(
                 "INFO",
                 format!(
                     "port {} in use locally ({}) \u{2014} using TCP /checkport probe",
-                    port, e
+                    host_port, e
                 ),
             );
-            match probe_external_tcp(ctx, port).await {
+            match probe_external_tcp(ctx, external_port).await {
                 ProbeOutcome::HostResponded => PortProbeResult::Verified,
                 ProbeOutcome::Unreachable => PortProbeResult::Unreachable,
                 ProbeOutcome::RateLimited(retry) => PortProbeResult::RateLimited {
@@ -447,7 +482,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
                 "INFO",
                 format!(
                     "port {} is free locally \u{2014} holding temp listener, using TCP probe",
-                    port
+                    host_port
                 ),
             );
             let accept_task = tokio::spawn(async move {
@@ -457,7 +492,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
                     }
                 }
             });
-            let outcome = probe_external_tcp(ctx, port).await;
+            let outcome = probe_external_tcp(ctx, external_port).await;
             accept_task.abort();
             match outcome {
                 ProbeOutcome::HostResponded => PortProbeResult::ForwardReady,
@@ -477,7 +512,7 @@ async fn probe_port_forwarding_uncached(ctx: &CheckCtx, port: u16) -> PortProbeR
 /// Plain wrapper for callers without a `CheckCtx` (TUI). Runs silently.
 pub async fn probe_port_forwarding(port: u16) -> PortProbeResult {
     let ctx = CheckCtx::from_settings(None);
-    probe_port_forwarding_with_ctx(&ctx, port).await
+    probe_port_forwarding_with_ctx(&ctx, port, port).await
 }
 
 async fn probe_external_tcp(ctx: &CheckCtx, port: u16) -> ProbeOutcome {
@@ -749,7 +784,13 @@ fn idle_item(id: &str, ctx: &CheckCtx) -> CheckItem {
         "hostname" => CheckItem::new(id, "Hostname accessible to internet", false, None),
         "port" => CheckItem::new(
             id,
-            &format!("Public API port {} — press Retry to test", ctx.port),
+            &with_host_port_note(
+                format!(
+                    "Public API port {} — press Retry to test",
+                    ctx.advertised_port
+                ),
+                ctx,
+            ),
             false,
             None,
         ),
@@ -1027,9 +1068,20 @@ async fn run_check_port(ctx: &CheckCtx) -> CheckItem {
             .with_state(CheckState::Warn)
             .with_label("Public API port publishing is disabled");
     }
-    let result = probe_port_forwarding_with_ctx(ctx, ctx.port).await;
-    let (state, label) = port_probe_state_label(result, "Public API", ctx.port);
-    base.with_state(state).with_label(label)
+    let result = probe_port_forwarding_with_ctx(ctx, ctx.port, ctx.advertised_port).await;
+    let (state, label) = port_probe_state_label(result, "Public API", ctx.advertised_port);
+    base.with_state(state)
+        .with_label(with_host_port_note(label, ctx))
+}
+
+/// Appends the host port to a Public API label when the advertised port is
+/// overridden, so an operator whose router remaps ports can see both ends of
+/// the forward the check expects.
+fn with_host_port_note(label: String, ctx: &CheckCtx) -> String {
+    if ctx.advertised_port == ctx.port {
+        return label;
+    }
+    format!("{label} (forwarded to host port {})", ctx.port)
 }
 
 async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
@@ -1039,7 +1091,7 @@ async fn run_check_port_validator(ctx: &CheckCtx) -> CheckItem {
             .with_state(CheckState::Warn)
             .with_label("Validator P2P port publishing is disabled");
     }
-    let result = probe_port_forwarding_with_ctx(ctx, ctx.validator_port).await;
+    let result = probe_port_forwarding_with_ctx(ctx, ctx.validator_port, ctx.validator_port).await;
     let (state, label) = port_probe_state_label(result, "Validator P2P", ctx.validator_port);
     base.with_state(state).with_label(label)
 }
@@ -1292,6 +1344,7 @@ mod tests {
             run_mode: RunMode::Docker,
             image_tag: ImageTag::Cpu,
             port: 20049,
+            advertised_port: 20049,
             validator_port: 30333,
             public_api_enabled: true,
             validator_p2p_enabled: true,
@@ -1301,6 +1354,28 @@ mod tests {
             app: None,
             public_ip: OnceCell::new(),
         }
+    }
+
+    /// The "Override Public Host & Port" port is what peers are told to dial,
+    /// so it is the port the reachability check must name and probe. The host
+    /// port stays visible so the operator can see both ends of the forward.
+    #[test]
+    fn public_api_check_targets_the_advertised_port_when_overridden() {
+        let mut ctx = test_ctx();
+        ctx.advertised_port = 24444;
+
+        assert_eq!(
+            idle_item("port", &ctx).label,
+            "Public API port 24444 \u{2014} press Retry to test (forwarded to host port 20049)"
+        );
+        let (state, label) =
+            port_probe_state_label(PortProbeResult::Unreachable, "Public API", 24444);
+        assert_eq!(state, CheckState::Warn);
+        assert_eq!(
+            with_host_port_note(label, &ctx),
+            "Public API port 24444 not reachable \u{2014} check router forward + firewall \
+             (forwarded to host port 20049)"
+        );
     }
 
     #[tokio::test]
