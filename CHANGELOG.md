@@ -70,10 +70,7 @@ Click **More info**, then **Run anyway**.
 
 ---
 
-<!-- Release tags use literal version spelling. -->
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc7
-<!-- vale Google.Headings = YES -->
 
 - Stop the macOS release build from changing the runner's keychain
   configuration. The tag build made its job keychain the default keychain
@@ -83,9 +80,7 @@ Click **More info**, then **Run anyway**.
   routes `codesign` through a wrapper that passes `--keychain`, writes no
   keychain preference, and deletes the keychain when the job ends.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc6
-<!-- vale Google.Headings = YES -->
 
 - Make the Public API reachability check probe the port peers are told to
   dial. With "Override Public Host & Port" set, the check named and probed
@@ -98,9 +93,7 @@ Click **More info**, then **Run anyway**.
   at 20049 inside the container. Both fields now point to Service Ports as
   the place that moves the listening port. The TUI shows the same hint.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc5
-<!-- vale Google.Headings = YES -->
 
 - Bring the headless TUI to parity with the GUI. Settings: a CPU mining
   switch, the TLS fields (hostname, ACME email, ZeroSSL key), the Metal
@@ -116,9 +109,7 @@ Click **More info**, then **Run anyway**.
 - Generate the node secret through the same function in both front ends. The
   TUI had its own copy of the logic.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc4
-<!-- vale Google.Headings = YES -->
 
 - Refuse to start when no mining backend is on. The miner rejects a
   config with no `[cpu]`, `[cuda.N]`, `[metal]`, or `[dwave]` table, and its
@@ -137,9 +128,7 @@ Click **More info**, then **Run anyway**.
   and reveals the fields when on. The public-access slider sits before the
   port and explains loopback versus all interfaces.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc3
-<!-- vale Google.Headings = YES -->
 
 - Read the stack log from one merged file. Every container now writes through a
   collector into `data/logs/quip-node.log`, and the log pane tails that file
@@ -155,9 +144,7 @@ Click **More info**, then **Run anyway**.
   alone, so after the collector rotated at 10 MB it could keep reading the
   renamed file and show nothing further until the next restart.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc2
-<!-- vale Google.Headings = YES -->
 
 - Repair the container health probes in the Windows builds, which failed on
   every call. The Windows build machine checked out the embedded shell scripts
@@ -176,7 +163,6 @@ Click **More info**, then **Run anyway**.
   at Default keeps the binary that the image chooses.
 
 ## v0.2.6-rc1
-<!-- vale Google.Headings = YES -->
 
 - Show container logs during stack startup. Keep logs visible through waits and failed starts.
   Retry the log connection while Compose files are staging or Docker reconnects.
