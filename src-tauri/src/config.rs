@@ -38,6 +38,20 @@ fn native_attempts_dir() -> String {
     data_dir().join("attempts").to_string_lossy().to_string()
 }
 
+// The dwave miner's QPU spend ledger. It must survive a restart, or the miner
+// meters the quota period from zero again. In Docker, `/data` is the `./data`
+// mount.
+const DOCKER_USAGE_DB: &str = "/data/qpu-usage.db";
+
+/// Spend ledger for the native dwave miner: `<data_dir>/qpu-usage.db`. The
+/// miner's own default is `/data/qpu-usage.db`, which a Mac does not have.
+fn native_usage_db() -> String {
+    data_dir()
+        .join("qpu-usage.db")
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Native miner → local validator: the validator container publishes its raw
 /// JSON-RPC on the host loopback (see stack_assets), so the host-side miner
 /// connects directly rather than through Caddy's `/rpc` route. The host port
@@ -186,7 +200,11 @@ struct DwaveToml {
     #[serde(skip_serializing_if = "String::is_empty")]
     token: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    daily_budget: String,
+    budget: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_reset_day: Option<u8>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    usage_db: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     solver: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -336,16 +354,31 @@ impl ConfigToml {
         }
 
         let (qpu, dwave) = match &config.dwave_config {
-            Some(dw) => (
-                Some(MarkerToml::default()),
-                Some(DwaveToml {
-                    binary: native_binary(run_mode, "quip-dwave-qa"),
-                    token: dw.token.clone(),
-                    daily_budget: dw.daily_budget.clone(),
-                    solver: dw.solver.clone(),
-                    dwave_region_url: dw.dwave_region_url.clone(),
-                }),
-            ),
+            Some(dw) => {
+                // The miner meters QPU time only when `budget` is set. The
+                // reset day and the ledger path mean nothing without it.
+                let budget = dw.budget.trim().to_string();
+                let metered = !budget.is_empty();
+                let usage_db = if !metered {
+                    String::new()
+                } else if is_docker {
+                    DOCKER_USAGE_DB.to_string()
+                } else {
+                    native_usage_db()
+                };
+                (
+                    Some(MarkerToml::default()),
+                    Some(DwaveToml {
+                        binary: native_binary(run_mode, "quip-dwave-qa"),
+                        token: dw.token.clone(),
+                        budget,
+                        budget_reset_day: metered.then_some(dw.budget_reset_day),
+                        usage_db,
+                        solver: dw.solver.clone(),
+                        dwave_region_url: dw.dwave_region_url.clone(),
+                    }),
+                )
+            }
             None => (None, None),
         };
 
@@ -1118,7 +1151,8 @@ mod tests {
         let cfg = NodeConfig {
             dwave_config: Some(DwaveConfig {
                 token: "DWAVE-TOKEN".to_string(),
-                daily_budget: "60s".to_string(),
+                budget: "40h".to_string(),
+                budget_reset_day: 9,
                 ..DwaveConfig::default()
             }),
             ..NodeConfig::default()
@@ -1128,7 +1162,45 @@ mod tests {
         assert!(toml.contains("[qpu]\n"));
         assert!(toml.contains("[dwave]\n"));
         assert!(toml.contains("token = \"DWAVE-TOKEN\""));
-        assert!(toml.contains("daily_budget = \"60s\""));
+        assert!(toml.contains("budget = \"40h\""));
+        assert!(toml.contains("budget_reset_day = 9"));
+        assert!(toml.contains("usage_db = \"/data/qpu-usage.db\""));
+        assert!(!toml.contains("daily_budget"));
         assert!(toml.contains("solver = \"Advantage2_System1.13\""));
+    }
+
+    #[test]
+    fn native_dwave_budget_keeps_its_ledger_in_the_data_dir() {
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "DWAVE-TOKEN".to_string(),
+                budget: "40h".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+
+        assert!(toml.contains(&format!("usage_db = {:?}", native_usage_db())));
+        assert!(!toml.contains("usage_db = \"/data/qpu-usage.db\""));
+        assert!(toml.contains("budget_reset_day = 1"));
+    }
+
+    #[test]
+    fn dwave_without_budget_writes_no_budget_keys() {
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "DWAVE-TOKEN".to_string(),
+                budget: "  ".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let toml = render_config_toml(&cfg, &mode);
+            assert!(toml.contains("[dwave]\n"), "{mode:?}: [dwave] missing");
+            assert!(!toml.contains("budget"), "{mode:?}: budget key rendered");
+            assert!(!toml.contains("usage_db"), "{mode:?}: usage_db rendered");
+        }
     }
 }

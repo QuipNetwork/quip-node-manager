@@ -155,7 +155,13 @@ pub struct DwaveConfig {
     pub solver: String,
     #[serde(default = "default_dwave_region_url")]
     pub dwave_region_url: String,
-    pub daily_budget: String,
+    /// QPU access time per D-Wave quota period, as a duration such as "40h".
+    /// Empty leaves the miner unmetered.
+    #[serde(default)]
+    pub budget: String,
+    /// UTC day of the month (1-31) on which the quota period resets.
+    #[serde(default = "default_budget_reset_day")]
+    pub budget_reset_day: u8,
     #[serde(default)]
     pub qpu_min_blocks_for_estimation: Option<u32>,
     #[serde(default)]
@@ -168,6 +174,9 @@ fn default_dwave_solver() -> String {
 fn default_dwave_region_url() -> String {
     "https://na-west-1.cloud.dwavesys.com/sapi/v2/".to_string()
 }
+fn default_budget_reset_day() -> u8 {
+    1
+}
 
 impl Default for DwaveConfig {
     fn default() -> Self {
@@ -175,7 +184,8 @@ impl Default for DwaveConfig {
             token: String::new(),
             solver: default_dwave_solver(),
             dwave_region_url: default_dwave_region_url(),
-            daily_budget: String::new(),
+            budget: String::new(),
+            budget_reset_day: default_budget_reset_day(),
             qpu_min_blocks_for_estimation: None,
             qpu_ema_alpha: None,
         }

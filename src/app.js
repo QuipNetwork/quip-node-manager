@@ -702,7 +702,13 @@ function collectConfig() {
         token: qpuToken,
         solver: 'Advantage2_System1.13',
         dwave_region_url: 'https://na-west-1.cloud.dwavesys.com/sapi/v2/',
-        daily_budget: document.getElementById('qpu-daily-budget')?.value?.trim() ?? '',
+        budget: document.getElementById('qpu-budget')?.value?.trim() ?? '',
+        // The miner stops on a reset day outside 1-31; min/max on the input
+        // do not stop a typed value from reaching this read.
+        budget_reset_day: Math.min(
+          31,
+          Math.max(1, parseInt(document.getElementById('qpu-budget-reset-day')?.value) || 1),
+        ),
         qpu_min_blocks_for_estimation: null,
         qpu_ema_alpha: null,
       }
@@ -872,7 +878,8 @@ async function populateForm(settings) {
   const dw = c.dwave_config;
   if (dw) {
     document.getElementById('qpu-api-key').value = dw.token ?? '';
-    document.getElementById('qpu-daily-budget').value = dw.daily_budget ?? '';
+    document.getElementById('qpu-budget').value = dw.budget ?? '';
+    document.getElementById('qpu-budget-reset-day').value = dw.budget_reset_day ?? 1;
     if (dw.token) {
       document.getElementById('qpu-section').style.display = 'block';
       document.getElementById('btn-qpu-toggle').textContent =
