@@ -270,7 +270,8 @@ fn activate(app: &mut TuiApp) -> Action {
         | FocusId::CpuCores
         | FocusId::MetalIdleAfter
         | FocusId::QpuApiKey
-        | FocusId::QpuDailyBudget
+        | FocusId::QpuBudget
+        | FocusId::QpuBudgetResetDay
         | FocusId::NodeLog
         | FocusId::HttpLog
         | FocusId::LogFilter => {
@@ -301,7 +302,8 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::CpuCores => app.form.cpu_cores.clone(),
         FocusId::MetalIdleAfter => app.form.metal_idle_after.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
-        FocusId::QpuDailyBudget => app.form.qpu_daily_budget.clone(),
+        FocusId::QpuBudget => app.form.qpu_budget.clone(),
+        FocusId::QpuBudgetResetDay => app.form.qpu_budget_reset_day.clone(),
         FocusId::NodeLog => app.form.node_log.clone(),
         FocusId::HttpLog => app.form.http_log.clone(),
         FocusId::LogFilter => app.log_filter.clone(),
@@ -339,7 +341,8 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::CpuCores => app.form.cpu_cores = buf,
             FocusId::MetalIdleAfter => app.form.metal_idle_after = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
-            FocusId::QpuDailyBudget => app.form.qpu_daily_budget = buf,
+            FocusId::QpuBudget => app.form.qpu_budget = buf,
+            FocusId::QpuBudgetResetDay => app.form.qpu_budget_reset_day = buf,
             FocusId::NodeLog => app.form.node_log = buf,
             FocusId::HttpLog => app.form.http_log = buf,
             _ => {}

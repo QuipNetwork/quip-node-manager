@@ -54,7 +54,7 @@ Click **More info**, then **Run anyway**.
 - **Pre-flight checklist** -- verifies Docker + Compose v2 availability (plus WSL on Windows, the miner binary in Native mode, and the D-Wave token when QPU mining is configured), node secret, public IP, hostname, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
 - **Live log streaming** -- tails `docker compose logs -f <node>` in a collapsible drawer; switches to `data/node.log` once the node writes to it
 - **GPU configuration** -- detects CUDA and Metal devices, per-device enable/disable, utilization slider, yielding mode
-- **D-Wave QPU support** -- optional quantum processing unit configuration with daily budget controls
+- **D-Wave QPU support** -- optional quantum processing unit configuration with a monthly QPU time budget
 - **Background update monitor** -- checks for new node + dashboard image digests and manager app releases every 30 minutes; optional auto-restart on digest change
 - **TLS certificate guidance** -- Caddy's ACME (Let's Encrypt or ZeroSSL) is wired up out of the box; set a DNS name + email and TLS "just works"
 

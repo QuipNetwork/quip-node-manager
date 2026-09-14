@@ -661,9 +661,19 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
         ));
         lines.push(field_line(
             app,
-            &FocusId::QpuDailyBudget,
-            "  Daily Budget",
-            &field_value(app, &FocusId::QpuDailyBudget, &app.form.qpu_daily_budget),
+            &FocusId::QpuBudget,
+            "  Monthly Budget",
+            &field_value(app, &FocusId::QpuBudget, &app.form.qpu_budget),
+        ));
+        lines.push(field_line(
+            app,
+            &FocusId::QpuBudgetResetDay,
+            "  Reset Day (UTC)",
+            &field_value(
+                app,
+                &FocusId::QpuBudgetResetDay,
+                &app.form.qpu_budget_reset_day,
+            ),
         ));
     }
 

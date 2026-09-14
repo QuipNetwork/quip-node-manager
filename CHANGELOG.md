@@ -48,6 +48,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.7
+
+- **The D-Wave budget is monthly, and the miner enforces it again**: the D-Wave miner in quip-miner v0.3.1 and later reads only `budget` and `budget_reset_day`. The manager wrote `daily_budget` instead, so a node with a Daily Budget set had no spending limit. Settings now has a Monthly Budget field, such as `40h`, and a Reset Day field, the day of the month in UTC. The manager writes both, plus a spend ledger in the data directory that survives a restart.
+
+- **Set your D-Wave budget again**: the manager does not convert the old Daily Budget value. Enter the QPU time of your D-Wave plan for one quota period in Settings, with the day the quota resets. With no budget, the miner spends without a limit.
+
 ## v0.2.6
 
 - **The stack log is one merged file**: every container writes through a collector into `data/logs/quip-node.log`, and the log pane tails that file. The file outlives a container replacement and keeps slashes and tabs. The reader follows it across the 10 MB rotation. The embedded stack is nodes.quip.network v0.3.2.

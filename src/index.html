@@ -320,8 +320,12 @@
                   <input type="password" id="qpu-api-key" placeholder="DEV-..." />
                 </div>
                 <div class="form-group">
-                  <label for="qpu-daily-budget">Daily Budget <span style="color:var(--text-faint);font-weight:400;">(e.g. 60s, 5m)</span></label>
-                  <input type="text" id="qpu-daily-budget" placeholder="60s" />
+                  <label for="qpu-budget">Monthly Budget <span style="color:var(--text-faint);font-weight:400;">(QPU time, e.g. 40h)</span></label>
+                  <input type="text" id="qpu-budget" placeholder="40h" />
+                </div>
+                <div class="form-group">
+                  <label for="qpu-budget-reset-day">Reset Day <span style="color:var(--text-faint);font-weight:400;">(day of month, UTC)</span></label>
+                  <input type="number" id="qpu-budget-reset-day" min="1" max="31" value="1" />
                 </div>
               </div>
             </div>

@@ -183,7 +183,8 @@ pub enum FocusId {
     MetalIdleAfter,
     QpuToggle,
     QpuApiKey,
-    QpuDailyBudget,
+    QpuBudget,
+    QpuBudgetResetDay,
     Save,
     ApplyRestart,
     ResetDashboardDb,
@@ -268,7 +269,8 @@ pub struct FormState {
     pub metal_active_util: u8,
     pub metal_idle_after: String,
     pub qpu_api_key: String,
-    pub qpu_daily_budget: String,
+    pub qpu_budget: String,
+    pub qpu_budget_reset_day: String,
     // Advanced settings
     pub timeout: String,
     pub heartbeat_interval: String,
@@ -342,7 +344,8 @@ impl FormState {
             metal_active_util: nc.metal_config.active_util,
             metal_idle_after: nc.metal_config.idle_after_s.to_string(),
             qpu_api_key: dw.token,
-            qpu_daily_budget: dw.daily_budget,
+            qpu_budget: dw.budget,
+            qpu_budget_reset_day: dw.budget_reset_day.to_string(),
             timeout: nc.timeout.to_string(),
             heartbeat_interval: nc.heartbeat_interval.to_string(),
             heartbeat_timeout: nc.heartbeat_timeout.to_string(),
@@ -491,7 +494,8 @@ impl FormState {
                 token: dwave_token.to_string(),
                 solver: "Advantage2_System1.13".to_string(),
                 dwave_region_url: "https://na-west-1.cloud.dwavesys.com/sapi/v2/".to_string(),
-                daily_budget: self.qpu_daily_budget.clone(),
+                budget: self.qpu_budget.trim().to_string(),
+                budget_reset_day: parse_reset_day(&self.qpu_budget_reset_day),
                 qpu_min_blocks_for_estimation: None,
                 qpu_ema_alpha: None,
             })
@@ -545,6 +549,20 @@ impl FormState {
 
 /// The persisted GPU backend for a hardware survey string, matching the GUI's
 /// `gpuBackend = survey.gpu_backend === 'metal' ? 'mps' : 'local'`.
+/// The D-Wave quota reset day typed into the TUI, as the 1-31 value the dwave
+/// miner accepts. The miner maps a day past the end of a short month onto that
+/// month's last day, so every value in 1-31 is valid in every month.
+///
+/// A number outside that range is clamped to the nearest valid day, because the
+/// miner stops on a reset day it cannot use. Anything that is not a number
+/// falls back to 1, the miner's own default.
+pub fn parse_reset_day(input: &str) -> u8 {
+    let Ok(day) = input.trim().parse::<u32>() else {
+        return 1;
+    };
+    day.clamp(1, 31) as u8
+}
+
 pub fn gpu_backend_from_survey(survey_backend: &str) -> crate::settings::GpuBackend {
     if survey_backend == "metal" {
         crate::settings::GpuBackend::Mps
@@ -1520,7 +1538,8 @@ impl TuiApp {
             list.push(FocusId::QpuToggle);
             if self.qpu_expanded {
                 list.push(FocusId::QpuApiKey);
-                list.push(FocusId::QpuDailyBudget);
+                list.push(FocusId::QpuBudget);
+                list.push(FocusId::QpuBudgetResetDay);
             }
             list.push(FocusId::Save);
             list.push(FocusId::ApplyRestart);
@@ -1945,6 +1964,18 @@ mod tests {
         assert!(!nc.gpu_device_configs[0].enabled);
         assert!(nc.gpu_device_configs[1].enabled);
         assert!(!nc.gpu_device_configs[2].enabled);
+    }
+
+    #[test]
+    fn reset_day_is_always_a_day_the_miner_accepts() {
+        assert_eq!(parse_reset_day("9"), 9);
+        assert_eq!(parse_reset_day(" 15 "), 15);
+        assert_eq!(parse_reset_day("31"), 31);
+        assert_eq!(parse_reset_day("0"), 1);
+        assert_eq!(parse_reset_day("90"), 31);
+        assert_eq!(parse_reset_day(""), 1);
+        assert_eq!(parse_reset_day("abc"), 1);
+        assert_eq!(parse_reset_day("-3"), 1);
     }
 
     #[test]
