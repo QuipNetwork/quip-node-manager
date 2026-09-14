@@ -48,6 +48,28 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.6
+
+- **The stack log is one merged file**: every container writes through a collector into `data/logs/quip-node.log`, and the log pane tails that file. The file outlives a container replacement and keeps slashes and tabs. The reader follows it across the 10 MB rotation. The embedded stack is nodes.quip.network v0.3.2.
+
+- **Logs stay visible during startup**: the log pane shows container output through waits and failed starts. It reconnects while the Compose files stage or Docker restarts.
+
+- **Each service has its own host ports**: both interfaces group the validator, miner, dashboard, PostgreSQL, and Caddy host ports by service, each with a switch. When public ports are off, the health checks use the internal network. The manager rejects conflicting host ports.
+
+- **Each GPU and CPU backend has a solver selector**: the CPU, CUDA, and Metal selectors read their lists from the miner image or the native bundle. The options match what the coordinator can start.
+
+- **An initial chain sync reads SYNCING, not DEGRADED**: the status pill shows a progress bar with the block counts.
+
+- **The Windows health probes work**: the embedded shell scripts had carriage-return line endings, so every probe failed and the validator stayed unhealthy.
+
+- **The headless TUI matches the GUI**: settings, checks, status, updates, and log actions are the same in both. The TUI also writes the GPU backend it detects, so a Metal Mac gets a `[metal]` section.
+
+- **Start refuses a config with no mining backend**: the manager names the cause before it writes the file. A Start before the hardware survey answers keeps the saved GPU list.
+
+- **The Public API check probes the advertised port**: with "Override Public Host & Port" set, the check probes the port that peers dial.
+
+---
+
 <!-- Release tags use literal version spelling. -->
 <!-- vale Google.Headings = NO -->
 ## v0.2.6-rc7
