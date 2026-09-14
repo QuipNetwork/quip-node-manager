@@ -48,10 +48,29 @@ Click **More info**, then **Run anyway**.
 
 ---
 
-<!-- Release tags use literal version spelling. -->
-<!-- vale Google.Headings = NO -->
+## v0.2.6
+
+- **The stack log is one merged file**: every container writes through a collector into `data/logs/quip-node.log`, and the log pane tails that file. The file outlives a container replacement and keeps slashes and tabs. The reader follows it across the 10 MB rotation. The embedded stack is nodes.quip.network v0.3.2.
+
+- **Logs stay visible during startup**: the log pane shows container output through waits and failed starts. It reconnects while the Compose files stage or Docker restarts.
+
+- **Each service has its own host ports**: both interfaces group the validator, miner, dashboard, PostgreSQL, and Caddy host ports by service, each with a switch. When public ports are off, the health checks use the internal network. The manager rejects conflicting host ports.
+
+- **Each GPU and CPU backend has a solver selector**: the CPU, CUDA, and Metal selectors read their lists from the miner image or the native bundle. The options match what the coordinator can start.
+
+- **An initial chain sync reads SYNCING, not DEGRADED**: the status pill shows a progress bar with the block counts.
+
+- **The Windows health probes work**: the embedded shell scripts had carriage-return line endings, so every probe failed and the validator stayed unhealthy.
+
+- **The headless TUI matches the GUI**: settings, checks, status, updates, and log actions are the same in both. The TUI also writes the GPU backend it detects, so a Metal Mac gets a `[metal]` section.
+
+- **Start refuses a config with no mining backend**: the manager names the cause before it writes the file. A Start before the hardware survey answers keeps the saved GPU list.
+
+- **The Public API check probes the advertised port**: with "Override Public Host & Port" set, the check probes the port that peers dial.
+
+---
+
 ## v0.2.6-rc7
-<!-- vale Google.Headings = YES -->
 
 - Stop the macOS release build from changing the runner's keychain
   configuration. The tag build made its job keychain the default keychain
@@ -61,9 +80,7 @@ Click **More info**, then **Run anyway**.
   routes `codesign` through a wrapper that passes `--keychain`, writes no
   keychain preference, and deletes the keychain when the job ends.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc6
-<!-- vale Google.Headings = YES -->
 
 - Make the Public API reachability check probe the port peers are told to
   dial. With "Override Public Host & Port" set, the check named and probed
@@ -76,9 +93,7 @@ Click **More info**, then **Run anyway**.
   at 20049 inside the container. Both fields now point to Service Ports as
   the place that moves the listening port. The TUI shows the same hint.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc5
-<!-- vale Google.Headings = YES -->
 
 - Bring the headless TUI to parity with the GUI. Settings: a CPU mining
   switch, the TLS fields (hostname, ACME email, ZeroSSL key), the Metal
@@ -94,9 +109,7 @@ Click **More info**, then **Run anyway**.
 - Generate the node secret through the same function in both front ends. The
   TUI had its own copy of the logic.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc4
-<!-- vale Google.Headings = YES -->
 
 - Refuse to start when no mining backend is on. The miner rejects a
   config with no `[cpu]`, `[cuda.N]`, `[metal]`, or `[dwave]` table, and its
@@ -115,9 +128,7 @@ Click **More info**, then **Run anyway**.
   and reveals the fields when on. The public-access slider sits before the
   port and explains loopback versus all interfaces.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc3
-<!-- vale Google.Headings = YES -->
 
 - Read the stack log from one merged file. Every container now writes through a
   collector into `data/logs/quip-node.log`, and the log pane tails that file
@@ -133,9 +144,7 @@ Click **More info**, then **Run anyway**.
   alone, so after the collector rotated at 10 MB it could keep reading the
   renamed file and show nothing further until the next restart.
 
-<!-- vale Google.Headings = NO -->
 ## v0.2.6-rc2
-<!-- vale Google.Headings = YES -->
 
 - Repair the container health probes in the Windows builds, which failed on
   every call. The Windows build machine checked out the embedded shell scripts
@@ -154,7 +163,6 @@ Click **More info**, then **Run anyway**.
   at Default keeps the binary that the image chooses.
 
 ## v0.2.6-rc1
-<!-- vale Google.Headings = YES -->
 
 - Show container logs during stack startup. Keep logs visible through waits and failed starts.
   Retry the log connection while Compose files are staging or Docker reconnects.
