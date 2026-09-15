@@ -90,6 +90,19 @@ pub fn next_solver(current: &str, available: &[crate::solvers::Solver]) -> Strin
     }
 }
 
+/// The solver list worth keeping for later presses, or `None` when the read
+/// failed. A failed read holds only the current selection, and caching it would
+/// pin the picker to that one entry until the TUI restarts, even after the
+/// image is pulled or the bundle is installed.
+pub fn cacheable_solvers(
+    catalog: &crate::solvers::SolverCatalog,
+) -> Option<Vec<crate::solvers::Solver>> {
+    match catalog.unavailable {
+        Some(_) => None,
+        None => Some(catalog.solvers.clone()),
+    }
+}
+
 /// Map miner state plus the compose roll-up to a headline state. Pure so the
 /// mapping is testable without Docker.
 ///
@@ -1895,6 +1908,32 @@ mod tests {
     fn solver_cycle_with_nothing_available_stays_on_the_default() {
         assert_eq!(next_solver("", &[]), "");
         assert_eq!(next_solver("quip-cpu-sa", &[]), "");
+    }
+
+    /// A failed read must not be cached, or the Metal picker stays pinned to
+    /// quip-metal-sa after the bundle that carries quip-metal-gibbs arrives.
+    #[test]
+    fn only_a_successful_solver_read_is_cached() {
+        use crate::solvers::{Backend, SolverCatalog};
+        let listed = crate::solvers::solvers_from_listing(
+            Backend::Metal,
+            "quip-metal-gibbs\nquip-metal-sa\n",
+        );
+        let read = SolverCatalog {
+            backend: Backend::Metal,
+            solvers: listed.clone(),
+            selected: "quip-metal-sa".to_string(),
+            default_solver: "quip-metal-sa".to_string(),
+            unavailable: None,
+        };
+        assert_eq!(cacheable_solvers(&read), Some(listed));
+
+        let failed = SolverCatalog {
+            solvers: crate::solvers::solvers_from_listing(Backend::Metal, "quip-metal-sa"),
+            unavailable: Some("read bin: No such file or directory".to_string()),
+            ..read
+        };
+        assert_eq!(cacheable_solvers(&failed), None);
     }
 
     /// Each backend keeps its own selection. Sharing one field would let a CUDA

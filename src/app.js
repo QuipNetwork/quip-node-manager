@@ -2332,6 +2332,9 @@ async function init() {
       // The survey decides whether the tuning row reads metal_config or the
       // CUDA device list, so re-seed it now that the answer is known.
       if (state.settings) populateGpuTuning(state.settings.node_config);
+      // populateForm ran before the survey existed, so the CUDA and Metal
+      // pickers are still hidden. The survey names which one this machine runs.
+      if (state.settings) renderSolverPickers(state.settings.node_config);
     })
     .catch(() => {});
 
