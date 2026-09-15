@@ -48,6 +48,12 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.8
+
+- **The CUDA and Metal solver selectors appear in the desktop app**: the app drew these selectors before the hardware check finished. Only the CPU selector was visible. You can now choose `gibbs` or `sa` for CUDA and Metal.
+
+- **The terminal UI retries a failed solver list**: after a failed first read, the list held only the current solver until a restart. The next press now reads the list again.
+
 ## v0.2.7
 
 - **The D-Wave budget is monthly, and the miner enforces it again**: the D-Wave miner in quip-miner v0.3.1 and later reads only `budget` and `budget_reset_day`. The manager wrote `daily_budget` instead, so a node with a Daily Budget set had no spending limit. Settings now has a Monthly Budget field, such as `40h`, and a Reset Day field, the day of the month in UTC. The manager writes both, plus a spend ledger in the data directory that survives a restart.

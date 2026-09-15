@@ -132,26 +132,30 @@ fn activate(app: &mut TuiApp) -> Action {
         FocusId::ApplyRestart => Action::ApplyRestart,
 
         // Solver pickers — cycle the default plus whatever that backend ships.
-        // The list is read on first use; a failed read leaves it empty, so the
-        // field then only offers the default and says so in the status line.
+        // A successful read is kept. A failed read offers only the current
+        // selection for this press, says why in the status line, and is read
+        // again on the next press.
         FocusId::Solver(backend) => {
-            if !app.solvers.contains_key(&backend) {
-                let catalog = tokio::runtime::Runtime::new()
-                    .ok()
-                    .map(|rt| rt.block_on(crate::solvers::list_solvers(backend)));
-                match catalog {
-                    Some(c) => {
-                        if let Some(reason) = &c.unavailable {
-                            app.set_status(format!("could not list solvers: {reason}"));
+            let available = match app.solvers.get(&backend) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let catalog = tokio::runtime::Runtime::new()
+                        .ok()
+                        .map(|rt| rt.block_on(crate::solvers::list_solvers(backend)));
+                    match catalog {
+                        Some(c) => {
+                            if let Some(reason) = &c.unavailable {
+                                app.set_status(format!("could not list solvers: {reason}"));
+                            }
+                            if let Some(solvers) = crate::tui_app::cacheable_solvers(&c) {
+                                app.solvers.insert(backend, solvers);
+                            }
+                            c.solvers
                         }
-                        app.solvers.insert(backend, c.solvers);
-                    }
-                    None => {
-                        app.solvers.insert(backend, Vec::new());
+                        None => Vec::new(),
                     }
                 }
-            }
-            let available = app.solvers.get(&backend).cloned().unwrap_or_default();
+            };
             let next = crate::tui_app::next_solver(app.form.solver(backend), &available);
             app.form.set_solver(backend, next);
             app.dirty = true;
