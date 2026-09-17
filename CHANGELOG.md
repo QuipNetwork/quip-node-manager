@@ -48,6 +48,16 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.9-rc2
+
+- **Windows builds are signed with the company certificate**: the Windows executable now carries an Authenticode signature from SSL.com, issued to HADAMARD GATE INCORPORATED. Windows shows that name as the publisher instead of an unknown-publisher warning.
+
+- **Linux releases publish a signed RPM**: Fedora, RHEL and openSUSE users can install an RPM and check it with `rpm --checksig`, after importing the release key.
+
+- **Every release publishes SHA256SUMS and a signature over it**: the install script checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
+
+- **Release tags must be signed**: CI verifies the signature on each `v*` tag against a list of keys tracked in the repository, and refuses to build a release from a tag it cannot verify.
+
 ## v0.2.9-rc1
 
 - **Unset solvers default to `msa` when it is installed**: when you leave a solver on Default, Start now runs the `msa` build for that backend if the miner image or bundle has one. Otherwise Start runs `sa`, as before. A solver that you choose does not change. The Default entry in the desktop app and the terminal UI shows the solver that Start will run.

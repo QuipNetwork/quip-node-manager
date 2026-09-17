@@ -8,95 +8,135 @@ the Quip Node Manager Tauri app on Windows.
 ## Code Signing Certificates
 
 Windows code signing requires a certificate from a trusted Certificate
-Authority (CA). There are two types:
+Authority (CA). Since 2023 every CA must keep the private key in hardware or
+in a cloud HSM, so no certificate type ships as a `.pfx` file.
 
-### OV (Organization Validation) Code Signing Certificate
+| Type | Validates | SmartScreen | Cost per year |
+|------|-----------|-------------|---------------|
+| **IV** (Individual) | A person's identity | Reputation builds over time | $100--200 |
+| **OV** (Organization) | The legal entity | Reputation builds over time | $200--400 |
+| **EV** (Extended) | The legal entity, stricter | Trusted from the first download | $300--600 |
 
-- **Cost**: $200--400/year
-- **Providers**: DigiCert, Sectigo, GlobalSign
-- **Validation**: Verifies the organization's legal identity
-- **SmartScreen**: Reputation builds gradually over time with download volume
-- **Form factor**: Software-based (`.pfx` file) or hardware token
+The project uses an **SSL.com eSigner** certificate. eSigner is SSL.com's
+cloud HSM. The key never leaves SSL.com, and signing is an authenticated API
+call. A document signing certificate cannot sign code, because Windows
+rejects its key usage.
 
-### EV (Extended Validation) Code Signing Certificate
+**Recommendation**: use an EV certificate. The immediate SmartScreen trust is
+worth the higher cost for user-facing software.
 
-- **Cost**: $300--600/year
-- **Providers**: DigiCert, Sectigo, GlobalSign
-- **Validation**: Stricter organization verification
-- **SmartScreen**: Immediate trust -- no reputation building period
-- **Form factor**: Hardware token required (USB key or cloud HSM)
+## How CI Signs the Binary
 
-**Recommendation**: Start with an EV certificate to avoid SmartScreen warnings
-from day one. The immediate trust is worth the higher cost for user-facing
-software.
+The `sign-windows-x86_64` job in `.gitlab-ci.yml` signs
+`dist/quip-node-manager-windows-x86_64.exe` after `build-windows-x86_64`
+produces it. The job runs on a Linux runner. eSigner's `CodeSignTool` hashes
+the file locally and sends only the hash to SSL.com. The returned Authenticode
+signature is then written into the file. No Windows API is involved.
 
-## Signing the Installer
+Two scripts do the work:
 
-Use Microsoft's `signtool` (included with the Windows SDK) to sign the
-installer executable:
+| Script | Purpose |
+|--------|---------|
+| `scripts/sign-windows.sh` | Downloads a sha256-pinned CodeSignTool and signs the file in place |
+| `scripts/verify-windows-signing.sh` | Reads the signed file with `osslsigncode` and fails the job unless the digest, timestamp, and signer match |
+
+The job runs on every tag. On branches it is a manual job, but the protected
+variables make it fail there. Test a change to the scripts on a release
+candidate tag instead.
+
+### CI/CD Variables
+
+All five variables are set, hold the production values, and are protected.
+GitLab withholds a protected variable from an unprotected branch, so the
+manual branch job now fails with `ESIGNER_ENV is not set`. Signing runs on a
+`v*` tag, which is protected.
+
+Four of the five are masked. GitLab refuses to mask `ESIGNER_PASSWORD`,
+because masking accepts only values of at least 8 characters, on one line,
+from the base64 alphabet plus `@:.~+=/-`. Nothing in the pipeline prints the
+password, and `sign-windows.sh` never enables `set -x`. A password that meets
+those rules can be masked after a rotation.
+
+| Variable | Description |
+|----------|-------------|
+| `ESIGNER_ENV` | `TEST` for the SSL.com sandbox, `PROD` for the real service |
+| `ESIGNER_USERNAME` | SSL.com account username |
+| `ESIGNER_PASSWORD` | SSL.com account password |
+| `ESIGNER_CREDENTIAL_ID` | eSigner credential ID of the code signing certificate |
+| `ESIGNER_TOTP_SECRET` | TOTP secret shown once during eSigner enrollment |
+
+GitLab refuses to mask a value that contains characters outside its masking
+alphabet, such as `#`. A password with such characters must be stored
+unmasked, or changed.
+
+### Sandbox and Production
+
+`ESIGNER_ENV=TEST` points CodeSignTool at SSL.com's sandbox. SSL.com
+publishes a demo account for it, so the pipeline can run before the real
+certificate exists:
+
+| Variable | Sandbox value |
+|----------|---------------|
+| `ESIGNER_USERNAME` | `esigner_demo` |
+| `ESIGNER_PASSWORD` | `esignerDemo#1` |
+| `ESIGNER_CREDENTIAL_ID` | Run `CodeSignTool get_credential_ids` with the two values above |
+| `ESIGNER_TOTP_SECRET` | `RDXYgV9qju+6/7GnMf1vCbKexXVJmUVr+86Wq/8aIGg=` |
+
+A sandbox signature chains to "SSL.com EV Root Certification Authority RSA R2
+- Development". No Windows machine trusts it, so a sandbox-signed binary
+shows the same SmartScreen dialog as an unsigned one. The sign job refuses to
+run with `TEST` on a release tag. Tags that contain `-rc` are allowed, so a
+release candidate can exercise the path.
+
+The sandbox API endpoint chains to a TLS root that the Java runtime does not
+carry. `sign-windows.sh` adds that root to a private trust store for the
+sandbox only. Production endpoints need nothing.
+
+### Switching to Production
+
+1. Enroll the issued certificate in eSigner (next section).
+2. Set `ESIGNER_USERNAME`, `ESIGNER_PASSWORD`, `ESIGNER_CREDENTIAL_ID`, and
+   `ESIGNER_TOTP_SECRET` to the real values.
+3. Set `EXPECTED_CN_PROD` in `scripts/verify-windows-signing.sh` to the common
+   name on the certificate. Windows shows this string as the publisher. The
+   verify step fails while it is empty, so a production run cannot pass by
+   accident.
+4. Set `ESIGNER_ENV` to `PROD`.
+
+## eSigner Enrollment
+
+Enrollment is possible only after SSL.com validates the order and issues the
+certificate. In the SSL.com portal:
+
+1. Open **Orders**, find the code signing order, and click **details**.
+2. Scroll to **eSigner Cloud Signing Enrollment**.
+3. Under **Second factor authentication**, choose **OTP APP**.
+4. Enter a **4 digit PIN** and store it.
+5. Click **create OTP and issue certificate**.
+6. A QR code appears with its **secret** as text. Copy the text into
+   `ESIGNER_TOTP_SECRET` now. A page reload hides it, and recovering it means
+   a reset in the portal.
+
+The credential ID is on the same order page, or from:
+
+```sh
+CodeSignTool get_credential_ids -username=<user> -password=<password>
+```
+
+An empty list means the certificate is not yet enrolled, whatever the portal
+shows.
+
+## Verifying a Signed Binary on Windows
 
 ```powershell
-signtool sign `
-  /fd SHA256 `
-  /tr http://timestamp.digicert.com `
-  /td SHA256 `
-  /f cert.pfx `
-  /p PASSWORD `
-  "src-tauri\target\release\bundle\nsis\Quip Node Manager Setup.exe"
+Get-AuthenticodeSignature .\quip-node-manager-windows-x86_64.exe | Format-List
+signtool verify /pa /v .\quip-node-manager-windows-x86_64.exe
 ```
 
-Parameter reference:
-
-| Flag | Purpose |
-|------|---------|
-| `/fd SHA256` | File digest algorithm |
-| `/tr http://timestamp.digicert.com` | RFC 3161 timestamp server URL |
-| `/td SHA256` | Timestamp digest algorithm |
-| `/f cert.pfx` | Path to the certificate file |
-| `/p PASSWORD` | Certificate password |
-
-### Signing with an EV Token (SafeNet/Hardware)
-
-EV certificates on hardware tokens use a different invocation:
-
-```powershell
-signtool sign `
-  /fd SHA256 `
-  /tr http://timestamp.digicert.com `
-  /td SHA256 `
-  /sha1 CERTIFICATE_THUMBPRINT `
-  "src-tauri\target\release\bundle\nsis\Quip Node Manager Setup.exe"
-```
-
-The `/sha1` flag selects the certificate by thumbprint from the Windows
-certificate store (where the hardware token's certificate is registered).
-
-### Verifying the Signature
-
-```powershell
-signtool verify /pa /v "Quip Node Manager Setup.exe"
-```
-
-## Tauri Configuration
-
-Add signing settings to `src-tauri/tauri.conf.json`:
-
-```json
-{
-  "bundle": {
-    "windows": {
-      "certificateThumbprint": "CERTIFICATE_THUMBPRINT_HEX",
-      "digestAlgorithm": "sha256",
-      "timestampUrl": "http://timestamp.digicert.com"
-    }
-  }
-}
-```
-
-With this configuration, `bun run build` will automatically sign the NSIS
-installer during the build process. The certificate must be available in the
-Windows certificate store (either imported from `.pfx` or present on a
-connected hardware token).
+`Status` must read `Valid`. `SignerCertificate.Subject` names
+`HADAMARD GATE INCORPORATED`, the organization on the issued certificate.
+CI checks that same name through `verify-windows-signing.sh`. A sandbox-signed file reports
+`UnknownError` or `NotTrusted`. That is expected.
 
 ## SmartScreen Reputation
 
@@ -105,88 +145,22 @@ Windows SmartScreen protects users from unknown software:
 | Certificate Type | SmartScreen Behavior |
 |------------------|----------------------|
 | **EV** | Immediate trust. No warnings from the first download. |
-| **OV** | Warnings shown until enough users download and run the software. Reputation builds over weeks to months. |
+| **OV / IV** | Warnings shown until enough users download and run the software. Reputation builds over weeks to months. |
 | **None** | "Windows protected your PC" blocking dialog. Most users will not proceed. |
 
-## NSIS Installer
+## Distribution Format
 
-Tauri uses [NSIS](https://nsis.sourceforge.io/) as the default Windows
-installer framework. It produces a single `.exe` setup file that handles:
-
-- Installation directory selection
-- Start menu shortcuts
-- Uninstaller registration in Add/Remove Programs
-- Optional desktop shortcut
-
-No additional NSIS configuration is needed beyond Tauri's defaults unless
-custom installer pages are required.
-
-The built installer is located at:
+CI ships the bare executable, built with `tauri build --no-bundle`. Tauri can
+also produce an [NSIS](https://nsis.sourceforge.io/) installer, a single
+`.exe` setup file with an uninstaller, Start menu shortcuts, and Add/Remove
+Programs registration. A build with bundling writes it to:
 
 ```
 src-tauri/target/release/bundle/nsis/Quip Node Manager Setup.exe
 ```
 
-## CI Setup (GitLab)
-
-Sign builds in CI using a certificate stored as a CI/CD variable:
-
-```yaml
-build-windows:
-  tags: [windows]
-  variables:
-    SIGNTOOL_PATH: "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.22621.0\\x64\\signtool.exe"
-  before_script:
-    # Decode the base64-encoded .pfx from CI variable
-    - >
-      [System.IO.File]::WriteAllBytes(
-        "cert.pfx",
-        [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX)
-      )
-
-    # Import into the certificate store
-    - >
-      Import-PfxCertificate
-      -FilePath cert.pfx
-      -CertStoreLocation Cert:\CurrentUser\My
-      -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force)
-
-  script:
-    - bun install
-    - bun run build
-
-    # Sign the installer
-    - >
-      & $env:SIGNTOOL_PATH sign
-      /fd SHA256
-      /tr http://timestamp.digicert.com
-      /td SHA256
-      /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT
-      "src-tauri\target\release\bundle\nsis\Quip Node Manager Setup.exe"
-
-    # Verify
-    - >
-      & $env:SIGNTOOL_PATH verify /pa /v
-      "src-tauri\target\release\bundle\nsis\Quip Node Manager Setup.exe"
-
-  after_script:
-    - Remove-Item cert.pfx -ErrorAction SilentlyContinue
-
-  artifacts:
-    paths:
-      - src-tauri/target/release/bundle/nsis/*.exe
-    expire_in: 30 days
-```
-
-### Required CI/CD Variables
-
-| Variable | Description |
-|----------|-------------|
-| `WINDOWS_CERTIFICATE_PFX` | Base64-encoded `.pfx` certificate file |
-| `WINDOWS_CERTIFICATE_PASSWORD` | Password for the `.pfx` file |
-| `WINDOWS_CERTIFICATE_THUMBPRINT` | SHA-1 thumbprint of the certificate |
-
-Store all of these as **masked, protected** CI/CD variables.
+To ship the installer, add it to the sign job. `CodeSignTool batch_sign`
+signs a directory of files with one OTP.
 
 ## Optional: Microsoft Store via MSIX
 
@@ -200,7 +174,7 @@ For distribution through the Microsoft Store:
    [Tauri MSIX documentation](https://v2.tauri.app/distribute/windows-store/).
 
 3. MSIX packages use a separate signing flow managed by the Microsoft Store
-   submission process; no external code signing certificate is required for
+   submission process. No external code signing certificate is required for
    Store-distributed builds.
 
 The Microsoft Store provides automatic updates, sandboxing, and visibility

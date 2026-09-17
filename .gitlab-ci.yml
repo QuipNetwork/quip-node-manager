@@ -5,6 +5,7 @@ stages:
   - toolchain
   - lint
   - build
+  - sign
   - release
 
 # Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
@@ -165,6 +166,53 @@ build-toolchain-image:
 # Tracks floating stable, like every other job. A new stable rustfmt can
 # therefore fail this on unchanged code; the fix is to run the formatter, not
 # to pin, since nothing else in this file pins either.
+# A release tag is what authorises a Windows binary signed with the company
+# certificate and a public GitLab Release, so a tag nobody vouched for must
+# stop the pipeline before the sign stage ever reaches SSL.com. lint runs
+# ahead of build, sign and release, and no job in those stages declares
+# `needs:`, so a failure here blocks every one of them.
+#
+# The signer list is `.gitlab/allowed-signers`, tracked in the repo: public
+# keys only, and a change to it is reviewable like any other diff. git matches
+# the tagger's email against a principal in that file, so a tag signed by a key
+# nobody listed fails exactly like an unsigned one.
+#
+# Commit signatures are reported, not enforced. Every commit reaching a tag
+# came through a merge request, and GitLab's own merge commits are unsigned,
+# so failing on them would block every release for a reason unrelated to
+# whether the release itself is authentic.
+verify-tag-signature:
+  stage: lint
+  image: alpine:3.22
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    # ssh-keygen does the signature maths; git alone cannot verify an SSH
+    # signature without it.
+    - apk add --no-cache git openssh-keygen
+  script:
+    - git config gpg.ssh.allowedSignersFile .gitlab/allowed-signers
+    # A tag pipeline checks out the tagged commit, which does not guarantee the
+    # tag object itself is present, and the signature lives on that object.
+    - git fetch --no-tags --depth 1 origin "refs/tags/$CI_COMMIT_TAG:refs/tags/$CI_COMMIT_TAG" || true
+    - |
+      if ! git cat-file -t "$CI_COMMIT_TAG" 2>/dev/null | grep -q '^tag$'; then
+        echo "$CI_COMMIT_TAG is a lightweight tag: it carries no signature. Tag with git tag -s." >&2
+        exit 1
+      fi
+    - git verify-tag "$CI_COMMIT_TAG"
+    - |
+      echo "Commit signatures reachable from $CI_COMMIT_TAG (report only):"
+      git log --format='%h %G? %an <%ae> %s' -n 20 "$CI_COMMIT_TAG" |
+        while IFS= read -r line; do
+          case "$(printf '%s' "$line" | cut -d' ' -f2)" in
+            G) printf '  signed      %s\n' "$line" ;;
+            *) printf '  unverified  %s\n' "$line" ;;
+          esac
+        done
+
 rustfmt:
   stage: lint
   image: rust:slim
@@ -440,6 +488,16 @@ build-linux-x86_64:
     - mkdir -p dist
     - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
     - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
+    # `targets: all` builds this. A missing file means the bundler changed, and
+    # failing here — in the build stage — costs nothing, while discovering it
+    # after the sign stage would waste a real SSL.com signature.
+    - |
+      rpm=$(ls src-tauri/target/release/bundle/rpm/*.rpm 2>/dev/null | head -1)
+      if [ -z "$rpm" ]; then
+        echo "no RPM in src-tauri/target/release/bundle/rpm; check bundle.targets in tauri.conf.json" >&2
+        exit 1
+      fi
+      cp "$rpm" dist/quip-node-manager-linux-x86_64.rpm
     - |
       cat > dist/README-linux.txt << 'HEREDOC'
       Quip Node Manager — Linux
@@ -453,11 +511,20 @@ build-linux-x86_64:
         sudo dpkg -i quip-node-manager-linux-x86_64.deb
         quip-node-manager
         # Add --cli for terminal UI mode
+
+      Fedora/RHEL/SUSE (.rpm):
+        sudo rpm --import https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+        rpm --checksig quip-node-manager-linux-x86_64.rpm
+        sudo rpm -i quip-node-manager-linux-x86_64.rpm
+        # Add --cli for terminal UI mode
+
+      Every release also publishes SHA256SUMS and SHA256SUMS.asc.
       HEREDOC
   artifacts:
     paths:
       - dist/quip-node-manager-linux-x86_64.AppImage
       - dist/quip-node-manager-linux-x86_64.deb
+      - dist/quip-node-manager-linux-x86_64.rpm
       - dist/README-linux.txt
 
 # ---------------------------------------------------------------------------
@@ -491,10 +558,165 @@ build-windows-x86_64:
   artifacts:
     paths:
       - dist/quip-node-manager-windows-x86_64.exe
+  # .tauri_build's rules plus the signing scripts: sign-windows-x86_64 needs
+  # this job's artifact, and a branch that changes only a script would
+  # otherwise schedule the sign job with nothing to sign, which GitLab
+  # rejects at pipeline creation ("needs job not in pipeline").
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - scripts/sign-windows.sh
+        - scripts/verify-windows-signing.sh
+
+# ---------------------------------------------------------------------------
+# Windows signing (SSL.com eSigner)
+# ---------------------------------------------------------------------------
+
+# Signs the Windows binary from a Linux job. eSigner keeps the key in SSL.com's
+# HSM and CodeSignTool only ever sends it a hash, so nothing about signing a PE
+# needs Windows, and a Linux container is easier to make reproducible than the
+# shell runner's global state.
+#
+# ESIGNER_ENV selects the SSL.com sandbox (TEST) or the real service (PROD).
+# TEST signs with a demo certificate under a "- Development" root that no
+# Windows machine trusts; it exists so the pipeline can be exercised before
+# the certificate order is issued. A release tag therefore refuses TEST — the
+# result would look signed on the release page and be rejected on the desktop.
+# Tags carrying -rc are allowed through so a candidate can prove the path.
+#
+# Manual on branches: it costs a round trip to SSL.com and there is nothing to
+# gain from signing every branch build, but a change to the signing scripts
+# can only be tested by running them.
+sign-windows-x86_64:
+  stage: sign
+  # Not the toolchain image: it carries no Java. Pinned by digest like
+  # TOOLCHAIN_IMAGE, because this job handles the signing credentials.
+  image: eclipse-temurin@sha256:5726444f65e67c407bac4ff1e036b475051f50bb3840273e81814e77c6fa8ee3
+  tags: [linux, x86_64]
+  needs:
+    - build-windows-x86_64
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends osslsigncode curl unzip ca-certificates openssl
+  script:
+    # Protected variables are withheld on unprotected branches, and the
+    # script's own "not set" message does not say why.
+    - |
+      if [ -z "${ESIGNER_ENV:-}" ]; then
+        echo "ESIGNER_ENV is not set. If the ESIGNER_* variables are protected, this ref must be protected too." >&2
+        exit 1
+      fi
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ] && [ "$ESIGNER_ENV" != "PROD" ]; then
+        case "$CI_COMMIT_TAG" in
+          *-rc*) echo "release candidate: signing with ESIGNER_ENV=$ESIGNER_ENV" ;;
+          *) echo "release tag $CI_COMMIT_TAG requires ESIGNER_ENV=PROD, got $ESIGNER_ENV" >&2; exit 1 ;;
+        esac
+      fi
+    - ./scripts/sign-windows.sh dist/quip-node-manager-windows-x86_64.exe
+    - ./scripts/verify-windows-signing.sh dist/quip-node-manager-windows-x86_64.exe
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - dist/quip-node-manager-windows-x86_64.exe
+  rules:
+    - if: $CI_COMMIT_TAG
+    # Same trigger set as build-windows-x86_64, so `needs` always finds it.
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - src/**/*
+        - src-tauri/**/*
+        - package.json
+        - bun.lock
+        - scripts/sign-windows.sh
+        - scripts/verify-windows-signing.sh
+      when: manual
+      allow_failure: true
 
 # ---------------------------------------------------------------------------
 # Release (tags only)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Release signing: RPM signature and signed checksums
+# ---------------------------------------------------------------------------
+
+# No Linux tool verifies a downloaded .deb or AppImage on its own: apt checks a
+# repository's Release file, not a file a user fetched from a release page. So
+# the download path this project actually tells people to use is covered by a
+# signed SHA256SUMS instead, which install.sh checks.
+#
+# The RPM is different. rpm --checksig verifies an embedded signature once the
+# user imports the public key, so the RPM is signed in place as well.
+#
+# Runs after sign-windows-x86_64 so the checksum covers the signed .exe, not
+# the unsigned one the Windows build produced.
+sign-artifacts:
+  stage: sign
+  image: debian:bookworm-slim
+  tags: [linux, x86_64]
+  needs:
+    - build-macos-universal
+    - build-linux-x86_64
+    - sign-windows-x86_64
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends gnupg rpm coreutils
+  script:
+    - |
+      if [ -z "${RELEASE_GPG_PRIVATE_KEY:-}" ]; then
+        echo "RELEASE_GPG_PRIVATE_KEY is not set. If it is protected, this ref must be protected too." >&2
+        exit 1
+      fi
+    # GNUPGHOME under the build directory keeps the imported secret key on the
+    # job's own disk, which the runner clears, rather than in a home directory
+    # shared with whatever runs next.
+    - export GNUPGHOME="$CI_PROJECT_DIR/.gnupg"
+    - mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+    - gpg --batch --quiet --import "$RELEASE_GPG_PRIVATE_KEY"
+    - |
+      KEY_ID=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+      echo "signing as $KEY_ID"
+    # Loopback pinentry is what lets gpg take the passphrase without a terminal.
+    - |
+      rpmsign --define "_gpg_name $KEY_ID" \
+              --define "_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file $RELEASE_GPG_PASSPHRASE" \
+              --addsign dist/quip-node-manager-linux-x86_64.rpm
+    # --checksig reports NOT OK when the key is absent from the rpm keyring, so
+    # import the public half first and let this fail the job if the signature
+    # did not take.
+    - |
+      gpg --batch --armor --export "$KEY_ID" > "$CI_PROJECT_DIR/release-signing-key.asc"
+    - rpm --import "$CI_PROJECT_DIR/release-signing-key.asc"
+    - rpm --checksig dist/quip-node-manager-linux-x86_64.rpm
+    # Checksums cover every file a user can download, the RPM included, and are
+    # computed from the dist directory so the file names match what they fetch.
+    - cd dist && sha256sum quip-node-manager-* > SHA256SUMS && cd ..
+    - cat dist/SHA256SUMS
+    - |
+      gpg --batch --pinentry-mode loopback --passphrase-file "$RELEASE_GPG_PASSPHRASE" \
+          --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+    - gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+  after_script:
+    # The secret key outlives the script on a shell runner otherwise.
+    - rm -rf "$CI_PROJECT_DIR/.gnupg"
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - dist/quip-node-manager-linux-x86_64.rpm
+      - dist/SHA256SUMS
+      - dist/SHA256SUMS.asc
 
 release-binaries:
   stage: release
@@ -502,7 +724,8 @@ release-binaries:
   needs:
     - build-macos-universal
     - build-linux-x86_64
-    - build-windows-x86_64
+    - sign-windows-x86_64
+    - sign-artifacts
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -526,4 +749,7 @@ release-binaries:
         --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
-        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=build-windows-x86_64","link_type":"package"}'
+        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=sign-windows-x86_64","link_type":"package"}' \
+        --assets-link='{"name":"Linux x86_64 rpm (signed)","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.rpm?job=sign-artifacts","link_type":"package"}' \
+        --assets-link='{"name":"SHA256SUMS","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS?job=sign-artifacts","link_type":"other"}' \
+        --assets-link='{"name":"SHA256SUMS.asc","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS.asc?job=sign-artifacts","link_type":"other"}'
