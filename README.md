@@ -41,9 +41,12 @@ sudo dpkg -i quip-node-manager-linux-x86_64.deb
 
 ### Windows
 
-Download the `.exe` and run it. Windows SmartScreen may show a warning because the binary is not yet code-signed.
+Download the `.exe` and run it. Windows names HADAMARD GATE INCORPORATED as the
+publisher. SmartScreen may still warn until the certificate builds reputation
+across enough downloads. Click **More info**, then **Run anyway**.
 
-Click **More info**, then **Run anyway**.
+To check a signature or a checksum by hand, see the verification steps on the
+[release page](https://gitlab.com/quip.network/quip-node-manager/-/releases).
 
 ## Features
 
