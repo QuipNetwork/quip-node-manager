@@ -689,17 +689,28 @@ sign-artifacts:
       KEY_ID=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
       echo "signing as $KEY_ID"
     # Loopback pinentry is what lets gpg take the passphrase without a terminal.
+    # rpm's own %__gpg macro is /usr/bin/gpg2, which Debian does not ship — the
+    # binary is /usr/bin/gpg — and rpmsign then fails with "Could not exec gpg".
     - |
-      rpmsign --define "_gpg_name $KEY_ID" \
+      rpmsign --define "__gpg $(command -v gpg)" \
+              --define "_gpg_name $KEY_ID" \
               --define "_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file $RELEASE_GPG_PASSPHRASE" \
               --addsign dist/quip-node-manager-linux-x86_64.rpm
-    # --checksig reports NOT OK when the key is absent from the rpm keyring, so
-    # import the public half first and let this fail the job if the signature
-    # did not take.
+    # Import the public half so --checksig can judge the signature, not just the
+    # digests.
     - |
       gpg --batch --armor --export "$KEY_ID" > "$CI_PROJECT_DIR/release-signing-key.asc"
     - rpm --import "$CI_PROJECT_DIR/release-signing-key.asc"
-    - rpm --checksig dist/quip-node-manager-linux-x86_64.rpm
+    # An unsigned package passes `rpm --checksig` with "digests OK" and exit 0,
+    # so the exit status proves nothing. The word "signatures" in that line is
+    # what separates a signed package from an unsigned one.
+    - |
+      report=$(rpm --checksig dist/quip-node-manager-linux-x86_64.rpm)
+      echo "$report"
+      case "$report" in
+        *"digests signatures OK"*) ;;
+        *) echo "the RPM is not signed by $KEY_ID" >&2; exit 1 ;;
+      esac
     # Checksums cover every file a user can download, the RPM included, and are
     # computed from the dist directory so the file names match what they fetch.
     - cd dist && sha256sum quip-node-manager-* > SHA256SUMS && cd ..
