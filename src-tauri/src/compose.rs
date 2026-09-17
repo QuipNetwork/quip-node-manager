@@ -924,6 +924,12 @@ pub(crate) async fn start_stack_core(
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     sink.log("INFO", "$ Writing config.toml");
+    crate::solvers::resolve_unset_solvers(
+        &mut settings.node_config,
+        &settings.run_mode,
+        settings.image_tag,
+    )
+    .await;
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);

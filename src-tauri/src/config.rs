@@ -145,7 +145,7 @@ fn solver_binary(
 ) -> String {
     match run_mode {
         RunMode::Docker => selected.unwrap_or_default().to_string(),
-        RunMode::Native => native_binary(run_mode, selected.unwrap_or(backend.default_solver())),
+        RunMode::Native => native_binary(run_mode, selected.unwrap_or(backend.fallback_solver())),
     }
 }
 
@@ -611,7 +611,7 @@ mod tests {
         assert!(native["cpu"]["binary"]
             .as_str()
             .expect("binary key")
-            .ends_with(crate::solvers::Backend::Cpu.default_solver()));
+            .ends_with(crate::solvers::Backend::Cpu.fallback_solver()));
     }
 
     /// The CUDA solver goes in `[cuda.N]`, per device — verified against

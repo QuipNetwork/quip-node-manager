@@ -71,7 +71,7 @@ fn ensure_native_supported() -> Result<(), String> {
     )
 }
 
-fn bin_dir() -> std::path::PathBuf {
+pub(crate) fn bin_dir() -> std::path::PathBuf {
     data_dir().join("bin")
 }
 
@@ -1090,12 +1090,6 @@ pub(crate) async fn start_native_node_core(
         return Err(e);
     }
 
-    // Write config.toml for native mode. The renderer derives the miner's REST
-    // bind address from the run mode (all interfaces, so the Caddy container
-    // can reach it via host.docker.internal), so no rest_host override is
-    // needed here.
-    crate::config::write_config_toml(&config, &RunMode::Native)?;
-
     // Auto-provision the miner binary when it's missing — mirrors Docker
     // mode pulling images on start, so a fresh or relocated data dir doesn't
     // dead-end here.
@@ -1116,6 +1110,14 @@ pub(crate) async fn start_native_node_core(
             bin.display()
         ));
     }
+
+    // Write config.toml for native mode. The renderer derives the miner's REST
+    // bind address from the run mode (all interfaces, so the Caddy container
+    // can reach it via host.docker.internal), so no rest_host override is
+    // needed here. This follows provisioning so a first start resolves unset
+    // solvers against the bundle it just installed.
+    crate::solvers::resolve_unset_solvers(&mut config, &RunMode::Native, settings.image_tag).await;
+    crate::config::write_config_toml(&config, &RunMode::Native)?;
 
     let config_path = data_dir().join("config.toml");
 
