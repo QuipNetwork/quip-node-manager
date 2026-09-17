@@ -166,6 +166,53 @@ build-toolchain-image:
 # Tracks floating stable, like every other job. A new stable rustfmt can
 # therefore fail this on unchanged code; the fix is to run the formatter, not
 # to pin, since nothing else in this file pins either.
+# A release tag is what authorises a Windows binary signed with the company
+# certificate and a public GitLab Release, so a tag nobody vouched for must
+# stop the pipeline before the sign stage ever reaches SSL.com. lint runs
+# ahead of build, sign and release, and no job in those stages declares
+# `needs:`, so a failure here blocks every one of them.
+#
+# The signer list is `.gitlab/allowed-signers`, tracked in the repo: public
+# keys only, and a change to it is reviewable like any other diff. git matches
+# the tagger's email against a principal in that file, so a tag signed by a key
+# nobody listed fails exactly like an unsigned one.
+#
+# Commit signatures are reported, not enforced. Every commit reaching a tag
+# came through a merge request, and GitLab's own merge commits are unsigned,
+# so failing on them would block every release for a reason unrelated to
+# whether the release itself is authentic.
+verify-tag-signature:
+  stage: lint
+  image: alpine:3.22
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    # ssh-keygen does the signature maths; git alone cannot verify an SSH
+    # signature without it.
+    - apk add --no-cache git openssh-keygen
+  script:
+    - git config gpg.ssh.allowedSignersFile .gitlab/allowed-signers
+    # A tag pipeline checks out the tagged commit, which does not guarantee the
+    # tag object itself is present, and the signature lives on that object.
+    - git fetch --no-tags --depth 1 origin "refs/tags/$CI_COMMIT_TAG:refs/tags/$CI_COMMIT_TAG" || true
+    - |
+      if ! git cat-file -t "$CI_COMMIT_TAG" 2>/dev/null | grep -q '^tag$'; then
+        echo "$CI_COMMIT_TAG is a lightweight tag: it carries no signature. Tag with git tag -s." >&2
+        exit 1
+      fi
+    - git verify-tag "$CI_COMMIT_TAG"
+    - |
+      echo "Commit signatures reachable from $CI_COMMIT_TAG (report only):"
+      git log --format='%h %G? %an <%ae> %s' -n 20 "$CI_COMMIT_TAG" |
+        while IFS= read -r line; do
+          case "$(printf '%s' "$line" | cut -d' ' -f2)" in
+            G) printf '  signed      %s\n' "$line" ;;
+            *) printf '  unverified  %s\n' "$line" ;;
+          esac
+        done
+
 rustfmt:
   stage: lint
   image: rust:slim

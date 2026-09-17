@@ -475,6 +475,43 @@ Rules:
   `:latest` rule binds on image-publishing repos (quip-miner); this repo ships
   desktop binaries via a per-tag GitLab Release and has no `:latest` to gate.
 
+## Signed Release Tags
+
+Every `v*` tag must carry an SSH signature from a key in
+`.gitlab/allowed-signers`. The `verify-tag-signature` job checks that
+signature in the `lint` stage of a tag pipeline. It fails when the tag is
+lightweight, when the tag is unsigned, and when the key is absent from the
+file. The `build`, `sign` and `release` stages run after `lint`, so a failure
+stops both the Windows signing and the GitLab Release.
+
+The job also reports the signature state of the last 20 commits. An unsigned
+commit does not fail the job, because GitLab writes its own merge commits
+without a signature.
+
+Set up signing once per clone:
+
+```bash
+git config gpg.format ssh
+git config user.signingkey "key::$(cat ~/.ssh/<your-key>.pub)"
+git config tag.gpgsign true
+git config commit.gpgsign true
+git config gpg.ssh.allowedSignersFile .gitlab/allowed-signers
+```
+
+`git tag -a v0.2.9-rc2 -m "0.2.9-rc2"` then signs the tag. Check it before you
+push with `git tag -v v0.2.9-rc2`.
+
+Two values must agree, or verification fails:
+
+| Value | Must match |
+|-------|------------|
+| The tagger email | A principal in `.gitlab/allowed-signers` |
+| The signing key | The key listed for that principal |
+
+To add a signer, add a line to `.gitlab/allowed-signers` and merge it. The file
+holds public keys only. Add the same key to your GitLab profile as a signing
+key so the web interface marks the tag as verified.
+
 ## Code Standards
 
 - All Rust files: `// SPDX-License-Identifier: AGPL-3.0-or-later` header
