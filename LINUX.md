@@ -19,27 +19,11 @@ bun run build
 # Output: src-tauri/target/release/bundle/appimage/quip-node-manager.AppImage
 ```
 
-### GPG Signing
+### Verification
 
-Sign the AppImage with a detached GPG signature so users can verify
-authenticity:
-
-```bash
-# Generate a GPG key if you don't have one
-gpg --full-generate-key
-
-# Create a detached signature
-gpg --detach-sign --armor \
-  src-tauri/target/release/bundle/appimage/quip-node-manager.AppImage
-
-# Output: quip-node-manager.AppImage.asc
-```
-
-Users verify the signature with:
-
-```bash
-gpg --verify quip-node-manager.AppImage.asc quip-node-manager.AppImage
-```
+The AppImage carries no signature of its own. No Linux tool checks one on a
+file a user downloaded, so each release publishes `SHA256SUMS` and a detached
+signature over that file instead. See [Release signing](#release-signing).
 
 ### Running
 
@@ -162,34 +146,52 @@ bun run build
 # Output: src-tauri/target/release/bundle/rpm/quip-node-manager-VERSION.x86_64.rpm
 ```
 
-### RPM Signing
+### RPM signing
 
-1. **Import your GPG key into RPM:**
-
-```bash
-# Export the public key
-gpg --armor --export "releases@quip.network" > RPM-GPG-KEY-quip
-
-# Configure ~/.rpmmacros
-cat >> ~/.rpmmacros <<'EOF'
-%_gpg_name releases@quip.network
-%_gpg_path ~/.gnupg
-%__gpg /usr/bin/gpg
-EOF
-```
-
-2. **Sign the RPM:**
+CI signs the published RPM in the `sign-artifacts` job. `rpm --checksig` then
+verifies it, once the user imports the public key:
 
 ```bash
-rpm --addsign quip-node-manager-VERSION.x86_64.rpm
+sudo rpm --import https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+rpm --checksig quip-node-manager-linux-x86_64.rpm
 ```
 
-3. **User verification:**
+A locally built RPM is unsigned. Sign one by hand only to reproduce a problem,
+and never with the release key.
+
+## Release signing
+
+Each release publishes `SHA256SUMS` over every artifact, plus `SHA256SUMS.asc`,
+a detached signature made with the release key.
+
+| Item | Value |
+|------|-------|
+| Key | `Quip Node Manager Release Signing <rick@postquant.xyz>` |
+| Fingerprint | `A63860E21E7070C2C26FDA5DC85BEAB01AD9FEE3` |
+| Type | RSA 4096, expires 2029-09-16 |
+| Public key | `.gitlab/release-signing-key.asc` in this repository |
+
+RSA rather than Ed25519, because `rpm` on older RHEL releases cannot verify an
+EdDSA signature.
+
+`scripts/install.sh` checks the checksum on every run. It also checks the
+signature when `gpg` is installed, against the fingerprint pinned in the
+script. macOS ships no `gpg`, so a Mac without GnuPG gets the checksum check
+and a message that the signature was skipped.
+
+To verify by hand:
 
 ```bash
-rpm --import RPM-GPG-KEY-quip
-rpm --checksig quip-node-manager-VERSION.x86_64.rpm
+curl -fsSLO https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+gpg --import release-signing-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 ```
+
+The private key lives in two places only: the `RELEASE_GPG_PRIVATE_KEY` and
+`RELEASE_GPG_PASSPHRASE` CI variables, which are protected and file type, and
+the `RICK_PQ_PGP` item in the shared password vault, which also holds the
+revocation certificate.
 
 ## Systemd Service (Headless Deployment)
 

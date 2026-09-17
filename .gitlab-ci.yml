@@ -488,6 +488,16 @@ build-linux-x86_64:
     - mkdir -p dist
     - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
     - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
+    # `targets: all` builds this. A missing file means the bundler changed, and
+    # failing here — in the build stage — costs nothing, while discovering it
+    # after the sign stage would waste a real SSL.com signature.
+    - |
+      rpm=$(ls src-tauri/target/release/bundle/rpm/*.rpm 2>/dev/null | head -1)
+      if [ -z "$rpm" ]; then
+        echo "no RPM in src-tauri/target/release/bundle/rpm; check bundle.targets in tauri.conf.json" >&2
+        exit 1
+      fi
+      cp "$rpm" dist/quip-node-manager-linux-x86_64.rpm
     - |
       cat > dist/README-linux.txt << 'HEREDOC'
       Quip Node Manager — Linux
@@ -501,11 +511,20 @@ build-linux-x86_64:
         sudo dpkg -i quip-node-manager-linux-x86_64.deb
         quip-node-manager
         # Add --cli for terminal UI mode
+
+      Fedora/RHEL/SUSE (.rpm):
+        sudo rpm --import https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+        rpm --checksig quip-node-manager-linux-x86_64.rpm
+        sudo rpm -i quip-node-manager-linux-x86_64.rpm
+        # Add --cli for terminal UI mode
+
+      Every release also publishes SHA256SUMS and SHA256SUMS.asc.
       HEREDOC
   artifacts:
     paths:
       - dist/quip-node-manager-linux-x86_64.AppImage
       - dist/quip-node-manager-linux-x86_64.deb
+      - dist/quip-node-manager-linux-x86_64.rpm
       - dist/README-linux.txt
 
 # ---------------------------------------------------------------------------
@@ -625,6 +644,80 @@ sign-windows-x86_64:
 # Release (tags only)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Release signing: RPM signature and signed checksums
+# ---------------------------------------------------------------------------
+
+# No Linux tool verifies a downloaded .deb or AppImage on its own: apt checks a
+# repository's Release file, not a file a user fetched from a release page. So
+# the download path this project actually tells people to use is covered by a
+# signed SHA256SUMS instead, which install.sh checks.
+#
+# The RPM is different. rpm --checksig verifies an embedded signature once the
+# user imports the public key, so the RPM is signed in place as well.
+#
+# Runs after sign-windows-x86_64 so the checksum covers the signed .exe, not
+# the unsigned one the Windows build produced.
+sign-artifacts:
+  stage: sign
+  image: debian:bookworm-slim
+  tags: [linux, x86_64]
+  needs:
+    - build-macos-universal
+    - build-linux-x86_64
+    - sign-windows-x86_64
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends gnupg rpm coreutils
+  script:
+    - |
+      if [ -z "${RELEASE_GPG_PRIVATE_KEY:-}" ]; then
+        echo "RELEASE_GPG_PRIVATE_KEY is not set. If it is protected, this ref must be protected too." >&2
+        exit 1
+      fi
+    # GNUPGHOME under the build directory keeps the imported secret key on the
+    # job's own disk, which the runner clears, rather than in a home directory
+    # shared with whatever runs next.
+    - export GNUPGHOME="$CI_PROJECT_DIR/.gnupg"
+    - mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+    - gpg --batch --quiet --import "$RELEASE_GPG_PRIVATE_KEY"
+    - |
+      KEY_ID=$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+      echo "signing as $KEY_ID"
+    # Loopback pinentry is what lets gpg take the passphrase without a terminal.
+    - |
+      rpmsign --define "_gpg_name $KEY_ID" \
+              --define "_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file $RELEASE_GPG_PASSPHRASE" \
+              --addsign dist/quip-node-manager-linux-x86_64.rpm
+    # --checksig reports NOT OK when the key is absent from the rpm keyring, so
+    # import the public half first and let this fail the job if the signature
+    # did not take.
+    - |
+      gpg --batch --armor --export "$KEY_ID" > "$CI_PROJECT_DIR/release-signing-key.asc"
+    - rpm --import "$CI_PROJECT_DIR/release-signing-key.asc"
+    - rpm --checksig dist/quip-node-manager-linux-x86_64.rpm
+    # Checksums cover every file a user can download, the RPM included, and are
+    # computed from the dist directory so the file names match what they fetch.
+    - cd dist && sha256sum quip-node-manager-* > SHA256SUMS && cd ..
+    - cat dist/SHA256SUMS
+    - |
+      gpg --batch --pinentry-mode loopback --passphrase-file "$RELEASE_GPG_PASSPHRASE" \
+          --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+    - gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+  after_script:
+    # The secret key outlives the script on a shell runner otherwise.
+    - rm -rf "$CI_PROJECT_DIR/.gnupg"
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - dist/quip-node-manager-linux-x86_64.rpm
+      - dist/SHA256SUMS
+      - dist/SHA256SUMS.asc
+
 release-binaries:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
@@ -632,6 +725,7 @@ release-binaries:
     - build-macos-universal
     - build-linux-x86_64
     - sign-windows-x86_64
+    - sign-artifacts
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -655,4 +749,7 @@ release-binaries:
         --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
-        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=sign-windows-x86_64","link_type":"package"}'
+        --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=sign-windows-x86_64","link_type":"package"}' \
+        --assets-link='{"name":"Linux x86_64 rpm (signed)","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.rpm?job=sign-artifacts","link_type":"package"}' \
+        --assets-link='{"name":"SHA256SUMS","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS?job=sign-artifacts","link_type":"other"}' \
+        --assets-link='{"name":"SHA256SUMS.asc","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS.asc?job=sign-artifacts","link_type":"other"}'

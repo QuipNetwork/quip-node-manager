@@ -52,6 +52,68 @@ DEST="${TMPDIR}/${ARTIFACT}"
 info "Downloading ${ARTIFACT}..."
 curl -fSL --progress-bar -o "$DEST" "$URL" || error "Download failed."
 
+# ── Verify ──────────────────────────────────────────────────────────────────
+# No Linux or macOS tool checks a file fetched this way on its own, so the
+# release publishes SHA256SUMS and a detached signature over it. The checksum
+# is mandatory: a mismatch means the download is not the released artifact,
+# whatever the cause. The signature is checked when gpg is present, and its
+# absence is reported rather than passed over in silence.
+#
+# RELEASE_KEY_FINGERPRINT pins the signer. Fetching the key without pinning it
+# would verify only that the file and the key came from the same place.
+RELEASE_KEY_FINGERPRINT="A63860E21E7070C2C26FDA5DC85BEAB01AD9FEE3"
+SUMS_URL="${BASE}/SHA256SUMS?job=sign-artifacts"
+SIG_URL="${BASE}/SHA256SUMS.asc?job=sign-artifacts"
+KEY_URL="https://gitlab.com/quip.network/quip-node-manager/-/raw/${TAG}/.gitlab/release-signing-key.asc"
+
+info "Verifying checksum..."
+SUMS="${TMPDIR}/quip-SHA256SUMS.$$"
+curl -fsSL -o "$SUMS" "$SUMS_URL" || error "Could not download SHA256SUMS."
+
+EXPECTED=$(awk -v f="$ARTIFACT" '$2 == f || $2 == "*" f {print $1; exit}' "$SUMS")
+[ -n "$EXPECTED" ] || error "SHA256SUMS lists no entry for ${ARTIFACT}."
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "$DEST" | cut -d" " -f1)
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "$DEST" | cut -d" " -f1)
+else
+  error "Neither sha256sum nor shasum is available; cannot verify the download."
+fi
+
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  rm -f "$DEST" "$SUMS"
+  error "Checksum mismatch for ${ARTIFACT}. The download was discarded."
+fi
+info "Checksum matches."
+
+if command -v gpg >/dev/null 2>&1; then
+  info "Verifying signature..."
+  SIG="${TMPDIR}/quip-SHA256SUMS.asc.$$"
+  KEY="${TMPDIR}/quip-release-key.asc.$$"
+  KEYRING="${TMPDIR}/quip-keyring.$$"
+  curl -fsSL -o "$SIG" "$SIG_URL" || error "Could not download SHA256SUMS.asc."
+  curl -fsSL -o "$KEY" "$KEY_URL" || error "Could not download the release signing key."
+
+  gpg --batch --no-default-keyring --keyring "$KEYRING" --quiet --import "$KEY" \
+    || error "Could not read the release signing key."
+  FOUND=$(gpg --batch --no-default-keyring --keyring "$KEYRING" --list-keys --with-colons \
+    | awk -F: '/^fpr/ {print $10; exit}')
+  if [ "$FOUND" != "$RELEASE_KEY_FINGERPRINT" ]; then
+    rm -f "$DEST" "$SUMS" "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+    error "Release key fingerprint is ${FOUND}, expected ${RELEASE_KEY_FINGERPRINT}."
+  fi
+  if ! gpg --batch --no-default-keyring --keyring "$KEYRING" --verify "$SIG" "$SUMS" 2>/dev/null; then
+    rm -f "$DEST" "$SUMS" "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+    error "Signature on SHA256SUMS is not valid. The download was discarded."
+  fi
+  info "Signature verified."
+  rm -f "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+else
+  info "gpg is not installed, so the signature was not checked. The checksum was."
+fi
+rm -f "$SUMS"
+
 # ── Install ─────────────────────────────────────────────────────────────────
 case "$PLATFORM" in
   macos)

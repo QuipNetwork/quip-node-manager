@@ -40,15 +40,22 @@ Two scripts do the work:
 | `scripts/sign-windows.sh` | Downloads a sha256-pinned CodeSignTool and signs the file in place |
 | `scripts/verify-windows-signing.sh` | Reads the signed file with `osslsigncode` and fails the job unless the digest, timestamp, and signer match |
 
-The job runs on every tag. On branches it is a manual job, so a change to the
-scripts can be tested without a tag.
+The job runs on every tag. On branches it is a manual job, but the protected
+variables make it fail there. Test a change to the scripts on a release
+candidate tag instead.
 
 ### CI/CD Variables
 
-Mask every one except `ESIGNER_ENV`. Protect all of them once they hold the
-production values. GitLab withholds protected variables from unprotected
-branches, so the manual branch job then fails with `ESIGNER_ENV is not set`.
-The sandbox values are public, so they stay unprotected.
+All five variables are set, hold the production values, and are protected.
+GitLab withholds a protected variable from an unprotected branch, so the
+manual branch job now fails with `ESIGNER_ENV is not set`. Signing runs on a
+`v*` tag, which is protected.
+
+Four of the five are masked. GitLab refuses to mask `ESIGNER_PASSWORD`,
+because masking accepts only values of at least 8 characters, on one line,
+from the base64 alphabet plus `@:.~+=/-`. Nothing in the pipeline prints the
+password, and `sign-windows.sh` never enables `set -x`. A password that meets
+those rules can be masked after a rotation.
 
 | Variable | Description |
 |----------|-------------|
@@ -126,8 +133,9 @@ Get-AuthenticodeSignature .\quip-node-manager-windows-x86_64.exe | Format-List
 signtool verify /pa /v .\quip-node-manager-windows-x86_64.exe
 ```
 
-`Status` must read `Valid`, and `SignerCertificate.Subject` must name the
-organization on the certificate. A sandbox-signed file reports
+`Status` must read `Valid`. `SignerCertificate.Subject` names
+`HADAMARD GATE INCORPORATED`, the organization on the issued certificate.
+CI checks that same name through `verify-windows-signing.sh`. A sandbox-signed file reports
 `UnknownError` or `NotTrusted`. That is expected.
 
 ## SmartScreen Reputation
