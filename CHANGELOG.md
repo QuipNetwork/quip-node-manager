@@ -48,7 +48,7 @@ Click **More info**, then **Run anyway**.
 
 ---
 
-## v0.2.9-rc2
+## v0.2.9-rc3
 
 - **Windows builds are signed with the company certificate**: the Windows executable now carries an Authenticode signature from SSL.com, issued to HADAMARD GATE INCORPORATED. Windows shows that name as the publisher instead of an unknown-publisher warning.
 
