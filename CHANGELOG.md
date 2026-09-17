@@ -1,9 +1,11 @@
 # Changelog
 
-> **Note:** The macOS builds are signed with an Apple Developer ID certificate
-> and notarized by Apple, so they install with no Gatekeeper warning and no
-> Terminal command. The Windows builds are not signed yet, so Windows shows a
-> SmartScreen warning on first run. Windows signing is tracked in QUI-347.
+> **Note:** Every download is signed. The macOS builds carry an Apple Developer
+> ID signature and Apple notarization, so they install with no Gatekeeper
+> warning and no Terminal command. The Windows builds carry an Authenticode
+> signature issued to HADAMARD GATE INCORPORATED. Each release also publishes
+> `SHA256SUMS` and an OpenPGP signature over that file. See
+> [Verify Your Download](#verify-your-download).
 
 ## Quick Install
 
@@ -40,13 +42,101 @@ A `.deb` package is also available for Debian/Ubuntu:
 sudo dpkg -i quip-node-manager-linux-x86_64.deb
 ```
 
+A signed `.rpm` package is available for Fedora, RHEL and openSUSE:
+
+```sh
+sudo rpm --import https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+sudo rpm -i quip-node-manager-linux-x86_64.rpm
+```
+
 ### Windows
 
-Download the `.exe` and run it. Windows SmartScreen may show a warning because the binary is not yet code-signed.
+Download the `.exe` and run it. Windows names HADAMARD GATE INCORPORATED as the
+publisher. SmartScreen may still warn until the certificate builds reputation
+across enough downloads. Click **More info**, then **Run anyway**.
 
-Click **More info**, then **Run anyway**.
+## Verify Your Download
+
+`scripts/install.sh` checks the checksum on every run, and checks the signature
+as well when `gpg` is installed. To check a download by hand instead, expand the
+section below.
+
+<details>
+<summary>Manual verification steps</summary>
+
+### Checksums, every platform
+
+Download `SHA256SUMS` and `SHA256SUMS.asc` from this release, then import the
+release key and check both the signature and the checksum:
+
+```sh
+curl -fsSLO https://gitlab.com/quip.network/quip-node-manager/-/raw/main/.gitlab/release-signing-key.asc
+gpg --import release-signing-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+On macOS, use `shasum -a 256 --check --ignore-missing SHA256SUMS` for the last
+step.
+
+`gpg --verify` must report a good signature from this key:
+
+| Item | Value |
+|------|-------|
+| Key | `Quip Node Manager Release Signing <rick@postquant.xyz>` |
+| Fingerprint | `A63860E21E7070C2C26FDA5DC85BEAB01AD9FEE3` |
+| Type | RSA 4096, expires 2029-09-16 |
+
+GnuPG reports the key as untrusted until you sign it yourself. That warning is
+expected. Compare the fingerprint in the output against the value above.
+
+### macOS
+
+```sh
+xcrun stapler validate quip-node-manager-macos-universal.dmg
+spctl --assess --type open --context context:primary-signature -v quip-node-manager-macos-universal.dmg
+```
+
+`stapler` must report `The validate action worked`. `spctl` must report
+`accepted` and `source=Notarized Developer ID`.
+
+### Windows
+
+```powershell
+Get-AuthenticodeSignature .\quip-node-manager-windows-x86_64.exe | Format-List
+```
+
+`Status` must read `Valid`, and `SignerCertificate.Subject` must name
+`HADAMARD GATE INCORPORATED`.
+
+### Linux RPM
+
+```sh
+sudo rpm --import release-signing-key.asc
+rpm --checksig quip-node-manager-linux-x86_64.rpm
+```
+
+The output must read `digests signatures OK`. An unsigned package reports
+`digests OK` and still exits 0, so read the words, not the exit status.
+
+The `.deb` and the AppImage carry no embedded signature. Check those two
+against `SHA256SUMS` as shown above.
+
+</details>
 
 ---
+
+## v0.2.9
+
+- **Unset solvers default to `msa` when it is installed**: when you leave a solver on Default, Start now runs the `msa` build for that backend if the miner image or bundle has one. Otherwise Start runs `sa`, as before. A solver that you choose does not change. The Default entry in the desktop app and the terminal UI shows the solver that Start will run.
+
+- **Windows builds are signed with the company certificate**: the Windows executable now carries an Authenticode signature from SSL.com, issued to HADAMARD GATE INCORPORATED. Windows shows that name as the publisher instead of an unknown-publisher warning.
+
+- **Linux releases publish a signed RPM**: Fedora, RHEL and openSUSE users can install an RPM and check it with `rpm --checksig`, after importing the release key.
+
+- **Every release publishes SHA256SUMS and a signature over it**: the install script checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
+
+- **Release tags must be signed**: CI verifies the signature on each `v*` tag against a list of keys tracked in the repository, and refuses to build a release from a tag it cannot verify.
 
 ## v0.2.9-rc3
 
