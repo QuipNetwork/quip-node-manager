@@ -19,7 +19,7 @@ set -euo pipefail
 # Windows shows this string as the publisher, so a change here is a change to
 # what the user sees. The PROD value is filled in once the certificate exists;
 # until then a production signing run fails here, on purpose.
-EXPECTED_CN_PROD=''
+EXPECTED_CN_PROD='HADAMARD GATE INCORPORATED'
 EXPECTED_CN_TEST='Esigner LLC'
 
 fail() {
