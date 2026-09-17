@@ -48,6 +48,10 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.9-rc1
+
+- **Unset solvers default to `msa` when it is installed**: when you leave a solver on Default, Start now runs the `msa` build for that backend if the miner image or bundle has one. Otherwise Start runs `sa`, as before. A solver that you choose does not change. The Default entry in the desktop app and the terminal UI shows the solver that Start will run.
+
 ## v0.2.8
 
 - **The CUDA and Metal solver selectors appear in the desktop app**: the app drew these selectors before the hardware check finished. Only the CPU selector was visible. You can now choose `gibbs` or `sa` for CUDA and Metal.

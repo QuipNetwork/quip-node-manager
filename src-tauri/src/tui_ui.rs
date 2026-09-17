@@ -386,12 +386,17 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
     ));
 
     // Solver pickers, one per backend this machine can actually run. Empty
-    // means that backend's own default, which is what an operator who has never
-    // opened the field is running.
+    // means the default Start resolves, which is what an operator who has never
+    // opened the field is running. Before the list is read, that is the
+    // fallback.
     for backend in app.selectable_solver_backends() {
         let selected = app.form.solver(backend);
         let display = if selected.is_empty() {
-            format!("default ({})", backend.default_solver())
+            let listed = app.solvers.get(&backend).map(Vec::as_slice).unwrap_or(&[]);
+            format!(
+                "default ({})",
+                crate::solvers::default_among(backend, listed)
+            )
         } else {
             let track = app
                 .solvers

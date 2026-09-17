@@ -40,10 +40,10 @@ impl Backend {
         }
     }
 
-    /// Binary used when the operator has not chosen one. Matches the `binary`
-    /// each backend's own config defaults to, so "no choice" and "the default"
-    /// render the same stack.
-    pub fn default_solver(self) -> &'static str {
+    /// Binary used when the operator has not chosen one and the preferred
+    /// solver is not installed. Matches the `binary` each backend's own config
+    /// defaults to.
+    pub fn fallback_solver(self) -> &'static str {
         match self {
             Backend::Cpu => "quip-cpu-sa",
             Backend::Cuda => "quip-cuda-sa",
@@ -144,6 +144,20 @@ const CATALOG: &[(&str, &str, Track)] = &[
     ),
 ];
 
+/// Algorithm an unset picker runs when this backend's build of it is installed.
+const PREFERRED_SUFFIX: &str = "msa";
+
+/// What "Default" means for a backend, given what is installed: the preferred
+/// solver when present, otherwise the backend's fallback.
+pub fn default_among(backend: Backend, available: &[Solver]) -> String {
+    let preferred = format!("{}{PREFERRED_SUFFIX}", backend.prefix());
+    if available.iter().any(|s| s.binary == preferred) {
+        preferred
+    } else {
+        backend.fallback_solver().to_string()
+    }
+}
+
 fn describe(backend: Backend, binary: &str) -> Solver {
     let suffix = binary.strip_prefix(backend.prefix()).unwrap_or("");
     let (algorithm, track) = CATALOG
@@ -204,7 +218,7 @@ impl SolverCatalog {
             backend,
             solvers: vec![describe(backend, selected)],
             selected: selected.to_string(),
-            default_solver: backend.default_solver().to_string(),
+            default_solver: backend.fallback_solver().to_string(),
             unavailable: Some(reason.into()),
         }
     }
@@ -227,12 +241,10 @@ const IMAGE_BIN_DIR: &str = "/usr/local/bin";
 #[tauri::command]
 pub async fn list_solvers(backend: Backend) -> SolverCatalog {
     let settings = crate::settings::load_settings();
-    let selected = selected_solver(&settings.node_config, backend)
-        .unwrap_or_else(|| backend.default_solver().to_string());
+    let saved = selected_solver(&settings.node_config, backend);
 
-    let native = backend == Backend::Metal || settings.run_mode == crate::settings::RunMode::Native;
-    let listing = if native {
-        native_listing(backend)
+    let listing = if reads_bundle(backend, &settings.run_mode) {
+        native_listing()
     } else {
         docker_listing(settings.image_tag).await
     };
@@ -243,19 +255,74 @@ pub async fn list_solvers(backend: Backend) -> SolverCatalog {
             if solvers.is_empty() {
                 return SolverCatalog::only_selected(
                     backend,
-                    &selected,
+                    &saved.unwrap_or_else(|| backend.fallback_solver().to_string()),
                     format!("no {}* binaries found", backend.prefix()),
                 );
             }
+            let default_solver = default_among(backend, &solvers);
             SolverCatalog {
                 backend,
+                selected: saved.unwrap_or_else(|| default_solver.clone()),
                 solvers,
-                selected,
-                default_solver: backend.default_solver().to_string(),
+                default_solver,
                 unavailable: None,
             }
         }
-        Err(reason) => SolverCatalog::only_selected(backend, &selected, reason),
+        Err(reason) => SolverCatalog::only_selected(
+            backend,
+            &saved.unwrap_or_else(|| backend.fallback_solver().to_string()),
+            reason,
+        ),
+    }
+}
+
+/// Metal has no container, and Native runs every backend from the bundle.
+fn reads_bundle(backend: Backend, run_mode: &crate::settings::RunMode) -> bool {
+    backend == Backend::Metal || *run_mode == crate::settings::RunMode::Native
+}
+
+/// Fill each unset solver with the default this install resolves to, so the
+/// rendered config names the preferred solver when it is installed.
+///
+/// Runs at Start, on a copy of the settings: the saved choice stays unset, so
+/// a later image or bundle that drops the preferred solver falls back instead
+/// of pinning a name that no longer exists. A source that cannot be read
+/// leaves the field unset, which renders the fallback exactly as before.
+pub async fn resolve_unset_solvers(
+    config: &mut crate::settings::NodeConfig,
+    run_mode: &crate::settings::RunMode,
+    image_tag: crate::settings::ImageTag,
+) {
+    let bundle = native_listing().ok();
+    let image = if *run_mode == crate::settings::RunMode::Docker {
+        docker_listing(image_tag).await.ok()
+    } else {
+        None
+    };
+    for backend in [Backend::Cpu, Backend::Cuda, Backend::Metal] {
+        let slot = match backend {
+            Backend::Cpu => &mut config.cpu_solver,
+            Backend::Cuda => &mut config.cuda_solver,
+            Backend::Metal => &mut config.metal_solver,
+        };
+        let listing = if reads_bundle(backend, run_mode) {
+            bundle.as_deref()
+        } else {
+            image.as_deref()
+        };
+        fill_unset(slot, backend, listing);
+    }
+}
+
+/// Set an unset slot to the preferred solver when `listing` carries it. The
+/// fallback is left unset rather than written, so it renders as it always has.
+fn fill_unset(slot: &mut Option<String>, backend: Backend, listing: Option<&str>) {
+    let (None, Some(listing)) = (&slot, listing) else {
+        return;
+    };
+    let default = default_among(backend, &solvers_from_listing(backend, listing));
+    if default != backend.fallback_solver() {
+        *slot = Some(default);
     }
 }
 
@@ -269,13 +336,10 @@ pub fn selected_solver(config: &crate::settings::NodeConfig, backend: Backend) -
 }
 
 /// Read the bundled miner directory. Native ships every backend's binaries in
-/// one directory, so the default solver's parent is the directory to list.
-fn native_listing(backend: Backend) -> Result<String, String> {
-    let path = crate::native::miner_binary_path(backend.default_solver());
-    let dir = path
-        .parent()
-        .ok_or_else(|| "native miner directory has no parent".to_string())?;
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+/// one directory.
+fn native_listing() -> Result<String, String> {
+    let dir = crate::native::bin_dir();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     Ok(entries
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
@@ -423,6 +487,39 @@ quip-cuda-sa";
         assert_eq!(got[1].track, Track::Experimental);
     }
 
+    /// v0.3.3 ships `quip-cpu-msa` but no CUDA build of it, so CPU defaults
+    /// to msa while CUDA keeps its fallback.
+    #[test]
+    fn default_prefers_msa_only_where_installed() {
+        let cpu = solvers_from_listing(Backend::Cpu, V033_CUDA_IMAGE);
+        assert_eq!(default_among(Backend::Cpu, &cpu), "quip-cpu-msa");
+        let cuda = solvers_from_listing(Backend::Cuda, V033_CUDA_IMAGE);
+        assert_eq!(default_among(Backend::Cuda, &cuda), "quip-cuda-sa");
+        // Nothing read yet: the fallback, never a name that may not exist.
+        assert_eq!(default_among(Backend::Metal, &[]), "quip-metal-sa");
+    }
+
+    /// Start fills only unset slots, and only with a solver the source lists.
+    #[test]
+    fn fill_unset_respects_choices_and_unreadable_sources() {
+        let mut unset = None;
+        fill_unset(&mut unset, Backend::Cpu, Some(V033_CUDA_IMAGE));
+        assert_eq!(unset.as_deref(), Some("quip-cpu-msa"));
+
+        let mut chosen = Some("quip-cpu-sa".to_string());
+        fill_unset(&mut chosen, Backend::Cpu, Some(V033_CUDA_IMAGE));
+        assert_eq!(chosen.as_deref(), Some("quip-cpu-sa"));
+
+        let mut unread = None;
+        fill_unset(&mut unread, Backend::Cpu, None);
+        assert!(unread.is_none());
+
+        // No CUDA msa in v0.3.3: stay unset so `[cuda.N]` keeps no binary key.
+        let mut cuda = None;
+        fill_unset(&mut cuda, Backend::Cuda, Some(V033_CUDA_IMAGE));
+        assert!(cuda.is_none());
+    }
+
     /// The prefix alone is not a solver name, and must not become an entry the
     /// coordinator would then try to spawn.
     #[test]
@@ -450,11 +547,11 @@ quip-cuda-sa";
         for backend in [Backend::Cpu, Backend::Cuda, Backend::Metal] {
             let c = SolverCatalog::only_selected(
                 backend,
-                backend.default_solver(),
+                backend.fallback_solver(),
                 "image not pulled yet",
             );
             assert_eq!(c.solvers.len(), 1);
-            assert_eq!(c.solvers[0].binary, backend.default_solver());
+            assert_eq!(c.solvers[0].binary, backend.fallback_solver());
             // Every backend's default must be a real catalog entry, or a fresh
             // install would render its own setting as an unknown solver.
             assert_eq!(c.solvers[0].track, Track::Production);
