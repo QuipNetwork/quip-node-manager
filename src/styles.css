@@ -223,6 +223,11 @@ body {
   background-color: var(--warning);
 }
 
+/* Blue, not amber: an initial sync is expected work, not a fault. */
+.status-dot.status-syncing {
+  background-color: var(--accent);
+}
+
 .status-dot.status-stopped {
   background-color: var(--error);
 }
@@ -237,6 +242,10 @@ body {
 
 .status-dot.status-degraded.active {
   animation: pulse-yellow 2s infinite;
+}
+
+.status-dot.status-syncing.active {
+  animation: pulse-blue 2s infinite;
 }
 
 .status-dot.status-stopped.active {
@@ -277,6 +286,21 @@ body {
   }
 }
 
+@keyframes pulse-blue {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.5);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 8px rgba(59, 130, 246, 0);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+}
+
 @keyframes pulse-red {
   0% {
     transform: scale(1);
@@ -306,8 +330,31 @@ body {
   color: var(--warning);
 }
 
+.status-text.status-syncing {
+  color: var(--accent);
+}
+
 .status-text.status-stopped {
   color: var(--error);
+}
+
+/* Initial-sync bar under the status pill. Sized to the subtext, not the pill,
+   so it reads as detail rather than a second headline. */
+.sync-progress {
+  width: 220px;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 3px;
+  background-color: var(--border-input);
+  overflow: hidden;
+}
+
+.sync-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background-color: var(--accent);
+  transition: width 0.4s ease;
 }
 
 .status-text.status-unhealthy {
@@ -1066,8 +1113,8 @@ button.check-action:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-/* ─── GPU Device Toggle Switch ──────────────────────────────────────────── */
-.gpu-toggle-switch {
+/* ─── Toggle Switch (sliders for on/off settings) ──────────────────────── */
+.toggle-switch {
   position: relative;
   display: inline-block;
   width: 36px;
@@ -1076,13 +1123,13 @@ button.check-action:disabled {
   cursor: pointer;
 }
 
-.gpu-toggle-switch input {
+.toggle-switch input {
   opacity: 0;
   width: 0;
   height: 0;
 }
 
-.gpu-toggle-slider {
+.toggle-slider {
   position: absolute;
   inset: 0;
   background: var(--bg-elevated);
@@ -1090,7 +1137,7 @@ button.check-action:disabled {
   transition: background 0.2s;
 }
 
-.gpu-toggle-slider::before {
+.toggle-slider::before {
   content: "";
   position: absolute;
   height: 14px;
@@ -1102,13 +1149,22 @@ button.check-action:disabled {
   transition: transform 0.2s, background 0.2s;
 }
 
-.gpu-toggle-switch input:checked + .gpu-toggle-slider {
+.toggle-switch input:checked + .toggle-slider {
   background: var(--accent);
 }
 
-.gpu-toggle-switch input:checked + .gpu-toggle-slider::before {
+.toggle-switch input:checked + .toggle-slider::before {
   transform: translateX(16px);
   background: #fff;
+}
+
+/* A slider with its caption, used for the settings-panel on/off rows. */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  margin: 0;
 }
 
 /* ─── Update Banner ─────────────────────────────────────────────────────── */
@@ -1149,4 +1205,62 @@ button.check-action:disabled {
 .segmented-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+/* Service port controls in advanced settings. */
+.service-port-group {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.service-port-group legend {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 0 6px;
+}
+
+.service-port-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.service-port-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.service-port-row input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.service-port-row input[type='number'] {
+  width: 100px;
+  flex-shrink: 0;
+}
+
+.service-port-note {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin: 6px 0;
+}
+
+.service-port-public-access {
+  margin: 8px 0;
+}
+
+.service-port-public-access .toggle-row {
+  font-size: 12px;
+}
+
+.service-port-public-access .service-port-note {
+  margin: 4px 0 0;
 }

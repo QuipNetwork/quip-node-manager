@@ -54,7 +54,7 @@ Click **More info**, then **Run anyway**.
 - **Pre-flight checklist** -- verifies Docker + Compose v2 availability (plus WSL on Windows, the miner binary in Native mode, and the D-Wave token when QPU mining is configured), node secret, public IP, hostname, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
 - **Live log streaming** -- tails `docker compose logs -f <node>` in a collapsible drawer; switches to `data/node.log` once the node writes to it
 - **GPU configuration** -- detects CUDA and Metal devices, per-device enable/disable, utilization slider, yielding mode
-- **D-Wave QPU support** -- optional quantum processing unit configuration with daily budget controls
+- **D-Wave QPU support** -- optional quantum processing unit configuration with a monthly QPU time budget
 - **Background update monitor** -- checks for new node + dashboard image digests and manager app releases every 30 minutes; optional auto-restart on digest change
 - **TLS certificate guidance** -- Caddy's ACME (Let's Encrypt or ZeroSSL) is wired up out of the box; set a DNS name + email and TLS "just works"
 
@@ -115,7 +115,18 @@ the desktop app.
 - **Config**: TOML generation matching quip-protocol format; `.env` generated from settings on every Start.
 - **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files.
 
-> **Native mode note (macOS):** the node's REST API binds to `127.0.0.1:20100`. Docker Desktop's vpnkit forwards container traffic from `host.docker.internal` through to the host's loopback, so the REST port is not exposed to the LAN.
+Advanced settings in both interfaces group host ports by service. Each port has
+an on/off switch and a host port field. Internal Docker addresses stay fixed,
+including `quip-validator:9944`, `postgres:5432`, and `quip-miner:8086`.
+
+Native mode requires validator RPC on a host port, which defaults to 9944.
+It stays on loopback unless you select public access. The native miner REST API
+binds to `0.0.0.0:20100` by default so Caddy can reach it through the Docker host gateway.
+Its host port is also editable in advanced settings.
+
+Container logs attach before stack startup. Logs remain visible if startup fails or waits
+for another service. The follower retries if the Compose file is not ready yet.
+
 
 ### Overriding the bundled stack
 

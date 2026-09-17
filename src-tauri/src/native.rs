@@ -26,14 +26,12 @@ pub struct BinaryDownloadProgress {
 
 pub struct NativeProcessState {
     child: Arc<Mutex<Option<Child>>>,
-    stop_flag: Arc<Mutex<bool>>,
 }
 
 impl NativeProcessState {
     pub fn new() -> Self {
         NativeProcessState {
             child: Arc::new(Mutex::new(None)),
-            stop_flag: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -73,7 +71,7 @@ fn ensure_native_supported() -> Result<(), String> {
     )
 }
 
-fn bin_dir() -> std::path::PathBuf {
+pub(crate) fn bin_dir() -> std::path::PathBuf {
     data_dir().join("bin")
 }
 
@@ -1022,7 +1020,7 @@ pub async fn start_native_node(
     let msg = start_native_node_core(Arc::clone(&sink), &state).await?;
     // Log tail uses AppHandle directly (continuous streaming; TUI provides its
     // own path). Start it after core succeeds so the log file exists.
-    start_log_tail(app, Arc::clone(&state.stop_flag));
+    start_log_tail(app);
     Ok(msg)
 }
 
@@ -1092,12 +1090,6 @@ pub(crate) async fn start_native_node_core(
         return Err(e);
     }
 
-    // Write config.toml for native mode. The renderer derives the miner's REST
-    // bind address from the run mode (all interfaces, so the Caddy container
-    // can reach it via host.docker.internal), so no rest_host override is
-    // needed here.
-    crate::config::write_config_toml(&config, &RunMode::Native)?;
-
     // Auto-provision the miner binary when it's missing — mirrors Docker
     // mode pulling images on start, so a fresh or relocated data dir doesn't
     // dead-end here.
@@ -1118,6 +1110,14 @@ pub(crate) async fn start_native_node_core(
             bin.display()
         ));
     }
+
+    // Write config.toml for native mode. The renderer derives the miner's REST
+    // bind address from the run mode (all interfaces, so the Caddy container
+    // can reach it via host.docker.internal), so no rest_host override is
+    // needed here. This follows provisioning so a first start resolves unset
+    // solvers against the bundle it just installed.
+    crate::solvers::resolve_unset_solvers(&mut config, &RunMode::Native, settings.image_tag).await;
+    crate::config::write_config_toml(&config, &RunMode::Native)?;
 
     let config_path = data_dir().join("config.toml");
 
@@ -1174,21 +1174,17 @@ pub(crate) async fn start_native_node_core(
     );
     sink.log("INFO", &format!("Native miner started (PID {})", pid));
 
-    // Arm the stop flag before storing the child so stop_native_node_core can
-    // observe the flag immediately if called in quick succession.
-    *state.stop_flag.lock().unwrap() = false;
     write_pid(pid);
     *state.child.lock().unwrap() = Some(child);
 
     Ok(format!("Native miner started (PID {})", pid))
 }
 
-/// Tail native-mode logs: host `node-output.log` (miner) plus compose logs
-/// for the containerized support services (validator/dashboard/postgres/caddy).
-fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
-    use crate::log_stream::{sources_for_run_mode, start_log_stream_for_app, LogStreamState};
+/// Tail native-mode logs: host `node-output.log` (miner) plus the collector's
+/// merged log for the containerized support services.
+fn start_log_tail(app: tauri::AppHandle) {
+    use crate::log_stream::{sources_for_run_mode, start_log_stream_for_app};
     use crate::settings::RunMode;
-    use tauri::Manager;
     let path = node_output_log_path();
     let _ = app.emit(
         "node-log",
@@ -1196,28 +1192,19 @@ fn start_log_tail(app: tauri::AppHandle, stop_flag: Arc<Mutex<bool>>) {
             "timestamp": "",
             "level": "INFO",
             "message": format!(
-                "[log-stream] native hybrid: tail {} + compose logs -f",
+                "[log-stream] native hybrid: tail {} + the merged stack log",
                 path.display()
             ),
             "source": "app",
         }),
     );
-    // ComposeAll spawns `docker compose logs -f`; store its PID in the shared
-    // LogStreamState so stop_stack / stop_log_stream / stop_native_node can
-    // kill it and unblock BufReader::lines().
-    let log_state = app.state::<LogStreamState>();
-    log_state.kill_child();
-    let child_pid = Arc::clone(&log_state.child_pid);
     let sources = sources_for_run_mode(&RunMode::Native);
-    start_log_stream_for_app(app, stop_flag, child_pid, sources);
+    start_log_stream_for_app(app, sources);
 }
 
 /// Start tailing native node logs (for orphan reconnect on app restart).
 #[tauri::command]
-pub async fn start_native_log_tail(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, NativeProcessState>,
-) -> Result<(), String> {
+pub async fn start_native_log_tail(app: tauri::AppHandle) -> Result<(), String> {
     let _ = app.emit(
         "node-log",
         serde_json::json!({
@@ -1227,9 +1214,7 @@ pub async fn start_native_log_tail(
             "source": "app",
         }),
     );
-    let stop_flag = Arc::clone(&state.stop_flag);
-    *stop_flag.lock().unwrap() = false;
-    start_log_tail(app, stop_flag);
+    start_log_tail(app);
     Ok(())
 }
 
@@ -1253,12 +1238,12 @@ pub async fn stop_native_node(
     app: tauri::AppHandle,
     state: tauri::State<'_, NativeProcessState>,
 ) -> Result<(), String> {
-    // Unblock the hybrid compose log child before signalling the stop flag.
+    // Cancel the hybrid log session before stopping the native process.
     {
         use crate::log_stream::LogStreamState;
         use tauri::Manager;
         let log_state = app.state::<LogStreamState>();
-        log_state.kill_child();
+        log_state.stop();
     }
     let sink: Arc<dyn ProgressSink> = Arc::new(crate::progress::TauriSink::new(app.clone()));
     stop_native_node_core(sink, &state).await?;
@@ -1281,7 +1266,7 @@ pub async fn stop_native_node(
 ///
 /// Args:
 ///     sink: Progress/log sink for `stop-started` and `stop-complete` events.
-///     state: Shared native-process state (child handle, stop flag, PID file).
+///     state: Shared native-process state holding the child handle.
 ///
 /// Returns:
 ///     `Ok(())` when the node has stopped; `Err` with a human-readable cause
@@ -1291,7 +1276,6 @@ pub(crate) async fn stop_native_node_core(
     state: &NativeProcessState,
 ) -> Result<(), String> {
     sink.stop_started();
-    *state.stop_flag.lock().unwrap() = true;
 
     // Snapshot PIDs we need to kill. Drops the guards before awaiting.
     let (child_pid, child_opt) = {

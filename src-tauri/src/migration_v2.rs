@@ -372,12 +372,21 @@ fn convert_v01_config(root: &mut Table, run_mode: &RunMode) -> Result<ConfigMigr
 
     let mut next = Table::new();
     next.insert("miner".to_string(), Value::Table(miner));
-    for (key, value) in std::mem::take(root) {
+    for (key, mut value) in std::mem::take(root) {
         if should_drop_top_level_table(&key) {
             warnings.push(format!("dropped v0.1 table [{key}]"));
-        } else {
-            next.insert(key, value);
+            continue;
         }
+        // The v0.3 dwave miner ignores `daily_budget` and mines unmetered, so
+        // carrying it over would look like a limit that is not there.
+        if key == "dwave" {
+            if let Value::Table(dwave) = &mut value {
+                if dwave.remove("daily_budget").is_some() {
+                    warnings.push(DROPPED_DAILY_BUDGET.to_string());
+                }
+            }
+        }
+        next.insert(key, value);
     }
 
     let content =
@@ -414,6 +423,9 @@ fn promoted_global_key(key: &str) -> bool {
         "node_name" | "public_host" | "public_port" | "rest_host" | "log_level" | "node_log"
     )
 }
+
+const DROPPED_DAILY_BUDGET: &str =
+    "dropped v0.1 config key [dwave].daily_budget; set a monthly D-Wave budget in Settings";
 
 fn should_drop_top_level_table(key: &str) -> bool {
     matches!(key, "telemetry" | "file_telemetry" | "http")
@@ -594,7 +606,10 @@ solver = "Advantage2_System1.13"
         assert!(migration.content.contains("[qpu]\n"));
         assert!(migration.content.contains("[dwave]\n"));
         assert!(migration.content.contains("token = \"DWAVE-TOKEN\""));
-        assert!(migration.content.contains("daily_budget = \"60s\""));
+        assert!(!migration.content.contains("daily_budget"));
+        assert!(migration
+            .warnings
+            .contains(&DROPPED_DAILY_BUDGET.to_string()));
     }
 
     #[test]

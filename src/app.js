@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { applyPortEdits, collectPortEdits, renderPortControls } from './service-ports.js';
 
 // Tauri IPC bridge
 const invoke =
@@ -17,6 +18,7 @@ const openUrl = (url) =>
 // App state
 const state = {
   settings: null,
+  servicePortControls: [],
   containerRunning: false,
   nativeRunning: false,
   // Full StackStatus returned by get_stack_status:
@@ -197,7 +199,7 @@ async function refreshChannelInfo() {
     info = await invoke('resolve_channel_info', {
       channel: state.settings.update_channel,
     });
-  } catch (e) {
+  } catch {
     if (caption) caption.textContent = 'Could not reach the release feed.';
     return;
   }
@@ -398,25 +400,6 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   list.style.display = expanded ? 'none' : '';
 });
 
-// ─── Port change → re-run port-related checks ────────────────────────────────
-document.getElementById('port').addEventListener('change', async () => {
-  const port = parseInt(document.getElementById('port').value) || 20049;
-  if (state.settings) {
-    state.settings.node_config.port = port;
-    await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port'] }).catch(console.error);
-  }
-});
-
-document.getElementById('validator-port').addEventListener('change', async () => {
-  const port = parseInt(document.getElementById('validator-port').value) || 30333;
-  if (state.settings) {
-    state.settings.node_config.validator_port = port;
-    await invoke('update_settings', { settings: state.settings }).catch(console.error);
-    await invoke('recheck', { ids: ['port-validator'] }).catch(console.error);
-  }
-});
-
 // ─── Custom settings toggle ───────────────────────────────────────────────────
 document.getElementById('btn-custom-toggle').addEventListener('click', () => {
   const btn = document.getElementById('btn-custom-toggle');
@@ -460,8 +443,22 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
 /// binary check).
 async function setMetalEnabled(enabled) {
   if (!state.settings) return;
-  state.settings.run_mode = enabled ? 'native' : 'docker';
-  await invoke('update_settings', { settings: state.settings }).catch(console.error);
+  try {
+    const proposed = { ...state.settings, node_config: collectConfig(),
+      run_mode: enabled ? 'native' : 'docker' };
+    const controls = await invoke('get_service_ports', {
+      config: proposed.node_config, runMode: proposed.run_mode,
+    });
+    await invoke('update_settings', { settings: proposed });
+    state.settings = proposed;
+    state.servicePortControls = controls;
+    renderPortControls(document.getElementById('service-port-controls'), controls);
+  } catch (error) {
+    document.getElementById('apply-status').textContent = `Mode change failed: ${error}`;
+    appendLog({ timestamp: '', level: 'ERROR', message: `Mode change failed: ${error}` });
+    renderGpuDevices();
+    return;
+  }
   // Mode change invalidates the whole cache — backend reseeds and reruns.
   state.checks.clear();
   await invoke('recheck').catch(console.error);
@@ -525,11 +522,11 @@ function renderGpuDevices() {
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
 
     const label = document.createElement('label');
-    label.className = 'gpu-toggle-switch';
+    label.className = 'toggle-switch';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     const slider = document.createElement('span');
-    slider.className = 'gpu-toggle-slider';
+    slider.className = 'toggle-slider';
 
     if (isMetal) {
       // Metal is a single implicit GPU only reachable from the native miner,
@@ -603,15 +600,42 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
   }
 });
 
-// ─── Public host enable toggle ────────────────────────────────────────────────
-document.getElementById('public-host-enable').addEventListener('change', () => {
+// ─── Public host override ─────────────────────────────────────────────────────
+//
+// With the override off the node advertises the detected public IP and the
+// Public API port, and the panel shows that pair. Turning the override on
+// reveals the fields, seeded with the same pair so the operator edits from
+// what is advertised today rather than from a blank.
+function advertisedPublicAddress() {
+  const host = state.detectedPublicIp || '';
+  const port = state.settings?.node_config?.port ?? CADDY_PUBLIC_API_PORT;
+  return { host, port };
+}
+
+function updatePublicHostUi() {
   const enabled = document.getElementById('public-host-enable').checked;
-  document.getElementById('public-host').disabled = !enabled;
-  document.getElementById('public-port').disabled = !enabled;
-  if (!enabled) {
+  document.getElementById('public-host-fields').style.display = enabled ? '' : 'none';
+  document.getElementById('public-host-detected').style.display = enabled ? 'none' : '';
+
+  const { host, port } = advertisedPublicAddress();
+  document.getElementById('public-host-detected-value').textContent = host
+    ? `${host}:${port}`
+    : (state.detectedPublicIp === null ? 'not detected' : 'detecting…');
+
+  if (enabled) {
+    const hostEl = document.getElementById('public-host');
+    const portEl = document.getElementById('public-port');
+    if (!hostEl.value) hostEl.value = host;
+    if (!portEl.value) portEl.value = port;
+  }
+}
+
+document.getElementById('public-host-enable').addEventListener('change', () => {
+  if (!document.getElementById('public-host-enable').checked) {
     document.getElementById('public-host').value = '';
     document.getElementById('public-port').value = '';
   }
+  updatePublicHostUi();
 });
 
 // ─── D-Wave section toggle ───────────────────────────────────────────────────
@@ -644,8 +668,15 @@ function collectConfig() {
   const survey = state.hardwareSurvey;
   const gpuBackend = survey?.gpu_backend === 'metal' ? 'mps' : 'local';
 
-  // Build per-device configs from toggle checkboxes
+  // Build per-device configs from the toggle checkboxes. Those only exist
+  // once the hardware survey has answered, so until then (or for good, when
+  // the survey failed) keep the saved list. Rebuilding from an empty page
+  // would drop every GPU from config.toml on a Start in that window, and
+  // with CPU mining off the miner then has nothing to launch.
   const gpuDeviceConfigs = [];
+  if (!survey) {
+    gpuDeviceConfigs.push(...(state.settings?.node_config?.gpu_device_configs || []));
+  }
   document.querySelectorAll('.gpu-device-toggle').forEach((cb) => {
     gpuDeviceConfigs.push({
       index: parseInt(cb.dataset.index),
@@ -671,18 +702,24 @@ function collectConfig() {
         token: qpuToken,
         solver: 'Advantage2_System1.13',
         dwave_region_url: 'https://na-west-1.cloud.dwavesys.com/sapi/v2/',
-        daily_budget: document.getElementById('qpu-daily-budget')?.value?.trim() ?? '',
+        budget: document.getElementById('qpu-budget')?.value?.trim() ?? '',
+        // The miner stops on a reset day outside 1-31; min/max on the input
+        // do not stop a typed value from reaching this read.
+        budget_reset_day: Math.min(
+          31,
+          Math.max(1, parseInt(document.getElementById('qpu-budget-reset-day')?.value) || 1),
+        ),
         qpu_min_blocks_for_estimation: null,
         qpu_ema_alpha: null,
       }
     : null;
 
   const base = state.settings?.node_config ?? {};
+  const portConfig = applyPortEdits(base, state.servicePortControls,
+    collectPortEdits(document.getElementById('service-port-controls'), state.servicePortControls));
 
   return {
-    port: parseInt(document.getElementById('port').value) || 20049,
-    validator_port: parseInt(document.getElementById('validator-port').value) || 30333,
-    validator_rpc_port: parseInt(document.getElementById('validator-rpc-port')?.value) || 9944,
+    ...portConfig,
     listen: base.listen ?? '::',
     public_host: document.getElementById('public-host-enable')?.checked
       ? document.getElementById('public-host')?.value?.trim() ?? ''
@@ -702,7 +739,7 @@ function collectConfig() {
     verify_tls: base.verify_tls ?? false,
     rest_host: base.rest_host ?? '127.0.0.1',
     rest_port: base.rest_port ?? -1,
-    rest_insecure_port: base.rest_insecure_port ?? -1,
+    rest_insecure_port: portConfig.rest_insecure_port ?? -1,
     telemetry_enabled: base.telemetry_enabled ?? true,
     telemetry_dir: base.telemetry_dir ?? 'telemetry',
     log_level: document.getElementById('log-level')?.value || 'info',
@@ -710,6 +747,11 @@ function collectConfig() {
     http_log: document.getElementById('http-log')?.value?.trim() ?? '',
     cpu_enabled: document.getElementById('cpu-enabled')?.checked ?? true,
     num_cpus: parseInt(document.getElementById('num-cpus').value) || 1,
+    // Empty means "no choice" — the backend then leaves the section's `binary`
+    // key out in Docker so the image's own default applies. Never send "".
+    cpu_solver: document.getElementById('cpu-solver')?.value || null,
+    cuda_solver: document.getElementById('cuda-solver')?.value || null,
+    metal_solver: document.getElementById('metal-solver')?.value || null,
     gpu_backend: gpuBackend,
     gpu_device_configs: gpuDeviceConfigs,
     metal_config: metalConfig,
@@ -745,13 +787,43 @@ function applyFormToSettings() {
 }
 
 // ─── Populate form from settings ─────────────────────────────────────────────
-function populateForm(settings) {
+async function refreshServicePortControls() {
+  const controls = await invoke('get_service_ports', {
+    config: state.settings.node_config, runMode: state.settings.run_mode,
+  });
+  state.servicePortControls = controls;
+  renderPortControls(document.getElementById('service-port-controls'), controls);
+}
+
+// GPU tuning: for Metal, utilization/yielding come from metal_config; for
+// CUDA, from the first enabled device (or defaults). Which of the two applies
+// is only known once the hardware survey has answered, and the form is
+// populated before that, so this runs again when the survey lands. Reading
+// the CUDA slot on a Mac before then showed Yielding off on every restart,
+// and the next Save wrote that back into metal_config.
+function populateGpuTuning(c) {
+  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
+  const metalCfg = c.metal_config ?? {};
+  const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
+  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
+  document.getElementById('gpu-utilization').value = savedUtil;
+  document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
+  document.getElementById('gpu-yielding').checked = isMetal
+    ? (metalCfg.yielding ?? true)
+    : (gpuCfg?.yielding ?? false);
+
+  // Metal-only adaptive-cap knobs
+  const activeUtil = metalCfg.active_util ?? 85;
+  document.getElementById('metal-active-util').value = activeUtil;
+  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
+  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
+}
+
+async function populateForm(settings) {
+  await refreshServicePortControls();
   const c = settings.node_config;
 
   // Validator / miner configuration
-  document.getElementById('port').value = c.port ?? 20049;
-  document.getElementById('validator-port').value = c.validator_port ?? 30333;
-  document.getElementById('validator-rpc-port').value = c.validator_rpc_port ?? 9944;
   document.getElementById('secret-display').value = c.secret ?? '';
 
   // Custom settings
@@ -760,10 +832,9 @@ function populateForm(settings) {
   const publicPort = c.public_port ?? null;
   const publicOverrideEnabled = !!(publicHost || publicPort);
   document.getElementById('public-host-enable').checked = publicOverrideEnabled;
-  document.getElementById('public-host').disabled = !publicOverrideEnabled;
-  document.getElementById('public-port').disabled = !publicOverrideEnabled;
   document.getElementById('public-host').value = publicHost;
   document.getElementById('public-port').value = publicPort ?? '';
+  updatePublicHostUi();
   document.getElementById('log-level').value = c.log_level ?? 'info';
   document.getElementById('node-log').value = c.node_log ?? '';
   document.getElementById('http-log').value = c.http_log ?? '';
@@ -798,31 +869,17 @@ function populateForm(settings) {
   // CPU Miner
   document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  renderSolverPickers(c);
   updateCpuUiVisibility();
 
-  // GPU Miner — for Metal, utilization/yielding come from metal_config;
-  // for CUDA, from the first enabled device (or defaults).
-  const isMetal = state.hardwareSurvey?.gpu_backend === 'metal';
-  const metalCfg = c.metal_config ?? {};
-  const gpuCfg = (c.gpu_device_configs || []).find((d) => d.enabled) || (c.gpu_device_configs || [])[0];
-  const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
-  document.getElementById('gpu-utilization').value = savedUtil;
-  document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
-  document.getElementById('gpu-yielding').checked = isMetal
-    ? (metalCfg.yielding ?? true)
-    : (gpuCfg?.yielding ?? false);
-
-  // Metal-only adaptive-cap knobs
-  const activeUtil = metalCfg.active_util ?? 85;
-  document.getElementById('metal-active-util').value = activeUtil;
-  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
-  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
+  populateGpuTuning(c);
 
   // D-Wave
   const dw = c.dwave_config;
   if (dw) {
     document.getElementById('qpu-api-key').value = dw.token ?? '';
-    document.getElementById('qpu-daily-budget').value = dw.daily_budget ?? '';
+    document.getElementById('qpu-budget').value = dw.budget ?? '';
+    document.getElementById('qpu-budget-reset-day').value = dw.budget_reset_day ?? 1;
     if (dw.token) {
       document.getElementById('qpu-section').style.display = 'block';
       document.getElementById('btn-qpu-toggle').textContent =
@@ -880,6 +937,13 @@ function setStatus(stateStr) {
     text.classList.add('status-running');
     text.textContent = 'RUNNING';
     sub.textContent = 'Node is running';
+  } else if (stateStr === 'syncing') {
+    // Blue, not amber: replaying the chain is expected work on a fresh node,
+    // not a fault. The bar below carries the actual progress.
+    dot.classList.add('status-syncing', 'active');
+    text.classList.add('status-syncing');
+    text.textContent = 'SYNCING';
+    sub.textContent = syncSubtext();
   } else if (stateStr === 'degraded') {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
@@ -903,6 +967,7 @@ function setStatus(stateStr) {
     text.textContent = 'STOPPED';
     sub.textContent = 'Node not running';
   }
+  renderSyncProgress(stateStr);
 }
 
 // ─── Checklist render (FSM) ──────────────────────────────────────────────────
@@ -1659,7 +1724,6 @@ async function runRestartToUpdate() {
 async function startNode() {
   if (isDockerMode()) {
     await invoke('start_stack');
-    await invoke('start_log_stream');
   } else {
     // Native mode: run the binary on the host + the compose stack's
     // non-node services so the user still gets the dashboard UI.
@@ -1762,10 +1826,10 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
 
 // ─── Save ─────────────────────────────────────────────────────────────────────
 document.getElementById('btn-save').addEventListener('click', async () => {
-  applyFormToSettings();
   const applyStatus = document.getElementById('apply-status');
   applyStatus.textContent = 'Saving\u2026';
   try {
+    applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     applyStatus.textContent = 'Settings saved.';
     setTimeout(() => { applyStatus.textContent = ''; }, 3000);
@@ -1809,6 +1873,99 @@ function partialSubtext() {
   return `Miner not running; ${up.length} support service${
     up.length === 1 ? '' : 's'
   } up (${up.join(', ')})`;
+}
+
+// Build one flat solver list per backend, each entry tagged with its track.
+// The list comes from the miner image (or the Native bundle), so it is exactly
+// what the coordinator can spawn — a name it does not carry fails minutes
+// later, after the chain connect and funding, with nothing in the error
+// pointing back at the solver choice.
+//
+// `selected` is the saved setting, or null for "backend default". A saved
+// solver the image no longer carries is kept as an entry, so switching images
+// cannot silently rewrite the operator's choice to something else.
+async function renderSolverPicker(backend, selected) {
+  const el = document.getElementById(`${backend}-solver`);
+  const note = document.getElementById(`${backend}-solver-note`);
+  if (!el) return;
+
+  let catalog;
+  try {
+    catalog = await invoke('list_solvers', { backend });
+  } catch (e) {
+    catalog = { solvers: [], unavailable: String(e) };
+  }
+
+  const solvers = [...(catalog.solvers ?? [])];
+  if (selected && !solvers.some((s) => s.binary === selected)) {
+    solvers.push({ binary: selected, algorithm: '', track: 'unknown' });
+  }
+
+  const label = (s) => {
+    const track = s.track && s.track !== 'unknown' ? ` — ${s.track}` : '';
+    return s.algorithm ? `${s.binary} — ${s.algorithm}${track}` : `${s.binary}${track}`;
+  };
+
+  // Option text is built with textContent below; nothing here parses HTML.
+  el.replaceChildren();
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = `Default (${catalog.default_solver ?? `quip-${backend}-sa`})`;
+  el.appendChild(def);
+  for (const s of solvers) {
+    const opt = document.createElement('option');
+    opt.value = s.binary;
+    opt.textContent = label(s);
+    el.appendChild(opt);
+  }
+  el.value = selected ?? '';
+
+  if (note) {
+    note.textContent = catalog.unavailable
+      ? `Could not list solvers (${catalog.unavailable}). Start the node once so the miner image is available.`
+      : '';
+  }
+}
+
+// Show only the GPU picker matching the detected backend — offering a CUDA
+// solver on a Mac, or Metal on Linux, would offer a binary that cannot run.
+function renderSolverPickers(config) {
+  const gpu = state.hardwareSurvey?.gpu_backend;
+  const cudaGroup = document.getElementById('cuda-solver-group');
+  const metalGroup = document.getElementById('metal-solver-group');
+  if (cudaGroup) cudaGroup.style.display = gpu === 'cuda' ? '' : 'none';
+  if (metalGroup) metalGroup.style.display = gpu === 'metal' ? '' : 'none';
+
+  renderSolverPicker('cpu', config.cpu_solver ?? null);
+  if (gpu === 'cuda') renderSolverPicker('cuda', config.cuda_solver ?? null);
+  if (gpu === 'metal') renderSolverPicker('metal', config.metal_solver ?? null);
+}
+
+// Subtext for the SYNCING pill. The health monitor only sets `sync` while the
+// validator reports an unfinished replay, so a missing field means the numbers
+// were not readable this poll — say so rather than showing a stale bar.
+function syncSubtext() {
+  const s = state.health?.sync;
+  if (!s) return 'Validator is catching up to the chain';
+  return `Catching up: block ${s.current_block.toLocaleString()} of ${
+    s.highest_block.toLocaleString()
+  } — ${s.behind.toLocaleString()} behind`;
+}
+
+// Paint the initial-sync bar. Hidden unless the pill is SYNCING and the monitor
+// reported progress, so it never lingers at a stale percentage after the node
+// reaches the head.
+function renderSyncProgress(stateStr) {
+  const bar = document.getElementById('sync-progress');
+  const fill = document.getElementById('sync-progress-fill');
+  if (!bar || !fill) return;
+  const s = stateStr === 'syncing' ? state.health?.sync : null;
+  bar.hidden = !s;
+  if (!s) return;
+  const pct = Math.max(0, Math.min(100, s.fraction * 100));
+  fill.style.width = `${pct}%`;
+  bar.setAttribute('aria-valuenow', String(Math.round(pct)));
+  bar.title = `${pct.toFixed(1)}% of this sync complete`;
 }
 
 // Map the stack roll-up + miner state to the status pill. The miner (container
@@ -2128,7 +2285,7 @@ async function init() {
   try {
     const settings = await invoke('get_settings');
     state.settings = settings;
-    populateForm(settings);
+    await populateForm(settings);
     // The Metal toggle (rendered once the hardware survey lands) reflects
     // run_mode; there is no separate run-mode control to seed here.
     if (settings.active_tab && settings.active_tab !== 'status') {
@@ -2172,8 +2329,26 @@ async function init() {
       // state reflects run_mode). gpu_backend itself is derived from the
       // survey in collectConfig, so there's nothing to seed here.
       updateRunModeUI();
+      // The survey decides whether the tuning row reads metal_config or the
+      // CUDA device list, so re-seed it now that the answer is known.
+      if (state.settings) populateGpuTuning(state.settings.node_config);
+      // populateForm ran before the survey existed, so the CUDA and Metal
+      // pickers are still hidden. The survey names which one this machine runs.
+      if (state.settings) renderSolverPickers(state.settings.node_config);
     })
     .catch(() => {});
+
+  // The override panel shows what the node advertises when no override is
+  // set, which is this address plus the Public API port.
+  invoke('detect_public_ip')
+    .then((ip) => {
+      state.detectedPublicIp = ip;
+      updatePublicHostUi();
+    })
+    .catch(() => {
+      state.detectedPublicIp = null;
+      updatePublicHostUi();
+    });
 
   // Seed placeholders from the cache, then kick off a full recheck.
   invoke('get_checklist')
@@ -2220,7 +2395,7 @@ async function init() {
   // Fallback health poll — the health-changed event is the primary path;
   // this catches any missed events (e.g. listener registered after first emit).
   setInterval(async () => {
-    try { renderHealth(await invoke('get_health')); } catch (_) { /* transient — backend may not have sampled yet */ }
+    try { renderHealth(await invoke('get_health')); } catch { /* transient — backend may not have sampled yet */ }
   }, 15_000);
 }
 

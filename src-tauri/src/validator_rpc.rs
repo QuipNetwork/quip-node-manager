@@ -55,6 +55,45 @@ pub struct SystemHealth {
     pub is_syncing: bool,
 }
 
+/// Initial-sync progress from `system_syncState`, which is available under
+/// `--rpc-methods=safe`.
+///
+/// `starting_block` is the height the node resumed from, and progress is
+/// measured against it rather than against genesis: a node that resumed at
+/// 94936 and has reached 134733 of 134733 is finished, not 70% through.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncState {
+    #[serde(rename = "startingBlock")]
+    pub starting_block: u64,
+    #[serde(rename = "currentBlock")]
+    pub current_block: u64,
+    #[serde(rename = "highestBlock")]
+    pub highest_block: u64,
+}
+
+impl SyncState {
+    /// Blocks still to replay before the node is at the chain head.
+    pub fn behind(&self) -> u64 {
+        self.highest_block.saturating_sub(self.current_block)
+    }
+
+    /// Share of this session's sync that is done, 0.0–1.0. A target at or below
+    /// the resume point leaves nothing to do, so it reports complete rather
+    /// than dividing by zero.
+    pub fn fraction(&self) -> f64 {
+        let total = self.highest_block.saturating_sub(self.starting_block);
+        if total == 0 {
+            return 1.0;
+        }
+        let done = self.current_block.saturating_sub(self.starting_block);
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
+pub fn parse_sync_state(v: &serde_json::Value) -> Result<SyncState, String> {
+    serde_json::from_value(v.clone()).map_err(|e| format!("bad system_syncState: {e}"))
+}
+
 pub fn parse_block_number(hex_str: &str) -> Result<u64, String> {
     let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     u64::from_str_radix(s, 16).map_err(|e| format!("bad block number {hex_str}: {e}"))
@@ -77,12 +116,21 @@ fn rpc_base_url(url: &str) -> String {
 
 pub struct ValidatorRpc {
     base: String,
+    docker: bool,
 }
 
 impl ValidatorRpc {
     pub fn new(url: &str) -> Self {
         ValidatorRpc {
             base: rpc_base_url(url),
+            docker: false,
+        }
+    }
+
+    pub(crate) fn docker() -> Self {
+        Self {
+            base: String::new(),
+            docker: true,
         }
     }
 
@@ -97,17 +145,33 @@ impl ValidatorRpc {
             "method": method,
             "params": params,
         });
-        let resp = reqwest::Client::new()
-            .post(&self.base)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|e| format!("{method} request failed: {e}"))?;
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("{method} bad json: {e}"))?;
+        let v: serde_json::Value = if self.docker {
+            let response = crate::container_http::request(
+                "quip-validator",
+                9944,
+                "POST",
+                "/",
+                &body.to_string(),
+            )
+            .await?;
+            serde_json::from_str(&response).map_err(|e| format!("{method} bad json: {e}"))?
+        } else {
+            reqwest::Client::new()
+                .post(&self.base)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| format!("{method} request failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("{method} HTTP error: {e}"))?
+                .json()
+                .await
+                .map_err(|e| format!("{method} bad json: {e}"))?
+        };
+        if let Some(error) = v.get("error") {
+            return Err(format!("{method} RPC error: {error}"));
+        }
         v.get("result")
             .cloned()
             .ok_or_else(|| format!("{method}: no result field"))
@@ -125,6 +189,11 @@ impl ValidatorRpc {
     pub async fn system_health(&self) -> Result<SystemHealth, String> {
         let r = self.call("system_health", serde_json::json!([])).await?;
         parse_system_health(&r)
+    }
+
+    pub async fn system_sync_state(&self) -> Result<SyncState, String> {
+        let r = self.call("system_syncState", serde_json::json!([])).await?;
+        parse_sync_state(&r)
     }
 
     pub async fn storage_u64(&self, key: &[u8]) -> Result<Option<u64>, String> {
@@ -216,5 +285,34 @@ b4e65b8ce157ce9ec3aa818920e7b81b04a23fdce38cf2374eee037d4320da7a"
         let h = parse_system_health(&v).unwrap();
         assert_eq!(h.peers, 8);
         assert!(!h.is_syncing);
+    }
+
+    #[test]
+    fn sync_progress_is_measured_from_the_resume_point() {
+        let parse = |s: &str| parse_sync_state(&serde_json::from_str(s).unwrap()).unwrap();
+
+        // Live shape from the node, mid-replay: 40% of this session's work.
+        let s = parse(r#"{"startingBlock":94936,"currentBlock":110855,"highestBlock":134733}"#);
+        assert_eq!(s.behind(), 23878);
+        assert!((s.fraction() - 0.4).abs() < 0.001);
+
+        // Caught up: measuring from genesis would report 70% here forever.
+        let s = parse(r#"{"startingBlock":94936,"currentBlock":134733,"highestBlock":134733}"#);
+        assert_eq!(s.behind(), 0);
+        assert_eq!(s.fraction(), 1.0);
+
+        // Fresh node with nothing to replay yet — no divide by zero.
+        let s = parse(r#"{"startingBlock":0,"currentBlock":0,"highestBlock":0}"#);
+        assert_eq!(s.fraction(), 1.0);
+
+        // A head that lags our own block must not produce a negative share.
+        let s = parse(r#"{"startingBlock":0,"currentBlock":500,"highestBlock":400}"#);
+        assert_eq!(s.behind(), 0);
+        assert_eq!(s.fraction(), 1.0);
+    }
+
+    #[test]
+    fn sync_state_rejects_a_malformed_payload() {
+        assert!(parse_sync_state(&serde_json::json!({"currentBlock": 1})).is_err());
     }
 }

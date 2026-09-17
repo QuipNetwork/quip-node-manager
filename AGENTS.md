@@ -21,7 +21,7 @@ quip-node-manager/
 ├── vendor/
 │   └── nodes.quip.network/        # git submodule — upstream compose stack
 │                                  # (docker-compose.yml, caddy/Caddyfile,
-│                                  # chain-specs/quip-testnet.json). Embedded into
+│                                  # chain-specs/aglais-network.json). Embedded into
 │                                  # the binary via include_str! in stack_assets.rs
 │                                  # at compile time (NOT Tauri's bundle.resources),
 │                                  # then staged + patched into ~/quip-data on
@@ -37,6 +37,8 @@ quip-node-manager/
         │                          # --cli passed or no display (headless/SSH)
         ├── lib.rs                 # Tauri builder, command registration,
         │                          # tray icon, background update monitor
+        ├── service_ports.rs       # Shared host port catalog and validation
+        ├── container_http.rs      # HTTP probes inside the Compose network
         ├── settings.rs            # AppSettings, NodeConfig, ImageTag (Cpu|Cuda),
         │                          # StackStatus/StackHealth, DwaveConfig
         ├── secret.rs              # Node secret (64-char hex)
@@ -68,7 +70,7 @@ quip-node-manager/
 
 - **Tauri version**: v2
 - **JS tooling**: Bun
-- **App version**: 0.2.3-rc2
+- **App version**: 0.2.9-rc1
 - **Window size**: 900×700
 - **Data directory**: `~/quip-data/` by default (bind-mount root for the compose
   stack). Overridable via `set_data_dir` → the `data_dir` key in
@@ -89,23 +91,13 @@ quip-node-manager/
   the CPU image via `config.toml [dwave]` (no separate qpu service). The
   upstream compose also defines an optional `quip-faucet` service behind a
   `faucet` profile, which the manager never starts.
-- **Ports** (published by the Caddy + validator services):
-  - `<settings.node_config.port>:20049/tcp` — Caddy public API port: dashboard
-    SPA, miner `/api/v1/*` REST, and Substrate `/rpc` WebSocket. Container-internal
-    port is always 20049; the host side is rewritten at stage time to the user's
-    configured port (default 20049). See "Port Handling".
-  - `80/tcp + 443/tcp` — Caddy ACME/TLS (always published; TLS only provisioned
-    when `QUIP_HOSTNAME` is a real DNS name).
-  - `<settings.node_config.validator_port>:30333/tcp + /udp` — validator libp2p
-    peering (host default 30333, container 30333 — a 1:1 mapping unless the user
-    overrides the host port). Must be reachable from the public internet for
-    chain peering.
-  - `127.0.0.1:<validator_rpc_port>:9944` (Native mode only) — validator raw
-    JSON-RPC published on host loopback (default 9944) so the host-side miner
-    connects via `ws://127.0.0.1:9944`.
-  - `<native_rest_port>/tcp` — native miner REST (default 20100, bound to
-    `127.0.0.1`); the dashboard container reaches it via
-    `host.docker.internal:<rest_port>`.
+- **Ports**: advanced settings in the GUI and TUI group host publications by
+  service. See "Port Handling" for the complete list. Container addresses stay
+  fixed regardless of host publishing settings.
+- **Native listeners**: validator RPC defaults to `127.0.0.1:9944`. Native mode
+  requires this host mapping, with public access optional. The native miner REST
+  listener defaults to `0.0.0.0:20100` so Caddy can reach it through
+  `host.docker.internal`.
 
 ## Docker Images
 
@@ -146,7 +138,7 @@ Selected by `AppSettings`:
 - `image_tag: ImageTag` — `Cpu` | `Cuda`. D-Wave QPU mining is not a separate
   image: it rides on the CPU image via the `[dwave]` section in `config.toml`.
 - `tls_enabled: bool` — controls whether Caddy provisions TLS (`:80`/`:443` are
-  always published by the caddy service).
+  published by default and configurable in advanced settings).
 
 The dashboard + postgres + caddy + validator services are always part
 of the `cpu`/`cuda` profile — there is no `dashboard_enabled` toggle.
@@ -187,7 +179,7 @@ starts.
 | `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_KEY, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
 | `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
-| `chain-specs/quip-testnet.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
+| `chain-specs/aglais-network.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
 | `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
 | `dashboard-data/` | bind-mount target for the dashboard | Dashboard auxiliary state |
@@ -214,28 +206,22 @@ ships a raw `.exe` (`tauri build --no-bundle`) with no sibling resource
 folder, and a `BaseDirectory::Resource` lookup would fail. Embedding
 makes the staged files travel as `&'static str` in `.rodata`.
 
-`stack_assets::sync_stack_assets(run_mode, public_api_port, validator_port,
-public_host, native_rest_port, validator_rpc_port)` is called from both
-`start_stack` and `pull_compose_images` before any `docker compose` invocation.
+`start_stack` and `pull_compose_images` call
+`stack_assets::sync_stack_assets(run_mode, config)` before invoking Docker Compose.
 It stages the embedded compose.yml, Caddyfile, and chain spec
-(`chain-specs/quip-testnet.json`), always overwriting — no merge. Patches:
+(`chain-specs/aglais-network.json`), always overwriting — no merge. Patches:
 
-1. **compose.yml port remap** (always): Caddy's host-published `"20049:20049"`
-   is rewritten to `"<public_api_port>:20049"`, and the validator's
-   `"30333:30333/tcp"` and `"30333:30333/udp"` mappings to
-   `"<validator_port>:30333/<proto>"`. Container-internal ports (20049, 30333)
-   stay fixed; only host sides move. No-op when the configured ports equal the
-   upstream defaults.
+1. **Compose host publications**: rebuild each managed service's `ports` list
+   from `service_ports::PORT_SPECS` and the saved enable switches and host ports.
+   Internal ports stay fixed. Public mappings omit the host address so Docker
+   can publish on both IPv4 and IPv6. Omit mappings with their switch off.
 
-2. **compose.yml `--public-addr`** (when `public_host` is set): a
-   `--public-addr=<multiaddr>` arg (built from `public_host` + `validator_port`,
-   e.g. `/dns4/host/tcp/30333` or `/ip4/.../tcp/30333`) is inserted into the
-   validator command after `--validator`.
+2. **Validator public address**: when the user sets `public_host` and turns on
+   P2P publishing, insert `--public-addr=<multiaddr>` using `validator_port`.
 
-3. **compose.yml validator RPC publish** (Native mode only): a
-   `"127.0.0.1:<validator_rpc_port>:9944"` mapping is inserted into the
-   validator's ports list so the host-side miner reaches the raw JSON-RPC
-   directly. Docker mode does not publish it.
+3. **Native validator RPC**: always publish
+   `127.0.0.1:<validator_rpc_port>:9944/tcp`. The public-access switch removes
+   the loopback restriction. Publish Docker RPC only when the user turns it on.
 
 4. **Caddyfile faucet strip** (always): the optional local faucet route block is
    removed. The manager uses the public faucet for the selected channel. Beta
@@ -253,15 +239,40 @@ var, so all the port/host remaps live in one patch pass for consistency.
 
 ## Port Handling
 
-Every container-internal port is fixed; only the host side is remapped at stage
-time (in `stack_assets`). v0.2 has three independently host-mappable
-validator/API ports:
+Container ports stay fixed. Each row below has an enable switch and host-port
+field in advanced settings. The shared catalog is `service_ports::PORT_SPECS`.
 
-| setting (`NodeConfig`) | container port | host default | published as |
-|------------------------|----------------|--------------|--------------|
-| `port` | Caddy 20049 (public API) | 20049 | `<port>:20049` |
-| `validator_port` | validator libp2p 30333 | 30333 | `<validator_port>:30333/tcp+udp` |
-| `validator_rpc_port` | validator JSON-RPC 9944 | 9944 | Native only: `127.0.0.1:<validator_rpc_port>:9944` |
+| Service | Ports and purpose | Public by default |
+|---------|-------------------|-------------------|
+| `quip-validator` | 30333 TCP/UDP P2P, 9944 TCP RPC, and 9615 TCP metrics | P2P only |
+| `quip-miner` | 8086 TCP REST for CPU or CUDA | No |
+| `quip-dashboard` | 3001 TCP HTTP | No |
+| `quip-postgres` | 5432 TCP PostgreSQL | No |
+| `quip-caddy` | 20049 TCP API, 80 TCP HTTP, and 443 TCP HTTPS | Yes |
+| `quip-caddy` | 443 UDP and 20049 UDP HTTP/3, 8088 TCP internal HTTP, and 2019 TCP administration | No |
+
+Host ports default to the container ports. HTTP/3 requires TLS on its matching
+site. Publishing the administration API also changes its bind address.
+That API can change the Caddy configuration.
+
+Native mode requires RPC, which defaults to 9944 and remains local unless the
+user selects public access. Caddy also needs native miner REST.
+Its separate host listener defaults to 20100. Switching modes preserves the
+Docker miner's optional host mapping. The manager probes Docker services from
+inside the validator container. Health reporting works with public ports off.
+Public API and P2P checks show a warning when their switches are off, without
+running an external probe.
+
+The existing `port`, `validator_port`, and `validator_rpc_port` fields hold
+host port numbers. Their switches are `public_api_enabled`,
+`validator_p2p_enabled`, and `validator_rpc_enabled`. Other bindings live in
+`NodeConfig.service_ports`. Saves reject zero, ports greater than 65535, and active
+bindings that conflict on the same transport protocol.
+
+The generated miner config and the staged first-start template both use only
+`ws://quip-validator:9944` in Docker mode. Native uses
+`ws://127.0.0.1:<validator_rpc_port>`. Public host mappings never change these
+internal Docker URLs.
 
 For the miner's own `config.toml`: `config.rs` always emits `public_port` in both
 modes. It takes `config.public_port` when the user sets an override, and falls
@@ -274,10 +285,9 @@ keys outright, and it disables the dashboard unless **both** `listen` and
 `data_dir` are set, so neither may be omitted. Docker renders
 `listen = "0.0.0.0:8086"` to match the Caddyfile's `quip-miner:8086` upstream,
 with `data_dir = "/data/attempts"` inside the volume. Native renders
-`listen = "127.0.0.1:<native_rest_port>"` (default 20100) and
-`data_dir = <data_dir>/attempts`. Native stays on loopback because Docker
-Desktop's `host.docker.internal` originates the connection on the host, so the
-Caddy container still reaches it.
+`listen = "0.0.0.0:<native_rest_port>"` (default 20100) and
+`data_dir = <data_dir>/attempts`. This bind lets the Caddy container reach the
+listener through the Docker host gateway.
 
 ### `public_host` resolution and the start gate
 
@@ -370,13 +380,18 @@ so non-Tauri callers (the TUI) probe silently.
   is accepted as an alias for `Cpu` via `deserialize_image_tag_compat`)
 - `GpuBackend` — `Local | Modal | Mps`
 - `NodeConfig` — port (public API), validator_port (libp2p), validator_rpc_port
-  (Native), secret, peers, GPU/QPU, REST, telemetry, …
+  (RPC), service_ports, publishing switches, secret, peers, GPU/QPU, REST, telemetry, …
 - `AppSettings` — `{ node_config, active_tab, window_maximized, image_tag,
   tls_enabled, hostname (alias dashboard_hostname), cert_email, zerossl_api_key,
   run_mode, auto_update_enabled }`
 - `StackStatus` — `{ services: Vec<ServiceStatus>, overall: StackHealth }`
 - `ServiceStatus` — `{ name, service, running, health, status_text, image }`
 - `StackHealth` — `Running | Degraded | Unhealthy | Stopped`
+
+The Rust service attaches container logs before stack startup. The follower waits for
+staged files and retries after Docker exits. Each log session owns its stop flag
+and child process. Native startup replaces the container session with a combined
+file and container session. Stop cancels the current session and its retries.
 
 ## Frontend IPC
 
@@ -438,7 +453,7 @@ bun install
 
 ## Versioning & Release Tags
 
-Canonical spec: `quip-protocol/docs/VERSIONING.md`. This repo follows the same
+Canonical spec: `quip-miner/docs/VERSIONING.md`. This repo follows the same
 cross-repo standard so `update.rs::parse_semver` orders release candidates
 correctly — it splits the pre-release on `-`, so a no-hyphen `v0.2.1rc18` loses
 *both* the patch and the rc number and collapses every rc to one value, which
@@ -457,7 +472,7 @@ Rules:
   tag and the package version; only the separator may differ.
 - CI: pre-release tags publish `:<tag>` + the rolling `:vMAJOR.MINOR` and MUST
   NOT move `:latest`; only `main` / a stable `vX.Y.Z` tag moves `:latest`. The
-  `:latest` rule binds on image-publishing repos (quip-protocol); this repo ships
+  `:latest` rule binds on image-publishing repos (quip-miner); this repo ships
   desktop binaries via a per-tag GitLab Release and has no `:latest` to gate.
 
 ## Code Standards

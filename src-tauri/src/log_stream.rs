@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
@@ -30,17 +29,24 @@ impl LogEntry {
     }
 }
 
-/// Shared state for the Docker logs streamer.
+/// Shared state for the log streamer.
 ///
-/// `child_pid` holds the PID of the in-flight `docker compose logs -f` process
-/// whenever one is running. Killing this child at stop time unblocks
-/// `BufReader::lines()` immediately instead of waiting for the next log
-/// line — critical because Docker stop isn't visible to the streamer
-/// until the daemon closes the pipe.
+/// Every source is a file tailer that checks `stop` between reads, so
+/// cancellation no longer needs a child process to kill: setting the flag ends
+/// each tailer within one poll interval. The stack's own collector does the
+/// merging now, so there is no `docker compose logs -f` child to manage.
 pub struct LogStreamState {
-    pub handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-    pub stop_flag: Arc<Mutex<bool>>,
-    pub child_pid: Arc<Mutex<Option<u32>>>,
+    session: Mutex<Option<LogSession>>,
+}
+
+struct LogSession {
+    stop: Arc<Mutex<bool>>,
+}
+
+impl LogSession {
+    fn stop(&self) {
+        *self.stop.lock().unwrap() = true;
+    }
 }
 
 impl Default for LogStreamState {
@@ -52,34 +58,35 @@ impl Default for LogStreamState {
 impl LogStreamState {
     pub fn new() -> Self {
         LogStreamState {
-            handle: Arc::new(Mutex::new(None)),
-            stop_flag: Arc::new(Mutex::new(false)),
-            child_pid: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
         }
     }
 
-    /// Kill the in-flight `docker compose logs` child (if any) and clear the PID.
-    /// Safe to call when no child is running.
-    pub fn kill_child(&self) {
-        if let Some(pid) = self.child_pid.lock().unwrap().take() {
-            kill_log_child(pid);
+    /// Cancel the current follower and prevent it from reconnecting.
+    pub fn stop(&self) {
+        if let Some(session) = self.session.lock().unwrap().take() {
+            session.stop();
         }
     }
-}
 
-/// Kill a single child process by PID (not its process group).
-/// The docker logs CLI has no workers we need to clean up, so a
-/// simple single-process kill is sufficient.
-fn kill_log_child(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    #[cfg(windows)]
+    fn start<F>(&self, sources: Vec<StreamSource>, emit: F)
+    where
+        F: Fn(LogEntry) -> bool + Send + Sync + 'static,
     {
-        let _ = crate::cmd::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
+        let mut current = self.session.lock().unwrap();
+        if let Some(previous) = current.take() {
+            previous.stop();
+        }
+        let stop = Arc::new(Mutex::new(false));
+        *current = Some(LogSession {
+            stop: Arc::clone(&stop),
+        });
+        std::thread::spawn(move || {
+            let cancelled = Arc::clone(&stop);
+            stream_multiplexed(sources, stop, move |entry| {
+                !*cancelled.lock().unwrap() && emit(entry)
+            });
+        });
     }
 }
 
@@ -187,30 +194,51 @@ pub fn parse_log_line(line: &str) -> LogEntry {
     }
 }
 
-/// Parse docker compose's `servicename  | line` prefix (emitted when
-/// `--no-log-prefix` is NOT passed). Returns `(service, rest)` on match.
+/// Split one line of the collector's merged log into its parts.
 ///
-/// Compose right-pads the service name so the `|` column aligns; we trim
-/// trailing spaces on the left-hand side.
-pub fn parse_compose_prefix(line: &str) -> Option<(&str, &str)> {
-    let pipe = line.find(" | ")?;
-    let service = line[..pipe].trim_end();
-    if service.is_empty() {
+/// `syslog-ng/syslog-ng.conf` writes `${ISODATE} ${PROGRAM} ${MESSAGE}`, where
+/// PROGRAM is the container name Docker's syslog driver sends as `tag`. Verified
+/// against a live collector:
+///
+/// ```text
+/// 2026-09-12T21:50:48+00:00 quip-validator block imported
+/// ```
+///
+/// Returns `(timestamp, program, message)`. A message can be empty, so a line
+/// with only two fields still parses.
+pub fn parse_merged_line(line: &str) -> Option<(&str, &str, &str)> {
+    let (timestamp, rest) = line.split_once(' ')?;
+    // ISODATE always starts with the year, which is what separates a merged
+    // line from a raw one that merely contains spaces.
+    if !timestamp.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
-    // Service names are a single token: letters, digits, hyphen, underscore.
-    if !service
+    let (program, message) = rest.split_once(' ').unwrap_or((rest, ""));
+    if program.is_empty() {
+        return None;
+    }
+    // Container names are a single token: letters, digits, hyphen, underscore.
+    if !program
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return None;
     }
-    Some((service, &line[pipe + 3..]))
+    Some((timestamp, program, message))
 }
 
-/// Map a compose service name (YAML key) to a UI `source` tag.
-/// `cpu`/`cuda` both map to `miner`. Unknown services return `None`.
+/// Map a compose service key or container tag to a UI `source` tag.
+/// `cpu`/`cuda` both map to `miner`. Unknown names return `None`.
 pub fn map_compose_service_to_source(service: &str) -> Option<&'static str> {
+    // Compose adds a replica number when container_name is not specified.
+    let service = match service.rsplit_once('-') {
+        Some((name, replica))
+            if !replica.is_empty() && replica.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => service,
+    };
     match service {
         "cpu" | "cuda" | "quip-cpu" | "quip-cuda" => Some("miner"),
         "quip-validator" | "validator" => Some("validator"),
@@ -221,35 +249,78 @@ pub fn map_compose_service_to_source(service: &str) -> Option<&'static str> {
     }
 }
 
-/// Turn a raw compose log line into a tagged `LogEntry`. Lines with no
-/// recognizable service prefix keep `last_source` (or `"app"` when empty).
-fn entry_from_compose_line(line: &str, last_source: &mut String) -> LogEntry {
-    if let Some((service, rest)) = parse_compose_prefix(line) {
-        if let Some(src) = map_compose_service_to_source(service) {
-            *last_source = src.to_string();
-            return parse_log_line(rest).with_source(src);
-        }
-    }
-    let source = if last_source.is_empty() {
-        default_log_source()
-    } else {
-        last_source.clone()
+/// Turn one merged-log line into a tagged `LogEntry`.
+///
+/// The collector tags every line individually, so unlike the old compose
+/// stream there are no untagged continuation lines to carry a previous source
+/// onto — this needs no state between lines.
+///
+/// The collector's own ISODATE is used only when the message carries no
+/// timestamp of its own, so a structured miner or Caddy line keeps the time it
+/// reported rather than the time the collector received it.
+fn entry_from_merged_line(line: &str) -> LogEntry {
+    let Some((timestamp, program, message)) = parse_merged_line(line) else {
+        return parse_log_line(line);
     };
-    parse_log_line(line).with_source(source)
+    // `parse_log_line` already defaults the source to `app`, so an unmapped
+    // container simply keeps that rather than duplicating the default here.
+    let mut entry = parse_log_line(message);
+    if let Some(source) = map_compose_service_to_source(program) {
+        entry = entry.with_source(source);
+    }
+    if entry.timestamp.is_empty() {
+        entry.timestamp = timestamp.to_string();
+    }
+    entry
 }
 
 // ─── File tailing ────────────────────────────────────────────────────────────
 
+/// Identity of whatever file currently sits at `path`.
+///
+/// Length alone cannot detect the collector's rename-then-SIGHUP rotation: the
+/// replacement file can already be longer than our offset in the renamed one by
+/// the time we look, and we would then keep reading the renamed inode forever
+/// while the pane sits silent. Comparing identity catches the swap whatever the
+/// two sizes are.
+///
+/// Windows has no cheap stable equivalent through `std`, so this reports `None`
+/// there and the length check below remains the only signal.
+#[cfg(unix)]
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Tail a log file: backfill last 200 lines, then follow new output.
-/// Handles rotation/truncation by reopening when the file shrinks.
-fn tail_file<F>(path: &std::path::Path, stop: &Mutex<bool>, emit: &F)
+///
+/// Reopens when the file at `path` is no longer the one we hold, or when it is
+/// shorter than our offset. That covers the collector's rotation and a plain
+/// truncation.
+///
+/// Waits for the file instead of giving up when it is missing. The merged log
+/// does not exist until the collector receives its first line, and streaming
+/// starts before the stack is up.
+fn tail_file<F, P>(path: &std::path::Path, stop: &Mutex<bool>, to_entry: &P, emit: &F)
 where
     F: Fn(LogEntry) -> bool,
+    P: Fn(&str) -> LogEntry,
 {
     let open = || std::fs::File::open(path);
-    let mut file = match open() {
-        Ok(f) => f,
-        Err(_) => return,
+    let mut file = loop {
+        if *stop.lock().unwrap() {
+            return;
+        }
+        match open() {
+            Ok(f) => break f,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
     };
 
     let mut existing = String::new();
@@ -260,12 +331,13 @@ where
         if *stop.lock().unwrap() {
             return;
         }
-        if !emit(parse_log_line(line)) {
+        if !emit(to_entry(line)) {
             return;
         }
     }
 
     let mut pos = file.seek(SeekFrom::End(0)).unwrap_or(0);
+    let mut identity = file_identity(path);
     let mut buf = String::new();
     loop {
         if *stop.lock().unwrap() {
@@ -273,14 +345,14 @@ where
         }
 
         let reopened = match std::fs::metadata(path) {
-            Ok(meta) if meta.len() < pos => true,
+            Ok(meta) => meta.len() < pos || file_identity(path) != identity,
             Err(_) => true,
-            _ => false,
         };
         if reopened {
             if let Ok(f) = open() {
                 file = f;
                 pos = 0;
+                identity = file_identity(path);
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 continue;
@@ -298,7 +370,7 @@ where
                     if *stop.lock().unwrap() {
                         return;
                     }
-                    if !emit(parse_log_line(line)) {
+                    if !emit(to_entry(line)) {
                         return;
                     }
                 }
@@ -312,43 +384,39 @@ where
 
 /// One concurrent input to the unified log streamer.
 pub enum StreamSource {
-    /// `docker compose logs -f --tail 100` with no service filter and with
-    /// the default service prefix (`servicename  | line`). Prefixes are
-    /// parsed into `LogEntry.source`.
-    ComposeAll,
+    /// Tail the stack's merged log, written by the quip-syslog collector.
+    /// Every line carries the emitting container's name, which is parsed into
+    /// `LogEntry.source`.
+    MergedLog { path: PathBuf },
     /// Tail a host file, tagging every line with a fixed `source`.
     File { path: PathBuf, source: &'static str },
 }
 
 /// Sources for the given run mode.
 ///
-/// - Docker: one compose multiplexer covering miner + support services.
-/// - Native: host `node-output.log` (miner) plus the same compose
-///   multiplexer for the containerized support services.
+/// - Docker: the collector's merged log, which already covers every container.
+/// - Native: host `node-output.log` for the miner, which runs outside Docker
+///   and so never reaches the collector, plus the merged log for the
+///   containerized support services.
 pub fn sources_for_run_mode(run_mode: &crate::settings::RunMode) -> Vec<StreamSource> {
+    let merged = StreamSource::MergedLog {
+        path: crate::stack_assets::merged_log_file(),
+    };
     match run_mode {
-        crate::settings::RunMode::Docker => vec![StreamSource::ComposeAll],
+        crate::settings::RunMode::Docker => vec![merged],
         crate::settings::RunMode::Native => vec![
             StreamSource::File {
                 path: crate::settings::data_dir().join("node-output.log"),
                 source: "miner",
             },
-            StreamSource::ComposeAll,
+            merged,
         ],
     }
 }
 
 /// Fan-in every source concurrently into a single tagged stream.
-///
-/// `child_pid` is populated with the PID of the `docker compose logs -f`
-/// child (when a `ComposeAll` source is present) so the owner can kill it
-/// at stop time. File-only runs leave the slot `None`.
-fn stream_multiplexed<F>(
-    sources: Vec<StreamSource>,
-    stop: Arc<Mutex<bool>>,
-    child_pid: Arc<Mutex<Option<u32>>>,
-    emit: F,
-) where
+fn stream_multiplexed<F>(sources: Vec<StreamSource>, stop: Arc<Mutex<bool>>, emit: F)
+where
     F: Fn(LogEntry) -> bool + Send + Sync + 'static,
 {
     let emit = Arc::new(emit);
@@ -357,13 +425,14 @@ fn stream_multiplexed<F>(
     for source in sources {
         let stop = Arc::clone(&stop);
         let emit = Arc::clone(&emit);
-        let child_pid = Arc::clone(&child_pid);
         handles.push(std::thread::spawn(move || match source {
-            StreamSource::ComposeAll => {
-                stream_compose_all(&stop, &child_pid, emit);
+            StreamSource::MergedLog { path } => {
+                tail_file(&path, &stop, &entry_from_merged_line, &|entry| emit(entry));
             }
             StreamSource::File { path, source } => {
-                tail_file(&path, &stop, &|entry| emit(entry.with_source(source)));
+                tail_file(&path, &stop, &parse_log_line, &|entry| {
+                    emit(entry.with_source(source))
+                });
             }
         }));
     }
@@ -373,107 +442,26 @@ fn stream_multiplexed<F>(
     }
 }
 
-/// Follow all compose services; parse the `service | line` prefix into
-/// `source`. Stderr is drained on a second thread (compose / container
-/// loggers often write there).
-fn stream_compose_all<F>(stop: &Arc<Mutex<bool>>, child_pid: &Arc<Mutex<Option<u32>>>, emit: Arc<F>)
-where
-    F: Fn(LogEntry) -> bool + Send + Sync + 'static,
-{
-    // Reuse the shared builder so log streaming sees the same compose model
-    // as the rest of the app, including any operator docker-compose.override.yml.
-    // No service argument → follow every service in the project.
-    // No `--no-log-prefix` → compose emits `servicename  | line`.
-    //
-    // Both profiles are required, exactly as the stop path needs them: every
-    // service in this stack sits behind a profile, so a profile-less
-    // `docker compose logs` resolves an empty service set and prints nothing
-    // at all — not an error, just silence. Passing cpu *and* cuda covers the
-    // stack whichever miner flavour is active, and the support services come
-    // along with either.
-    let mut child = match crate::compose::compose_cmd()
-        .args(["--profile", "cpu", "--profile", "cuda"])
-        .args(["logs", "-f", "--tail", "100"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    *child_pid.lock().unwrap() = Some(child.id());
-
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => return,
-    };
-    let stderr = match child.stderr.take() {
-        Some(s) => s,
-        None => return,
-    };
-
-    // Drain stderr on a second thread. Each stream tracks its own
-    // last-source for continuation lines without a recognizable prefix.
-    let stop_err = Arc::clone(stop);
-    let emit_err = Arc::clone(&emit);
-    let stderr_thread = std::thread::spawn(move || {
-        let mut last_source = String::new();
-        for line in BufReader::new(stderr).lines() {
-            if *stop_err.lock().unwrap() {
-                break;
-            }
-            if let Ok(line) = line {
-                if !emit_err(entry_from_compose_line(&line, &mut last_source)) {
-                    break;
-                }
-            }
-        }
-    });
-
-    let mut last_source = String::new();
-    for line in BufReader::new(stdout).lines() {
-        if *stop.lock().unwrap() {
-            break;
-        }
-        if let Ok(line) = line {
-            if !emit(entry_from_compose_line(&line, &mut last_source)) {
-                break;
-            }
-        }
-    }
-    let _ = child.kill();
-    *child_pid.lock().unwrap() = None;
-    let _ = stderr_thread.join();
-}
-
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Spawn a thread that streams logs to the Tauri app from the given sources.
-pub fn start_log_stream_for_app(
-    app: tauri::AppHandle,
-    stop: Arc<Mutex<bool>>,
-    child_pid: Arc<Mutex<Option<u32>>>,
-    sources: Vec<StreamSource>,
-) {
-    std::thread::spawn(move || {
-        stream_multiplexed(sources, stop, child_pid, move |entry| {
-            app.emit("node-log", &entry).is_ok()
-        });
+pub fn start_log_stream_for_app(app: tauri::AppHandle, sources: Vec<StreamSource>) {
+    use tauri::Manager;
+    let state = app.state::<LogStreamState>();
+    let emitter = app.clone();
+    state.start(sources, move |entry| {
+        emitter.emit("node-log", &entry).is_ok()
     });
 }
 
 /// Start log streaming without Tauri — sends entries via mpsc channel.
-/// Picks sources from the current run mode (Docker: compose-all; Native:
-/// node-output.log + compose-all).
+/// Picks sources from the current run mode (Docker: the merged log; Native:
+/// node-output.log plus the merged log).
 pub fn start_log_stream_core(tx: SyncSender<LogEntry>, stop: Arc<Mutex<bool>>) {
-    let child_pid = Arc::new(Mutex::new(None));
     let run_mode = crate::settings::load_settings().run_mode;
     let sources = sources_for_run_mode(&run_mode);
     std::thread::spawn(move || {
-        stream_multiplexed(sources, stop, child_pid, move |entry| {
-            tx.send(entry).is_ok()
-        });
+        stream_multiplexed(sources, stop, move |entry| tx.send(entry).is_ok());
     });
 }
 
@@ -489,33 +477,20 @@ pub async fn start_log_stream(
         serde_json::json!({
             "timestamp": "",
             "level": "INFO",
-            "message": "[log-stream] starting multi-source compose logs -f",
+            "message": "[log-stream] tailing the merged stack log",
             "source": "app",
         }),
     );
-    // Stop any existing streamer first, including killing its child.
-    state.kill_child();
-    *state.stop_flag.lock().unwrap() = true;
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    *state.stop_flag.lock().unwrap() = false;
-
-    let stop_flag = Arc::clone(&state.stop_flag);
-    let child_pid = Arc::clone(&state.child_pid);
-    let handle = std::thread::spawn(move || {
-        stream_multiplexed(sources, stop_flag, child_pid, move |entry| {
-            app.emit("node-log", &entry).is_ok()
-        });
+    let emitter = app.clone();
+    state.start(sources, move |entry| {
+        emitter.emit("node-log", &entry).is_ok()
     });
-
-    *state.handle.lock().unwrap() = Some(handle);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn stop_log_stream(state: tauri::State<'_, LogStreamState>) -> Result<(), String> {
-    // Kill the child FIRST so BufReader::lines() unblocks immediately.
-    state.kill_child();
-    *state.stop_flag.lock().unwrap() = true;
+    state.stop();
     Ok(())
 }
 
@@ -523,40 +498,27 @@ pub async fn stop_log_stream(state: tauri::State<'_, LogStreamState>) -> Result<
 mod tests {
     use super::*;
 
-    // ── parse_compose_prefix ───────────────────────────────────────────────
-
     #[test]
-    fn compose_prefix_basic() {
-        let (svc, rest) = parse_compose_prefix("cpu | hello world").unwrap();
-        assert_eq!(svc, "cpu");
-        assert_eq!(rest, "hello world");
-    }
-
-    #[test]
-    fn compose_prefix_padded_service_name() {
-        // Compose right-pads short names so the pipe column aligns.
-        let (svc, rest) = parse_compose_prefix("cpu              | Starting miner").unwrap();
-        assert_eq!(svc, "cpu");
-        assert_eq!(rest, "Starting miner");
-    }
-
-    #[test]
-    fn compose_prefix_hyphenated_service() {
-        let (svc, rest) = parse_compose_prefix("quip-validator | peer connected").unwrap();
-        assert_eq!(svc, "quip-validator");
-        assert_eq!(rest, "peer connected");
-    }
-
-    #[test]
-    fn compose_prefix_rejects_plain_line() {
-        assert!(parse_compose_prefix("just a normal log line").is_none());
-        assert!(parse_compose_prefix("ERROR:module:msg").is_none());
-    }
-
-    #[test]
-    fn compose_prefix_rejects_spaces_in_service() {
-        // A " | " mid-message after free text is not a compose prefix.
-        assert!(parse_compose_prefix("note: foo | bar").is_none());
+    fn replacing_a_session_cancels_the_previous_one() {
+        let state = LogStreamState::new();
+        state.start(vec![], |_| true);
+        let old_stop = {
+            let session = state.session.lock().unwrap();
+            Arc::clone(&session.as_ref().unwrap().stop)
+        };
+        state.start(vec![], |_| true);
+        // The replaced session stays cancelled, and the new one starts live —
+        // the flag is now the only thing that stops a tailer, so a shared or
+        // reset flag would leave the old tailers running forever.
+        assert!(*old_stop.lock().unwrap());
+        {
+            let session = state.session.lock().unwrap();
+            let session = session.as_ref().unwrap();
+            assert!(!*session.stop.lock().unwrap());
+            assert!(!Arc::ptr_eq(&session.stop, &old_stop));
+        }
+        state.stop();
+        assert!(state.session.lock().unwrap().is_none());
     }
 
     // ── map_compose_service_to_source ──────────────────────────────────────
@@ -609,43 +571,6 @@ mod tests {
     fn map_unknown_service_is_none() {
         assert_eq!(map_compose_service_to_source("faucet"), None);
         assert_eq!(map_compose_service_to_source("unknown"), None);
-    }
-
-    // ── entry_from_compose_line (prefix + last-source carry) ───────────────
-
-    #[test]
-    fn compose_line_tags_known_service_and_strips_prefix() {
-        let mut last = String::new();
-        let entry = entry_from_compose_line("dashboard | ready on :3000", &mut last);
-        assert_eq!(entry.source, "dashboard");
-        assert_eq!(entry.message, "ready on :3000");
-        assert_eq!(last, "dashboard");
-    }
-
-    #[test]
-    fn compose_line_without_prefix_keeps_last_source() {
-        let mut last = "validator".to_string();
-        let entry = entry_from_compose_line("continuation without prefix", &mut last);
-        assert_eq!(entry.source, "validator");
-        assert_eq!(entry.message, "continuation without prefix");
-    }
-
-    #[test]
-    fn compose_line_without_prefix_or_history_defaults_to_app() {
-        let mut last = String::new();
-        let entry = entry_from_compose_line("orphan line", &mut last);
-        assert_eq!(entry.source, "app");
-        assert_eq!(entry.message, "orphan line");
-    }
-
-    #[test]
-    fn compose_line_unknown_service_prefix_keeps_last_source() {
-        let mut last = "miner".to_string();
-        let entry = entry_from_compose_line("faucet | drip", &mut last);
-        assert_eq!(entry.source, "miner");
-        // Full line kept when the service is not in our map.
-        assert_eq!(entry.message, "faucet | drip");
-        assert_eq!(last, "miner");
     }
 
     // ── parse_log_line ─────────────────────────────────────────────────────
@@ -768,5 +693,185 @@ mod tests {
         let e = parse_log_line("x").with_source("miner");
         assert_eq!(e.source, "miner");
         assert_eq!(e.message, "x");
+    }
+
+    // ── merged stack log ───────────────────────────────────────────────────
+
+    /// Captured verbatim from a live collector (syslog-ng 4.11 with the
+    /// vendored config, fed through Docker's syslog driver with
+    /// `tag: "{{.Name}}"`), so the parser is pinned to observed output rather
+    /// than to a reading of the template.
+    const MERGED_VALIDATOR: &str = "2026-09-12T21:50:48+00:00 quip-validator block imported";
+    const MERGED_MINER: &str = "2026-09-12T21:50:49+00:00 quip-cpu \
+        [miner.py:42] 2026-01-01T12:00:00+00:00 INFO - attempt submitted";
+
+    #[test]
+    fn merged_line_splits_timestamp_program_and_message() {
+        let (timestamp, program, message) = parse_merged_line(MERGED_VALIDATOR).unwrap();
+        assert_eq!(timestamp, "2026-09-12T21:50:48+00:00");
+        assert_eq!(program, "quip-validator");
+        assert_eq!(message, "block imported");
+    }
+
+    #[test]
+    fn merged_line_tags_source_from_the_container_name() {
+        let entry = entry_from_merged_line(MERGED_VALIDATOR);
+        assert_eq!(entry.source, "validator");
+        assert_eq!(entry.message, "block imported");
+        // The message carries no time of its own, so the collector's is used.
+        assert_eq!(entry.timestamp, "2026-09-12T21:50:48+00:00");
+    }
+
+    /// A structured miner line keeps the time the miner reported, not the time
+    /// the collector received it — those differ by the queueing delay, and the
+    /// miner's is the one that lines up with the rest of its output.
+    #[test]
+    fn merged_line_prefers_the_message_timestamp() {
+        let entry = entry_from_merged_line(MERGED_MINER);
+        assert_eq!(entry.source, "miner");
+        assert_eq!(entry.level, "INFO");
+        assert_eq!(entry.message, "attempt submitted");
+        assert_eq!(entry.timestamp, "2026-01-01T12:00:00+00:00");
+    }
+
+    #[test]
+    fn merged_line_with_an_empty_message_still_parses() {
+        let (_, program, message) =
+            parse_merged_line("2026-09-12T21:50:48+00:00 quip-cpu").unwrap();
+        assert_eq!(program, "quip-cpu");
+        assert!(message.is_empty());
+    }
+
+    /// Without the leading-digit check, `ERROR: could not reach host` would
+    /// parse as timestamp `ERROR:` and program `could`, mistagging the line.
+    #[test]
+    fn non_merged_lines_fall_through_to_plain_parsing() {
+        assert!(parse_merged_line("just a normal log line").is_none());
+        assert!(parse_merged_line("ERROR: could not reach host").is_none());
+        let entry = entry_from_merged_line("just a normal log line");
+        assert_eq!(entry.source, "app");
+        assert_eq!(entry.message, "just a normal log line");
+    }
+
+    /// The faucet writes to the merged file but has no source mapping. Those
+    /// lines land on `app` rather than inheriting whichever service logged
+    /// last, which is what the old compose stream did.
+    #[test]
+    fn unmapped_container_falls_back_to_app() {
+        let entry = entry_from_merged_line("2026-09-12T21:50:48+00:00 quip-faucet drip sent");
+        assert_eq!(entry.source, "app");
+        assert_eq!(entry.message, "drip sent");
+    }
+
+    /// The merged file preserves the message, so a Caddy line keeps the tabs
+    /// `parse_caddy_console_line` splits on and a 502 reads as ERROR.
+    ///
+    /// Captured from a live collector running the narrowed sanitize call
+    /// (`--no-ctrl-chars --invalid-chars '\n\r'`, nodes.quip.network!28).
+    /// Before that, the bare `$(sanitize ${MESSAGE})` rewrote `/` and every
+    /// control character to `_`: the same line arrived as
+    /// `2026_08_16 05:22:02.881_ERROR_...` and fell through to plain text as
+    /// INFO, and every URL in every service's output was rewritten the same
+    /// way.
+    ///
+    /// This covers the parsing side only, against a captured line. What pins
+    /// the upstream template is
+    /// `stack_assets::tests::collector_template_keeps_slashes_and_tabs`, which
+    /// asserts on the embedded config itself.
+    #[test]
+    fn merged_lines_keep_caddy_levels_and_urls() {
+        let captured = "2026-09-13T10:07:17+00:00 quip-caddy \
+            2026/08/16 05:22:02.881\tERROR\thttp.log.error\t\
+            dial tcp 192.168.107.3:9944: connect: connection refused";
+        let entry = entry_from_merged_line(captured);
+        assert_eq!(entry.source, "caddy");
+        assert_eq!(entry.level, "ERROR");
+        // The Caddy branch sets the time from the message, so the collector's
+        // receive time is not substituted for it.
+        assert_eq!(entry.timestamp, "2026/08/16 05:22:02.881");
+        assert!(entry.message.contains("dial tcp 192.168.107.3:9944"));
+
+        // Slashes survive in ordinary miner output too.
+        let miner = entry_from_merged_line(
+            "2026-09-13T10:07:17+00:00 quip-cpu validators=ws://quip-validator:9944 dir=/data/logs",
+        );
+        assert_eq!(miner.source, "miner");
+        assert_eq!(
+            miner.message,
+            "validators=ws://quip-validator:9944 dir=/data/logs"
+        );
+    }
+
+    /// The tailer now waits for a file that does not exist yet, because the
+    /// merged log is not created until the collector's first line. Stop has to
+    /// break that wait, or the thread outlives the session.
+    #[cfg(unix)]
+    #[test]
+    fn stop_unblocks_a_tailer_waiting_for_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("quip-tail-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("never-created.log");
+        let stop = Arc::new(Mutex::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            tail_file(&path, &waiter, &parse_log_line, &|_| true);
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        *stop.lock().unwrap() = true;
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("tailer ignored stop while waiting for the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The collector rotates by renaming the live file and signalling
+    /// syslog-ng to recreate the path. The tailer must follow the path to the
+    /// new inode; holding the renamed one means the pane goes quiet after the
+    /// first 10 MB and never recovers.
+    #[cfg(unix)]
+    #[test]
+    fn tailer_follows_the_path_across_a_rotation() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("quip-tail-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quip-node.log");
+        std::fs::write(&path, "2026-09-12T00:00:00+00:00 quip-cpu before\n").unwrap();
+
+        let stop = Arc::new(Mutex::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let follow_path = path.clone();
+        let follow_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            tail_file(
+                &follow_path,
+                &follow_stop,
+                &entry_from_merged_line,
+                &|entry| tx.send(entry).is_ok(),
+            );
+        });
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("no backfill");
+        assert_eq!(first.message, "before");
+
+        std::fs::rename(&path, dir.join("quip-node.log.1")).unwrap();
+        let mut recreated = std::fs::File::create(&path).unwrap();
+        writeln!(recreated, "2026-09-12T00:00:01+00:00 quip-validator after").unwrap();
+        recreated.flush().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let entry = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("tailer never picked up the rotated file");
+            if entry.message == "after" {
+                assert_eq!(entry.source, "validator");
+                break;
+            }
+        }
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

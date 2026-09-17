@@ -30,12 +30,38 @@ fn status(state: DimensionState, detail: impl Into<String>) -> DimensionStatus {
     }
 }
 
+/// Progress of an unfinished initial sync, forwarded to the UI so the status
+/// pill can show a bar instead of a bare "degraded".
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SyncProgress {
+    pub current_block: u64,
+    pub highest_block: u64,
+    pub behind: u64,
+    /// 0.0–1.0, measured from the block the node resumed at.
+    pub fraction: f64,
+}
+
+impl From<&crate::validator_rpc::SyncState> for SyncProgress {
+    fn from(s: &crate::validator_rpc::SyncState) -> Self {
+        SyncProgress {
+            current_block: s.current_block,
+            highest_block: s.highest_block,
+            behind: s.behind(),
+            fraction: s.fraction(),
+        }
+    }
+}
+
 /// Chain is live when the substrate block advanced since the last poll and the
 /// node has peers and is not syncing. The first poll has no baseline → Unknown.
+///
+/// `sync` carries `system_syncState` when it was readable; without it the
+/// syncing arm falls back to the bare block height it has always reported.
 pub fn check_chain(
     prev_block: Option<u64>,
     now_block: u64,
     health: &SystemHealth,
+    sync: Option<&SyncProgress>,
 ) -> DimensionStatus {
     let Some(prev) = prev_block else {
         return status(
@@ -53,10 +79,22 @@ pub fn check_chain(
         );
     }
     if health.is_syncing {
-        return status(
-            DimensionState::Warn,
-            format!("syncing at block {now_block}"),
-        );
+        return match sync {
+            Some(s) => status(
+                DimensionState::Warn,
+                format!(
+                    "syncing: block {} of {} ({} behind, {:.1}%)",
+                    s.current_block,
+                    s.highest_block,
+                    s.behind,
+                    s.fraction * 100.0
+                ),
+            ),
+            None => status(
+                DimensionState::Warn,
+                format!("syncing at block {now_block}"),
+            ),
+        };
     }
     status(
         DimensionState::Ok,
@@ -95,6 +133,10 @@ pub fn check_infra(stack: StackHealth, miner_up: bool) -> DimensionStatus {
     }
     match stack {
         StackHealth::Running => status(DimensionState::Ok, "all services up"),
+        // Compose never rolls up to Syncing — only the health monitor does, and
+        // sync belongs to the chain dimension. Treated as Running here so a
+        // stale value can never make infra look broken.
+        StackHealth::Syncing => status(DimensionState::Ok, "all services up"),
         StackHealth::Degraded => status(DimensionState::Warn, "stack degraded"),
         StackHealth::Unhealthy => status(DimensionState::Fail, "stack unhealthy"),
         StackHealth::Stopped => status(DimensionState::Fail, "stack stopped"),
@@ -122,17 +164,28 @@ pub struct HealthReport {
     pub infra: DimensionStatus,
     pub chain: DimensionStatus,
     pub participation: DimensionStatus,
+    /// Set only while the validator reports an unfinished initial sync.
+    pub sync: Option<SyncProgress>,
 }
 
 /// Worst-wins: any Fail → Unhealthy; else any Warn/Unknown → Degraded; else Running.
+///
+/// An unfinished initial sync outranks Degraded. Replaying the chain takes
+/// hours on a fresh node, and during it there is legitimately no participation
+/// marker and no fresh head, so folding it into Degraded reports a healthy node
+/// as broken for the whole first run. A hard Fail still wins: a stack with a
+/// dead service is broken whether or not the validator is also catching up.
 pub fn roll_up(
     infra: DimensionStatus,
     chain: DimensionStatus,
     participation: DimensionStatus,
+    sync: Option<SyncProgress>,
 ) -> HealthReport {
     let states = [&infra.state, &chain.state, &participation.state];
     let overall = if states.iter().any(|s| **s == DimensionState::Fail) {
         StackHealth::Unhealthy
+    } else if sync.is_some() {
+        StackHealth::Syncing
     } else if states
         .iter()
         .any(|s| matches!(s, DimensionState::Warn | DimensionState::Unknown))
@@ -146,6 +199,7 @@ pub fn roll_up(
         infra,
         chain,
         participation,
+        sync,
     }
 }
 
@@ -157,6 +211,7 @@ fn stopped_report(infra_detail: &str) -> HealthReport {
         infra: status(DimensionState::Unknown, infra_detail),
         chain: status(DimensionState::Unknown, "node stopped"),
         participation: status(DimensionState::Unknown, "node stopped"),
+        sync: None,
     }
 }
 
@@ -184,7 +239,7 @@ pub fn debounce(
 }
 
 #[derive(Default)]
-struct MonitorState {
+pub(crate) struct MonitorState {
     prev_block: Option<u64>,
     consecutive_fails: u32,
     prev_overall: Option<StackHealth>,
@@ -195,6 +250,20 @@ struct MonitorState {
 
 /// One measurement of all three dimensions, rolled up and debounced.
 async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
+    // get_native_node_status is an async #[tauri::command] over managed
+    // NativeProcessState; fetch that state and call it directly.
+    let native_state = app.state::<crate::native::NativeProcessState>();
+    let native_miner_up = crate::native::get_native_node_status(native_state)
+        .await
+        .map(|s| s.running)
+        .unwrap_or(false);
+    sample_with(st, native_miner_up).await
+}
+
+/// The measurement itself, for callers that know their own host-miner state:
+/// the GUI reads it from `NativeProcessState`, the TUI from `node.pid`. Only
+/// Native mode consults `native_miner_up`.
+pub(crate) async fn sample_with(st: &Mutex<MonitorState>, native_miner_up: bool) -> HealthReport {
     let settings = crate::settings::load_settings();
     let run_mode = settings.run_mode.clone();
     let cfg = &settings.node_config;
@@ -205,15 +274,7 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
         .map(|s| s.overall)
         .unwrap_or(StackHealth::Unhealthy);
     let miner_up = match run_mode {
-        RunMode::Native => {
-            // get_native_node_status is an async #[tauri::command] over managed
-            // NativeProcessState; fetch that state and call it directly.
-            let native_state = app.state::<crate::native::NativeProcessState>();
-            crate::native::get_native_node_status(native_state)
-                .await
-                .map(|s| s.running)
-                .unwrap_or(false)
-        }
+        RunMode::Native => native_miner_up,
         RunMode::Docker => !matches!(stack, StackHealth::Stopped),
     };
 
@@ -228,12 +289,16 @@ async fn sample(app: &AppHandle, st: &Mutex<MonitorState>) -> HealthReport {
     }
     let infra = check_infra(stack, miner_up);
 
-    // Dimensions B & C via validator RPC (native_miner_validator_url is pub(crate)).
-    let validator_url = crate::native::native_miner_validator_url(cfg);
-    let rpc = crate::validator_rpc::ValidatorRpc::new(&validator_url);
-    let (chain, participation) = probe_chain_and_participation(&rpc, st, &settings).await;
+    // Docker probes run inside the stack even when every host publication is off.
+    let rpc = match run_mode {
+        RunMode::Docker => crate::validator_rpc::ValidatorRpc::docker(),
+        RunMode::Native => {
+            crate::validator_rpc::ValidatorRpc::new(&crate::config::native_validator_rpc_url(cfg))
+        }
+    };
+    let (chain, participation, sync) = probe_chain_and_participation(&rpc, st, &settings).await;
 
-    let candidate = roll_up(infra, chain, participation);
+    let candidate = roll_up(infra, chain, participation, sync);
     let mut guard = st.lock().unwrap();
     let prev = guard.prev_overall.unwrap_or(StackHealth::Stopped);
     let debounced = debounce(&prev, candidate.overall, &mut guard.consecutive_fails);
@@ -248,13 +313,14 @@ async fn probe_chain_and_participation(
     rpc: &crate::validator_rpc::ValidatorRpc,
     st: &Mutex<MonitorState>,
     settings: &crate::settings::AppSettings,
-) -> (DimensionStatus, DimensionStatus) {
+) -> (DimensionStatus, DimensionStatus, Option<SyncProgress>) {
     let now_block = match rpc.current_block().await {
         Ok(b) => b,
         Err(e) => {
             return (
                 status(DimensionState::Unknown, e),
                 status(DimensionState::Unknown, "rpc unreachable"),
+                None,
             );
         }
     };
@@ -264,17 +330,40 @@ async fn probe_chain_and_participation(
             return (
                 status(DimensionState::Unknown, e),
                 status(DimensionState::Unknown, "rpc unreachable"),
+                None,
             );
         }
     };
+    // Only ask for progress when the node says it is syncing. A node at the head
+    // needs no extra round trip, and an RPC that cannot answer downgrades the
+    // detail line rather than the verdict.
+    let sync = if health.is_syncing {
+        rpc.system_sync_state()
+            .await
+            .ok()
+            .map(|s| SyncProgress::from(&s))
+    } else {
+        None
+    };
     let prev_block = { st.lock().unwrap().prev_block };
-    let chain = check_chain(prev_block, now_block, &health);
+    let chain = check_chain(prev_block, now_block, &health, sync.as_ref());
     {
         st.lock().unwrap().prev_block = Some(now_block);
     }
 
+    // A syncing node has not reached the qblock it would mark participation at,
+    // so probing would report "no participation marker" — a Fail that outranks
+    // Syncing and puts the stack back on UNHEALTHY for the whole initial sync.
+    if health.is_syncing {
+        return (
+            chain,
+            status(DimensionState::Unknown, "waiting for initial sync"),
+            sync,
+        );
+    }
+
     let participation = probe_participation(rpc, st, settings).await;
-    (chain, participation)
+    (chain, participation, sync)
 }
 
 /// The account is read from the running coordinator, not from disk: the
@@ -395,7 +484,7 @@ mod tests {
     #[test]
     fn rollup_all_ok_is_running() {
         assert!(matches!(
-            roll_up(ok(), ok(), ok()).overall,
+            roll_up(ok(), ok(), ok(), None).overall,
             StackHealth::Running
         ));
     }
@@ -403,7 +492,7 @@ mod tests {
     #[test]
     fn rollup_infra_fail_is_unhealthy() {
         assert!(matches!(
-            roll_up(fail(), ok(), ok()).overall,
+            roll_up(fail(), ok(), ok(), None).overall,
             StackHealth::Unhealthy
         ));
     }
@@ -411,7 +500,7 @@ mod tests {
     #[test]
     fn rollup_chain_fail_is_unhealthy() {
         assert!(matches!(
-            roll_up(ok(), fail(), ok()).overall,
+            roll_up(ok(), fail(), ok(), None).overall,
             StackHealth::Unhealthy
         ));
     }
@@ -419,9 +508,95 @@ mod tests {
     #[test]
     fn rollup_warn_is_degraded_not_unhealthy() {
         assert!(matches!(
-            roll_up(ok(), warn(), ok()).overall,
+            roll_up(ok(), warn(), ok(), None).overall,
             StackHealth::Degraded
         ));
+    }
+
+    fn progress(current: u64, highest: u64) -> SyncProgress {
+        SyncProgress::from(&crate::validator_rpc::SyncState {
+            starting_block: 0,
+            current_block: current,
+            highest_block: highest,
+        })
+    }
+
+    /// The point of the Syncing state: a node replaying the chain reports
+    /// SYNCING, not DEGRADED, for the hours the initial sync takes.
+    #[test]
+    fn rollup_sync_outranks_degraded() {
+        assert!(matches!(
+            roll_up(ok(), warn(), ok(), Some(progress(50, 100))).overall,
+            StackHealth::Syncing
+        ));
+    }
+
+    /// A dead service is still a dead service. Syncing must not mask it.
+    #[test]
+    fn rollup_fail_outranks_sync() {
+        assert!(matches!(
+            roll_up(fail(), warn(), ok(), Some(progress(50, 100))).overall,
+            StackHealth::Unhealthy
+        ));
+    }
+
+    #[test]
+    fn rollup_carries_sync_progress_to_the_ui() {
+        let r = roll_up(ok(), warn(), ok(), Some(progress(50, 100)));
+        assert_eq!(r.sync.unwrap().behind, 50);
+        assert!(roll_up(ok(), ok(), ok(), None).sync.is_none());
+    }
+
+    /// `app.js` reads `overall === 'syncing'` and `health.sync.{current_block,
+    /// highest_block, behind, fraction}` by name. Renaming any of them silently
+    /// leaves the pill on the fallback text and the bar hidden, so pin the wire
+    /// shape here rather than finding out in the UI.
+    #[test]
+    fn report_serializes_to_the_shape_the_frontend_reads() {
+        let r = roll_up(ok(), warn(), ok(), Some(progress(110855, 134733)));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["overall"], "syncing");
+        assert_eq!(v["sync"]["current_block"], 110855);
+        assert_eq!(v["sync"]["highest_block"], 134733);
+        assert_eq!(v["sync"]["behind"], 23878);
+        assert!((v["sync"]["fraction"].as_f64().unwrap() - 0.82278).abs() < 0.0001);
+
+        // A node at the head sends an explicit null, which `renderSyncProgress`
+        // reads as "hide the bar".
+        let done = roll_up(ok(), ok(), ok(), None);
+        assert!(serde_json::to_value(&done).unwrap()["sync"].is_null());
+    }
+
+    /// Syncing is not a failure, so it must not advance the Unhealthy debounce.
+    #[test]
+    fn debounce_treats_sync_as_recovery() {
+        let mut n = 1;
+        let out = debounce(&StackHealth::Degraded, StackHealth::Syncing, &mut n);
+        assert!(matches!(out, StackHealth::Syncing));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn chain_detail_names_the_blocks_when_progress_is_known() {
+        let s = check_chain(
+            Some(100),
+            110855,
+            &health(8, true),
+            Some(&progress(110855, 134733)),
+        );
+        assert_eq!(s.state, DimensionState::Warn);
+        assert_eq!(
+            s.detail,
+            "syncing: block 110855 of 134733 (23878 behind, 82.3%)"
+        );
+    }
+
+    /// `system_syncState` failing degrades the detail line, not the verdict.
+    #[test]
+    fn chain_falls_back_to_block_height_without_progress() {
+        let s = check_chain(Some(100), 103, &health(8, true), None);
+        assert_eq!(s.state, DimensionState::Warn);
+        assert_eq!(s.detail, "syncing at block 103");
     }
 
     #[test]
@@ -450,31 +625,31 @@ mod tests {
 
     #[test]
     fn chain_ok_when_block_advances_and_synced() {
-        let s = check_chain(Some(100), 103, &health(8, false));
+        let s = check_chain(Some(100), 103, &health(8, false), None);
         assert_eq!(s.state, DimensionState::Ok);
     }
 
     #[test]
     fn chain_fails_when_block_stalls() {
-        let s = check_chain(Some(100), 100, &health(8, false));
+        let s = check_chain(Some(100), 100, &health(8, false), None);
         assert_eq!(s.state, DimensionState::Fail);
     }
 
     #[test]
     fn chain_warns_while_syncing() {
-        let s = check_chain(Some(100), 103, &health(8, true));
+        let s = check_chain(Some(100), 103, &health(8, true), None);
         assert_eq!(s.state, DimensionState::Warn);
     }
 
     #[test]
     fn chain_fails_with_no_peers() {
-        let s = check_chain(Some(100), 103, &health(0, false));
+        let s = check_chain(Some(100), 103, &health(0, false), None);
         assert_eq!(s.state, DimensionState::Fail);
     }
 
     #[test]
     fn chain_unknown_on_first_sample() {
-        let s = check_chain(None, 100, &health(8, false));
+        let s = check_chain(None, 100, &health(8, false), None);
         assert_eq!(s.state, DimensionState::Unknown);
     }
 

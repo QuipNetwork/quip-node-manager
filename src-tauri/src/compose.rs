@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Monotonic id stamped on every `pull-progress` / `pull-complete` event of a
 /// single pull. The frontend uses it to ignore stale events delivered out of
@@ -28,40 +28,6 @@ use tauri::{AppHandle, Emitter, Manager};
 static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // ── logging helpers (moved verbatim from docker.rs) ────────────────────────
-
-fn log_cmd(app: &AppHandle, cmd: &str) {
-    let entry = serde_json::json!({
-        "timestamp": "",
-        "level": "INFO",
-        "message": format!("$ {}", cmd),
-        "source": "app",
-    });
-    let _ = app.emit("node-log", entry);
-}
-
-fn log_output(app: &AppHandle, text: &str) {
-    for line in text.lines() {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "INFO",
-            "message": line,
-            "source": "app",
-        });
-        let _ = app.emit("node-log", entry);
-    }
-}
-
-fn log_err(app: &AppHandle, text: &str) {
-    for line in text.lines() {
-        let entry = serde_json::json!({
-            "timestamp": "",
-            "level": "ERROR",
-            "message": line,
-            "source": "app",
-        });
-        let _ = app.emit("node-log", entry);
-    }
-}
 
 // ── host uid/gid (moved verbatim from docker.rs) ───────────────────────────
 
@@ -106,7 +72,17 @@ pub fn compose_profile(image_tag: ImageTag) -> &'static str {
 pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     match run_mode {
         RunMode::Docker => &[],
-        RunMode::Native => &["quip-validator", "dashboard", "postgres", "caddy"],
+        // quip-syslog is named explicitly, not left to the profile: Native
+        // passes a service list, and compose starts only what that list names.
+        // Without it every service here forwards stdout to a port nothing is
+        // listening on, and the merged log is never written.
+        RunMode::Native => &[
+            "quip-syslog",
+            "quip-validator",
+            "dashboard",
+            "postgres",
+            "caddy",
+        ],
     }
 }
 
@@ -119,6 +95,7 @@ pub fn expected_services(run_mode: &RunMode, image_tag: ImageTag) -> Vec<&'stati
     match run_mode {
         RunMode::Docker => vec![
             image_tag.service(),
+            "quip-syslog",
             "quip-validator",
             "dashboard",
             "postgres",
@@ -748,14 +725,7 @@ pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Res
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
-    sync_stack_assets(
-        &settings.run_mode,
-        settings.node_config.port,
-        settings.node_config.validator_port,
-        &settings.node_config.public_host,
-        crate::config::native_rest_port(&settings.node_config),
-        settings.node_config.validator_rpc_port,
-    )?;
+    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
     // Write .env too: without the pins compose falls back to its own
     // `${CHANNEL:-beta}` default, so a standalone pull (outside the full start
     // sequence) would silently fetch a moving tag instead of the resolved one.
@@ -864,6 +834,10 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 ///   9. docker compose --profile <p> up -d [services...]
 #[tauri::command]
 pub async fn start_stack(app: AppHandle) -> Result<(), String> {
+    crate::log_stream::start_log_stream_for_app(
+        app.clone(),
+        crate::log_stream::sources_for_run_mode(&crate::settings::load_settings().run_mode),
+    );
     start_stack_core(Arc::new(TauriSink::new(app))).await
 }
 
@@ -936,19 +910,12 @@ pub(crate) async fn start_stack_core(
     // staged Caddyfile both publish the same port. (rest_host is forced to
     // loopback inside the config renderer.)
     if settings.run_mode == RunMode::Native {
-        settings.node_config.rest_insecure_port = rest_port as i16;
+        settings.node_config.rest_insecure_port = i32::from(rest_port);
     }
 
     // (4) Stage assets after migration/auto-detection so public_host can drive
     // the validator's public address.
-    sync_stack_assets(
-        &settings.run_mode,
-        settings.node_config.port,
-        settings.node_config.validator_port,
-        &settings.node_config.public_host,
-        rest_port,
-        settings.node_config.validator_rpc_port,
-    )?;
+    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
 
     // (5) .env — pin each image to its channel-resolved tag.
     let tags = resolve_channel_image_tags(&settings).await?;
@@ -957,6 +924,12 @@ pub(crate) async fn start_stack_core(
     // (6) config.toml (host side, bind-mounted into the node container in
     // Docker mode; read directly by the native binary in Native mode).
     sink.log("INFO", "$ Writing config.toml");
+    crate::solvers::resolve_unset_solvers(
+        &mut settings.node_config,
+        &settings.run_mode,
+        settings.image_tag,
+    )
+    .await;
     crate::config::write_config_toml(&settings.node_config, &settings.run_mode)?;
 
     let profile = compose_profile(settings.image_tag);
@@ -1342,12 +1315,18 @@ fn probe_postgres_auth(password: &str) -> PgAuthProbe {
 /// folder is unused but cleared for good measure.
 #[tauri::command]
 pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
-    log_cmd(&app, "Resetting dashboard database");
+    reset_dashboard_database_core(Arc::new(TauriSink::new(app))).await
+}
+
+pub(crate) async fn reset_dashboard_database_core(
+    sink: Arc<dyn ProgressSink>,
+) -> Result<(), String> {
+    sink.log("INFO", "$ Resetting dashboard database");
 
     // Force-remove only the dashboard + Postgres containers (by fixed name) so
     // the data volume is free to delete. Best-effort: missing containers just
     // error per-name, which we ignore. Deliberately no `compose up`.
-    log_cmd(&app, "docker rm -f quip-postgres quip-dashboard");
+    sink.log("INFO", "$ docker rm -f quip-postgres quip-dashboard");
     let _ = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
             .args(["rm", "-f", PG_CONTAINER, "quip-dashboard"])
@@ -1357,7 +1336,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 
     // Delete the Postgres data volume (the database + indexer state, including
     // the cached self identity).
-    log_cmd(&app, &format!("docker volume rm {PGDATA_VOLUME}"));
+    sink.log("INFO", &format!("$ docker volume rm {PGDATA_VOLUME}"));
     let rm = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
             .args(["volume", "rm", PGDATA_VOLUME])
@@ -1383,16 +1362,16 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     let dash_data = crate::settings::data_dir().join("dashboard-data");
     if let Err(e) = std::fs::remove_dir_all(&dash_data) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            log_err(
-                &app,
+            sink.log(
+                "ERROR",
                 &format!("Warning: clearing {} failed: {e}", dash_data.display()),
             );
         }
     }
     let _ = std::fs::create_dir_all(&dash_data);
 
-    log_output(
-        &app,
+    sink.log(
+        "INFO",
         "Dashboard database cleared. Start the node to bring the dashboard back up.",
     );
     Ok(())
@@ -1413,12 +1392,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// type — including containers left over from the other profile after a switch.
 #[tauri::command]
 pub async fn stop_stack(app: AppHandle) -> Result<(), String> {
-    // Kill the log-streamer child first — same ordering as the old
-    // stop_node_container sequence, so `docker compose logs -f` unblocks
-    // before we stop the containers.
-    let log_state = app.state::<LogStreamState>();
-    log_state.kill_child();
-    *log_state.stop_flag.lock().unwrap() = true;
+    app.state::<LogStreamState>().stop();
 
     stop_stack_core(Arc::new(TauriSink::new(app))).await
 }
@@ -1480,6 +1454,7 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-dashboard",
     "quip-postgres",
     "quip-caddy",
+    "quip-syslog",
     // Removed in v0.2 — the cpu/cuda miners self-bootstrap (faucet + miner +
     // descriptor registration), so the one-shot bootstrap container is gone.
     "quip-bootstrap",
@@ -1797,6 +1772,7 @@ mod tests {
         let services = vec![
             svc("cpu", false, None),
             svc("cuda", true, None),
+            svc("quip-syslog", true, None),
             svc("quip-validator", true, None),
             svc("dashboard", true, Some("healthy")),
             svc("postgres", true, Some("healthy")),
@@ -1813,8 +1789,10 @@ mod tests {
     #[test]
     fn missing_expected_service_is_degraded() {
         // Dashboard container never created — the stack is not fully Running.
+        // Everything else is present so the dashboard is the only thing missing.
         let services = vec![
             svc("cpu", true, None),
+            svc("quip-syslog", true, None),
             svc("quip-validator", true, None),
             svc("postgres", true, Some("healthy")),
             svc("caddy", true, None),
@@ -1860,11 +1838,30 @@ mod tests {
         let services = compose_services(&RunMode::Native);
         assert_eq!(
             services,
-            ["quip-validator", "dashboard", "postgres", "caddy"]
+            [
+                "quip-syslog",
+                "quip-validator",
+                "dashboard",
+                "postgres",
+                "caddy"
+            ]
         );
         assert!(!services.contains(&"cpu"));
         assert!(!services.contains(&"cuda"));
         assert!(!services.contains(&"quip-bootstrap"));
+    }
+
+    /// Native names its services explicitly, so compose starts only what the
+    /// list holds. Dropping the collector would leave every service forwarding
+    /// stdout to a port nothing listens on, and quip-node.log would stay empty
+    /// with no error anywhere — UDP does not report a missing receiver.
+    #[test]
+    fn the_log_collector_starts_in_both_run_modes() {
+        assert!(compose_services(&RunMode::Native).contains(&"quip-syslog"));
+        for tag in [ImageTag::Cpu, ImageTag::Cuda] {
+            assert!(expected_services(&RunMode::Docker, tag).contains(&"quip-syslog"));
+            assert!(expected_services(&RunMode::Native, tag).contains(&"quip-syslog"));
+        }
     }
 
     #[test]

@@ -48,6 +48,151 @@ Click **More info**, then **Run anyway**.
 
 ---
 
+## v0.2.9-rc1
+
+- **Unset solvers default to `msa` when it is installed**: when you leave a solver on Default, Start now runs the `msa` build for that backend if the miner image or bundle has one. Otherwise Start runs `sa`, as before. A solver that you choose does not change. The Default entry in the desktop app and the terminal UI shows the solver that Start will run.
+
+## v0.2.8
+
+- **The CUDA and Metal solver selectors appear in the desktop app**: the app drew these selectors before the hardware check finished. Only the CPU selector was visible. You can now choose `gibbs` or `sa` for CUDA and Metal.
+
+- **The terminal UI retries a failed solver list**: after a failed first read, the list held only the current solver until a restart. The next press now reads the list again.
+
+## v0.2.7
+
+- **The D-Wave budget is monthly, and the miner enforces it again**: the D-Wave miner in quip-miner v0.3.1 and later reads only `budget` and `budget_reset_day`. The manager wrote `daily_budget` instead, so a node with a Daily Budget set had no spending limit. Settings now has a Monthly Budget field, such as `40h`, and a Reset Day field, the day of the month in UTC. The manager writes both, plus a spend ledger in the data directory that survives a restart.
+
+- **Set your D-Wave budget again**: the manager does not convert the old Daily Budget value. Enter the QPU time of your D-Wave plan for one quota period in Settings, with the day the quota resets. With no budget, the miner spends without a limit.
+
+## v0.2.6
+
+- **The stack log is one merged file**: every container writes through a collector into `data/logs/quip-node.log`, and the log pane tails that file. The file outlives a container replacement and keeps slashes and tabs. The reader follows it across the 10 MB rotation. The embedded stack is nodes.quip.network v0.3.2.
+
+- **Logs stay visible during startup**: the log pane shows container output through waits and failed starts. It reconnects while the Compose files stage or Docker restarts.
+
+- **Each service has its own host ports**: both interfaces group the validator, miner, dashboard, PostgreSQL, and Caddy host ports by service, each with a switch. When public ports are off, the health checks use the internal network. The manager rejects conflicting host ports.
+
+- **Each GPU and CPU backend has a solver selector**: the CPU, CUDA, and Metal selectors read their lists from the miner image or the native bundle. The options match what the coordinator can start.
+
+- **An initial chain sync reads SYNCING, not DEGRADED**: the status pill shows a progress bar with the block counts.
+
+- **The Windows health probes work**: the embedded shell scripts had carriage-return line endings, so every probe failed and the validator stayed unhealthy.
+
+- **The headless TUI matches the GUI**: settings, checks, status, updates, and log actions are the same in both. The TUI also writes the GPU backend it detects, so a Metal Mac gets a `[metal]` section.
+
+- **Start refuses a config with no mining backend**: the manager names the cause before it writes the file. A Start before the hardware survey answers keeps the saved GPU list.
+
+- **The Public API check probes the advertised port**: with "Override Public Host & Port" set, the check probes the port that peers dial.
+
+---
+
+## v0.2.6-rc7
+
+- Stop the macOS release build from changing the runner's keychain
+  configuration. The tag build made its job keychain the default keychain
+  and added it to the user search list, and never put either back, so a
+  developer Mac acting as a runner was left with `quip-ci` as its default
+  keychain. The build now names its keychain on every `security` call and
+  routes `codesign` through a wrapper that passes `--keychain`, writes no
+  keychain preference, and deletes the keychain when the job ends.
+
+## v0.2.6-rc6
+
+- Make the Public API reachability check probe the port peers are told to
+  dial. With "Override Public Host & Port" set, the check named and probed
+  the Service Ports host port instead of the override, so a router that
+  remaps the external port always reported "not reachable". The check now
+  targets the advertised port, keeps its temporary listener on the host
+  port, and shows both when they differ.
+- Explain what the override port and the Caddy hostname port do. The
+  override changes only the address peers dial, and the Caddy port is fixed
+  at 20049 inside the container. Both fields now point to Service Ports as
+  the place that moves the listening port. The TUI shows the same hint.
+
+## v0.2.6-rc5
+
+- Bring the headless TUI to parity with the GUI. Settings: a CPU mining
+  switch, the TLS fields (hostname, ACME email, ZeroSSL key), the Metal
+  adaptive-cap knobs, and a Save button that does not restart the stack.
+  Checks: a Retry button on every item plus the Docker install fix. Status:
+  the three health dimensions under the status line and the installed miner
+  version. Actions: Check Updates with Update & Restart, and Reset Dashboard
+  DB behind a two-press confirmation. Logs: a filter (`/`) and clear (`c`).
+- Fix the TUI never writing the GPU backend it detected. A Metal Mac that only
+  ever used the TUI kept the CUDA default, so config.toml got a `[cuda.N]`
+  section for its GPU instead of `[metal]`. Start and Apply now set it from the
+  hardware survey, as the GUI does.
+- Generate the node secret through the same function in both front ends. The
+  TUI had its own copy of the logic.
+
+## v0.2.6-rc4
+
+- Refuse to start when no mining backend is on. The miner rejects a
+  config with no `[cpu]`, `[cuda.N]`, `[metal]`, or `[dwave]` table, and its
+  error blames the v0.2 config format because `faucet_url` is present. The
+  manager now names the cause before it writes the file: turn on CPU mining or
+  enable a GPU.
+- Keep the saved GPU list when the hardware survey has not answered. The GUI
+  rebuilt the list from the toggles on the page, so a Start before the survey
+  landed dropped every GPU from config.toml.
+- Restore the GPU Yielding switch after a restart on macOS. The form read the
+  CUDA slot before the hardware survey reported Metal, so the switch showed off
+  and the next Save wrote that into the Metal tuning.
+- Settings sliders: TLS (renamed from "Enable TLS/Caddy"), CPU mining, the
+  public host override, and the validator RPC public-access choice are sliders.
+  The override shows the detected address and the Public API port while off
+  and reveals the fields when on. The public-access slider sits before the
+  port and explains loopback versus all interfaces.
+
+## v0.2.6-rc3
+
+- Read the stack log from one merged file. Every container now writes through a
+  collector into `data/logs/quip-node.log`, and the log pane tails that file
+  instead of merging the output of `docker compose logs` itself. The merged file
+  outlives a container replacement, which the per-container logs did not.
+- Start the collector in both run modes, and stage the two files it mounts.
+  Without the collector, every service sends its output to a port that has no
+  listener. Nothing reports an error, so the file simply stays empty.
+- Keep the merged file readable. The collector rewrote every `/` and every tab
+  to `_`, which mangled each address and path the stack logs and hid the level
+  on Caddy error lines. Both survive now.
+- Follow the merged file across a rotation. The reader compared file length
+  alone, so after the collector rotated at 10 MB it could keep reading the
+  renamed file and show nothing further until the next restart.
+
+## v0.2.6-rc2
+
+- Repair the container health probes in the Windows builds, which failed on
+  every call. The Windows build machine checked out the embedded shell scripts
+  with carriage-return line endings, so bash rejected `set -euo pipefail` and
+  exited before it opened a socket. The staged validator healthcheck carried
+  the same fault, which held the validator at unhealthy and kept the miner and
+  the dashboard waiting behind their `service_healthy` conditions.
+- Report an initial chain sync as SYNCING instead of DEGRADED. The status pill
+  shows a progress bar and the block counts read from `system_syncState`.
+  A syncing node no longer counts as unhealthy for missing a participation
+  marker it cannot yet have.
+- Add solver selectors for the CPU, CUDA, and Metal backends in both interfaces.
+  Each selector reads its list from the miner image or the native bundle at
+  runtime, so the options match what the coordinator can start. Entries carry
+  the algorithm name and the production or experimental track. A selector left
+  at Default keeps the binary that the image chooses.
+
+## v0.2.6-rc1
+
+- Show container logs during stack startup. Keep logs visible through waits and failed starts.
+  Retry the log connection while Compose files are staging or Docker reconnects.
+  Replacing a log session permanently stops its previous follower.
+- Remove the loopback RPC fallback from the staged Docker miner template.
+  The miner uses `quip-validator:9944` regardless of public host port settings.
+- Add host port switches and port fields grouped by service in both interfaces.
+  These cover validator P2P, RPC and metrics, miner REST, dashboard HTTP,
+  PostgreSQL, and Caddy listeners. Internal container ports stay fixed.
+- Keep Native validator RPC required, with port 9944 as the default.
+  Public RPC access is optional. Native miner REST has a separate editable host port.
+- Check Docker service health through the internal network when public ports are off.
+  Reject conflicting host ports and keep the previous mode when a mode change fails.
+
 ## v0.2.5
 
 - **The miner asks the faucet for the network it actually runs**: the faucet URL followed the update channel, which was correct only while the two channels ran two different networks. With the Aglais images on the stable branches, both channels join Aglais, and a stack on Release kept asking the retired network's faucet. That failure is quiet: the miner has no built-in default and retries instead of exiting, so the balance stays at zero and the log reads like a slow faucet. The URL now follows the embedded chain specification, which is the thing that decides the network.

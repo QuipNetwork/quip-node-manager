@@ -38,6 +38,20 @@ fn native_attempts_dir() -> String {
     data_dir().join("attempts").to_string_lossy().to_string()
 }
 
+// The dwave miner's QPU spend ledger. It must survive a restart, or the miner
+// meters the quota period from zero again. In Docker, `/data` is the `./data`
+// mount.
+const DOCKER_USAGE_DB: &str = "/data/qpu-usage.db";
+
+/// Spend ledger for the native dwave miner: `<data_dir>/qpu-usage.db`. The
+/// miner's own default is `/data/qpu-usage.db`, which a Mac does not have.
+fn native_usage_db() -> String {
+    data_dir()
+        .join("qpu-usage.db")
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Native miner → local validator: the validator container publishes its raw
 /// JSON-RPC on the host loopback (see stack_assets), so the host-side miner
 /// connects directly rather than through Caddy's `/rpc` route. The host port
@@ -111,6 +125,47 @@ fn native_binary(run_mode: &RunMode, name: &str) -> String {
     }
 }
 
+/// A backend section's `binary` for the chosen solver.
+///
+/// Docker mode leaves the key out when nothing is chosen, so the image's own
+/// `/app/config.toml` stays authoritative and a future image can change its
+/// default without this app pinning the old name. Once the operator picks one,
+/// the bare name is written — `/usr/local/bin` is on the container's PATH.
+///
+/// Native mode has no PATH to fall back on: the coordinator resolves a bare
+/// name through PATH, and the bundle's bin dir is not on it, so every solver
+/// must be named by absolute path.
+///
+/// Verified against quip-miner v0.3.3: the supervisor spawns exactly the name
+/// this key carries, per section and per CUDA device.
+fn solver_binary(
+    run_mode: &RunMode,
+    backend: crate::solvers::Backend,
+    selected: Option<&str>,
+) -> String {
+    match run_mode {
+        RunMode::Docker => selected.unwrap_or_default().to_string(),
+        RunMode::Native => native_binary(run_mode, selected.unwrap_or(backend.fallback_solver())),
+    }
+}
+
+/// Same, for a section that has never carried a `binary` key.
+///
+/// `[cuda.N]` is the only one: rendering a default there would change what an
+/// existing Native CUDA miner spawns, from the coordinator's own choice to a
+/// bundle path this app picked. An operator who has not chosen keeps exactly
+/// what they run today.
+fn optional_solver_binary(
+    run_mode: &RunMode,
+    backend: crate::solvers::Backend,
+    selected: Option<&str>,
+) -> String {
+    match selected {
+        None => String::new(),
+        Some(_) => solver_binary(run_mode, backend, selected),
+    }
+}
+
 #[derive(Serialize)]
 struct CpuToml {
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -126,6 +181,12 @@ struct GpuToml {
 
 #[derive(Default, Serialize)]
 struct CudaDeviceToml {
+    /// Per-device, because that is where the coordinator reads it — there is no
+    /// `[gpu]` backend section in v0.3. The picker sets one solver for every
+    /// device, matching how utilization and yielding are already global in both
+    /// front ends.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    binary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     utilization: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +200,11 @@ struct DwaveToml {
     #[serde(skip_serializing_if = "String::is_empty")]
     token: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    daily_budget: String,
+    budget: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_reset_day: Option<u8>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    usage_db: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     solver: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -211,7 +276,7 @@ impl ConfigToml {
         };
 
         // [gpu] holds global defaults inherited by every backend section
-        // ([cuda.N], [metal], [modal]). See quip-protocol/quip-miner.example.toml.
+        // ([cuda.N], [metal], [modal]). See quip-miner/quip-miner.example.toml.
         //
         // Metal is unavailable in Linux containers regardless of what the Mac
         // host reports. In Docker mode we suppress Mps.
@@ -258,6 +323,11 @@ impl ConfigToml {
                         cuda.insert(
                             dev.index.to_string(),
                             CudaDeviceToml {
+                                binary: optional_solver_binary(
+                                    run_mode,
+                                    crate::solvers::Backend::Cuda,
+                                    config.cuda_solver.as_deref(),
+                                ),
                                 utilization: (dev.utilization != gpu_util)
                                     .then_some(dev.utilization),
                                 yielding: (dev.yielding != gpu_yield).then_some(dev.yielding),
@@ -268,7 +338,11 @@ impl ConfigToml {
             }
             Some(GpuBackend::Mps) => {
                 metal = Some(MetalToml {
-                    binary: native_binary(run_mode, "quip-metal-sa"),
+                    binary: solver_binary(
+                        run_mode,
+                        crate::solvers::Backend::Metal,
+                        config.metal_solver.as_deref(),
+                    ),
                     utilization: config.metal_config.utilization,
                     yielding: config.metal_config.yielding,
                     active_util: config.metal_config.active_util,
@@ -280,16 +354,31 @@ impl ConfigToml {
         }
 
         let (qpu, dwave) = match &config.dwave_config {
-            Some(dw) => (
-                Some(MarkerToml::default()),
-                Some(DwaveToml {
-                    binary: native_binary(run_mode, "quip-dwave-qa"),
-                    token: dw.token.clone(),
-                    daily_budget: dw.daily_budget.clone(),
-                    solver: dw.solver.clone(),
-                    dwave_region_url: dw.dwave_region_url.clone(),
-                }),
-            ),
+            Some(dw) => {
+                // The miner meters QPU time only when `budget` is set. The
+                // reset day and the ledger path mean nothing without it.
+                let budget = dw.budget.trim().to_string();
+                let metered = !budget.is_empty();
+                let usage_db = if !metered {
+                    String::new()
+                } else if is_docker {
+                    DOCKER_USAGE_DB.to_string()
+                } else {
+                    native_usage_db()
+                };
+                (
+                    Some(MarkerToml::default()),
+                    Some(DwaveToml {
+                        binary: native_binary(run_mode, "quip-dwave-qa"),
+                        token: dw.token.clone(),
+                        budget,
+                        budget_reset_day: metered.then_some(dw.budget_reset_day),
+                        usage_db,
+                        solver: dw.solver.clone(),
+                        dwave_region_url: dw.dwave_region_url.clone(),
+                    }),
+                )
+            }
             None => (None, None),
         };
 
@@ -319,7 +408,11 @@ impl ConfigToml {
                 },
             },
             cpu: config.cpu_enabled.then_some(CpuToml {
-                binary: native_binary(run_mode, "quip-cpu-sa"),
+                binary: solver_binary(
+                    run_mode,
+                    crate::solvers::Backend::Cpu,
+                    config.cpu_solver.as_deref(),
+                ),
                 num_cpus: config.num_cpus,
             }),
             gpu,
@@ -332,12 +425,41 @@ impl ConfigToml {
     }
 }
 
+impl ConfigToml {
+    /// Whether the coordinator would launch at least one miner from this
+    /// config. Only `[cpu]`, `[cuda.N]`, `[metal]`, and `[dwave]` count: the
+    /// v0.3 coordinator reads `[qpu]` solely as a fallback for `[dwave]`, and
+    /// `[gpu]` and `[modal]` not at all.
+    fn declares_mining_backend(&self) -> bool {
+        self.cpu.is_some() || !self.cuda.is_empty() || self.metal.is_some() || self.dwave.is_some()
+    }
+}
+
+/// Refuse a config the coordinator would reject for having nothing to launch.
+///
+/// The coordinator's own error for that case blames the v0.2 schema whenever
+/// `faucet_url` is present, and every config this app writes carries
+/// `faucet_url`. An operator who turned CPU mining off on a box with no enabled
+/// GPU would be told to reformat a file that is already v0.3. Name the setting
+/// that actually caused it, before anything is written or started.
+pub(crate) fn check_mining_backend(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
+    if ConfigToml::from_node_config(config, run_mode).declares_mining_backend() {
+        return Ok(());
+    }
+    Err(
+        "No mining backend is enabled, so the miner would refuse to start. \
+         Turn on CPU mining or enable at least one GPU in Settings, then start again."
+            .to_string(),
+    )
+}
+
 fn render_config_toml(config: &NodeConfig, run_mode: &RunMode) -> String {
     let config_toml = ConfigToml::from_node_config(config, run_mode);
     toml::to_string_pretty(&config_toml).expect("config TOML serialization should not fail")
 }
 
 pub fn write_config_toml(config: &NodeConfig, run_mode: &RunMode) -> Result<(), String> {
+    check_mining_backend(config, run_mode)?;
     crate::settings::ensure_data_dir()?;
     let content = render_config_toml(config, run_mode);
     // Docker mode: compose bind-mounts `./data:/data` (relative to the
@@ -441,6 +563,132 @@ mod tests {
 
         assert!(parsed["cpu"].get("binary").is_none());
         assert!(parsed["dwave"].get("binary").is_none());
+    }
+
+    /// Choosing a solver has to reach the coordinator, and in Docker that means
+    /// writing the key the app otherwise omits. Without this the picker would
+    /// change a setting that never leaves the app.
+    #[test]
+    fn chosen_solver_is_written_as_a_bare_name_in_docker() {
+        let cfg = NodeConfig {
+            cpu_solver: Some("quip-cpu-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        assert_eq!(parsed["cpu"]["binary"].as_str(), Some("quip-cpu-mps"));
+    }
+
+    /// Native has no PATH to fall back on, so the choice must come out as an
+    /// absolute path to that solver — not to the default.
+    #[test]
+    fn chosen_solver_is_an_absolute_path_in_native() {
+        let cfg = NodeConfig {
+            cpu_solver: Some("quip-cpu-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        let got = parsed["cpu"]["binary"].as_str().expect("binary key");
+        let path = std::path::Path::new(got);
+        assert!(path.is_absolute(), "{got} is not absolute");
+        assert!(path.ends_with("quip-cpu-mps"), "{got}");
+    }
+
+    /// Not choosing must stay exactly as it was, in both modes: no key in
+    /// Docker, the default path in Native.
+    #[test]
+    fn unset_solver_keeps_the_previous_rendering() {
+        let cfg = NodeConfig::default();
+        assert!(cfg.cpu_solver.is_none());
+
+        let docker: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        assert!(docker["cpu"].get("binary").is_none());
+
+        let native: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        assert!(native["cpu"]["binary"]
+            .as_str()
+            .expect("binary key")
+            .ends_with(crate::solvers::Backend::Cpu.fallback_solver()));
+    }
+
+    /// The CUDA solver goes in `[cuda.N]`, per device — verified against
+    /// v0.3.3, where the supervisor spawned exactly the name this key carried.
+    /// There is no `[gpu]` backend section to put it in.
+    #[test]
+    fn chosen_cuda_solver_reaches_every_enabled_device() {
+        let cfg = NodeConfig {
+            cuda_solver: Some("quip-cuda-gibbs".to_string()),
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![
+                    GpuDeviceConfig {
+                        index: 0,
+                        enabled: true,
+                        utilization: 80,
+                        yielding: false,
+                    },
+                    GpuDeviceConfig {
+                        index: 1,
+                        enabled: true,
+                        utilization: 80,
+                        yielding: false,
+                    },
+                ],
+            )
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Docker)).expect("valid toml");
+        for device in ["0", "1"] {
+            assert_eq!(
+                parsed["cuda"][device]["binary"].as_str(),
+                Some("quip-cuda-gibbs"),
+                "device {device}"
+            );
+        }
+        assert!(parsed.get("gpu").is_none() || parsed["gpu"].get("binary").is_none());
+    }
+
+    /// `[cuda.N]` never carried a binary key before. An operator who has not
+    /// chosen must keep the coordinator's own default in both modes, or this
+    /// change would silently repoint existing Native CUDA miners.
+    #[test]
+    fn unset_cuda_solver_writes_no_binary_key_in_either_mode() {
+        let cfg = cfg_with_gpu(
+            GpuBackend::Local,
+            vec![GpuDeviceConfig {
+                index: 0,
+                enabled: true,
+                utilization: 80,
+                yielding: false,
+            }],
+        );
+        assert!(cfg.cuda_solver.is_none());
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let parsed: toml::Value =
+                toml::from_str(&render_config_toml(&cfg, &mode)).expect("valid toml");
+            assert!(
+                parsed["cuda"]["0"].get("binary").is_none(),
+                "{mode:?} rendered a cuda binary that was never chosen"
+            );
+        }
+    }
+
+    /// Metal is macOS Native, so its choice must come out as an absolute path.
+    #[test]
+    fn chosen_metal_solver_is_an_absolute_path() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_solver: Some("quip-metal-mps".to_string()),
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cfg, &RunMode::Native)).expect("valid toml");
+        let got = parsed["metal"]["binary"].as_str().expect("binary key");
+        assert!(std::path::Path::new(got).is_absolute(), "{got}");
+        assert!(got.ends_with("quip-metal-mps"), "{got}");
     }
 
     #[test]
@@ -709,6 +957,84 @@ mod tests {
         assert!(toml[cuda1..].contains("yielding = true"));
     }
 
+    /// The settings file and config.toml are two representations of the same
+    /// GPU tuning. Parse the rendered file back and compare it against the
+    /// `NodeConfig` it came from, so a rename or a dropped key on either side
+    /// fails here instead of surfacing as a setting that silently stops
+    /// reaching the miner.
+    #[test]
+    fn rendered_gpu_tuning_round_trips_from_node_config() {
+        let cuda = cfg_with_gpu(
+            GpuBackend::Local,
+            vec![
+                GpuDeviceConfig {
+                    index: 0,
+                    enabled: true,
+                    utilization: 65,
+                    yielding: true,
+                },
+                GpuDeviceConfig {
+                    index: 1,
+                    enabled: true,
+                    utilization: 30,
+                    yielding: false,
+                },
+                GpuDeviceConfig {
+                    index: 2,
+                    enabled: false,
+                    utilization: 90,
+                    yielding: true,
+                },
+            ],
+        );
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&cuda, &RunMode::Docker)).expect("valid toml");
+        // [gpu] carries the shared defaults; a [cuda.N] key overrides them.
+        let shared = &parsed["gpu"];
+        for dev in cuda.gpu_device_configs.iter().filter(|d| d.enabled) {
+            let section = &parsed["cuda"][dev.index.to_string()];
+            let utilization = section
+                .get("utilization")
+                .or_else(|| shared.get("utilization"))
+                .and_then(toml::Value::as_integer)
+                .expect("utilization");
+            let yielding = section
+                .get("yielding")
+                .or_else(|| shared.get("yielding"))
+                .and_then(toml::Value::as_bool)
+                .expect("yielding");
+            assert_eq!(
+                utilization,
+                i64::from(dev.utilization),
+                "device {}",
+                dev.index
+            );
+            assert_eq!(yielding, dev.yielding, "device {}", dev.index);
+        }
+        assert!(
+            parsed["cuda"].get("2").is_none(),
+            "a disabled device must not reach the miner"
+        );
+
+        let metal = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_config: MetalConfig {
+                utilization: 45,
+                yielding: true,
+                active_util: 70,
+                idle_after_s: 120,
+            },
+            ..NodeConfig::default()
+        };
+        let parsed: toml::Value =
+            toml::from_str(&render_config_toml(&metal, &RunMode::Native)).expect("valid toml");
+        let section = &parsed["metal"];
+        assert_eq!(section["utilization"].as_integer(), Some(45));
+        assert_eq!(section["yielding"].as_bool(), Some(true));
+        assert_eq!(section["active_util"].as_integer(), Some(70));
+        assert_eq!(section["idle_after_s"].as_integer(), Some(120));
+    }
+
     #[test]
     fn mps_without_devices_skips_gpu_section() {
         let cfg = cfg_with_gpu(GpuBackend::Mps, vec![]);
@@ -726,6 +1052,78 @@ mod tests {
         let toml = render_config_toml(&cfg, &RunMode::Docker);
         assert!(toml.contains("[cpu]\n"));
         assert!(toml.contains("num_cpus = 8"));
+    }
+
+    /// The coordinator refuses a config with no backend table, and its error
+    /// blames the v0.2 schema whenever `faucet_url` is present, which every
+    /// config this app writes carries. An operator who turned CPU mining off
+    /// on a box with no enabled GPU is then told to reformat a file that is
+    /// already v0.3. Catch the empty launch plan here and name the setting.
+    #[test]
+    fn start_is_refused_when_no_mining_backend_is_enabled() {
+        let cfg = NodeConfig {
+            cpu_enabled: false,
+            ..NodeConfig::default()
+        };
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let err = check_mining_backend(&cfg, &mode)
+                .expect_err("no backend enabled must refuse the start");
+            assert!(err.contains("CPU mining"), "{mode:?}: {err}");
+        }
+
+        // Metal is suppressed in Docker, so a Mac profile with CPU mining off
+        // is empty in Docker mode and fine in Native mode.
+        let cfg = NodeConfig {
+            cpu_enabled: false,
+            gpu_backend: GpuBackend::Mps,
+            ..NodeConfig::default()
+        };
+        assert!(check_mining_backend(&cfg, &RunMode::Docker).is_err());
+        assert!(check_mining_backend(&cfg, &RunMode::Native).is_ok());
+    }
+
+    #[test]
+    fn any_launchable_backend_satisfies_the_guard() {
+        assert!(check_mining_backend(&NodeConfig::default(), &RunMode::Docker).is_ok());
+
+        let cuda_only = NodeConfig {
+            cpu_enabled: false,
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![GpuDeviceConfig {
+                    index: 0,
+                    enabled: true,
+                    utilization: 80,
+                    yielding: false,
+                }],
+            )
+        };
+        assert!(check_mining_backend(&cuda_only, &RunMode::Docker).is_ok());
+
+        // A device that is present but switched off launches nothing.
+        let cuda_off = NodeConfig {
+            cpu_enabled: false,
+            ..cfg_with_gpu(
+                GpuBackend::Local,
+                vec![GpuDeviceConfig {
+                    index: 0,
+                    enabled: false,
+                    utilization: 80,
+                    yielding: false,
+                }],
+            )
+        };
+        assert!(check_mining_backend(&cuda_off, &RunMode::Docker).is_err());
+
+        let dwave_only = NodeConfig {
+            cpu_enabled: false,
+            dwave_config: Some(DwaveConfig {
+                token: "tok".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        assert!(check_mining_backend(&dwave_only, &RunMode::Docker).is_ok());
     }
 
     #[test]
@@ -753,7 +1151,8 @@ mod tests {
         let cfg = NodeConfig {
             dwave_config: Some(DwaveConfig {
                 token: "DWAVE-TOKEN".to_string(),
-                daily_budget: "60s".to_string(),
+                budget: "40h".to_string(),
+                budget_reset_day: 9,
                 ..DwaveConfig::default()
             }),
             ..NodeConfig::default()
@@ -763,7 +1162,45 @@ mod tests {
         assert!(toml.contains("[qpu]\n"));
         assert!(toml.contains("[dwave]\n"));
         assert!(toml.contains("token = \"DWAVE-TOKEN\""));
-        assert!(toml.contains("daily_budget = \"60s\""));
+        assert!(toml.contains("budget = \"40h\""));
+        assert!(toml.contains("budget_reset_day = 9"));
+        assert!(toml.contains("usage_db = \"/data/qpu-usage.db\""));
+        assert!(!toml.contains("daily_budget"));
         assert!(toml.contains("solver = \"Advantage2_System1.13\""));
+    }
+
+    #[test]
+    fn native_dwave_budget_keeps_its_ledger_in_the_data_dir() {
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "DWAVE-TOKEN".to_string(),
+                budget: "40h".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+
+        assert!(toml.contains(&format!("usage_db = {:?}", native_usage_db())));
+        assert!(!toml.contains("usage_db = \"/data/qpu-usage.db\""));
+        assert!(toml.contains("budget_reset_day = 1"));
+    }
+
+    #[test]
+    fn dwave_without_budget_writes_no_budget_keys() {
+        let cfg = NodeConfig {
+            dwave_config: Some(DwaveConfig {
+                token: "DWAVE-TOKEN".to_string(),
+                budget: "  ".to_string(),
+                ..DwaveConfig::default()
+            }),
+            ..NodeConfig::default()
+        };
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let toml = render_config_toml(&cfg, &mode);
+            assert!(toml.contains("[dwave]\n"), "{mode:?}: [dwave] missing");
+            assert!(!toml.contains("budget"), "{mode:?}: budget key rendered");
+            assert!(!toml.contains("usage_db"), "{mode:?}: usage_db rendered");
+        }
     }
 }

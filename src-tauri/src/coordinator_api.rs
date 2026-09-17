@@ -8,61 +8,25 @@
 //! so anything that needs the account must ask the running process for it.
 
 use crate::settings::{AppSettings, RunMode};
-use std::net::SocketAddr;
 use std::time::Duration;
 
 const STATUS_PATH: &str = "/api/v1/status";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How to reach `/api/v1/status` from the host.
+/// Native probes run on the host. Docker probes run inside the stack.
 #[derive(Debug, PartialEq)]
-pub struct StatusEndpoint {
-    pub url: String,
-    /// `(host, addr)` override for the name resolution reqwest would otherwise
-    /// perform. Set only for Caddy's TLS front door, where the request must
-    /// carry the certificate's hostname but still connect over loopback.
-    pub resolve: Option<(String, SocketAddr)>,
+pub enum StatusEndpoint {
+    Native(String),
+    Docker,
 }
 
-fn loopback(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
-/// Pick the endpoint for the current run mode.
-///
-/// Native: the coordinator runs on the host and binds `[dashboard].listen`
-/// itself (see `config::native_rest_port`), so the probe talks to it directly.
-///
-/// Docker: the miner container publishes no host port, so the only route is
-/// Caddy's `handle /api/v1/*` on the public API port. That listener is plain
-/// HTTP for a port-only site and auto-TLS once a public DNS host is set, so
-/// the scheme follows the resolved Caddy site address. In the TLS case the
-/// request names the certificate's host but resolves to loopback, which keeps
-/// certificate validation on without depending on public DNS resolving back
-/// to this machine.
 pub fn status_endpoint(settings: &AppSettings) -> StatusEndpoint {
-    let cfg = &settings.node_config;
     match settings.run_mode {
-        RunMode::Native => StatusEndpoint {
-            url: format!(
-                "http://127.0.0.1:{}{STATUS_PATH}",
-                crate::config::native_rest_port(cfg)
-            ),
-            resolve: None,
-        },
-        RunMode::Docker => {
-            let port = cfg.port;
-            match crate::hostnames::caddy_tls_host(&cfg.public_host, &settings.hostname) {
-                Some(host) => StatusEndpoint {
-                    url: format!("https://{host}:{port}{STATUS_PATH}"),
-                    resolve: Some((host, loopback(port))),
-                },
-                None => StatusEndpoint {
-                    url: format!("http://127.0.0.1:{port}{STATUS_PATH}"),
-                    resolve: None,
-                },
-            }
-        }
+        RunMode::Native => StatusEndpoint::Native(format!(
+            "http://127.0.0.1:{}{STATUS_PATH}",
+            crate::config::native_rest_port(&settings.node_config)
+        )),
+        RunMode::Docker => StatusEndpoint::Docker,
     }
 }
 
@@ -90,21 +54,22 @@ pub fn parse_status_account_id(body: &str) -> Result<[u8; 32], String> {
 
 /// The account the coordinator signs extrinsics with.
 pub async fn fetch_account_id(endpoint: &StatusEndpoint) -> Result<[u8; 32], String> {
-    let mut builder = reqwest::Client::builder().timeout(TIMEOUT);
-    if let Some((host, addr)) = &endpoint.resolve {
-        builder = builder.resolve(host, *addr);
-    }
-    let client = builder
-        .build()
-        .map_err(|e| format!("cannot build http client: {e}"))?;
-    let body = client
-        .get(&endpoint.url)
-        .send()
-        .await
-        .map_err(|e| format!("coordinator unreachable at {}: {e}", endpoint.url))?
-        .text()
-        .await
-        .map_err(|e| format!("coordinator status body: {e}"))?;
+    let body = match endpoint {
+        StatusEndpoint::Docker => {
+            crate::container_http::request("quip-miner", 8086, "GET", STATUS_PATH, "").await?
+        }
+        StatusEndpoint::Native(url) => reqwest::Client::new()
+            .get(url)
+            .timeout(TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("coordinator unreachable at {url}: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("coordinator HTTP error: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("coordinator status body: {e}"))?,
+    };
     parse_status_account_id(&body)
 }
 
@@ -140,10 +105,7 @@ mod tests {
         };
         assert_eq!(
             status_endpoint(&settings),
-            StatusEndpoint {
-                url: "http://127.0.0.1:20100/api/v1/status".to_string(),
-                resolve: None,
-            }
+            StatusEndpoint::Native("http://127.0.0.1:20100/api/v1/status".into())
         );
     }
 
@@ -157,62 +119,19 @@ mod tests {
             },
             ..AppSettings::default()
         };
-        assert!(status_endpoint(&settings)
-            .url
-            .starts_with("http://127.0.0.1:20123/"));
-    }
-
-    #[test]
-    fn docker_port_only_site_is_plain_http_on_the_public_api_port() {
         assert_eq!(
-            status_endpoint(&docker("", ":20049", 20052)),
-            StatusEndpoint {
-                url: "http://127.0.0.1:20052/api/v1/status".to_string(),
-                resolve: None,
-            }
+            status_endpoint(&settings),
+            StatusEndpoint::Native("http://127.0.0.1:20123/api/v1/status".into())
         );
     }
 
-    /// An IP or localhost `public_host` still yields a port-only Caddy site, so
-    /// the probe must stay on plain HTTP.
     #[test]
-    fn docker_non_dns_public_host_stays_plain_http() {
-        for host in ["203.0.113.9", "localhost", "quip.local"] {
-            assert!(
-                status_endpoint(&docker(host, ":20049", 20049))
-                    .url
-                    .starts_with("http://127.0.0.1:20049/"),
-                "{host} must not select the TLS front door"
-            );
+    fn docker_probes_do_not_depend_on_public_bindings_or_tls() {
+        for host in ["", "203.0.113.9", "node.example.com"] {
+            let mut settings = docker(host, ":20049", 21049);
+            settings.node_config.public_api_enabled = false;
+            assert_eq!(status_endpoint(&settings), StatusEndpoint::Docker);
         }
-    }
-
-    /// A public DNS host puts Caddy on auto-TLS. The request must name the host
-    /// so the certificate validates, while connecting to loopback.
-    #[test]
-    fn docker_dns_host_uses_tls_pinned_to_loopback() {
-        assert_eq!(
-            status_endpoint(&docker("node.example.com", ":20049", 20049)),
-            StatusEndpoint {
-                url: "https://node.example.com:20049/api/v1/status".to_string(),
-                resolve: Some(("node.example.com".to_string(), loopback(20049))),
-            }
-        );
-    }
-
-    /// The hostname field carries the pre-formatted two-address form when the
-    /// user set it directly rather than through `public_host`.
-    #[test]
-    fn docker_dns_hostname_field_uses_tls_too() {
-        assert_eq!(
-            status_endpoint(&docker(
-                "",
-                "node.example.com, node.example.com:20049",
-                20049
-            ))
-            .url,
-            "https://node.example.com:20049/api/v1/status"
-        );
     }
 
     #[test]
