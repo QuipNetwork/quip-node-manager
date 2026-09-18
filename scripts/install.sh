@@ -50,7 +50,17 @@ esac
 TMPDIR="${TMPDIR:-/tmp}"
 DEST="${TMPDIR}/${ARTIFACT}"
 info "Downloading ${ARTIFACT}..."
-curl -fSL --progress-bar -o "$DEST" "$URL" || error "Download failed."
+# Resolve the redirect first, then fetch without -L. curl draws one progress
+# bar per HTTP transfer, and this URL redirects to a job-specific one, so a
+# single -L call drew two overlapping bars: the second bar's opening frame
+# landed past the end of the first bar's finished line and nothing erased it.
+# --head keeps the resolve free -- without it, -o /dev/null downloads the whole
+# artifact just to learn the URL. Should the resolved URL ever start
+# redirecting too, the checksum below catches the redirect page as a mismatch.
+REAL_URL=$(curl -fsSL --head -o /dev/null -w '%{url_effective}' "$URL") \
+  || error "Could not resolve the download URL."
+[ -n "$REAL_URL" ] || error "Resolving the download URL produced nothing."
+curl -fS --progress-bar -o "$DEST" "$REAL_URL" || error "Download failed."
 
 # ── Verify ──────────────────────────────────────────────────────────────────
 # No Linux or macOS tool checks a file fetched this way on its own, so the
