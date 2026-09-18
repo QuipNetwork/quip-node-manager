@@ -381,7 +381,7 @@ pub(crate) fn write_env_file(
     let path = stack_project_dir().join(".env");
     fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
 
-    // Best-effort 0600: DWAVE_API_KEY and POSTGRES_PASSWORD shouldn't be
+    // Best-effort 0600: DWAVE_API_TOKEN and POSTGRES_PASSWORD shouldn't be
     // world-readable on shared systems.
     #[cfg(unix)]
     {
@@ -399,25 +399,6 @@ fn cpu_set_for_config(cfg: &NodeConfig) -> String {
     }
 }
 
-/// The Leap region name inside a D-Wave SAPI endpoint, e.g. `na-west-1` from
-/// `https://na-west-1.cloud.dwavesys.com/sapi/v2/`.
-///
-/// Settings store the full endpoint URL, which is what the miner's `config.toml`
-/// takes, but `DWAVE_API_REGION` is the SDK's short region name. Anything that
-/// does not match the known host shape yields an empty value, which resolves
-/// identically to unset and lets the SDK choose.
-fn leap_region_from_url(url: &str) -> String {
-    url.split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .and_then(|host| host.strip_suffix(".cloud.dwavesys.com"))
-        .filter(|region| !region.is_empty() && !region.contains('.'))
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn render_env_lines(
     settings: &AppSettings,
     puid: u32,
@@ -425,8 +406,13 @@ fn render_env_lines(
     pg_password: &str,
     tags: &ResolvedImageTags,
 ) -> Vec<String> {
-    let dwave = settings.node_config.dwave_config.as_ref();
-    let dwave_key = dwave.map(|d| d.token.clone()).unwrap_or_default();
+    // Written blank without a [dwave] config so a stale token does not linger.
+    let dwave_env = match settings.node_config.dwave_config.as_ref() {
+        Some(dw) => dw.sdk_env().map(|(key, value)| format!("{key}={value}")),
+        None => crate::settings::DwaveConfig::default()
+            .sdk_env()
+            .map(|(key, _)| format!("{key}=")),
+    };
     let hostname = crate::hostnames::resolved_caddy_hostname(
         &settings.node_config.public_host,
         &settings.hostname,
@@ -454,23 +440,9 @@ fn render_env_lines(
         format!("QUIP_HOSTNAME={hostname}"),
         format!("CERT_EMAIL={}", settings.cert_email),
         format!("ZEROSSL_API_KEY={}", settings.zerossl_api_key),
-        // DWAVE_API_TOKEN is the name the miner and the Ocean SDK actually
-        // read. DWAVE_API_KEY is written too: the compose file maps it as a
-        // fallback, and an operator's existing .env may still carry it.
-        format!("DWAVE_API_TOKEN={dwave_key}"),
-        format!("DWAVE_API_KEY={dwave_key}"),
-        // Pin the solver. Left empty the SDK picks the account default, which
-        // may not be the Advantage2 system the chain topology targets.
-        format!(
-            "DWAVE_API_SOLVER={}",
-            dwave.map(|d| d.solver.as_str()).unwrap_or_default()
-        ),
-        format!(
-            "DWAVE_API_REGION={}",
-            dwave
-                .map(|d| leap_region_from_url(&d.dwave_region_url))
-                .unwrap_or_default()
-        ),
+    ];
+    lines.extend(dwave_env);
+    lines.extend([
         format!("POSTGRES_PASSWORD={pg_password}"),
         // CHANNEL names the moving tag the compose file falls back to. The
         // pins below win over it: the manager resolves an exact version per
@@ -492,7 +464,7 @@ fn render_env_lines(
         ),
         format!("VALIDATOR_NAME={validator_name}"),
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
-    ];
+    ]);
 
     // Miner memory ceiling. Omitted when unset so compose's own `:-16g`
     // default stays the single source of truth — writing an explicit value
@@ -2026,7 +1998,7 @@ mod tests {
     }
 
     #[test]
-    fn env_lines_preserve_dwave_key() {
+    fn env_lines_write_dwave_sdk_vars() {
         let mut settings = AppSettings::default();
         settings.node_config.dwave_config = Some(crate::settings::DwaveConfig {
             token: "dwave-token".to_string(),
@@ -2034,7 +2006,10 @@ mod tests {
         });
 
         let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
-        assert!(env.contains("DWAVE_API_KEY=dwave-token"));
+        assert!(env.contains("DWAVE_API_TOKEN=dwave-token\n"));
+        assert!(env.contains("DWAVE_API_SOLVER=Advantage2_System1.13\n"));
+        assert!(env.contains("DWAVE_API_REGION=na-west-1\n"));
+        assert!(!env.contains("DWAVE_API_KEY"));
     }
 
     #[test]

@@ -192,6 +192,43 @@ impl Default for DwaveConfig {
     }
 }
 
+impl DwaveConfig {
+    /// Ocean SDK environment for the miner. The v0.3 miner takes no D-Wave
+    /// credentials from config.toml; the SDK resolves them from these vars.
+    /// Docker mode writes them to `.env`, native mode sets them on the child.
+    pub fn sdk_env(&self) -> [(&'static str, String); 3] {
+        [
+            ("DWAVE_API_TOKEN", self.token.clone()),
+            // Pin the solver. Left empty the SDK picks the account default,
+            // which may not be the Advantage2 system the chain topology targets.
+            ("DWAVE_API_SOLVER", self.solver.clone()),
+            (
+                "DWAVE_API_REGION",
+                leap_region_from_url(&self.dwave_region_url),
+            ),
+        ]
+    }
+}
+
+/// The Leap region name inside a D-Wave SAPI endpoint, e.g. `na-west-1` from
+/// `https://na-west-1.cloud.dwavesys.com/sapi/v2/`.
+///
+/// Settings store the full endpoint URL, but `DWAVE_API_REGION` is the SDK's
+/// short region name, and it is the only location var the compose file
+/// forwards. Anything that does not match the known host shape yields an
+/// empty value, which resolves identically to unset and lets the SDK choose.
+fn leap_region_from_url(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .and_then(|host| host.strip_suffix(".cloud.dwavesys.com"))
+        .filter(|region| !region.is_empty() && !region.contains('.'))
+        .unwrap_or_default()
+        .to_string()
+}
+
 // ─── Defaults ───────────────────────────────────────────────────────────────
 
 fn default_port() -> u16 {

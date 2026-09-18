@@ -126,6 +126,10 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.2.10-rc1
+
+- **D-Wave mining finds its API token**: the manager now gives the miner its D-Wave token, solver and region as `DWAVE_API_TOKEN`, `DWAVE_API_SOLVER` and `DWAVE_API_REGION`. Before, the D-Wave miner stopped at startup with "API token not defined" even when you entered a valid token. Native mode now passes these values to the miner too. `config.toml` no longer holds the token.
+
 ## v0.2.9
 
 - **Unset solvers default to `msa` when it is installed**: when you leave a solver on Default, Start now runs the `msa` build for that backend if the miner image or bundle has one. Otherwise Start runs `sa`, as before. A solver that you choose does not change. The Default entry in the desktop app and the terminal UI shows the solver that Start will run.
