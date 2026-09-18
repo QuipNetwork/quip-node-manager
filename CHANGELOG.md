@@ -134,6 +134,8 @@ against `SHA256SUMS` as shown above.
 
 - **One progress bar during the download**: the download drew two overlapping progress bars; it now draws one.
 
+- **D-Wave mining finds its API token**: the manager now gives the miner its D-Wave token, solver and region as `DWAVE_API_TOKEN`, `DWAVE_API_SOLVER` and `DWAVE_API_REGION`. Before, the D-Wave miner stopped at startup with "API token not defined" even when you entered a valid token. Native mode now passes these values to the miner too. `config.toml` no longer holds the token.
+
 ---
 
 ## v0.2.9

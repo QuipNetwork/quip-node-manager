@@ -198,17 +198,11 @@ struct DwaveToml {
     #[serde(skip_serializing_if = "String::is_empty")]
     binary: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    token: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
     budget: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_reset_day: Option<u8>,
     #[serde(skip_serializing_if = "String::is_empty")]
     usage_db: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    solver: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    dwave_region_url: String,
 }
 
 #[derive(Default, Serialize)]
@@ -370,12 +364,9 @@ impl ConfigToml {
                     Some(MarkerToml::default()),
                     Some(DwaveToml {
                         binary: native_binary(run_mode, "quip-dwave-qa"),
-                        token: dw.token.clone(),
                         budget,
                         budget_reset_day: metered.then_some(dw.budget_reset_day),
                         usage_db,
-                        solver: dw.solver.clone(),
-                        dwave_region_url: dw.dwave_region_url.clone(),
                     }),
                 )
             }
@@ -1161,12 +1152,14 @@ mod tests {
 
         assert!(toml.contains("[qpu]\n"));
         assert!(toml.contains("[dwave]\n"));
-        assert!(toml.contains("token = \"DWAVE-TOKEN\""));
         assert!(toml.contains("budget = \"40h\""));
         assert!(toml.contains("budget_reset_day = 9"));
         assert!(toml.contains("usage_db = \"/data/qpu-usage.db\""));
         assert!(!toml.contains("daily_budget"));
-        assert!(toml.contains("solver = \"Advantage2_System1.13\""));
+        // Credentials reach the miner through the environment, never TOML.
+        for key in ["token", "solver", "dwave_region_url"] {
+            assert!(!toml.contains(&format!("{key} =")), "{key} rendered");
+        }
     }
 
     #[test]

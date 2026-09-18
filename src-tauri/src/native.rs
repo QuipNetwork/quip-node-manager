@@ -1152,6 +1152,15 @@ pub(crate) async fn start_native_node_core(
         .current_dir(&work_dir)
         .stdout(log_file)
         .stderr(log_file_err);
+    // The Ocean SDK in the dwave miner reads its credentials from the
+    // environment only; config.toml carries none.
+    if let Some(dw) = &config.dwave_config {
+        cmd.envs(
+            dw.sdk_env()
+                .into_iter()
+                .filter(|(_, value)| !value.is_empty()),
+        );
+    }
 
     // Put the child in its own process group so we can kill the
     // entire tree (miner workers, QUIC handlers, etc.) at once.
