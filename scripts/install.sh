@@ -50,7 +50,17 @@ esac
 TMPDIR="${TMPDIR:-/tmp}"
 DEST="${TMPDIR}/${ARTIFACT}"
 info "Downloading ${ARTIFACT}..."
-curl -fSL --progress-bar -o "$DEST" "$URL" || error "Download failed."
+# Resolve the redirect first, then fetch without -L. curl draws one progress
+# bar per HTTP transfer, and this URL redirects to a job-specific one, so a
+# single -L call drew two overlapping bars: the second bar's opening frame
+# landed past the end of the first bar's finished line and nothing erased it.
+# --head keeps the resolve free -- without it, -o /dev/null downloads the whole
+# artifact just to learn the URL. Should the resolved URL ever start
+# redirecting too, the checksum below catches the redirect page as a mismatch.
+REAL_URL=$(curl -fsSL --head -o /dev/null -w '%{url_effective}' "$URL") \
+  || error "Could not resolve the download URL."
+[ -n "$REAL_URL" ] || error "Resolving the download URL produced nothing."
+curl -fS --progress-bar -o "$DEST" "$REAL_URL" || error "Download failed."
 
 # ── Verify ──────────────────────────────────────────────────────────────────
 # No Linux or macOS tool checks a file fetched this way on its own, so the
@@ -66,23 +76,49 @@ SUMS_URL="${BASE}/SHA256SUMS?job=sign-artifacts"
 SIG_URL="${BASE}/SHA256SUMS.asc?job=sign-artifacts"
 KEY_URL="https://gitlab.com/quip.network/quip-node-manager/-/raw/${TAG}/.gitlab/release-signing-key.asc"
 
+# Every failure from here on discards the download: an unverified artifact
+# left behind in TMPDIR is worse than no artifact at all. SIG, KEY and GPGHOME
+# stay unset until the signature step creates them, and rm ignores an empty
+# operand, so this is safe to call anywhere past the SHA256SUMS download.
+discard() {
+    if [ -n "${GPGHOME:-}" ]; then
+        # rm -rf unlinks the directory but does not stop the keyboxd and
+        # gpg-agent processes that gpg 2.4 and later start against it, so
+        # they would outlive the home they were pointed at. Kill them first.
+        GNUPGHOME="$GPGHOME" gpgconf --kill all >/dev/null 2>&1 || true
+        rm -rf "$GPGHOME"
+    fi
+    rm -f "$DEST" "$SUMS" "${SIG:-}" "${KEY:-}"
+}
+
 info "Verifying checksum..."
 SUMS="${TMPDIR}/quip-SHA256SUMS.$$"
-curl -fsSL -o "$SUMS" "$SUMS_URL" || error "Could not download SHA256SUMS."
+curl -fsSL -o "$SUMS" "$SUMS_URL" \
+  || { discard; error "Could not download SHA256SUMS."; }
 
 EXPECTED=$(awk -v f="$ARTIFACT" '$2 == f || $2 == "*" f {print $1; exit}' "$SUMS")
-[ -n "$EXPECTED" ] || error "SHA256SUMS lists no entry for ${ARTIFACT}."
+[ -n "$EXPECTED" ] || { discard; error "SHA256SUMS lists no entry for ${ARTIFACT}."; }
 
+# Take the exit status of the checksum tool. A bare ACTUAL=$(...) hides it from
+# set -e, so a tool that fails outright leaves ACTUAL empty and is reported
+# below as a checksum mismatch: the download gets blamed for a broken local
+# tool, and the operator is told the release is corrupt when it is not.
 if command -v sha256sum >/dev/null 2>&1; then
-  ACTUAL=$(sha256sum "$DEST" | cut -d" " -f1)
+  DIGEST=$(sha256sum "$DEST") \
+    || { discard; error "sha256sum could not read ${DEST}."; }
 elif command -v shasum >/dev/null 2>&1; then
-  ACTUAL=$(shasum -a 256 "$DEST" | cut -d" " -f1)
+  DIGEST=$(shasum -a 256 "$DEST") \
+    || { discard; error "shasum could not read ${DEST}."; }
 else
+  discard
   error "Neither sha256sum nor shasum is available; cannot verify the download."
 fi
+ACTUAL=$(printf '%s\n' "$DIGEST" | cut -d" " -f1)
+[ -n "$ACTUAL" ] \
+  || { discard; error "The checksum tool printed no digest for ${ARTIFACT}."; }
 
 if [ "$EXPECTED" != "$ACTUAL" ]; then
-  rm -f "$DEST" "$SUMS"
+  discard
   error "Checksum mismatch for ${ARTIFACT}. The download was discarded."
 fi
 info "Checksum matches."
@@ -91,24 +127,46 @@ if command -v gpg >/dev/null 2>&1; then
   info "Verifying signature..."
   SIG="${TMPDIR}/quip-SHA256SUMS.asc.$$"
   KEY="${TMPDIR}/quip-release-key.asc.$$"
-  KEYRING="${TMPDIR}/quip-keyring.$$"
-  curl -fsSL -o "$SIG" "$SIG_URL" || error "Could not download SHA256SUMS.asc."
-  curl -fsSL -o "$KEY" "$KEY_URL" || error "Could not download the release signing key."
+  curl -fsSL -o "$SIG" "$SIG_URL" \
+    || { discard; error "Could not download SHA256SUMS.asc."; }
+  curl -fsSL -o "$KEY" "$KEY_URL" \
+    || { discard; error "Could not download the release signing key."; }
 
-  gpg --batch --no-default-keyring --keyring "$KEYRING" --quiet --import "$KEY" \
-    || error "Could not read the release signing key."
-  FOUND=$(gpg --batch --no-default-keyring --keyring "$KEYRING" --list-keys --with-colons \
-    | awk -F: '/^fpr/ {print $10; exit}')
+  # A throwaway GNUPGHOME, not --keyring. GnuPG 2.4 and later keep public keys
+  # in keyboxd, which ignores --keyring and --no-default-keyring outright: it
+  # says so on stderr and carries on. The key then lands in the caller's own
+  # keyring and the fingerprint read back is whatever keyboxd already held --
+  # another key, or nothing. A separate home directory is the one isolation
+  # every gpg version honours, and it is what .gitlab-ci.yml already does on
+  # the signing side. mktemp rather than a PID-derived name because TMPDIR
+  # falls back to a world-writable /tmp and mkdir -p accepts a path somebody
+  # else created first.
+  GPGHOME=$(mktemp -d "${TMPDIR}/quip-gnupg.XXXXXX") \
+    || { discard; error "Could not create a temporary GnuPG home."; }
+
+  GNUPGHOME="$GPGHOME" gpg --batch --quiet --import "$KEY" \
+    || { discard; error "Could not read the release signing key."; }
+
+  # Same reason as the checksum tool above: take the exit status, so a gpg
+  # that cannot answer is reported as a broken gpg and not as the wrong signer.
+  FOUND=$(GNUPGHOME="$GPGHOME" gpg --batch --list-keys --with-colons) \
+    || { discard; error "Could not read the release key back from gpg."; }
+  FOUND=$(printf '%s\n' "$FOUND" | awk -F: '/^fpr/ {print $10; exit}')
+  [ -n "$FOUND" ] \
+    || { discard; error "gpg reported no fingerprint for the release key."; }
+
   if [ "$FOUND" != "$RELEASE_KEY_FINGERPRINT" ]; then
-    rm -f "$DEST" "$SUMS" "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+    discard
     error "Release key fingerprint is ${FOUND}, expected ${RELEASE_KEY_FINGERPRINT}."
   fi
-  if ! gpg --batch --no-default-keyring --keyring "$KEYRING" --verify "$SIG" "$SUMS" 2>/dev/null; then
-    rm -f "$DEST" "$SUMS" "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+  if ! GNUPGHOME="$GPGHOME" gpg --batch --verify "$SIG" "$SUMS" 2>/dev/null; then
+    discard
     error "Signature on SHA256SUMS is not valid. The download was discarded."
   fi
   info "Signature verified."
-  rm -f "$SIG" "$KEY" "$KEYRING" "${KEYRING}~"
+  GNUPGHOME="$GPGHOME" gpgconf --kill all >/dev/null 2>&1 || true
+  rm -rf "$GPGHOME"
+  rm -f "$SIG" "$KEY"
 else
   info "gpg is not installed, so the signature was not checked. The checksum was."
 fi

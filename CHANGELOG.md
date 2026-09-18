@@ -128,7 +128,15 @@ against `SHA256SUMS` as shown above.
 
 ## v0.2.10-rc1
 
+- **The install script checks the release signature again**: `install.sh` verified the signature on `SHA256SUMS` against a key it believed it had isolated in a temporary keyring. GnuPG ignores that instruction wherever keyboxd is enabled, so on those systems the check could not read the key back and stopped the install with a fingerprint mismatch that named no fingerprint. The key is now kept in a temporary home directory that every GnuPG version honours, and it no longer lands in your own keyring. Releases from v0.2.9 were signed correctly throughout; only the checking was broken.
+
+- **A failing checksum tool no longer reads as a corrupt download**: if `sha256sum` or `shasum` could not run, `install.sh` reported a checksum mismatch and discarded the artifact. It now says the tool failed.
+
+- **One progress bar during the download**: the download drew two overlapping progress bars; it now draws one.
+
 - **D-Wave mining finds its API token**: the manager now gives the miner its D-Wave token, solver and region as `DWAVE_API_TOKEN`, `DWAVE_API_SOLVER` and `DWAVE_API_REGION`. Before, the D-Wave miner stopped at startup with "API token not defined" even when you entered a valid token. Native mode now passes these values to the miner too. `config.toml` no longer holds the token.
+
+---
 
 ## v0.2.9
 
