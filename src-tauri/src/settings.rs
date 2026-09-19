@@ -568,15 +568,11 @@ pub enum StackHealth {
 }
 
 /// Bootstrap config stored at a fixed OS-standard location.
-/// Holds install-level state that shouldn't live in app-settings.json
-/// (e.g. the Postgres password, which must not appear in support bundles
-/// or screenshots of the settings file).
+/// Holds install-level state that shouldn't live in app-settings.json.
 #[derive(Serialize, Deserialize, Default)]
 struct BootstrapConfig {
     #[serde(default)]
     data_dir: Option<String>,
-    #[serde(default)]
-    postgres_password: Option<String>,
 }
 
 fn bootstrap_path() -> PathBuf {
@@ -616,25 +612,6 @@ pub fn data_dir() -> PathBuf {
 
 pub fn ensure_data_dir() -> Result<(), String> {
     fs::create_dir_all(data_dir()).map_err(|e| e.to_string())
-}
-
-/// Postgres password for the dashboard's database, generated once on first
-/// access and persisted in bootstrap.json. Never regenerated — rotating
-/// would desync from the existing `quip_pgdata` volume.
-pub fn postgres_password() -> String {
-    let mut cfg = load_bootstrap();
-    if let Some(p) = cfg.postgres_password.as_ref().filter(|s| !s.is_empty()) {
-        return p.clone();
-    }
-    let bytes: [u8; 16] = rand::random();
-    let pw = hex::encode(bytes);
-    cfg.postgres_password = Some(pw.clone());
-    // Save is best-effort — if it fails, we'll regenerate next start (and
-    // break the DB). Log via stderr so it surfaces in the terminal.
-    if let Err(e) = save_bootstrap(&cfg) {
-        eprintln!("warning: failed to persist postgres password: {e}");
-    }
-    pw
 }
 
 fn settings_path() -> PathBuf {
@@ -706,8 +683,6 @@ pub async fn set_data_dir(path: String) -> Result<(), String> {
         fs::create_dir_all(&p).map_err(|e| format!("Cannot create directory {}: {}", path, e))?;
         Some(path)
     };
-    // Load-modify-save so we don't wipe postgres_password when changing the
-    // data dir.
     let mut cfg = load_bootstrap();
     cfg.data_dir = new_dir;
     save_bootstrap(&cfg)

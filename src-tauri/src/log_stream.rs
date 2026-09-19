@@ -15,9 +15,9 @@ pub struct LogEntry {
     pub timestamp: String,
     pub level: String,
     pub message: String,
-    /// Origin of the line: `miner`, `validator`, `dashboard`, `postgres`,
-    /// `caddy`, or `app`. Defaults to `app` for ops/manager messages and for
-    /// callers that omit the field when deserialising.
+    /// Origin of the line: `miner`, `validator`, `dashboard`, `caddy`, or
+    /// `app`. Defaults to `app` for ops/manager messages and for callers that
+    /// omit the field when deserialising.
     #[serde(default = "default_log_source")]
     pub source: String,
 }
@@ -243,8 +243,7 @@ pub fn map_compose_service_to_source(service: &str) -> Option<&'static str> {
         "cpu" | "cuda" | "quip-cpu" | "quip-cuda" => Some("miner"),
         "quip-validator" | "validator" => Some("validator"),
         "dashboard" | "quip-dashboard" => Some("dashboard"),
-        "postgres" | "quip-postgres" => Some("postgres"),
-        "caddy" | "quip-caddy" => Some("caddy"),
+        "caddy" => Some("caddy"),
         _ => None,
     }
 }
@@ -539,7 +538,6 @@ mod tests {
             map_compose_service_to_source("dashboard"),
             Some("dashboard")
         );
-        assert_eq!(map_compose_service_to_source("postgres"), Some("postgres"));
         assert_eq!(map_compose_service_to_source("caddy"), Some("caddy"));
     }
 
@@ -556,8 +554,7 @@ mod tests {
             ("quip-cuda", "miner"),
             ("quip-validator", "validator"),
             ("quip-dashboard", "dashboard"),
-            ("quip-postgres", "postgres"),
-            ("quip-caddy", "caddy"),
+            ("caddy", "caddy"),
         ] {
             assert_eq!(
                 map_compose_service_to_source(prefix),
@@ -571,6 +568,7 @@ mod tests {
     fn map_unknown_service_is_none() {
         assert_eq!(map_compose_service_to_source("faucet"), None);
         assert_eq!(map_compose_service_to_source("unknown"), None);
+        assert_eq!(map_compose_service_to_source("postgres"), None);
     }
 
     // ── parse_log_line ─────────────────────────────────────────────────────
@@ -780,7 +778,7 @@ mod tests {
     /// asserts on the embedded config itself.
     #[test]
     fn merged_lines_keep_caddy_levels_and_urls() {
-        let captured = "2026-09-13T10:07:17+00:00 quip-caddy \
+        let captured = "2026-09-13T10:07:17+00:00 caddy \
             2026/08/16 05:22:02.881\tERROR\thttp.log.error\t\
             dial tcp 192.168.107.3:9944: connect: connection refused";
         let entry = entry_from_merged_line(captured);

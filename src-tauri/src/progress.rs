@@ -21,8 +21,6 @@ pub trait ProgressSink: Send + Sync {
     fn stop_complete(&self, success: bool, error: Option<&str>);
     /// Native binary download progress (`binary-download-progress`).
     fn binary_download_progress(&self, downloaded: u64, total: Option<u64>, done: bool);
-    /// Dashboard Postgres credential mismatch detected (`dashboard-db-mismatch`).
-    fn dashboard_db_mismatch(&self, message: &str);
 }
 
 /// Emits progress as Tauri events for the desktop GUI frontend.
@@ -72,12 +70,6 @@ impl ProgressSink for TauriSink {
             serde_json::json!({ "downloaded": downloaded, "total": total, "done": done }),
         );
     }
-    fn dashboard_db_mismatch(&self, message: &str) {
-        let _ = self.app.emit(
-            "dashboard-db-mismatch",
-            serde_json::json!({ "message": message }),
-        );
-    }
 }
 
 /// No-op sink for tests and non-interactive callers.
@@ -90,7 +82,6 @@ impl ProgressSink for NullSink {
     fn stop_started(&self) {}
     fn stop_complete(&self, _success: bool, _error: Option<&str>) {}
     fn binary_download_progress(&self, _downloaded: u64, _total: Option<u64>, _done: bool) {}
-    fn dashboard_db_mismatch(&self, _message: &str) {}
 }
 
 #[cfg(test)]
@@ -108,6 +99,5 @@ mod tests {
         sink.stop_started();
         sink.stop_complete(true, None);
         sink.binary_download_progress(0, Some(10), false);
-        sink.dashboard_db_mismatch("test");
     }
 }
