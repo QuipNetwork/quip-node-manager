@@ -10,13 +10,13 @@ const rpc = {
   port_path: "validator_rpc_port",
   enabled_path: "validator_rpc_enabled",
 };
-const postgres = {
-  id: "postgres",
-  service: "quip-postgres",
-  label: "PostgreSQL",
+const metrics = {
+  id: "validator_metrics",
+  service: "quip-validator",
+  label: "Metrics",
   required: false,
-  port_path: "service_ports.postgres.host_port",
-  enabled_path: "service_ports.postgres.enabled",
+  port_path: "service_ports.validator_metrics.host_port",
+  enabled_path: "service_ports.validator_metrics.enabled",
 };
 
 test("public port edits preserve unrelated settings and use the selected host ports", () => {
@@ -24,17 +24,17 @@ test("public port edits preserve unrelated settings and use the selected host po
     validator_rpc_port: 9944,
     validator_rpc_enabled: false,
     node_name: "test",
-    service_ports: { postgres: { enabled: false, host_port: 5432 } },
+    service_ports: { validator_metrics: { enabled: false, host_port: 9615 } },
   };
-  const edited = applyPortEdits(base, [rpc, postgres], {
+  const edited = applyPortEdits(base, [rpc, metrics], {
     validator_rpc: { enabled: true, host_port: "29944" },
-    postgres: { enabled: true, host_port: "25432" },
+    validator_metrics: { enabled: true, host_port: "29615" },
   });
   expect(edited).toEqual({
     validator_rpc_port: 29944,
     validator_rpc_enabled: true,
     node_name: "test",
-    service_ports: { postgres: { enabled: true, host_port: 25432 } },
+    service_ports: { validator_metrics: { enabled: true, host_port: 29615 } },
   });
   expect(base.validator_rpc_port).toBe(9944);
 });
@@ -70,7 +70,7 @@ test("Native RPC public access is an independent explicit choice", () => {
 
 test("Native REST edits use the host listener field", () => {
   const control = {
-    ...postgres,
+    ...metrics,
     id: "miner_rest",
     required: true,
     port_path: "rest_insecure_port",

@@ -80,13 +80,6 @@ export function renderPortControls(container, controls) {
       group.append(renderPublicAccessToggle(control));
     }
     group.append(row);
-    if (control.id === "caddy_admin") {
-      const note = document.createElement("p");
-      note.className = "service-port-note";
-      note.textContent =
-        "The admin API can change Caddy configuration. Enable only on a trusted network.";
-      group.append(note);
-    }
   }
 }
 

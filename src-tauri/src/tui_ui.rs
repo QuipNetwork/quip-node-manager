@@ -469,12 +469,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                     &field_value(app, &focus, app.form.service_port_value(spec.id)),
                 ));
             }
-            if spec.id == crate::service_ports::PortId::CaddyAdmin {
-                lines.push(Line::from(Span::styled(
-                    "      Admin API changes Caddy config. Use a trusted network.",
-                    Style::default().fg(DIM),
-                )));
-            }
             if spec.id == crate::service_ports::PortId::ValidatorRpc && required {
                 let public = app.form.service_ports[&spec.id].0;
                 let check = if public { "[x]" } else { "[ ]" };

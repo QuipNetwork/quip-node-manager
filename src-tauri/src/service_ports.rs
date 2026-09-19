@@ -21,14 +21,12 @@ impl PortBinding {
 pub struct ServicePorts {
     pub validator_metrics: PortBinding,
     pub miner_rest: PortBinding,
-    pub dashboard_http: PortBinding,
-    pub postgres: PortBinding,
     pub caddy_http: PortBinding,
     pub caddy_https: PortBinding,
     pub caddy_http3: PortBinding,
     pub caddy_internal: PortBinding,
-    pub caddy_admin: PortBinding,
     pub caddy_api_http3: PortBinding,
+    pub log_collector: PortBinding,
 }
 
 impl Default for ServicePorts {
@@ -36,14 +34,12 @@ impl Default for ServicePorts {
         Self {
             validator_metrics: PortBinding::new(false, 9615),
             miner_rest: PortBinding::new(false, 8086),
-            dashboard_http: PortBinding::new(false, 3001),
-            postgres: PortBinding::new(false, 5432),
             caddy_http: PortBinding::new(true, 80),
             caddy_https: PortBinding::new(true, 443),
             caddy_http3: PortBinding::new(false, 443),
             caddy_internal: PortBinding::new(false, 8088),
-            caddy_admin: PortBinding::new(false, 2019),
             caddy_api_http3: PortBinding::new(false, 20049),
+            log_collector: PortBinding::new(true, 5514),
         }
     }
 }
@@ -55,15 +51,13 @@ pub enum PortId {
     ValidatorRpc,
     ValidatorMetrics,
     MinerRest,
-    DashboardHttp,
-    Postgres,
     PublicApi,
     CaddyHttp,
     CaddyHttps,
     CaddyHttp3,
     CaddyInternal,
-    CaddyAdmin,
     CaddyApiHttp3,
+    LogCollector,
 }
 
 #[derive(Clone, Serialize)]
@@ -115,26 +109,8 @@ pub const PORT_SPECS: &[PortSpec] = &[
         enabled_path: "service_ports.miner_rest.enabled",
     },
     PortSpec {
-        id: PortId::DashboardHttp,
-        service: "quip-dashboard",
-        label: "HTTP",
-        container_port: 3001,
-        protocols: &["tcp"],
-        port_path: "service_ports.dashboard_http.host_port",
-        enabled_path: "service_ports.dashboard_http.enabled",
-    },
-    PortSpec {
-        id: PortId::Postgres,
-        service: "quip-postgres",
-        label: "PostgreSQL",
-        container_port: 5432,
-        protocols: &["tcp"],
-        port_path: "service_ports.postgres.host_port",
-        enabled_path: "service_ports.postgres.enabled",
-    },
-    PortSpec {
         id: PortId::PublicApi,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "Public API",
         container_port: 20049,
         protocols: &["tcp"],
@@ -143,7 +119,7 @@ pub const PORT_SPECS: &[PortSpec] = &[
     },
     PortSpec {
         id: PortId::CaddyHttp,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "HTTP",
         container_port: 80,
         protocols: &["tcp"],
@@ -152,7 +128,7 @@ pub const PORT_SPECS: &[PortSpec] = &[
     },
     PortSpec {
         id: PortId::CaddyHttps,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "HTTPS",
         container_port: 443,
         protocols: &["tcp"],
@@ -161,7 +137,7 @@ pub const PORT_SPECS: &[PortSpec] = &[
     },
     PortSpec {
         id: PortId::CaddyHttp3,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "HTTP/3",
         container_port: 443,
         protocols: &["udp"],
@@ -170,7 +146,7 @@ pub const PORT_SPECS: &[PortSpec] = &[
     },
     PortSpec {
         id: PortId::CaddyInternal,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "Internal routing",
         container_port: 8088,
         protocols: &["tcp"],
@@ -178,28 +154,33 @@ pub const PORT_SPECS: &[PortSpec] = &[
         enabled_path: "service_ports.caddy_internal.enabled",
     },
     PortSpec {
-        id: PortId::CaddyAdmin,
-        service: "quip-caddy",
-        label: "Admin API",
-        container_port: 2019,
-        protocols: &["tcp"],
-        port_path: "service_ports.caddy_admin.host_port",
-        enabled_path: "service_ports.caddy_admin.enabled",
-    },
-    PortSpec {
         id: PortId::CaddyApiHttp3,
-        service: "quip-caddy",
+        service: "quip-dashboard",
         label: "Public API HTTP/3",
         container_port: 20049,
         protocols: &["udp"],
         port_path: "service_ports.caddy_api_http3.host_port",
         enabled_path: "service_ports.caddy_api_http3.enabled",
     },
+    PortSpec {
+        id: PortId::LogCollector,
+        service: "quip-dashboard",
+        label: "Log collector",
+        container_port: 5514,
+        protocols: &["udp"],
+        port_path: "service_ports.log_collector.host_port",
+        enabled_path: "service_ports.log_collector.enabled",
+    },
 ];
 
 impl PortId {
     pub fn required(self, mode: &RunMode) -> bool {
-        *mode == RunMode::Native && matches!(self, Self::ValidatorRpc | Self::MinerRest)
+        match self {
+            // The Docker logging driver of every service sends to this port.
+            Self::LogCollector => true,
+            Self::ValidatorRpc | Self::MinerRest => *mode == RunMode::Native,
+            _ => false,
+        }
     }
 
     pub fn binding(self, config: &NodeConfig, mode: &RunMode) -> PortBinding {
@@ -218,14 +199,12 @@ impl PortId {
             ),
             Self::MinerRest => ports.miner_rest,
             Self::ValidatorMetrics => ports.validator_metrics,
-            Self::DashboardHttp => ports.dashboard_http,
-            Self::Postgres => ports.postgres,
             Self::CaddyHttp => ports.caddy_http,
             Self::CaddyHttps => ports.caddy_https,
             Self::CaddyHttp3 => ports.caddy_http3,
             Self::CaddyInternal => ports.caddy_internal,
-            Self::CaddyAdmin => ports.caddy_admin,
             Self::CaddyApiHttp3 => ports.caddy_api_http3,
+            Self::LogCollector => ports.log_collector,
         }
     }
 
@@ -248,14 +227,14 @@ impl PortId {
             }
             Self::MinerRest => config.service_ports.miner_rest = binding,
             Self::ValidatorMetrics => config.service_ports.validator_metrics = binding,
-            Self::DashboardHttp => config.service_ports.dashboard_http = binding,
-            Self::Postgres => config.service_ports.postgres = binding,
             Self::CaddyHttp => config.service_ports.caddy_http = binding,
             Self::CaddyHttps => config.service_ports.caddy_https = binding,
             Self::CaddyHttp3 => config.service_ports.caddy_http3 = binding,
             Self::CaddyInternal => config.service_ports.caddy_internal = binding,
-            Self::CaddyAdmin => config.service_ports.caddy_admin = binding,
             Self::CaddyApiHttp3 => config.service_ports.caddy_api_http3 = binding,
+            Self::LogCollector => {
+                config.service_ports.log_collector = PortBinding::new(true, binding.host_port);
+            }
         }
     }
 }
@@ -313,8 +292,49 @@ mod tests {
             PortId::ValidatorRpc.binding(&config, &RunMode::Docker),
             PortBinding::new(false, 29944)
         );
-        assert!(!config.service_ports.postgres.enabled);
+        assert!(!config.service_ports.validator_metrics.enabled);
         validate(&config, &RunMode::Docker).unwrap();
+    }
+
+    #[test]
+    fn front_door_and_collector_ports_belong_to_the_dashboard() {
+        for id in [
+            PortId::PublicApi,
+            PortId::CaddyHttp,
+            PortId::CaddyHttps,
+            PortId::CaddyHttp3,
+            PortId::CaddyInternal,
+            PortId::CaddyApiHttp3,
+            PortId::LogCollector,
+        ] {
+            let spec = PORT_SPECS.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(spec.service, "quip-dashboard", "{id:?}");
+        }
+        assert!(PORT_SPECS
+            .iter()
+            .all(|s| ["quip-validator", "quip-miner", "quip-dashboard"].contains(&s.service)));
+    }
+
+    #[test]
+    fn log_collector_is_required_in_both_modes_and_cannot_be_turned_off() {
+        let mut config = NodeConfig::default();
+        for mode in [RunMode::Docker, RunMode::Native] {
+            assert!(PortId::LogCollector.required(&mode));
+            PortId::LogCollector.set_binding(&mut config, &mode, PortBinding::new(false, 15514));
+            assert_eq!(
+                config.service_ports.log_collector,
+                PortBinding::new(true, 15514)
+            );
+        }
+    }
+
+    #[test]
+    fn log_collector_conflicts_with_other_udp_ports() {
+        let mut config = NodeConfig::default();
+        config.service_ports.caddy_http3 = PortBinding::new(true, 5514);
+        assert!(validate(&config, &RunMode::Docker)
+            .unwrap_err()
+            .contains("5514/udp"));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! Stage the docker-compose stack files into the user's data dir so
 //! `docker compose` can run with `--project-directory`.
 //!
-//! The compose.yml, Caddyfile, chain spec, miner config template,
-//! and validator healthcheck are embedded into the binary at compile time via
+//! The compose.yml, chain spec, miner config template, and validator
+//! healthcheck are embedded into the binary at compile time via
 //! `include_str!`. That avoids Tauri's resource-bundler path entirely, so a raw
 //! exe (e.g. Windows `--no-bundle` builds that ship just
 //! `quip-node-manager.exe` with no sibling resource folder) still has the files
@@ -15,22 +15,21 @@
 //! expected. `every_relative_bind_mount_has_a_staged_source` guards that.
 //!
 //! Runtime patches are applied before writing:
-//!   - compose.yml: Caddy's host-published public API port is rewritten
-//!     from upstream 20049 to the user configured API port.
+//!   - compose.yml: each enabled service port is published on its configured
+//!     host port. Native RPC and the log collector are mandatory: the host
+//!     miner needs the RPC, and every service's Docker logging driver sends
+//!     to the collector.
 //!   - compose.yml: the validator libp2p host port is rewritten from
 //!     upstream 30333 to the configured `validator_port` (default 30333,
 //!     i.e. a no-op 1:1 mapping unless the user overrides it).
 //!   - compose.yml: when `public_host` is set, the validator command gets
 //!     a matching `--public-addr=<multiaddr>` using the public validator port.
-//!   - Caddyfile: the optional local faucet route is stripped; the manager
-//!     points the miner at the public faucet for its channel directly via
-//!     `FAUCET_URL` in the rendered config.toml.
-//!   - Caddyfile (Native mode only): `/api/v1/*` upstream is rewritten
-//!     from `quip-miner:8086` (compose network alias, absent when the miner
-//!     is on the host) to `host.docker.internal:<native_rest_port>`.
-//!   - compose.yml: each enabled service port is published on its configured
-//!     host port. Native RPC is mandatory so the host miner can reach it.
-//!     Docker health probes run inside the stack without public mappings.
+//!   - compose.yml: the validator's dependents are ungated so they start as
+//!     soon as its container is up, rather than waiting for a full sync.
+//!   - compose.yml: `QUIP_MINER_UPSTREAM` is added for the dashboard's
+//!     embedded Caddy, which upstream compose does not pass.
+//!   - compose.yml: the fixed Caddy volume names are stripped so they scope
+//!     to the compose project instead of colliding across stacks.
 
 use crate::settings::{data_dir, NodeConfig, RunMode};
 use std::fs;
@@ -41,10 +40,6 @@ use std::path::PathBuf;
 /// path so `cargo build` rebuilds whenever the file changes.
 pub(crate) const COMPOSE_YML: &str =
     include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
-
-/// Upstream Caddyfile, embedded alongside the compose.yml. Patched at
-/// runtime for Native mode (see `sync_stack_assets`).
-const CADDYFILE: &str = include_str!("../../vendor/nodes.quip.network/caddy/Caddyfile");
 
 /// Aglais chain spec — the live Quip test network (runtime spec 117). Replaces
 /// the retired `quip-testnet.json`, which upstream deleted at the relaunch.
@@ -81,23 +76,10 @@ const MINER_CONFIG_TEMPLATE: &str =
     include_str!("../../vendor/nodes.quip.network/config/quip-miner.toml");
 
 /// Validator sync gate, bind-mounted as the validator's healthcheck command.
-/// The miner, dashboard, and faucet all wait on `service_healthy`, so a missing
-/// or non-executable script leaves the whole stack permanently unstarted.
+/// The miner and the faucet wait on `service_healthy`, so a missing or
+/// non-executable script leaves the whole stack permanently unstarted.
 const VALIDATOR_HEALTHCHECK: &str =
     include_str!("../../vendor/nodes.quip.network/scripts/validator-healthcheck.sh");
-
-/// syslog-ng configuration for the merged stack log. Every service forwards
-/// stdout through the Docker syslog driver to the colocated collector, which
-/// writes one host-readable file at `data/logs/quip-node.log`.
-const SYSLOG_CONF: &str = include_str!("../../vendor/nodes.quip.network/syslog-ng/syslog-ng.conf");
-
-/// The collector's PID 1. It supervises syslog-ng and rotates the merged log,
-/// because syslog-ng OSE has no size-based rotation and the custom entrypoint
-/// bypasses the image's own supervisor. Staged executable for the same reason
-/// as the validator healthcheck: a non-executable entrypoint stops the
-/// container, and every other service gates on it through `depends_on`.
-const SYSLOG_ENTRYPOINT: &str =
-    include_str!("../../vendor/nodes.quip.network/syslog-ng/entrypoint.sh");
 
 /// `<data_dir>/docker-compose.yml` — staged from the embedded bytes.
 pub fn stack_compose_file() -> PathBuf {
@@ -116,12 +98,6 @@ pub fn stack_compose_file() -> PathBuf {
 /// invocation here passes `-f`, so `compose_cmd` must add it explicitly.
 pub fn stack_override_file() -> PathBuf {
     data_dir().join("docker-compose.override.yml")
-}
-
-/// `<data_dir>/caddy/Caddyfile` — staged from the embedded bytes, possibly
-/// patched for Native mode.
-pub fn stack_caddyfile() -> PathBuf {
-    data_dir().join("caddy").join("Caddyfile")
 }
 
 /// `<data_dir>/chain-specs/aglais-network.json` — staged from embedded bytes.
@@ -145,16 +121,13 @@ pub fn stack_project_dir() -> PathBuf {
     data_dir()
 }
 
-/// Write the embedded compose.yml, Caddyfile, and chain spec into
-/// `<data_dir>/`, and create the subdirectories compose bind-mounts.
-/// Idempotent — always overwrites.
+/// Write the embedded compose.yml and chain spec into `<data_dir>/`, and
+/// create the subdirectories compose bind-mounts. Idempotent — always
+/// overwrites.
 ///
 /// The port settings control only host publications. All internal ports stay fixed.
 /// `config.public_host`, when set and P2P publishing is enabled, is converted
 /// into a Substrate public multiaddr using `config.validator_port`.
-///
-/// In Native mode the Caddyfile's upstream for `/api/v1/*` is also
-/// rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>`.
 pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), String> {
     crate::service_ports::validate(config, run_mode)?;
     let base = data_dir();
@@ -169,11 +142,9 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
         // validator runs as PUID/PGID.
         "data/aglais-chain-db",
         "dashboard-data",
-        "caddy",
         "chain-specs",
         "config",
         "scripts",
-        "syslog-ng",
         // Destination of the merged stack log. Created here for the same
         // reason as the validator database above: Docker would fabricate the
         // missing bind-mount source owned by root, and the collector writes as
@@ -187,29 +158,14 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
 
-    let caddy_out = patch_caddyfile(run_mode, CADDYFILE, crate::config::native_rest_port(config));
-    let caddy_out = configure_caddy_admin(&caddy_out, config.service_ports.caddy_admin.enabled)?;
-    fs::write(stack_caddyfile(), caddy_out).map_err(|e| format!("write Caddyfile: {e}"))?;
-
     fs::write(stack_chain_spec_file(), CHAIN_SPEC).map_err(|e| format!("write chain spec: {e}"))?;
 
     fs::write(stack_miner_config_file(), miner_config_template()?)
         .map_err(|e| format!("write miner config template: {e}"))?;
 
     write_healthcheck_script()?;
-    write_syslog_assets()?;
 
     Ok(())
-}
-
-/// `<data_dir>/syslog-ng/syslog-ng.conf` — staged from the embedded bytes.
-pub fn stack_syslog_conf_file() -> PathBuf {
-    data_dir().join("syslog-ng").join("syslog-ng.conf")
-}
-
-/// `<data_dir>/syslog-ng/entrypoint.sh` — staged executable.
-pub fn stack_syslog_entrypoint_file() -> PathBuf {
-    data_dir().join("syslog-ng").join("entrypoint.sh")
 }
 
 /// `<data_dir>/data/logs/quip-node.log` — the merged stack log the collector
@@ -217,32 +173,6 @@ pub fn stack_syslog_entrypoint_file() -> PathBuf {
 /// the collector does, on its first received line.
 pub fn merged_log_file() -> PathBuf {
     data_dir().join("data").join("logs").join("quip-node.log")
-}
-
-/// Stage the collector's config and entrypoint.
-///
-/// Both are written with LF endings. The entrypoint is a shell script embedded
-/// at compile time from `vendor/`, which is its own git repo and so is not
-/// covered by this repo's `.gitattributes`; a Windows build machine with
-/// `core.autocrlf=true` would bake in `set -eu\r`, which `/bin/sh` rejects, and
-/// would turn the `LOG=/logs/quip-node.log` assignment into a path ending in a
-/// carriage return. The container runs Linux whatever the host is.
-fn write_syslog_assets() -> Result<(), String> {
-    fs::write(stack_syslog_conf_file(), SYSLOG_CONF.replace("\r\n", "\n"))
-        .map_err(|e| format!("write syslog-ng.conf: {e}"))?;
-
-    let path = stack_syslog_entrypoint_file();
-    fs::write(&path, SYSLOG_ENTRYPOINT.replace("\r\n", "\n"))
-        .map_err(|e| format!("write syslog-ng entrypoint: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod syslog-ng entrypoint: {e}"))?;
-    }
-
-    Ok(())
 }
 
 fn miner_config_template() -> Result<String, String> {
@@ -274,8 +204,6 @@ fn apply_port_publications(
         ("cpu", "quip-miner"),
         ("cuda", "quip-miner"),
         ("dashboard", "quip-dashboard"),
-        ("postgres", "quip-postgres"),
-        ("caddy", "quip-caddy"),
     ] {
         let mut mappings = Vec::new();
         for spec in PORT_SPECS.iter().filter(|spec| spec.service == name) {
@@ -284,9 +212,10 @@ fn apply_port_publications(
             }
             let binding = spec.id.binding(config, mode);
             if binding.enabled || spec.id.required(mode) {
-                let address = if spec.id == PortId::ValidatorRpc
-                    && *mode == RunMode::Native
-                    && !binding.enabled
+                let address = if spec.id == PortId::LogCollector
+                    || (spec.id == PortId::ValidatorRpc
+                        && *mode == RunMode::Native
+                        && !binding.enabled)
                 {
                     "127.0.0.1:"
                 } else {
@@ -353,16 +282,6 @@ fn replace_service_ports(src: &str, service: &str, mappings: &[String]) -> Resul
     Ok(output)
 }
 
-fn configure_caddy_admin(src: &str, enabled: bool) -> Result<String, String> {
-    if !enabled {
-        return Ok(src.to_string());
-    }
-    if !src.contains("\n{\n") {
-        return Err("embedded Caddyfile has no global options block".into());
-    }
-    Ok(src.replacen("\n{\n", "\n{\n\tadmin :2019\n", 1))
-}
-
 /// Stage the validator healthcheck, executable. Compose runs it as the
 /// container's `CMD` healthcheck, and a non-executable file fails every probe,
 /// which keeps the validator `unhealthy` forever and blocks the miner and the
@@ -397,11 +316,29 @@ fn patch_compose_file(src: &str, config: &NodeConfig, mode: &RunMode) -> Result<
     };
     let patched = patch_validator_public_addr(&patched, public_host, config.validator_port);
     let patched = ungate_validator_dependents(&patched);
+    let patched = link_dashboard_miner_upstream(&patched)?;
     Ok(strip_volume_names(&patched))
 }
 
-/// Start the miner, dashboard, and faucet as soon as the validator's container
-/// is up, rather than waiting for it to finish syncing.
+/// Pass Caddy's `/api/v1/*` upstream to the dashboard container.
+///
+/// The dashboard image's Caddyfile reads `QUIP_MINER_UPSTREAM`, but upstream
+/// compose passes only the backend's `QUIP_MINER_REST_URL`. Native mode needs
+/// both to name the host miner, so `.env` supplies the value.
+fn link_dashboard_miner_upstream(src: &str) -> Result<String, String> {
+    let anchor = "      QUIP_MINER_REST_URL: ${QUIP_MINER_REST_URL:-http://quip-miner:8086}\n";
+    if !src.contains(anchor) {
+        return Err("embedded compose has no dashboard QUIP_MINER_REST_URL entry".into());
+    }
+    Ok(src.replacen(
+        anchor,
+        &format!("{anchor}      QUIP_MINER_UPSTREAM: ${{QUIP_MINER_UPSTREAM:-quip-miner:8086}}\n"),
+        1,
+    ))
+}
+
+/// Start the miner and the faucet as soon as the validator's container is up,
+/// rather than waiting for it to finish syncing.
 ///
 /// Upstream gates them on `service_healthy`, where healthy means "synced to the
 /// chain head", with a 24h `start_period` to match. That is correct for the
@@ -415,38 +352,25 @@ fn patch_compose_file(src: &str, config: &NodeConfig, mode: &RunMode) -> Result<
 /// `start_period`. The tradeoff is that the miner now restart-loops against a
 /// syncing validator instead of waiting, which is visible in its logs.
 ///
-/// Only the `quip-validator` dependencies are relaxed. The dashboard's
-/// dependency on `postgres` is also `service_healthy`, but that check passes in
-/// seconds and skipping it would race the database.
+/// The miner and the faucet are the only dependents of `quip-validator` in the
+/// embedded compose. The dashboard has no `depends_on` at all.
 fn ungate_validator_dependents(src: &str) -> String {
-    // Two indentation levels: the `x-dashboard` anchor and the services.
     src.replace(
-        "    quip-validator:\n      condition: service_healthy",
-        "    quip-validator:\n      condition: service_started",
-    )
-    .replace(
         "      quip-validator:\n        condition: service_healthy",
         "      quip-validator:\n        condition: service_started",
     )
 }
 
-/// Drop the fixed `name: quip-*` directives from the top-level `volumes:`
-/// block so each volume is scoped to the compose project (`quip_<key>`) rather
-/// than a global name. The upstream compose pins `name: quip-pgdata` (and the
-/// caddy volumes), which makes them collide with any other Quip stack on the
-/// same host — e.g. a developer running the raw `docker compose`. Sharing the
-/// Postgres volume across stacks breaks the dashboard: `POSTGRES_PASSWORD` is
-/// only applied when the data dir is first initialised, so a volume created by
-/// one stack keeps its original password and authentication fails for the
-/// other.
-/// Upstream renamed the Postgres volume `quip-pgdata` -> `aglais-pgdata` at the
-/// Aglais relaunch. These are literal matches, so an upstream rename silently
-/// stops stripping and reintroduces the collision this exists to prevent;
-/// `strip_volume_names_leaves_no_fixed_name` fails the build if that recurs.
+/// Drop the fixed `name: quip-caddy-*` directives from the top-level
+/// `volumes:` block so each volume is scoped to the compose project
+/// (`quip_<key>`) rather than a global name. The upstream compose pins these
+/// names, which makes them collide with any other Quip stack on the same host
+/// — e.g. a developer running the raw `docker compose`.
+///
+/// The named volumes that remain hold Caddy's ACME certificates and account
+/// key, which the dashboard container mounts at `/data/caddy/{data,config}`.
 fn strip_volume_names(src: &str) -> String {
-    src.replace("\n    name: aglais-pgdata", "")
-        .replace("\n    name: quip-pgdata", "")
-        .replace("\n    name: quip-caddy-data", "")
+    src.replace("\n    name: quip-caddy-data", "")
         .replace("\n    name: quip-caddy-config", "")
 }
 
@@ -463,78 +387,16 @@ fn patch_validator_public_addr(src: &str, public_host: &str, validator_port: u16
     )
 }
 
-fn patch_caddyfile(run_mode: &RunMode, src: &str, native_rest_port: u16) -> String {
-    let src = strip_local_faucet_route(src);
-    match run_mode {
-        RunMode::Native => src.replace(
-            "quip-miner:8086",
-            &format!("host.docker.internal:{native_rest_port}"),
-        ),
-        RunMode::Docker => src,
-    }
-}
-
-fn strip_local_faucet_route(src: &str) -> String {
-    let Some(start) = src.find("\t# Optional faucet sidecar") else {
-        return src.to_string();
-    };
-    let Some(relative_end) = src[start..].find("\n\n\t# Miner telemetry") else {
-        return src.to_string();
-    };
-
-    let end = start + relative_end + 2;
-    let mut out = String::with_capacity(src.len());
-    out.push_str(&src[..start]);
-    out.push_str(&src[end..]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The collector is the service every other service gates on through
-    /// `depends_on`, so a CRLF entrypoint stops the whole stack rather than
-    /// only the log. A carriage return would also land in the `LOG=` path and
-    /// name the file with a trailing return.
-    #[test]
-    fn staged_syslog_assets_are_lf_whatever_the_build_machine_checked_out() {
-        for embedded in [SYSLOG_ENTRYPOINT, SYSLOG_CONF] {
-            let crlf = embedded.replace('\n', "\r\n");
-            let staged = crlf.replace("\r\n", "\n");
-            assert!(!staged.contains('\r'));
-            assert_eq!(embedded.replace("\r\n", "\n"), staged);
-        }
-        assert!(SYSLOG_ENTRYPOINT
-            .replace("\r\n", "\n")
-            .contains("set -eu\n"));
-        assert!(SYSLOG_ENTRYPOINT.contains("LOG=/logs/quip-node.log"));
-    }
-
-    /// The path the collector writes, the directory compose mounts, and the
-    /// directory `sync_stack_assets` creates all have to name the same place,
-    /// or the app stages a directory that nothing ever writes into.
+    /// The collector inside the dashboard image writes `/logs/quip-node.log`.
+    /// The mount and `merged_log_file` must name the same host directory.
     #[test]
     fn collector_writes_into_the_mounted_log_directory() {
         assert!(COMPOSE_YML.contains("- ./data/logs:/logs"));
-        assert!(SYSLOG_CONF.contains("/logs/quip-node.log"));
-        assert!(SYSLOG_ENTRYPOINT.contains("LOG=/logs/quip-node.log"));
-    }
-
-    /// The log pane depends on the collector preserving the message it relays.
-    ///
-    /// A bare `$(sanitize ${MESSAGE})` rewrites `/` and every control character
-    /// to `_`. That mangles every URL the stack logs and collapses Caddy's
-    /// tab-delimited console format, so a 502 renders as INFO. It degrades the
-    /// pane silently — every line still arrives, just wrong — which is why this
-    /// is pinned here, against the embedded config, rather than trusted to stay
-    /// fixed upstream (nodes.quip.network!28).
-    #[test]
-    fn collector_template_keeps_slashes_and_tabs() {
-        assert!(
-            SYSLOG_CONF.contains(r"$(sanitize --no-ctrl-chars --invalid-chars '\n\r' ${MESSAGE})"),
-            "the merged-log template lost its narrowed sanitize options"
-        );
+        assert!(merged_log_file().ends_with("data/logs/quip-node.log"));
     }
 
     /// Dual logging is what keeps `docker compose logs` — and so the app's log
@@ -627,26 +489,22 @@ mod tests {
             "40001:9944/tcp",
             "40002:9615/tcp",
             "40003:8086/tcp",
-            "40004:3001/tcp",
-            "40005:5432/tcp",
-            "40006:20049/tcp",
-            "40007:80/tcp",
-            "40008:443/tcp",
-            "40009:443/udp",
-            "40010:8088/tcp",
-            "40011:2019/tcp",
-            "40012:20049/udp",
+            "40004:20049/tcp",
+            "40005:80/tcp",
+            "40006:443/tcp",
+            "40007:443/udp",
+            "40008:8088/tcp",
+            "40009:20049/udp",
+            "127.0.0.1:40010:5514/udp",
         ] {
             assert!(output.contains(expected), "missing mapping {expected}");
         }
         assert_eq!(output.matches("40003:8086/tcp").count(), 2, "CPU and CUDA");
-        assert!(output.contains("@postgres:5432/"));
-        assert!(output.contains("ws://quip-caddy:8088/rpc"));
         assert!(output.contains("--rpc-port=9944"));
     }
 
     #[test]
-    fn all_host_publications_can_be_disabled_in_docker() {
+    fn only_the_log_collector_stays_published_when_everything_is_off() {
         use crate::service_ports::PORT_SPECS;
         let mut config = NodeConfig::default();
         for spec in PORT_SPECS {
@@ -655,15 +513,23 @@ mod tests {
             spec.id.set_binding(&mut config, &RunMode::Docker, binding);
         }
         let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
-        assert!(!output.lines().any(|line| line.trim() == "ports:"));
+        assert_eq!(output.lines().filter(|l| l.trim() == "ports:").count(), 1);
+        assert!(output.contains("\"127.0.0.1:5514:5514/udp\""));
         assert!(output.contains("--rpc-port=9944"));
     }
 
+    /// The Docker logging driver sends to the host port in `QUIP_LOG_PORT`.
+    /// The collector mapping must stay on loopback so nothing off-box can
+    /// inject lines into the operator's log.
     #[test]
-    fn admin_listener_is_reachable_only_when_requested() {
-        assert_eq!(configure_caddy_admin(CADDYFILE, false).unwrap(), CADDYFILE);
-        let enabled = configure_caddy_admin(CADDYFILE, true).unwrap();
-        assert!(enabled.contains("admin :2019"));
+    fn log_collector_is_always_published_on_loopback() {
+        let mut config = NodeConfig::default();
+        config.service_ports.log_collector.host_port = 15514;
+        for mode in [RunMode::Docker, RunMode::Native] {
+            let output = apply_port_publications(COMPOSE_YML, &config, &mode).unwrap();
+            assert!(output.contains("\"127.0.0.1:15514:5514/udp\""), "{mode:?}");
+        }
+        assert!(COMPOSE_YML.contains("udp://127.0.0.1:${QUIP_LOG_PORT:-5514}"));
     }
 
     /// Asserts on the *shape* rather than on the three names we happen to know:
@@ -687,7 +553,6 @@ mod tests {
              other Quip stack on the host: {leftover:?}"
         );
         // The volume keys themselves are preserved.
-        assert!(patched.contains("\n  pgdata:"));
         assert!(patched.contains("\n  caddy-data:"));
         assert!(patched.contains("\n  caddy-config:"));
     }
@@ -697,7 +562,7 @@ mod tests {
         // `container_name:` is a different directive — it must survive so the
         // cleanup/reaping logic can still find containers by name.
         let patched = strip_volume_names(COMPOSE_YML);
-        assert!(patched.contains("container_name: quip-postgres"));
+        assert!(patched.contains("container_name: quip-validator"));
         assert!(patched.contains("container_name: quip-dashboard"));
     }
 
@@ -738,38 +603,18 @@ mod tests {
         assert!(!patched.contains("--public-addr"));
     }
 
-    /// Upstream gates the miner, dashboard, and faucet on the validator being
-    /// *synced*, which is hours on a fresh install. Only those three relax to
-    /// `service_started`; the dashboard's postgres dependency must keep waiting
-    /// for health, since that check passes in seconds and skipping it races the
-    /// database.
+    /// Upstream gates the miner and the faucet on the validator being synced,
+    /// which takes hours on a fresh install. The dashboard has no dependency.
     #[test]
-    fn ungating_relaxes_only_the_validator_dependencies() {
+    fn ungating_relaxes_every_validator_dependency() {
         let patched =
             patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
-
-        assert!(
-            !patched.contains("quip-validator:\n        condition: service_healthy"),
-            "a service still waits for the validator to finish syncing"
-        );
-        assert!(
-            !patched.contains("quip-validator:\n      condition: service_healthy"),
-            "the dashboard anchor still waits for the validator to finish syncing"
-        );
-        assert!(
-            patched.contains("postgres:\n      condition: service_healthy"),
-            "the dashboard must still wait for postgres to be healthy"
-        );
-
-        // Every validator dependency upstream declares is accounted for.
+        assert!(!patched.contains("quip-validator:\n        condition: service_healthy"));
         assert_eq!(
             COMPOSE_YML.matches("condition: service_healthy").count(),
-            patched.matches("condition: service_healthy").count()
-                + patched.matches("condition: service_started").count()
+            patched.matches("condition: service_started").count()
                 - COMPOSE_YML.matches("condition: service_started").count(),
         );
-
-        // The healthcheck itself stays: it still reports sync progress.
         assert!(patched.contains("test: [\"CMD\", \"validator-healthcheck\"]"));
     }
 
@@ -790,12 +635,9 @@ mod tests {
             "./data",
             "./data/aglais-chain-db",
             "./dashboard-data",
-            "./caddy/Caddyfile",
             "./chain-specs/aglais-network.json",
             "./config/quip-miner.toml",
             "./scripts/validator-healthcheck.sh",
-            "./syslog-ng/syslog-ng.conf",
-            "./syslog-ng/entrypoint.sh",
             "./data/logs",
         ];
         for line in COMPOSE_YML.lines() {
@@ -809,18 +651,6 @@ mod tests {
                 "compose bind-mounts {src}, which sync_stack_assets does not stage"
             );
         }
-    }
-
-    /// The Caddyfile upstream and the `[dashboard].listen` we render must name
-    /// the same container port. They live in different repositories, so nothing
-    /// but this test stops one from moving without the other and leaving
-    /// `/api/v1/*` proxying into a closed port.
-    #[test]
-    fn caddy_miner_upstream_matches_the_rendered_dashboard_port() {
-        assert!(CADDYFILE.contains(&format!(
-            "reverse_proxy quip-miner:{}",
-            crate::config::DOCKER_MINER_REST_PORT
-        )));
     }
 
     /// Upstream reintroduced a miner config template mount at the Aglais
@@ -841,41 +671,37 @@ mod tests {
         );
     }
 
-    /// Caddy picks console vs JSON from whether stderr is a terminal, and under
-    /// compose it never is. The Caddyfile pins console explicitly; if the
-    /// submodule drops that block, every Caddy line reverts to a JSON blob that
-    /// `log_stream::parse_log_line` cannot level-tag.
+    /// Caddy in the dashboard image reads its `/api/v1/*` upstream from
+    /// `QUIP_MINER_UPSTREAM`. Upstream compose does not pass it, so the patch
+    /// adds it. The default must keep Docker mode on the miner container.
     #[test]
-    fn caddyfile_pins_human_readable_console_logging() {
-        assert!(
-            CADDYFILE.contains("wrap console"),
-            "Caddyfile must pin the console encoder"
-        );
-        assert!(
-            patch_caddyfile(&RunMode::Native, CADDYFILE, 20100).contains("wrap console"),
-            "patching must not drop the log block"
+    fn dashboard_receives_the_caddy_miner_upstream() {
+        let patched =
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+        assert_eq!(
+            patched
+                .matches("      QUIP_MINER_UPSTREAM: ${QUIP_MINER_UPSTREAM:-quip-miner:8086}\n")
+                .count(),
+            1
         );
     }
 
+    /// The dashboard backend dials the miner REST listener directly. The
+    /// compose default and the `[dashboard].listen` port that `config.rs`
+    /// renders must name the same container port.
     #[test]
-    fn docker_caddyfile_keeps_v02_routes_and_miner_upstream() {
-        let patched = patch_caddyfile(&RunMode::Docker, CADDYFILE, 20100);
-        assert!(patched.contains("handle /rpc"));
-        assert!(patched.contains("handle /api/v1/*"));
-        assert!(patched.contains("reverse_proxy quip-miner:8086"));
-        assert!(!patched.contains("/api/faucet"));
-        assert!(!patched.contains("quip-faucet"));
-        assert!(!patched.contains("host.docker.internal:20100"));
+    fn compose_miner_rest_default_matches_the_rendered_dashboard_port() {
+        assert!(COMPOSE_YML.contains(&format!(
+            "QUIP_MINER_REST_URL: ${{QUIP_MINER_REST_URL:-http://quip-miner:{}}}",
+            crate::config::DOCKER_MINER_REST_PORT
+        )));
     }
 
+    /// The front door and the collector moved into the dashboard container.
     #[test]
-    fn native_caddyfile_rewrites_only_miner_upstream() {
-        let patched = patch_caddyfile(&RunMode::Native, CADDYFILE, 20100);
-        assert!(patched.contains("handle /rpc"));
-        assert!(patched.contains("handle /api/v1/*"));
-        assert!(patched.contains("reverse_proxy host.docker.internal:20100"));
-        assert!(!patched.contains("reverse_proxy quip-miner:8086"));
-        assert!(!patched.contains("/api/faucet"));
-        assert!(!patched.contains("quip-faucet"));
+    fn embedded_compose_has_no_standalone_front_door_or_database() {
+        for gone in ["\n  caddy:", "\n  postgres:", "\n  quip-syslog:"] {
+            assert!(!COMPOSE_YML.contains(gone), "{gone}");
+        }
     }
 }
