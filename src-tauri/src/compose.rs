@@ -33,23 +33,28 @@ static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Host uid/gid for the PUID/PGID env vars passed to containers that need
 /// to chown bind-mounted `/data` to the host user.
-///
-/// Gids below 1000 are clamped up to 1000 — macOS users default to gid 20
-/// (staff), which collides with Alpine's `games` group inside the node
-/// image and breaks the entrypoint's `groupmod`. Keeping the real uid
-/// preserves host-side ownership; the gid just won't have a friendly name.
 pub(crate) fn host_uid_gid() -> (u32, u32) {
     #[cfg(unix)]
     {
         // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        (uid, gid.max(1000))
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        runtime_ids(uid, gid)
     }
     #[cfg(not(unix))]
     {
         (1000, 1000)
     }
+}
+
+/// Container-safe PUID/PGID for a host uid/gid.
+///
+/// Root maps to 1000, because the dashboard image refuses PUID or PGID 0 and
+/// exits. Gids below 1000 are clamped up to 1000: macOS users default to gid
+/// 20 (staff), which collides with Alpine's `games` group inside the node
+/// image and breaks the entrypoint's `groupmod`.
+fn runtime_ids(uid: u32, gid: u32) -> (u32, u32) {
+    let uid = if uid == 0 { 1000 } else { uid };
+    (uid, gid.max(1000))
 }
 
 // ── profile + services selection ───────────────────────────────────────────
@@ -431,6 +436,10 @@ fn render_env_lines(
         ),
         format!("VALIDATOR_NAME={validator_name}"),
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
+        format!(
+            "QUIP_LOG_PORT={}",
+            settings.node_config.service_ports.log_collector.host_port
+        ),
     ]);
 
     // Miner memory ceiling. Omitted when unset so compose's own `:-16g`
@@ -447,6 +456,19 @@ fn render_env_lines(
     // QUIP_VALIDATOR_RPC_URLS is not written. Its compose default,
     // ws://quip-validator:9944, is correct in both modes, because the
     // validator is a container in both.
+
+    // Native runs the miner on the host. The dashboard backend dials its REST
+    // listener directly, and Caddy proxies /api/v1/* to it, so both go
+    // through the Docker host gateway. Docker mode keeps the compose defaults.
+    if settings.run_mode == RunMode::Native {
+        let rest_port = crate::config::native_rest_port(&settings.node_config);
+        lines.push(format!(
+            "QUIP_MINER_REST_URL=http://host.docker.internal:{rest_port}"
+        ));
+        lines.push(format!(
+            "QUIP_MINER_UPSTREAM=host.docker.internal:{rest_port}"
+        ));
+    }
 
     lines
 }
@@ -844,8 +866,8 @@ pub(crate) async fn start_stack_core(
     let rest_port = crate::config::native_rest_port(&settings.node_config);
 
     // (3) Materialise the resolved native REST port so config rendering and the
-    // staged Caddyfile both publish the same port. (rest_host is forced to
-    // loopback inside the config renderer.)
+    // dashboard's `.env` miner URLs both publish the same port. (rest_host is
+    // forced to loopback inside the config renderer.)
     if settings.run_mode == RunMode::Native {
         settings.node_config.rest_insecure_port = i32::from(rest_port);
     }
@@ -1836,6 +1858,53 @@ mod tests {
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));
+    }
+
+    /// The logging driver of every service and the collector's published port
+    /// both read QUIP_LOG_PORT. A mismatch drops every log line silently.
+    #[test]
+    fn env_lines_write_the_log_collector_port() {
+        let mut settings = AppSettings::default();
+        settings.node_config.service_ports.log_collector.host_port = 15514;
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
+        assert!(env.contains("QUIP_LOG_PORT=15514"), "{env}");
+    }
+
+    /// Docker mode keeps the compose defaults, which name the miner container.
+    #[test]
+    fn env_lines_docker_defers_miner_urls_to_compose() {
+        let env = render_env_lines(&AppSettings::default(), 501, 1000, &uniform_tags("v0.3.0"))
+            .join("\n");
+        assert!(!env.contains("QUIP_MINER_REST_URL"), "{env}");
+        assert!(!env.contains("QUIP_MINER_UPSTREAM"), "{env}");
+    }
+
+    /// In Native mode the miner runs on the host. The dashboard backend and
+    /// Caddy both reach it through the Docker host gateway.
+    #[test]
+    fn env_lines_native_point_the_dashboard_at_the_host_miner() {
+        let mut settings = AppSettings {
+            run_mode: RunMode::Native,
+            ..AppSettings::default()
+        };
+        settings.node_config.rest_insecure_port = 20111;
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
+        assert!(
+            env.contains("QUIP_MINER_REST_URL=http://host.docker.internal:20111"),
+            "{env}"
+        );
+        assert!(
+            env.contains("QUIP_MINER_UPSTREAM=host.docker.internal:20111"),
+            "{env}"
+        );
+    }
+
+    /// The dashboard image exits when PUID or PGID is 0.
+    #[test]
+    fn runtime_ids_never_pass_root_to_the_containers() {
+        assert_eq!(runtime_ids(0, 0), (1000, 1000));
+        assert_eq!(runtime_ids(501, 20), (501, 1000));
+        assert_eq!(runtime_ids(1001, 1001), (1001, 1001));
     }
 
     // ── post-up wiring check ───────────────────────────────────────────────
