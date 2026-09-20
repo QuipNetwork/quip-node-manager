@@ -237,7 +237,13 @@ pub(crate) async fn resolve_channel_image_tags(
             "QUIP_VALIDATOR_TAG",
             Some(crate::stack_assets::MIN_VALIDATOR_TAG)
         ),
-        resolve_pair(&client, DASHBOARD_IMAGE, "QUIP_DASHBOARD_TAG", None),
+        // The compose file expects Caddy and the collector inside this image.
+        resolve_pair(
+            &client,
+            DASHBOARD_IMAGE,
+            "QUIP_DASHBOARD_TAG",
+            Some(crate::stack_assets::MIN_DASHBOARD_TAG)
+        ),
     );
 
     Ok(ResolvedImageTags {
@@ -253,7 +259,7 @@ pub(crate) async fn resolve_channel_image_tags(
 ///
 /// `min_tag`, when set, is a compatibility floor: tags below it are dropped
 /// before either channel is picked, and the `.env` fallback is held to it too.
-/// See `stack_assets::MIN_VALIDATOR_TAG`.
+/// See `stack_assets::MIN_VALIDATOR_TAG` and `stack_assets::MIN_DASHBOARD_TAG`.
 async fn resolve_pair(
     client: &reqwest::Client,
     image: &str,

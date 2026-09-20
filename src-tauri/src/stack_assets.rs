@@ -59,6 +59,14 @@ const CHAIN_SPEC: &str =
 /// at a new network and this floor is what stops the old images coming with it.
 pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.3.0-rc1";
 
+/// Oldest dashboard image that can run `COMPOSE_YML`.
+///
+/// The compose file has no Caddy or collector service. It expects both inside
+/// the dashboard image, which first ships them in `v0.2.3-rc1`. It also mounts
+/// the Caddy certificate volumes under the image's `/data`, and `v0.2.3-rc2` is
+/// the first tag that serves only the public `/files` trees from there.
+pub(crate) const MIN_DASHBOARD_TAG: &str = "v0.2.3-rc2";
+
 /// Faucet for the network `CHAIN_SPEC` names.
 ///
 /// The miner ships no built-in default: without `faucet_url` a fresh wallet
@@ -703,5 +711,18 @@ mod tests {
         for gone in ["\n  caddy:", "\n  postgres:", "\n  quip-syslog:"] {
             assert!(!COMPOSE_YML.contains(gone), "{gone}");
         }
+    }
+
+    /// The compose file expects Caddy and the collector inside the dashboard
+    /// image, and mounts certificate volumes under its `/data`. Only tags at or
+    /// above the floor ship both and serve just the public `/files` trees.
+    #[test]
+    fn dashboard_floor_admits_only_embedded_service_images() {
+        use crate::update::parse_semver;
+        let floor = parse_semver(MIN_DASHBOARD_TAG);
+        assert!(parse_semver("v0.2.2") < floor);
+        assert!(parse_semver("v0.2.3-rc1") < floor);
+        assert!(parse_semver("v0.2.3-rc2") >= floor);
+        assert!(parse_semver("v0.2.3") >= floor);
     }
 }
