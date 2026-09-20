@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { test, expect } from "bun:test";
-import { applyPortEdits } from "./service-ports.js";
+import { applyPortEdits, requiredNote } from "./service-ports.js";
 
 const rpc = {
   id: "validator_rpc",
@@ -83,4 +83,31 @@ test("Native REST edits use the host listener field", () => {
   );
   expect(edited.rest_insecure_port).toBe(50000);
   expect(edited.service_ports.miner_rest).toEqual({ enabled: false, host_port: 8086 });
+});
+
+test("required rows explain why they cannot be turned off", () => {
+  expect(requiredNote({ id: "log_collector", required: true })).toBe(
+    " (always on; listens on 127.0.0.1 only)",
+  );
+  expect(requiredNote({ id: "validator_rpc", required: true })).toBe(
+    " (required in Native mode; this is a host port)",
+  );
+  expect(requiredNote({ id: "validator_rpc", required: false })).toBe("");
+});
+
+test("editing the collector row changes only its host port", () => {
+  const collector = {
+    id: "log_collector",
+    service: "quip-dashboard",
+    label: "Log collector",
+    required: true,
+    public_access_optional: false,
+    port_path: "service_ports.log_collector.host_port",
+    enabled_path: "service_ports.log_collector.enabled",
+  };
+  const base = { service_ports: { log_collector: { enabled: true, host_port: 5514 } } };
+  const edited = applyPortEdits(base, [collector], {
+    log_collector: { enabled: false, host_port: "15514" },
+  });
+  expect(edited.service_ports.log_collector).toEqual({ enabled: true, host_port: 15514 });
 });

@@ -441,10 +441,12 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             let enabled = app.form.service_port_enabled(spec.id);
             let required = spec.id.required(&app.form.run_mode());
             let check = if enabled { "[x]" } else { "[ ]" };
-            let suffix = if required {
-                " (required in Native mode)"
-            } else {
-                ""
+            let suffix = match (required, spec.id) {
+                (false, _) => "",
+                (true, crate::service_ports::PortId::LogCollector) => {
+                    " (always on; 127.0.0.1 only)"
+                }
+                (true, _) => " (required in Native mode)",
             };
             let listener = if spec.id == crate::service_ports::PortId::MinerRest && required {
                 "native".to_string()
