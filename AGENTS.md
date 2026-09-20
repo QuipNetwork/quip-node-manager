@@ -5,10 +5,11 @@ Instructions for AI coding agents (Claude Code, Codex, Cursor, etc.).
 ## Project Overview
 
 Quip Node Desktop Manager — a Tauri v2 desktop app that orchestrates and monitors the Quip node
-stack (miner + validator + dashboard + postgres + caddy). Runs the stack via Docker
-Compose, or in Native mode (default on macOS) where the miner binary runs on the host and the
-support services run in Docker. The same binary also exposes a headless TUI (`--cli`, or when no
-display is available — SSH/headless). Rust backend + vanilla HTML/CSS/JS frontend.
+stack (miner + validator + dashboard). The dashboard image runs Caddy, the log collector, and its
+own index. Runs the stack via Docker Compose, or in Native mode (default on macOS) where the miner
+binary runs on the host and the dashboard runs in Docker. The same binary also exposes a headless
+TUI (`--cli`, or when no display is available — SSH/headless). Rust backend + vanilla HTML/CSS/JS
+frontend.
 
 ## Architecture
 
@@ -20,7 +21,7 @@ quip-node-manager/
 │   └── app.js
 ├── vendor/
 │   └── nodes.quip.network/        # git submodule — upstream compose stack
-│                                  # (docker-compose.yml, caddy/Caddyfile,
+│                                  # (docker-compose.yml,
 │                                  # chain-specs/aglais-network.json). Embedded into
 │                                  # the binary via include_str! in stack_assets.rs
 │                                  # at compile time (NOT Tauri's bundle.resources),
@@ -46,9 +47,9 @@ quip-node-manager/
         ├── cmd.rs                 # Command wrapper: PATH augmentation (login-shell
         │                          # $PATH + known tool dirs) + Windows no-console-flash
         ├── compose.rs             # docker compose orchestration: miner +
-        │                          # validator + dashboard + postgres + caddy
-        ├── stack_assets.rs        # include_str! the compose.yml + Caddyfile + chain
-        │                          # spec; patch ports + Native upstream at stage time
+        │                          # validator + dashboard
+        ├── stack_assets.rs        # include_str! the compose.yml + chain spec;
+        │                          # patch ports + Native upstream at stage time
         ├── log_stream.rs          # docker compose logs -f → Tauri events
         ├── native.rs              # native binary download + lifecycle
         ├── hardware.rs            # GPU/Docker/Python detection
@@ -81,8 +82,8 @@ quip-node-manager/
   `docker-compose` (v1), not the Python bindings.
 - **Container names** (from compose `container_name`): `quip-cpu` or
   `quip-cuda` (miner, chosen by GPU presence), `quip-validator` (Substrate
-  block-producing validator), `quip-dashboard`, `quip-postgres`, `quip-caddy`. The
-  dashboard/Caddy reach the miner via the compose network alias `quip-miner`,
+  block-producing validator), and `quip-dashboard`. In Docker mode, the
+  dashboard reaches the miner via the compose network alias `quip-miner:8086`,
   and the validator via `quip-validator`. The miner self-bootstraps on first
   start — it auto-funds via the faucet for the selected channel and registers
   its keystore in `QuantumPow.Miners`, so there is no separate one-shot
@@ -96,7 +97,7 @@ quip-node-manager/
   fixed regardless of host publishing settings.
 - **Native listeners**: validator RPC defaults to `127.0.0.1:9944`. Native mode
   requires this host mapping, with public access optional. The native miner REST
-  listener defaults to `0.0.0.0:20100` so Caddy can reach it through
+  listener defaults to `0.0.0.0:20100` so the dashboard container reaches it through
   `host.docker.internal`.
 
 ## Docker Images
@@ -131,24 +132,28 @@ digests tag by tag, and `latest` moves under it.
   `not found`.
 - Validator: `registry.gitlab.com/quip.network/quip-validator/quip-network-node`
 - Dashboard: `registry.gitlab.com/quip.network/dashboard.quip.network`
-- Postgres: `postgres:16` (Docker Hub)
-- Caddy: `caddy:2-alpine` (Docker Hub)
+
+The manager holds the dashboard image to a floor of `MIN_DASHBOARD_TAG =
+v0.2.3-rc2` (`stack_assets.rs`). `v0.2.3-rc1` is the first tag with Caddy
+embedded in the image, and `v0.2.3-rc2` is the first tag with the `/files`
+allowlist the upstream changelog requires.
 
 Selected by `AppSettings`:
 - `image_tag: ImageTag` — `Cpu` | `Cuda`. D-Wave QPU mining is not a separate
   image: it rides on the CPU image via the `[dwave]` section in `config.toml`.
-- `tls_enabled: bool` — controls whether Caddy provisions TLS (`:80`/`:443` are
-  published by default and configurable in advanced settings).
+- `tls_enabled: bool` — controls whether the dashboard's embedded Caddy
+  provisions TLS (`:80`/`:443` are published by default and configurable in
+  advanced settings).
 
-The dashboard + postgres + caddy + validator services are always part
-of the `cpu`/`cuda` profile — there is no `dashboard_enabled` toggle.
+The dashboard and validator services are always part of the `cpu`/`cuda`
+profile — there is no `dashboard_enabled` toggle.
 
 ## Run Modes
 
 | run_mode | node | compose services run |
 |----------|------|----------------------|
-| `Docker` | `quip-{cpu,cuda}` miner container via compose | every profile service: miner + `quip-validator` + `dashboard` + `postgres` + `caddy` (empty positional list ⇒ compose starts the whole profile) |
-| `Native` (macOS only) | native miner binary on the host (`~/quip-data/bin/quip-miner-*`) | explicit list `quip-validator dashboard postgres caddy` — no miner container. The validator's JSON-RPC (9944) is published on `127.0.0.1:<validator_rpc_port>` so the host miner connects via `ws://127.0.0.1:<validator_rpc_port>`; the dashboard reaches the host miner's REST at `host.docker.internal:<rest_port>` |
+| `Docker` | `quip-{cpu,cuda}` miner container via compose | every profile service: miner + `quip-validator` + `dashboard` (empty positional list ⇒ compose starts the whole profile) |
+| `Native` (macOS only) | native miner binary on the host (`~/quip-data/bin/quip-miner-*`) | explicit list `quip-validator dashboard` — no miner container. The validator's JSON-RPC (9944) is published on `127.0.0.1:<validator_rpc_port>` so the host miner connects via `ws://127.0.0.1:<validator_rpc_port>`. The dashboard reaches the host miner's REST at `host.docker.internal:<rest_port>` |
 
 ## Compose Profiles
 
@@ -156,19 +161,18 @@ of the `cpu`/`cuda` profile — there is no `dashboard_enabled` toggle.
 
 | profile | services started |
 |---------|------------------|
-| `cpu` | `cpu` miner + `quip-validator` + `dashboard` + `postgres` + `caddy` |
-| `cuda` | `cuda` miner + `quip-validator` + `dashboard` + `postgres` + `caddy` |
+| `cpu` | `cpu` miner + `quip-validator` + `dashboard` |
+| `cuda` | `cuda` miner + `quip-validator` + `dashboard` |
 
 `compose_profile(image_tag)` returns the image's service name (`cpu` or `cuda`) —
 there is no `qpu` profile (D-Wave mining rides on the CPU image via
-`config.toml [dwave]`), and no `-notls`/`-nodash` variants. Caddy is always in
-both profiles. The vendored compose file also defines an opt-in `faucet` profile
-(`quip-faucet`), which the manager never selects.
+`config.toml [dwave]`), and no `-notls`/`-nodash` variants. The dashboard is
+always in both profiles. The vendored compose file also defines an opt-in
+`faucet` profile (`quip-faucet`), which the manager never selects.
 
 In Native mode, `start_stack` passes an explicit positional service list
-(`quip-validator dashboard postgres caddy`) that omits the miner, so
-`--profile` gates eligibility while positional args restrict what actually
-starts.
+(`quip-validator dashboard`) that omits the miner, so `--profile` gates
+eligibility while positional args restrict what actually starts.
 
 ## Data Files (all in `~/quip-data/`)
 
@@ -176,39 +180,36 @@ starts.
 |------|------------------------|---------|
 | `app-settings.json` | settings.rs (user preferences) | UI toggles + NodeConfig |
 | `config.toml` | config.rs on every Start | Node config (bind-mounted into the node container in Docker mode; read directly by the binary in Native mode) |
-| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_TOKEN, DWAVE_API_SOLVER, DWAVE_API_REGION, POSTGRES_PASSWORD, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION; mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-caddy:8088/rpc`, Caddy's internal front door, so the dashboard resolves both the chain RPC and the local miner REST from one host.) |
-| `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with Caddy host API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, and (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944` |
-| `caddy/Caddyfile` | stack_assets.rs (embedded copy + patch) | Caddy routes; the local faucet route is always stripped; in Native mode the `/api/v1/*` upstream is rewritten from `quip-miner:8086` to `host.docker.internal:<rest_port>` |
+| `.env` | compose.rs on every Start | Compose env: PUID, PGID, QUIP_HOSTNAME, CERT_EMAIL, ZEROSSL_API_KEY, DWAVE_API_TOKEN, DWAVE_API_SOLVER, DWAVE_API_REGION, QUIP_MINER_TAG, QUIP_DASHBOARD_TAG, QUIP_VALIDATOR_TAG, QUIP_MINER_CPUSET, VALIDATOR_NAME, QUIP_GPU_UTILIZATION, QUIP_LOG_PORT (both modes), and (Native only) QUIP_MINER_REST_URL and QUIP_MINER_UPSTREAM. The file has mode 0600 on Unix. (No QUIP_NODE_URL — removed in v0.2. No QUIP_VALIDATORS — the upstream compose made the miner fully config-driven, so validators live only in `config.toml`. QUIP_VALIDATOR_RPC_URLS is deliberately NOT written — it defers to the compose default `ws://quip-validator:9944`, which is correct in both modes because the validator is a container in both.) |
+| `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with the dashboard's public API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944`, and the `QUIP_MINER_UPSTREAM` patch that adds the dashboard's embedded Caddy upstream, which upstream compose does not pass |
 | `chain-specs/aglais-network.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
 | `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
-| `dashboard-data/` | bind-mount target for the dashboard | Dashboard auxiliary state |
+| `dashboard-data/` | bind-mount target for the dashboard | the dashboard index (`dashboard.db`) and collector state |
 | `node-secret.json` | secret.rs | `{ "secret": "<64-hex>" }` — read by secret.rs and gates the `secret` pre-flight check, but NOT written into config.toml in v0.2. The node's actual signing identity is `keystore.json` (Docker `/data/keystore.json`, Native `keystore.json`). |
 | `bin/quip-miner-*` | native.rs | Downloaded native miner binary (`quip-miner-macos-arm64` / `-x86_64`). Legacy pre-v0.2 `quip-network-node-*` binaries here are auto-deleted on launch. |
 
 Project-scoped Docker volumes (survive `docker compose down` by design):
-`quip_pgdata`, `quip_caddy-data`, `quip_caddy-config`. The upstream compose
-pins fixed global `name:`s (`quip-pgdata`, …); the manager strips them at
-stage time (`stack_assets::strip_volume_names`) so they don't collide with
-other Quip stacks on the same host.
+`quip_caddy-data`, `quip_caddy-config`. The dashboard container mounts them.
+The upstream compose pins fixed global `name:`s (`quip-caddy-data`, …). The
+manager strips them at stage time (`stack_assets::strip_volume_names`) so they
+do not collide with other Quip stacks on the same host.
 
 Bootstrap state at `~/.config/quip-node-manager/bootstrap.json`:
-holds a `data_dir` override plus a per-install `postgres_password`
-(generated once on first access, never rotated — it's keyed to the stored
-Postgres volume hash).
+holds only a `data_dir` override.
 
 ## Stack Asset Patching
 
-`vendor/nodes.quip.network/docker-compose.yml` and `caddy/Caddyfile` are
-**embedded into the binary at compile time** via `include_str!`. This
-avoids Tauri's runtime resource resolution entirely — on Windows, the CI
-ships a raw `.exe` (`tauri build --no-bundle`) with no sibling resource
-folder, and a `BaseDirectory::Resource` lookup would fail. Embedding
-makes the staged files travel as `&'static str` in `.rodata`.
+`vendor/nodes.quip.network/docker-compose.yml` is **embedded into the binary
+at compile time** via `include_str!`. This avoids Tauri's runtime resource
+resolution entirely — on Windows, the CI ships a raw `.exe`
+(`tauri build --no-bundle`) with no sibling resource folder, and a
+`BaseDirectory::Resource` lookup would fail. Embedding makes the staged file
+travel as a `&'static str` in `.rodata`.
 
 `start_stack` and `pull_compose_images` call
 `stack_assets::sync_stack_assets(run_mode, config)` before invoking Docker Compose.
-It stages the embedded compose.yml, Caddyfile, and chain spec
+It stages the embedded compose.yml and chain spec
 (`chain-specs/aglais-network.json`), always overwriting — no merge. Patches:
 
 1. **Compose host publications**: rebuild each managed service's `ports` list
@@ -223,19 +224,15 @@ It stages the embedded compose.yml, Caddyfile, and chain spec
    `127.0.0.1:<validator_rpc_port>:9944/tcp`. The public-access switch removes
    the loopback restriction. Publish Docker RPC only when the user turns it on.
 
-4. **Caddyfile faucet strip** (always): the optional local faucet route block is
-   removed. The manager uses the public faucet for the selected channel. Beta
-   uses the Aglais faucet. Release uses the testnet faucet. See
-   `UpdateChannel::faucet_url`.
-
-5. **Caddyfile upstream rewrite** (Native mode only): `quip-miner:8086` becomes
-   `host.docker.internal:<native_rest_port>` so the dashboard container reaches
-   the host miner. Docker mode keeps `quip-miner:8086`.
+4. **Dashboard miner upstream**: add `QUIP_MINER_UPSTREAM` to the dashboard
+   environment. The dashboard image's embedded Caddy reads it, but upstream
+   compose passes only `QUIP_MINER_REST_URL` (the backend's own upstream), so
+   the patch fills the gap.
 
 Why embedded + patched at stage time (instead of compose's `${VAR}` env
-substitution): the Caddyfile upstream rewrite and the validator `--public-addr`
-arg both require rewriting a YAML/Caddyfile token, not just supplying an env
-var, so all the port/host remaps live in one patch pass for consistency.
+substitution): the validator `--public-addr` arg requires rewriting a YAML
+token, not just supplying an env var, so all the port/host remaps live in one
+patch pass for consistency.
 
 ## Port Handling
 
@@ -246,17 +243,17 @@ field in advanced settings. The shared catalog is `service_ports::PORT_SPECS`.
 |---------|-------------------|-------------------|
 | `quip-validator` | 30333 TCP/UDP P2P, 9944 TCP RPC, and 9615 TCP metrics | P2P only |
 | `quip-miner` | 8086 TCP REST for CPU or CUDA | No |
-| `quip-dashboard` | 3001 TCP HTTP | No |
-| `quip-postgres` | 5432 TCP PostgreSQL | No |
-| `quip-caddy` | 20049 TCP API, 80 TCP HTTP, and 443 TCP HTTPS | Yes |
-| `quip-caddy` | 443 UDP and 20049 UDP HTTP/3, 8088 TCP internal HTTP, and 2019 TCP administration | No |
+| `quip-dashboard` | 20049 TCP API, 80 TCP HTTP, and 443 TCP HTTPS | Yes |
+| `quip-dashboard` | 443 UDP and 20049 UDP HTTP/3, and 8088 TCP internal HTTP | No |
+| `quip-dashboard` | 5514 UDP log collector | Always on, 127.0.0.1 only |
 
 Host ports default to the container ports. HTTP/3 requires TLS on its matching
-site. Publishing the administration API also changes its bind address.
-That API can change the Caddy configuration.
+site. The log collector row is always published on loopback, and only its host
+port can change. The manager writes that port to `QUIP_LOG_PORT`, which the
+Docker logging driver reads.
 
 Native mode requires RPC, which defaults to 9944 and remains local unless the
-user selects public access. Caddy also needs native miner REST.
+user selects public access. The dashboard also needs native miner REST.
 Its separate host listener defaults to 20100. Switching modes preserves the
 Docker miner's optional host mapping. The manager probes Docker services from
 inside the validator container. Health reporting works with public ports off.
@@ -286,8 +283,8 @@ keys outright, and it disables the dashboard unless **both** `listen` and
 `listen = "0.0.0.0:8086"` to match the Caddyfile's `quip-miner:8086` upstream,
 with `data_dir = "/data/attempts"` inside the volume. Native renders
 `listen = "0.0.0.0:<native_rest_port>"` (default 20100) and
-`data_dir = <data_dir>/attempts`. This bind lets the Caddy container reach the
-listener through the Docker host gateway.
+`data_dir = <data_dir>/attempts`. This bind lets the dashboard container's
+Caddy reach the listener through the Docker host gateway.
 
 ### `public_host` resolution and the start gate
 
@@ -399,7 +396,7 @@ The frontend uses `window.__TAURI__.core.invoke` (`withGlobalTauri: true`).
 
 Events emitted by backend (complete set): `node-log`, `checklist-update`,
 `pull-progress`, `pull-complete`, `stop-started`, `stop-complete`,
-`dashboard-db-mismatch`, `image-update-available`, `binary-update-available`,
+`image-update-available`, `binary-update-available`,
 `binary-download-progress`, `app-update-available`.
 
 - `node-log` → `{ timestamp, level, message }`
@@ -410,7 +407,6 @@ Events emitted by backend (complete set): `node-log`, `checklist-update`,
 - `pull-complete` → `{ gen, success, error }` (emitted when the pull process
   exits — the authoritative "pull is over" signal)
 - `stop-started`, `stop-complete` — stop lifecycle
-- `dashboard-db-mismatch` → `{ message }` (Postgres volume password mismatch)
 - `image-update-available` → `{ image, info }` (emitted per image whose digest
   changed, gated on `info.update_available`)
 - `binary-update-available` → native-binary UpdateInfo
