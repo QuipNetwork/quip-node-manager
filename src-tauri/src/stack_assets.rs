@@ -195,9 +195,15 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
     Ok(())
 }
 
-/// Chown the given staged bind-mount directories (and their contents) to the
-/// runtime PUID/PGID, but only when those ids differ from the calling
-/// process's uid/gid. No-op on Windows.
+/// Chown the given staged bind-mount directories to the runtime PUID/PGID,
+/// but only when those ids differ from the calling process's uid/gid. No-op
+/// on Windows.
+///
+/// Only `data/logs` is chowned recursively. The container entrypoints chown
+/// `/data` themselves, so the chain database underneath it needs no walk here
+/// — and walking it would re-own hundreds of thousands of files on every
+/// Start. Nothing chowns `/logs`, which is a separate mount point, so the
+/// collector depends on this call.
 #[cfg(unix)]
 fn chown_staged_bind_mounts<const N: usize>(
     base: &std::path::Path,
@@ -210,7 +216,12 @@ fn chown_staged_bind_mounts<const N: usize>(
         return Ok(());
     }
     for sub in dirs {
-        chown_recursive(&base.join(sub), puid, pgid)?;
+        let path = base.join(sub);
+        if sub == "data/logs" {
+            chown_recursive(&path, puid, pgid)?;
+        } else {
+            chown_one(&path, puid, pgid)?;
+        }
     }
     Ok(())
 }
