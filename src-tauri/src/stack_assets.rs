@@ -195,9 +195,9 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
     Ok(())
 }
 
-/// Chown the given staged bind-mount directories to the runtime PUID/PGID,
-/// but only when those ids differ from the calling process's uid/gid. No-op
-/// on Windows.
+/// Chown the given staged bind-mount directories to the runtime PUID/PGID
+/// when the manager runs as root. No-op on Windows, and no-op for every
+/// non-root caller.
 ///
 /// Only `data/logs` is chowned recursively. The container entrypoints chown
 /// `/data` themselves, so the chain database underneath it needs no walk here
@@ -209,12 +209,16 @@ fn chown_staged_bind_mounts<const N: usize>(
     base: &std::path::Path,
     dirs: [&str; N],
 ) -> Result<(), String> {
-    let (puid, pgid) = crate::compose::host_uid_gid();
-    // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    if (uid, gid) == (puid, pgid) {
+    // Only root both needs this and is allowed to do it. A non-root caller
+    // already owns what it staged, so the containers (which run as its own
+    // uid) can write there. It also cannot chown to a group it does not
+    // belong to: a macOS account sits in gid 20 while `runtime_ids` raises
+    // PGID to 1000, so chowning would fail with EPERM and abort every Start.
+    // SAFETY: geteuid takes no arguments and cannot fail per POSIX.
+    if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
+    let (puid, pgid) = crate::compose::host_uid_gid();
     for sub in dirs {
         let path = base.join(sub);
         if sub == "data/logs" {
@@ -819,14 +823,15 @@ mod tests {
     /// run as PUID/PGID 1000+ (`runtime_ids`), so those directories must be
     /// re-owned or the collector cannot write `data/logs/quip-node.log`.
     ///
-    /// Running as root to observe the chown actually happen needs root, which
-    /// CI does not have. What this test pins without root: the staged
-    /// directories exist after the call, and the call is a no-op — it does
-    /// not error, and it does not touch ownership — when the runtime ids
-    /// already match the calling process (the common non-root case).
+    /// Both branches matter, so this asserts whichever one the caller is in.
+    /// As root (the CI container), the staged directories must come back
+    /// owned by the runtime ids. As any other user, the call must leave
+    /// ownership alone: a macOS account sits in gid 20 while `runtime_ids`
+    /// raises PGID to 1000, and chowning to a group the caller is not in
+    /// fails with EPERM, which aborted every Start.
     #[cfg(unix)]
     #[test]
-    fn chown_staged_bind_mounts_is_a_noop_when_ids_already_match() {
+    fn chown_staged_bind_mounts_is_a_noop_for_a_non_root_caller() {
         use std::os::unix::fs::MetadataExt;
         let dir = unique_temp_dir("chown-noop");
         for sub in [
@@ -838,29 +843,30 @@ mod tests {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
 
-        // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        // SAFETY: geteuid takes no arguments and cannot fail per POSIX.
+        let root = unsafe { libc::geteuid() } == 0;
         let before = fs::metadata(dir.join("data/logs")).unwrap();
 
-        // The calling test process's own ids are not root, so `host_uid_gid`
-        // maps them back to themselves (see `runtime_ids`): puid == uid and
-        // pgid == gid.max(1000). When gid is already >= 1000 (true for every
-        // non-root CI/dev account), this call must be the no-op branch.
-        if gid >= 1000 {
-            chown_staged_bind_mounts(
-                &dir,
-                [
-                    "data",
-                    "data/aglais-chain-db",
-                    "dashboard-data",
-                    "data/logs",
-                ],
-            )
-            .unwrap();
-            let after = fs::metadata(dir.join("data/logs")).unwrap();
+        chown_staged_bind_mounts(
+            &dir,
+            [
+                "data",
+                "data/aglais-chain-db",
+                "dashboard-data",
+                "data/logs",
+            ],
+        )
+        .unwrap();
+
+        let after = fs::metadata(dir.join("data/logs")).unwrap();
+        if root {
+            let (puid, pgid) = crate::compose::host_uid_gid();
+            assert_eq!(after.uid(), puid, "root must hand the logs dir to PUID");
+            assert_eq!(after.gid(), pgid, "root must hand the logs dir to PGID");
+            assert_ne!(after.uid(), 0, "the collector never runs as uid 0");
+        } else {
             assert_eq!(before.uid(), after.uid());
             assert_eq!(before.gid(), after.gid());
-            assert_eq!(before.uid(), uid);
         }
 
         for sub in [
