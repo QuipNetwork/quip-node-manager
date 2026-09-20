@@ -383,7 +383,8 @@ where
 
 /// One concurrent input to the unified log streamer.
 pub enum StreamSource {
-    /// Tail the stack's merged log, written by the quip-syslog collector.
+    /// Tail the stack's merged log, written by the collector inside the dashboard
+    /// container.
     /// Every line carries the emitting container's name, which is parsed into
     /// `LogEntry.source`.
     MergedLog { path: PathBuf },

@@ -791,7 +791,7 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 ///   2. auto-detect public_host when unset, then refuse to start if it is
 ///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
-///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   4. sync_stack_assets (staging + compose patches)
 ///   5. write .env
 ///   6. write_config_toml
 ///   7. docker compose down  (clean slate; no-op on first start)
@@ -813,7 +813,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 ///   2. auto-detect public_host when unset, then refuse to start if it is
 ///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
-///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   4. sync_stack_assets (staging + compose patches)
 ///   5. write .env
 ///   6. write_config_toml
 ///   7. docker compose --profile <p> pull
@@ -1159,10 +1159,11 @@ async fn broken_services(services: &[String]) -> Vec<String> {
 /// Delete the dashboard's database + indexer state. Used to clear stale
 /// dashboard data, e.g. a cached node identity.
 ///
-/// This ONLY deletes data — it does not run `docker compose up` or start
-/// anything. It force-removes `quip-dashboard` so the data volume is free,
-/// then clears the dashboard's bind-mounted data folder. The validator and
-/// miner are left as-is. The dashboard comes back, empty, on the next Start.
+/// This only deletes data. It does not run `docker compose up` and it does
+/// not start anything. It force-removes `quip-dashboard` so nothing holds the
+/// database open, then clears the bind-mounted `dashboard-data` folder. The
+/// validator and the miner stay as they are. The dashboard comes back, empty,
+/// on the next Start.
 #[tauri::command]
 pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     reset_dashboard_database_core(Arc::new(TauriSink::new(app))).await

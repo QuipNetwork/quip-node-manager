@@ -132,19 +132,19 @@ against `SHA256SUMS` as shown above.
 
 The stack now runs three containers: the miner, the validator, and the
 dashboard. The dashboard image runs Caddy, the log collector, and its own
-index database. The `quip-caddy`, `quip-postgres`, and `quip-syslog`
-containers are removed on the next Start.
+index database. The next Start removes the `quip-caddy`, `quip-postgres`, and
+`quip-syslog` containers.
 
 - The advanced port settings list the API, HTTP, HTTPS, HTTP/3, and internal
   routing ports under `quip-dashboard`.
 - A new "Log collector" row sets the loopback UDP port for the merged log.
   The default is 5514.
-- The Caddy admin API, dashboard HTTP, and PostgreSQL rows are removed. The
-  new dashboard image does not expose those listeners.
+- The port settings drop the Caddy admin API, dashboard HTTP, and PostgreSQL
+  rows. The new dashboard image does not expose those listeners.
 - The dashboard rebuilds its index from genesis on the first Start. TLS
   certificates carry over.
 - The manager requires dashboard image `v0.2.3-rc2` or later. Release stays
-  unavailable until a stable dashboard at or above that version exists.
+  unavailable until a stable dashboard at that version or later exists.
 - The old `quip_pgdata` volume is no longer used. Remove it with
   `docker volume rm quip_pgdata`.
 

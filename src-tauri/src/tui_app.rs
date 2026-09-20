@@ -972,9 +972,9 @@ impl TuiApp {
     /// Refresh the headline status.
     ///
     /// The compose stack is queried in BOTH run modes. Native mode still runs
-    /// the validator, dashboard, Postgres and Caddy in Docker, so reading only
-    /// `node.pid` reported a dead miner as a fully stopped stack and hid four
-    /// running containers from the operator.
+    /// the validator and the dashboard in Docker, so reading only `node.pid`
+    /// reported a dead miner as a fully stopped stack and hid the running
+    /// containers from the operator.
     pub fn refresh_status(&mut self) {
         let native = self.form.run_mode() == RunMode::Native;
         let miner_running = if native {
@@ -1121,7 +1121,7 @@ impl TuiApp {
     ///
     /// In Docker mode: `start_stack_core` brings up the full compose stack.
     /// In Native mode: `start_stack_core` starts support services first
-    /// (validator, dashboard, postgres, caddy), then `start_native_node_core`
+    /// (the validator and the dashboard), then `start_native_node_core`
     /// starts the host miner (which waits for the validator RPC).
     fn start_node(&mut self) {
         let mut settings = self.settings.clone();
