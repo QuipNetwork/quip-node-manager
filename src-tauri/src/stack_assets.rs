@@ -162,6 +162,25 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
         fs::create_dir_all(base.join(sub)).map_err(|e| format!("mkdir {sub}: {e}"))?;
     }
 
+    // The four directories above that are actually bind-mounted for container
+    // writes are created as the calling process, which is uid 0 when the
+    // manager runs as root. `host_uid_gid` maps root to PUID/PGID 1000 (see
+    // `runtime_ids`) so the containers never run as uid 0, so a root-run
+    // manager would otherwise stage root-owned directories that PUID/PGID
+    // cannot write into. `chown_staged_bind_mounts` closes that gap by
+    // chowning them to the runtime ids whenever those ids differ from ours;
+    // it is a no-op on Windows and whenever the calling process already runs
+    // as PUID/PGID.
+    chown_staged_bind_mounts(
+        &base,
+        [
+            "data",
+            "data/aglais-chain-db",
+            "dashboard-data",
+            "data/logs",
+        ],
+    )?;
+
     let compose_out = patch_compose_file(COMPOSE_YML, config, run_mode)?;
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
@@ -173,6 +192,64 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
 
     write_healthcheck_script()?;
 
+    Ok(())
+}
+
+/// Chown the given staged bind-mount directories (and their contents) to the
+/// runtime PUID/PGID, but only when those ids differ from the calling
+/// process's uid/gid. No-op on Windows.
+#[cfg(unix)]
+fn chown_staged_bind_mounts<const N: usize>(
+    base: &std::path::Path,
+    dirs: [&str; N],
+) -> Result<(), String> {
+    let (puid, pgid) = crate::compose::host_uid_gid();
+    // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    if (uid, gid) == (puid, pgid) {
+        return Ok(());
+    }
+    for sub in dirs {
+        chown_recursive(&base.join(sub), puid, pgid)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_staged_bind_mounts<const N: usize>(
+    _base: &std::path::Path,
+    _dirs: [&str; N],
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) -> Result<(), String> {
+    chown_one(path, uid, gid)?;
+    if path.is_dir() {
+        for entry in fs::read_dir(path).map_err(|e| format!("read_dir {}: {e}", path.display()))? {
+            let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", path.display()))?;
+            chown_recursive(&entry.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_one(path: &std::path::Path, uid: u32, gid: u32) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| format!("chown {}: not a valid C string: {e}", path.display()))?;
+    // SAFETY: c_path is a valid NUL-terminated C string that outlives this call.
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(format!(
+            "chown {} to {uid}:{gid}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }
 
@@ -724,5 +801,71 @@ mod tests {
         assert!(parse_semver("v0.2.3-rc1") < floor);
         assert!(parse_semver("v0.2.3-rc2") >= floor);
         assert!(parse_semver("v0.2.3") >= floor);
+    }
+
+    /// The chown step is the fix for the root-PUID bind-mount ownership gap:
+    /// a root-run manager stages directories as uid 0 while the containers
+    /// run as PUID/PGID 1000+ (`runtime_ids`), so those directories must be
+    /// re-owned or the collector cannot write `data/logs/quip-node.log`.
+    ///
+    /// Running as root to observe the chown actually happen needs root, which
+    /// CI does not have. What this test pins without root: the staged
+    /// directories exist after the call, and the call is a no-op — it does
+    /// not error, and it does not touch ownership — when the runtime ids
+    /// already match the calling process (the common non-root case).
+    #[cfg(unix)]
+    #[test]
+    fn chown_staged_bind_mounts_is_a_noop_when_ids_already_match() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = unique_temp_dir("chown-noop");
+        for sub in [
+            "data",
+            "data/aglais-chain-db",
+            "dashboard-data",
+            "data/logs",
+        ] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+
+        // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let before = fs::metadata(dir.join("data/logs")).unwrap();
+
+        // The calling test process's own ids are not root, so `host_uid_gid`
+        // maps them back to themselves (see `runtime_ids`): puid == uid and
+        // pgid == gid.max(1000). When gid is already >= 1000 (true for every
+        // non-root CI/dev account), this call must be the no-op branch.
+        if gid >= 1000 {
+            chown_staged_bind_mounts(
+                &dir,
+                [
+                    "data",
+                    "data/aglais-chain-db",
+                    "dashboard-data",
+                    "data/logs",
+                ],
+            )
+            .unwrap();
+            let after = fs::metadata(dir.join("data/logs")).unwrap();
+            assert_eq!(before.uid(), after.uid());
+            assert_eq!(before.gid(), after.gid());
+            assert_eq!(before.uid(), uid);
+        }
+
+        for sub in [
+            "data",
+            "data/aglais-chain-db",
+            "dashboard-data",
+            "data/logs",
+        ] {
+            assert!(dir.join(sub).is_dir(), "{sub} missing after chown step");
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce: u64 = rand::random();
+        std::env::temp_dir().join(format!("quip-stack-assets-test-{label}-{nonce}"))
     }
 }

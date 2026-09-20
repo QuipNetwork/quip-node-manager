@@ -243,7 +243,7 @@ pub fn map_compose_service_to_source(service: &str) -> Option<&'static str> {
         "cpu" | "cuda" | "quip-cpu" | "quip-cuda" => Some("miner"),
         "quip-validator" | "validator" => Some("validator"),
         "dashboard" | "quip-dashboard" => Some("dashboard"),
-        "caddy" => Some("caddy"),
+        "caddy" | "quip-caddy" => Some("caddy"),
         _ => None,
     }
 }
@@ -540,6 +540,7 @@ mod tests {
             Some("dashboard")
         );
         assert_eq!(map_compose_service_to_source("caddy"), Some("caddy"));
+        assert_eq!(map_compose_service_to_source("quip-caddy"), Some("caddy"));
     }
 
     /// Compose prefixes lines with the *container* name, not the YAML service
@@ -765,18 +766,21 @@ mod tests {
     /// The merged file preserves the message, so a Caddy line keeps the tabs
     /// `parse_caddy_console_line` splits on and a 502 reads as ERROR.
     ///
-    /// Captured from a live collector running the narrowed sanitize call
-    /// (`--no-ctrl-chars --invalid-chars '\n\r'`, nodes.quip.network!28).
-    /// Before that, the bare `$(sanitize ${MESSAGE})` rewrote `/` and every
-    /// control character to `_`: the same line arrived as
-    /// `2026_08_16 05:22:02.881_ERROR_...` and fell through to plain text as
-    /// INFO, and every URL in every service's output was rewritten the same
-    /// way.
+    /// Hand-built from the narrowed sanitize call
+    /// (`--no-ctrl-chars --invalid-chars '\n\r'`, nodes.quip.network!28), not
+    /// captured from a live collector — the dashboard image's internal
+    /// supervisor is not in this repository, so the exact program tag it
+    /// emits for Caddy (`caddy`, `quip-caddy`, or something else) is unverified.
+    /// Before the narrowed sanitize call, the bare `$(sanitize ${MESSAGE})`
+    /// rewrote `/` and every control character to `_`: the same line arrived
+    /// as `2026_08_16 05:22:02.881_ERROR_...` and fell through to plain text
+    /// as INFO, and every URL in every service's output was rewritten the
+    /// same way.
     ///
-    /// This covers the parsing side only, against a captured line. What pins
-    /// the upstream template is
-    /// `stack_assets::tests::collector_template_keeps_slashes_and_tabs`, which
-    /// asserts on the embedded config itself.
+    /// This covers the parsing side only, against a fixture built by hand.
+    /// `map_compose_service_to_source` keeps both `"caddy"` and
+    /// `"quip-caddy"` match arms until the tag is confirmed against a live
+    /// v0.3.2 Docker host.
     #[test]
     fn merged_lines_keep_caddy_levels_and_urls() {
         let captured = "2026-09-13T10:07:17+00:00 caddy \
