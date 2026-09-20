@@ -167,10 +167,9 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
     // manager runs as root. `host_uid_gid` maps root to PUID/PGID 1000 (see
     // `runtime_ids`) so the containers never run as uid 0, so a root-run
     // manager would otherwise stage root-owned directories that PUID/PGID
-    // cannot write into. `chown_staged_bind_mounts` closes that gap by
-    // chowning them to the runtime ids whenever those ids differ from ours;
-    // it is a no-op on Windows and whenever the calling process already runs
-    // as PUID/PGID.
+    // cannot write into. `chown_staged_bind_mounts` closes that gap. It is a
+    // no-op on Windows and for every non-root caller, which stages the
+    // directories as the uid its own containers then run as.
     chown_staged_bind_mounts(
         &base,
         [
