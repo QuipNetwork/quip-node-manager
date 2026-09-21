@@ -71,7 +71,7 @@ quip-node-manager/
 
 - **Tauri version**: v2
 - **JS tooling**: Bun
-- **App version**: 0.2.10-rc3
+- **App version**: 0.2.10-rc4
 - **Window size**: 900×700
 - **Data directory**: `~/quip-data/` by default (bind-mount root for the compose
   stack). Overridable via `set_data_dir` → the `data_dir` key in
@@ -244,13 +244,19 @@ field in advanced settings. The shared catalog is `service_ports::PORT_SPECS`.
 | `quip-validator` | 30333 TCP/UDP P2P, 9944 TCP RPC, and 9615 TCP metrics | P2P only |
 | `quip-miner` | 8086 TCP REST for CPU or CUDA | No |
 | `quip-dashboard` | 20049 TCP API, 80 TCP HTTP, and 443 TCP HTTPS | Yes |
-| `quip-dashboard` | 443 UDP and 20049 UDP HTTP/3, and 8088 TCP internal HTTP | No |
+| `quip-dashboard` | 8088 TCP internal HTTP | No |
 | `quip-dashboard` | 5514 UDP log collector | Always on, 127.0.0.1 only |
 
-Host ports default to the container ports. HTTP/3 requires TLS on its matching
-site. The log collector row is always published on loopback, and only its host
-port can change. The manager writes that port to `QUIP_LOG_PORT`, which the
-Docker logging driver reads.
+Host ports default to the container ports. The log collector row is always
+published on loopback, and only its host port can change. The manager writes
+that port to `QUIP_LOG_PORT`, which the Docker logging driver reads.
+
+HTTP/3 has no row. QUIC has no plaintext mode, so it exists only on a site
+that serves TLS, and it must answer on that site's own port because that is
+what `Alt-Svc` advertises. With `tls_enabled` set, `published_protocols` adds
+a UDP leg to the Public API and HTTPS rows on their existing host ports.
+`service_ports::validate` and the compose mappings both read that one
+function, so they cannot disagree about which UDP ports are published.
 
 Native mode requires RPC, which defaults to 9944 and remains local unless the
 user selects public access. The dashboard also needs native miner REST.

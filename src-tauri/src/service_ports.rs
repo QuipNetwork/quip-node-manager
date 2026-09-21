@@ -23,9 +23,7 @@ pub struct ServicePorts {
     pub miner_rest: PortBinding,
     pub caddy_http: PortBinding,
     pub caddy_https: PortBinding,
-    pub caddy_http3: PortBinding,
     pub caddy_internal: PortBinding,
-    pub caddy_api_http3: PortBinding,
     pub log_collector: PortBinding,
 }
 
@@ -36,9 +34,7 @@ impl Default for ServicePorts {
             miner_rest: PortBinding::new(false, 8086),
             caddy_http: PortBinding::new(true, 80),
             caddy_https: PortBinding::new(true, 443),
-            caddy_http3: PortBinding::new(false, 443),
             caddy_internal: PortBinding::new(false, 8088),
-            caddy_api_http3: PortBinding::new(false, 20049),
             log_collector: PortBinding::new(true, 5514),
         }
     }
@@ -54,9 +50,7 @@ pub enum PortId {
     PublicApi,
     CaddyHttp,
     CaddyHttps,
-    CaddyHttp3,
     CaddyInternal,
-    CaddyApiHttp3,
     LogCollector,
 }
 
@@ -136,15 +130,6 @@ pub const PORT_SPECS: &[PortSpec] = &[
         enabled_path: "service_ports.caddy_https.enabled",
     },
     PortSpec {
-        id: PortId::CaddyHttp3,
-        service: "quip-dashboard",
-        label: "HTTP/3",
-        container_port: 443,
-        protocols: &["udp"],
-        port_path: "service_ports.caddy_http3.host_port",
-        enabled_path: "service_ports.caddy_http3.enabled",
-    },
-    PortSpec {
         id: PortId::CaddyInternal,
         service: "quip-dashboard",
         label: "Internal routing",
@@ -152,15 +137,6 @@ pub const PORT_SPECS: &[PortSpec] = &[
         protocols: &["tcp"],
         port_path: "service_ports.caddy_internal.host_port",
         enabled_path: "service_ports.caddy_internal.enabled",
-    },
-    PortSpec {
-        id: PortId::CaddyApiHttp3,
-        service: "quip-dashboard",
-        label: "Public API HTTP/3",
-        container_port: 20049,
-        protocols: &["udp"],
-        port_path: "service_ports.caddy_api_http3.host_port",
-        enabled_path: "service_ports.caddy_api_http3.enabled",
     },
     PortSpec {
         id: PortId::LogCollector,
@@ -173,7 +149,30 @@ pub const PORT_SPECS: &[PortSpec] = &[
     },
 ];
 
+/// Host protocols a row publishes, including the UDP leg that HTTP/3 rides
+/// on. `tls` gates that leg because QUIC cannot run without it.
+///
+/// This is the one place the UDP publication is decided, so the compose
+/// mappings and the collision check can never disagree about it.
+pub fn published_protocols(spec: &PortSpec, tls: bool) -> Vec<&'static str> {
+    let mut protocols = spec.protocols.to_vec();
+    if tls && spec.id.serves_http3() {
+        protocols.push("udp");
+    }
+    protocols
+}
+
 impl PortId {
+    /// Whether this site also answers HTTP/3 when TLS is on.
+    ///
+    /// HTTP/3 is QUIC, which has no plaintext mode, so it exists only on a
+    /// site that serves TLS. It is not a port of its own: it rides the TLS
+    /// site's own port over UDP, because that is the port the `Alt-Svc`
+    /// header advertises. Publishing it anywhere else answers nothing.
+    pub fn serves_http3(self) -> bool {
+        matches!(self, Self::PublicApi | Self::CaddyHttps)
+    }
+
     pub fn required(self, mode: &RunMode) -> bool {
         match self {
             // The Docker logging driver of every service sends to this port.
@@ -201,9 +200,7 @@ impl PortId {
             Self::ValidatorMetrics => ports.validator_metrics,
             Self::CaddyHttp => ports.caddy_http,
             Self::CaddyHttps => ports.caddy_https,
-            Self::CaddyHttp3 => ports.caddy_http3,
             Self::CaddyInternal => ports.caddy_internal,
-            Self::CaddyApiHttp3 => ports.caddy_api_http3,
             Self::LogCollector => ports.log_collector,
         }
     }
@@ -229,9 +226,7 @@ impl PortId {
             Self::ValidatorMetrics => config.service_ports.validator_metrics = binding,
             Self::CaddyHttp => config.service_ports.caddy_http = binding,
             Self::CaddyHttps => config.service_ports.caddy_https = binding,
-            Self::CaddyHttp3 => config.service_ports.caddy_http3 = binding,
             Self::CaddyInternal => config.service_ports.caddy_internal = binding,
-            Self::CaddyApiHttp3 => config.service_ports.caddy_api_http3 = binding,
             Self::LogCollector => {
                 config.service_ports.log_collector = PortBinding::new(true, binding.host_port);
             }
@@ -239,7 +234,7 @@ impl PortId {
     }
 }
 
-pub fn validate(config: &NodeConfig, mode: &RunMode) -> Result<(), String> {
+pub fn validate(config: &NodeConfig, mode: &RunMode, tls: bool) -> Result<(), String> {
     if *mode == RunMode::Native
         && (config.rest_insecure_port == 0
             || config.rest_insecure_port > 65535
@@ -257,7 +252,7 @@ pub fn validate(config: &NodeConfig, mode: &RunMode) -> Result<(), String> {
             ));
         }
         if binding.enabled || spec.id.required(mode) {
-            for protocol in spec.protocols {
+            for protocol in published_protocols(spec, tls) {
                 if let Some(previous) = used.insert((binding.host_port, protocol), spec) {
                     return Err(format!(
                         "{} {} and {} {} both use host port {}/{protocol}; choose different ports",
@@ -293,7 +288,7 @@ mod tests {
             PortBinding::new(false, 29944)
         );
         assert!(!config.service_ports.validator_metrics.enabled);
-        validate(&config, &RunMode::Docker).unwrap();
+        validate(&config, &RunMode::Docker, false).unwrap();
     }
 
     #[test]
@@ -302,9 +297,7 @@ mod tests {
             PortId::PublicApi,
             PortId::CaddyHttp,
             PortId::CaddyHttps,
-            PortId::CaddyHttp3,
             PortId::CaddyInternal,
-            PortId::CaddyApiHttp3,
             PortId::LogCollector,
         ] {
             let spec = PORT_SPECS.iter().find(|s| s.id == id).unwrap();
@@ -331,23 +324,72 @@ mod tests {
     #[test]
     fn log_collector_conflicts_with_other_udp_ports() {
         let mut config = NodeConfig::default();
-        config.service_ports.caddy_http3 = PortBinding::new(true, 5514);
-        assert!(validate(&config, &RunMode::Docker)
+        // The HTTPS row's UDP leg, which only exists with TLS on.
+        config.service_ports.caddy_https = PortBinding::new(true, 5514);
+        assert!(validate(&config, &RunMode::Docker, true)
             .unwrap_err()
             .contains("5514/udp"));
+        // Without TLS the HTTPS row publishes TCP only, so there is no clash.
+        validate(&config, &RunMode::Docker, false).unwrap();
     }
 
     #[test]
     fn duplicate_tcp_publications_are_rejected_but_tcp_and_udp_can_share_a_port() {
         let mut config = NodeConfig::default();
-        config.service_ports.caddy_http3.enabled = true;
-        validate(&config, &RunMode::Docker).unwrap();
+        // With TLS on, Public API holds 20049 on both tcp and udp at once.
+        validate(&config, &RunMode::Docker, true).unwrap();
         config.validator_rpc_port = 20049;
-        validate(&config, &RunMode::Docker).unwrap(); // Disabled RPC does not bind.
+        validate(&config, &RunMode::Docker, true).unwrap(); // Disabled RPC does not bind.
         config.validator_rpc_enabled = true;
-        assert!(validate(&config, &RunMode::Docker)
+        assert!(validate(&config, &RunMode::Docker, true)
             .unwrap_err()
             .contains("20049/tcp"));
+    }
+
+    /// HTTP/3 is not a row an operator can set. It follows TLS, and it lands
+    /// on its TLS site's own host port, because that is the port `Alt-Svc`
+    /// advertises. The rows it replaced could be pointed somewhere else.
+    #[test]
+    fn http3_follows_tls_and_rides_its_siblings_port() {
+        let mut config = NodeConfig {
+            port: 21049,
+            ..NodeConfig::default()
+        };
+        config.service_ports.caddy_https = PortBinding::new(true, 8443);
+
+        let https = PORT_SPECS
+            .iter()
+            .find(|s| s.id == PortId::CaddyHttps)
+            .unwrap();
+        let api = PORT_SPECS
+            .iter()
+            .find(|s| s.id == PortId::PublicApi)
+            .unwrap();
+        let http = PORT_SPECS
+            .iter()
+            .find(|s| s.id == PortId::CaddyHttp)
+            .unwrap();
+
+        assert_eq!(published_protocols(https, false), vec!["tcp"]);
+        assert_eq!(published_protocols(api, false), vec!["tcp"]);
+        assert_eq!(published_protocols(https, true), vec!["tcp", "udp"]);
+        assert_eq!(published_protocols(api, true), vec!["tcp", "udp"]);
+        // Plaintext HTTP never gains a UDP leg: QUIC needs TLS.
+        assert_eq!(published_protocols(http, true), vec!["tcp"]);
+
+        // The UDP leg uses the sibling's host port, never a separate one.
+        assert_eq!(
+            PortId::CaddyHttps
+                .binding(&config, &RunMode::Docker)
+                .host_port,
+            8443
+        );
+        assert_eq!(
+            PortId::PublicApi
+                .binding(&config, &RunMode::Docker)
+                .host_port,
+            21049
+        );
     }
 
     #[test]
@@ -356,12 +398,12 @@ mod tests {
             validator_rpc_port: 20049,
             ..NodeConfig::default()
         };
-        assert!(validate(&config, &RunMode::Native).is_err());
+        assert!(validate(&config, &RunMode::Native, false).is_err());
         config.validator_rpc_port = 9944;
         config.rest_insecure_port = 9944;
-        assert!(validate(&config, &RunMode::Native).is_err());
+        assert!(validate(&config, &RunMode::Native, false).is_err());
         config.rest_insecure_port = 50000;
-        validate(&config, &RunMode::Native).unwrap();
+        validate(&config, &RunMode::Native, false).unwrap();
         assert_eq!(
             PortId::MinerRest
                 .binding(&config, &RunMode::Native)
@@ -377,7 +419,7 @@ mod tests {
                 rest_insecure_port: port,
                 ..NodeConfig::default()
             };
-            assert!(validate(&config, &RunMode::Native).is_err());
+            assert!(validate(&config, &RunMode::Native, false).is_err());
         }
     }
 }

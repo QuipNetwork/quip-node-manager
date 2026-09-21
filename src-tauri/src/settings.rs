@@ -120,19 +120,15 @@ impl Default for GpuDeviceConfig {
 
 /// Apple Metal (MPS) tuning. A Mac exposes a single implicit GPU, so this
 /// is a standalone config rather than a per-device list. Maps 1:1 to the
-/// v0.2 `[metal]` section: `utilization`/`yielding` are shared GPU keys,
-/// `active_util`/`idle_after_s` are Metal-only adaptive-cap knobs the
-/// protocol keeps out of `[gpu]` inheritance.
+/// `[metal]` section, which reads `utilization` and `yielding` and nothing
+/// else. The adaptive cap those two drive is not tunable: the miner gives
+/// headroom back one-for-one against external load, down to half the cap.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetalConfig {
-    /// Idle/headless occupancy cap (1-100). Flat-out when nobody's present.
+    /// Occupancy cap (1-100). The miner clamps values outside that range.
     pub utilization: u8,
     /// Enable the adaptive cap monitor (HID-idle / thermal / battery sensing).
     pub yielding: bool,
-    /// Occupancy cap (%) while the user is present.
-    pub active_util: u8,
-    /// Seconds of no input before going idle/flat-out.
-    pub idle_after_s: u32,
 }
 
 impl Default for MetalConfig {
@@ -140,8 +136,6 @@ impl Default for MetalConfig {
         MetalConfig {
             utilization: 100,
             yielding: true,
-            active_util: 85,
-            idle_after_s: 60,
         }
     }
 }
@@ -633,7 +627,11 @@ pub fn load_settings() -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
-    crate::service_ports::validate(&settings.node_config, &settings.run_mode)?;
+    crate::service_ports::validate(
+        &settings.node_config,
+        &settings.run_mode,
+        settings.tls_enabled,
+    )?;
     ensure_data_dir()?;
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), content).map_err(|e| e.to_string())

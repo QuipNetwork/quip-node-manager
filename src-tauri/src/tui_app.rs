@@ -190,10 +190,6 @@ pub enum FocusId {
     GpuDevice(u32),
     GpuUtilization,
     GpuYielding,
-    /// Metal adaptive cap: the utilization while somebody is at the Mac.
-    MetalActiveUtil,
-    /// Metal adaptive cap: seconds of inactivity before the idle cap applies.
-    MetalIdleAfter,
     QpuToggle,
     QpuApiKey,
     QpuBudget,
@@ -277,10 +273,6 @@ pub struct FormState {
     // backend's field the same way, without a match at each call site.
     pub gpu_utilization: u8,
     pub gpu_yielding: bool,
-    /// Metal-only adaptive cap. `[metal]` reads these beside utilization and
-    /// yielding, so a Metal Mac has two more knobs than a CUDA box.
-    pub metal_active_util: u8,
-    pub metal_idle_after: String,
     pub qpu_api_key: String,
     pub qpu_budget: String,
     pub qpu_budget_reset_day: String,
@@ -354,8 +346,6 @@ impl FormState {
             metal_solver: nc.metal_solver.clone().unwrap_or_default(),
             gpu_utilization: first_gpu.map(|d| d.utilization).unwrap_or(80),
             gpu_yielding: first_gpu.map(|d| d.yielding).unwrap_or(false),
-            metal_active_util: nc.metal_config.active_util,
-            metal_idle_after: nc.metal_config.idle_after_s.to_string(),
             qpu_api_key: dw.token,
             qpu_budget: dw.budget,
             qpu_budget_reset_day: dw.budget_reset_day.to_string(),
@@ -493,12 +483,6 @@ impl FormState {
         // miner ignored the TUI's slider entirely until this mirrored it.
         nc.metal_config.utilization = self.gpu_utilization;
         nc.metal_config.yielding = self.gpu_yielding;
-        nc.metal_config.active_util = self.metal_active_util;
-        nc.metal_config.idle_after_s = self
-            .metal_idle_after
-            .trim()
-            .parse()
-            .unwrap_or(base.metal_config.idle_after_s);
         let dwave_token = self.qpu_api_key.trim();
         nc.dwave_config = if dwave_token.is_empty() {
             None
@@ -1543,10 +1527,6 @@ impl TuiApp {
             if !self.settings.node_config.gpu_device_configs.is_empty() {
                 list.push(FocusId::GpuUtilization);
                 list.push(FocusId::GpuYielding);
-                if self.metal_knobs_apply() {
-                    list.push(FocusId::MetalActiveUtil);
-                    list.push(FocusId::MetalIdleAfter);
-                }
             }
             list.push(FocusId::QpuToggle);
             if self.qpu_expanded {
@@ -1560,12 +1540,6 @@ impl TuiApp {
         }
         list.push(FocusId::LogFilter);
         list
-    }
-
-    /// The Metal adaptive cap only reaches a miner that reads `[metal]`: a
-    /// Metal Mac in Native mode, matching where the GUI shows the knobs.
-    pub fn metal_knobs_apply(&self) -> bool {
-        self.gpu_backend == "metal" && self.form.run_mode() == RunMode::Native
     }
 
     /// A Fix button appears for a failing check whose fix is not folded into
@@ -2025,35 +1999,21 @@ mod tests {
     }
 
     /// Metal reads `[metal]`, not the per-device list, so the TUI slider did
-    /// nothing on macOS Native until Apply mirrored it across. The adaptive
-    /// cap travels the same way now that the form carries it.
+    /// nothing on macOS Native until Apply mirrored it across.
     #[test]
     fn apply_mirrors_gpu_tuning_into_metal_config() {
-        let mut settings = AppSettings {
+        let settings = AppSettings {
             node_config: nc_with_gpus(1, true),
             ..Default::default()
         };
-        settings.node_config.metal_config.active_util = 42;
-        settings.node_config.metal_config.idle_after_s = 900;
 
         let mut form = FormState::from_settings(&settings);
-        assert_eq!(form.metal_active_util, 42);
-        assert_eq!(form.metal_idle_after, "900");
         form.gpu_utilization = 65;
         form.gpu_yielding = true;
-        form.metal_active_util = 70;
-        form.metal_idle_after = "120".to_string();
 
         let nc = form.to_node_config(&settings.node_config);
         assert_eq!(nc.metal_config.utilization, 65);
         assert!(nc.metal_config.yielding);
-        assert_eq!(nc.metal_config.active_util, 70);
-        assert_eq!(nc.metal_config.idle_after_s, 120);
-
-        // A garbled entry keeps the saved value rather than resetting it.
-        form.metal_idle_after = "soon".to_string();
-        let nc = form.to_node_config(&settings.node_config);
-        assert_eq!(nc.metal_config.idle_after_s, 900);
     }
 
     /// The bug the parity audit found: nothing in the TUI wrote the persisted

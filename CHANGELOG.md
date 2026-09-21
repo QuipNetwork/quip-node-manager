@@ -126,6 +126,62 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.2.10-rc4
+
+### The Metal settings no longer offer two knobs the miner ignores
+
+The GPU settings offered an "Active utilization" slider and an "Idle after"
+field for Apple Metal. The miner never read either one. It logged
+`unknown field 'active_util' for metal (ignored)` at every start and mined at
+the main utilization cap instead.
+
+- The desktop app and the terminal UI no longer show either control, and the
+  manager no longer writes `active_util` or `idle_after_s` to `config.toml`.
+- Utilization and Yielding are unchanged. They are the only two keys the
+  Metal backend reads.
+- Metal still adapts to other load while Yielding is on. The miner returns
+  headroom against outside demand down to half the utilization cap. The miner
+  does this on its own, and no setting ever controlled it.
+- An existing `config.toml` keeps the two dead keys until the next Start
+  rewrites it. They do nothing in the meantime.
+
+### HTTP/3 follows TLS instead of asking
+
+The port settings listed "HTTP/3" and "Public API HTTP/3" as two more rows
+with their own checkboxes and their own host ports. The settings no longer
+list either row.
+
+HTTP/3 is QUIC, which has no plaintext mode. It runs only on a site that
+serves TLS. It answers on that site's own port, because the `Alt-Svc` header
+advertises that port. Neither value was ever a choice.
+
+- Turn TLS on and the Public API and HTTPS ports also publish UDP, on the same
+  host port each already uses. Turn TLS off and neither does.
+- The old rows could point HTTP/3 at a different host port from the site that
+  advertised it. Nothing rejected that, and the result served nothing. Moving
+  HTTPS to host port 8443 while HTTP/3 stayed on 443 was enough to do it.
+- The manager drops any saved HTTP/3 port setting, because no row holds it
+  any more.
+
+### CUDA devices now carry their own utilization and yielding
+
+The manager wrote a `[gpu]` table and gave each `[cuda.N]` section only the
+values that differed from it. The miner reads no `[gpu]` table, so any device
+matching that table reached the miner with no governor keys and ran at the
+miner defaults: utilization 100, yielding off.
+
+This hit every box whose GPUs share one setting, including every box with a
+single GPU. A ceiling of 50 percent with yielding on produced a miner running
+flat out and yielding to nothing.
+
+- Each `[cuda.N]` section now carries `utilization` and `yielding` outright.
+- The manager writes no `[gpu]` table. A `[gpu]` table in a config carried
+  over from v0.1 or v0.2 still has no effect. Delete it.
+- The next Start rewrites `config.toml`. Check the values afterward if you
+  edited that file by hand.
+
+---
+
 ## v0.2.10-rc3
 
 ### The dashboard runs the front door and the log collector

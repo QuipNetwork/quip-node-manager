@@ -174,12 +174,6 @@ struct CpuToml {
     num_cpus: u32,
 }
 
-#[derive(Serialize)]
-struct GpuToml {
-    utilization: u8,
-    yielding: bool,
-}
-
 #[derive(Default, Serialize)]
 struct CudaDeviceToml {
     /// Per-device, because that is where the coordinator reads it — there is no
@@ -188,10 +182,8 @@ struct CudaDeviceToml {
     /// front ends.
     #[serde(skip_serializing_if = "String::is_empty")]
     binary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    utilization: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    yielding: Option<bool>,
+    utilization: u8,
+    yielding: bool,
 }
 
 #[derive(Serialize)]
@@ -209,17 +201,15 @@ struct DwaveToml {
 #[derive(Default, Serialize)]
 struct MarkerToml {}
 
-/// v0.2 `[metal]` section. Carries shared GPU keys (`utilization`,
-/// `yielding`) plus the Metal-only adaptive-cap knobs directly, rather
-/// than relying on a shared `[gpu]` block.
+/// `[metal]` section. `utilization` and `yielding` are the only governor
+/// keys the backend reads, and it carries them directly rather than
+/// relying on a shared `[gpu]` block.
 #[derive(Serialize)]
 struct MetalToml {
     #[serde(skip_serializing_if = "String::is_empty")]
     binary: String,
     utilization: u8,
     yielding: bool,
-    active_util: u8,
-    idle_after_s: u32,
 }
 
 #[derive(Serialize)]
@@ -230,8 +220,6 @@ struct ConfigToml {
     // the backend switch, so the section must vanish entirely, not zero out.
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu: Option<CpuToml>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gpu: Option<GpuToml>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     cuda: BTreeMap<String, CudaDeviceToml>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,9 +258,6 @@ impl ConfigToml {
             node_log: config.node_log.clone(),
         };
 
-        // [gpu] holds global defaults inherited by every backend section
-        // ([cuda.N], [metal], [modal]). See quip-miner/quip-miner.example.toml.
-        //
         // Metal is unavailable in Linux containers regardless of what the Mac
         // host reports. In Docker mode we suppress Mps.
         let enabled_devices: Vec<&crate::settings::GpuDeviceConfig> = config
@@ -287,48 +272,29 @@ impl ConfigToml {
             Some(config.gpu_backend.clone())
         };
 
-        let (gpu_util, gpu_yield) = enabled_devices
-            .first()
-            .map(|d| (d.utilization, d.yielding))
-            .unwrap_or((100, false));
-
-        // [gpu] holds shared defaults for the CUDA-style backends only. Metal
-        // carries its own tuning in [metal] (the protocol keeps Metal's
-        // adaptive-cap keys out of [gpu] inheritance), so MPS never emits it.
-        let gpu = if matches!(
-            effective_backend,
-            Some(GpuBackend::Local) | Some(GpuBackend::Modal)
-        ) && !enabled_devices.is_empty()
-        {
-            Some(GpuToml {
-                utilization: gpu_util,
-                yielding: gpu_yield,
-            })
-        } else {
-            None
-        };
-
         let mut cuda = BTreeMap::new();
         let mut metal = None;
         let mut modal = None;
         match effective_backend {
             Some(GpuBackend::Local) => {
-                if gpu.is_some() {
-                    for dev in &enabled_devices {
-                        cuda.insert(
-                            dev.index.to_string(),
-                            CudaDeviceToml {
-                                binary: optional_solver_binary(
-                                    run_mode,
-                                    crate::solvers::Backend::Cuda,
-                                    config.cuda_solver.as_deref(),
-                                ),
-                                utilization: (dev.utilization != gpu_util)
-                                    .then_some(dev.utilization),
-                                yielding: (dev.yielding != gpu_yield).then_some(dev.yielding),
-                            },
-                        );
-                    }
+                // Every device carries its own governor keys. There is no
+                // inheritance to lean on: the coordinator reads [cpu],
+                // [cuda.N], [metal], and [dwave]/[qpu] only, so a key left out
+                // here falls back to the miner's defaults (utilization 100,
+                // yielding false), not to a shared value.
+                for dev in &enabled_devices {
+                    cuda.insert(
+                        dev.index.to_string(),
+                        CudaDeviceToml {
+                            binary: optional_solver_binary(
+                                run_mode,
+                                crate::solvers::Backend::Cuda,
+                                config.cuda_solver.as_deref(),
+                            ),
+                            utilization: dev.utilization,
+                            yielding: dev.yielding,
+                        },
+                    );
                 }
             }
             Some(GpuBackend::Mps) => {
@@ -340,8 +306,6 @@ impl ConfigToml {
                     ),
                     utilization: config.metal_config.utilization,
                     yielding: config.metal_config.yielding,
-                    active_util: config.metal_config.active_util,
-                    idle_after_s: config.metal_config.idle_after_s,
                 })
             }
             Some(GpuBackend::Modal) => modal = Some(MarkerToml::default()),
@@ -407,7 +371,6 @@ impl ConfigToml {
                 ),
                 num_cpus: config.num_cpus,
             }),
-            gpu,
             cuda,
             metal,
             modal,
@@ -852,16 +815,13 @@ mod tests {
 
     #[test]
     fn mps_backend_writes_tuning_into_metal_section() {
-        // v0.2 [metal] carries its own utilization/yielding plus the
-        // Metal-only adaptive-cap keys; it does NOT rely on a shared [gpu]
-        // block (which the protocol reserves for CUDA inheritance).
+        // [metal] carries its own utilization/yielding. No backend section
+        // inherits from a shared [gpu] block, because v0.3 does not read one.
         let cfg = NodeConfig {
             gpu_backend: GpuBackend::Mps,
             metal_config: MetalConfig {
                 utilization: 5,
                 yielding: true,
-                active_util: 70,
-                idle_after_s: 30,
             },
             ..NodeConfig::default()
         };
@@ -873,8 +833,36 @@ mod tests {
         );
         assert!(toml[metal..].contains("utilization = 5"));
         assert!(toml[metal..].contains("yielding = true"));
-        assert!(toml[metal..].contains("active_util = 70"));
-        assert!(toml[metal..].contains("idle_after_s = 30"));
+    }
+
+    /// `utilization` and `yielding` are the only governor keys the Metal
+    /// backend reads. Anything else draws an "unknown field ... (ignored)"
+    /// warning from quip_solver_core and configures nothing, so the manager
+    /// must not write the keys it used to.
+    #[test]
+    fn metal_section_writes_no_keys_the_miner_rejects() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_config: MetalConfig {
+                utilization: 50,
+                yielding: true,
+            },
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+        let parsed: toml::Value = toml::from_str(&toml).expect("valid toml");
+        let keys: Vec<&str> = parsed["metal"]
+            .as_table()
+            .expect("[metal] is a table")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            assert!(
+                matches!(*key, "binary" | "utilization" | "yielding"),
+                "[metal] carries {key}, which the miner ignores; keys={keys:?}"
+            );
+        }
     }
 
     #[test]
@@ -892,8 +880,6 @@ mod tests {
             metal_config: MetalConfig {
                 utilization: 42,
                 yielding: true,
-                active_util: 85,
-                idle_after_s: 60,
             },
             ..NodeConfig::default()
         };
@@ -903,8 +889,10 @@ mod tests {
         assert!(toml[metal..].contains("utilization = 42"));
     }
 
+    /// The coordinator reads no `[gpu]` table, so Modal carries only its own
+    /// marker section. Tuning for a Modal run lives per device in `[cuda.N]`.
     #[test]
-    fn modal_backend_emits_gpu_globals_before_modal() {
+    fn modal_backend_emits_no_gpu_globals() {
         let cfg = cfg_with_gpu(
             GpuBackend::Modal,
             vec![GpuDeviceConfig {
@@ -915,12 +903,17 @@ mod tests {
             }],
         );
         let toml = render_config_toml(&cfg, &RunMode::Docker);
-        assert!(toml.contains("[gpu]\nutilization = 80\nyielding = false"));
+        assert!(!toml.contains("[gpu]"));
         assert!(toml.contains("[modal]"));
     }
 
+    /// Every `[cuda.N]` carries its own `utilization` and `yielding`, even
+    /// when the devices agree. They used to be emitted only as deltas against
+    /// a `[gpu]` table the v0.3 coordinator ignores, so the first device — and
+    /// every device on a uniformly configured box — reached the miner with no
+    /// governor keys at all and silently ran at the defaults.
     #[test]
-    fn cuda_per_device_emits_only_deltas() {
+    fn cuda_per_device_always_emits_its_governor_keys() {
         let cfg = cfg_with_gpu(
             GpuBackend::Local,
             vec![
@@ -941,10 +934,8 @@ mod tests {
         let toml = render_config_toml(&cfg, &RunMode::Docker);
         let cuda0 = toml.find("[cuda.0]").unwrap();
         let cuda1 = toml.find("[cuda.1]").unwrap();
-        // [cuda.0] matches globals → no overrides
-        assert!(!toml[cuda0..cuda1].contains("utilization"));
-        assert!(!toml[cuda0..cuda1].contains("yielding"));
-        // [cuda.1] differs → both fields emitted
+        assert!(toml[cuda0..cuda1].contains("utilization = 80"));
+        assert!(toml[cuda0..cuda1].contains("yielding = false"));
         assert!(toml[cuda1..].contains("utilization = 50"));
         assert!(toml[cuda1..].contains("yielding = true"));
     }
@@ -981,18 +972,17 @@ mod tests {
         );
         let parsed: toml::Value =
             toml::from_str(&render_config_toml(&cuda, &RunMode::Docker)).expect("valid toml");
-        // [gpu] carries the shared defaults; a [cuda.N] key overrides them.
-        let shared = &parsed["gpu"];
+        // Read the section exactly as the coordinator does, with no fallback.
+        // Resolving a missing key here instead would let the renderer drop one
+        // and still pass.
         for dev in cuda.gpu_device_configs.iter().filter(|d| d.enabled) {
             let section = &parsed["cuda"][dev.index.to_string()];
             let utilization = section
                 .get("utilization")
-                .or_else(|| shared.get("utilization"))
                 .and_then(toml::Value::as_integer)
                 .expect("utilization");
             let yielding = section
                 .get("yielding")
-                .or_else(|| shared.get("yielding"))
                 .and_then(toml::Value::as_bool)
                 .expect("yielding");
             assert_eq!(
@@ -1013,8 +1003,6 @@ mod tests {
             metal_config: MetalConfig {
                 utilization: 45,
                 yielding: true,
-                active_util: 70,
-                idle_after_s: 120,
             },
             ..NodeConfig::default()
         };
@@ -1023,12 +1011,10 @@ mod tests {
         let section = &parsed["metal"];
         assert_eq!(section["utilization"].as_integer(), Some(45));
         assert_eq!(section["yielding"].as_bool(), Some(true));
-        assert_eq!(section["active_util"].as_integer(), Some(70));
-        assert_eq!(section["idle_after_s"].as_integer(), Some(120));
     }
 
     #[test]
-    fn mps_without_devices_skips_gpu_section() {
+    fn mps_without_devices_still_emits_metal() {
         let cfg = cfg_with_gpu(GpuBackend::Mps, vec![]);
         let toml = render_config_toml(&cfg, &RunMode::Native);
         assert!(!toml.contains("[gpu]"));

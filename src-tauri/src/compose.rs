@@ -690,7 +690,11 @@ pub(crate) async fn pull_compose_images_core(sink: Arc<dyn ProgressSink>) -> Res
     let settings = crate::settings::load_settings();
 
     // Ensure assets are staged before compose tries to read the compose file.
-    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
+    sync_stack_assets(
+        &settings.run_mode,
+        &settings.node_config,
+        settings.tls_enabled,
+    )?;
     // Write .env too: without the pins compose falls back to its own
     // `${CHANNEL:-beta}` default, so a standalone pull (outside the full start
     // sequence) would silently fetch a moving tag instead of the resolved one.
@@ -880,7 +884,11 @@ pub(crate) async fn start_stack_core(
 
     // (4) Stage assets after migration/auto-detection so public_host can drive
     // the validator's public address.
-    sync_stack_assets(&settings.run_mode, &settings.node_config)?;
+    sync_stack_assets(
+        &settings.run_mode,
+        &settings.node_config,
+        settings.tls_enabled,
+    )?;
 
     // (5) .env — pin each image to its channel-resolved tag.
     let tags = resolve_channel_image_tags(&settings).await?;
