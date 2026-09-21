@@ -441,10 +441,12 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
             let enabled = app.form.service_port_enabled(spec.id);
             let required = spec.id.required(&app.form.run_mode());
             let check = if enabled { "[x]" } else { "[ ]" };
-            let suffix = if required {
-                " (required in Native mode)"
-            } else {
-                ""
+            let suffix = match (required, spec.id) {
+                (false, _) => "",
+                (true, crate::service_ports::PortId::LogCollector) => {
+                    " (always on; 127.0.0.1 only)"
+                }
+                (true, _) => " (required in Native mode)",
             };
             let listener = if spec.id == crate::service_ports::PortId::MinerRest && required {
                 "native".to_string()
@@ -468,12 +470,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                     "  Host port",
                     &field_value(app, &focus, app.form.service_port_value(spec.id)),
                 ));
-            }
-            if spec.id == crate::service_ports::PortId::CaddyAdmin {
-                lines.push(Line::from(Span::styled(
-                    "      Admin API changes Caddy config. Use a trusted network.",
-                    Style::default().fg(DIM),
-                )));
             }
             if spec.id == crate::service_ports::PortId::ValidatorRpc && required {
                 let public = app.form.service_ports[&spec.id].0;

@@ -224,9 +224,10 @@ pub struct ChannelInfo {
     /// unreachable), keyed by display name (Miner/Validator/Dashboard).
     pub images: Vec<(String, Option<String>)>,
     /// Whether the Release channel is selectable — that is, whether a stable
-    /// validator exists that can run the embedded chain spec. False while the
-    /// only compatible builds are `-rc`, which grays Release out and moves the
-    /// selection to Beta.
+    /// validator that can run the embedded chain spec, and a stable dashboard
+    /// at or above its floor, both exist. False while either's only compatible
+    /// builds are `-rc`, which grays Release out and moves the selection to
+    /// Beta.
     pub stable_available: bool,
 }
 
@@ -269,13 +270,15 @@ pub async fn resolve_channel_info(channel: UpdateChannel) -> ChannelInfo {
             .map(|((name, _), tag)| (name.to_string(), tag))
             .collect(),
         // Release is offered only when its validator slot holds a real stable
-        // build. Below the chain spec's floor `resolve_pair` substitutes the
-        // newest compatible tag, so an `-rc` sitting in the Release slot is the
-        // signal that no stable build can join this network yet. An unreachable
-        // registry is not evidence either way, so it leaves Release alone
-        // rather than flipping the operator's channel on a network blip.
+        // build that can run the chain spec, and its dashboard slot holds a
+        // real stable build at or above the embedded-services floor. Below
+        // either floor `resolve_pair` substitutes the newest compatible tag,
+        // so an `-rc` sitting in the Release slot is the signal that no
+        // stable build can join this network yet. An unreachable registry is
+        // not evidence either way, so it leaves Release alone rather than
+        // flipping the operator's channel on a network blip.
         stable_available: match &tags {
-            Some(t) => !t.validator.prod.contains("-rc"),
+            Some(t) => !t.validator.prod.contains("-rc") && !t.dashboard.prod.contains("-rc"),
             None => true,
         },
     }

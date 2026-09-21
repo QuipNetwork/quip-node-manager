@@ -126,6 +126,30 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.2.10-rc2
+
+### The dashboard runs the front door and the log collector
+
+The stack now runs three containers: the miner, the validator, and the
+dashboard. The dashboard image runs Caddy, the log collector, and its own
+index database. The next Start removes the `quip-caddy`, `quip-postgres`, and
+`quip-syslog` containers.
+
+- The advanced port settings list the API, HTTP, HTTPS, HTTP/3, and internal
+  routing ports under `quip-dashboard`.
+- A new "Log collector" row sets the loopback UDP port for the merged log.
+  The default is 5514.
+- The port settings drop the Caddy admin API, dashboard HTTP, and PostgreSQL
+  rows. The new dashboard image does not expose those listeners.
+- The dashboard rebuilds its index from genesis on the first Start. TLS
+  certificates carry over.
+- The manager requires dashboard image `v0.2.3-rc2` or later. Release stays
+  unavailable until a stable dashboard at that version or later exists.
+- The old `quip_pgdata` volume is no longer used. Remove it with
+  `docker volume rm quip_pgdata`.
+
+---
+
 ## v0.2.10-rc1
 
 - **The install script checks the release signature again**: `install.sh` verified the signature on `SHA256SUMS` against a key it believed it had isolated in a temporary keyring. GnuPG ignores that instruction wherever keyboxd is enabled, so on those systems the check could not read the key back and stopped the install with a fingerprint mismatch that named no fingerprint. The key is now kept in a temporary home directory that every GnuPG version honours, and it no longer lands in your own keyring. Releases from v0.2.9 were signed correctly throughout; only the checking was broken.

@@ -53,9 +53,8 @@ const state = {
   // Merged from `checklist-update` events; rendered by renderChecklist().
   checks: new Map(),
   hardwareSurvey: null,
-  // Set by the `dashboard-db-mismatch` event when Postgres rejects the
-  // dashboard's password; cleared once the dashboard comes up. Drives the
-  // error message + Reset button in the dashboard placeholder.
+  // Set when a dashboard reset fails. Drives the error message in the
+  // dashboard placeholder.
   dashboardDbError: null,
   // Highest pull generation that has received its `pull-complete`. Progress
   // events at or below this are stale (a late layer event from a finished
@@ -355,10 +354,9 @@ document.getElementById('btn-config-toggle').addEventListener('click', () => {
 
 // ─── Dashboard database reset ─────────────────────────────────────────────────
 // Offered whenever the dashboard isn't running (e.g. to clear a stale cached
-// identity or recover from a Postgres password mismatch). Data-only: it deletes
-// the Postgres volume + indexer data and does NOT start anything. A missing
-// volume is treated as success by the backend. On success we send the user back
-// to the Status Monitor tab; on failure we stay and show the error.
+// identity). The reset deletes the dashboard's index and does not start
+// anything. On success we send the user back to the Status Monitor tab; on
+// failure we stay and show the error.
 document.getElementById('dashboard-reset-btn')?.addEventListener('click', async () => {
   const btn = document.getElementById('dashboard-reset-btn');
   const msg = document.getElementById('dashboard-empty-msg');
@@ -911,9 +909,9 @@ function updateStartStopState() {
 
   stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
   // Stop is gated on "is there anything to stop", not on `running`. `running`
-  // tracks the *miner* only, so a partially started stack — validator, postgres,
-  // caddy and dashboard up with no miner container — left Stop disabled while
-  // the stack was plainly alive, with no way to shut it down from the UI.
+  // tracks the *miner* only, so a partially started stack — validator and
+  // dashboard up with no miner container — left Stop disabled while the
+  // stack was plainly alive, with no way to shut it down from the UI.
   stopBtn.disabled =
     !(running || anyStackServiceRunning()) ||
     state.starting ||
@@ -1229,7 +1227,7 @@ function appendTextWithLinks(el, text) {
 }
 
 /** Stable display order for source filter chips. */
-const LOG_SOURCE_ORDER = ['app', 'miner', 'validator', 'dashboard', 'postgres', 'caddy'];
+const LOG_SOURCE_ORDER = ['app', 'miner', 'validator', 'dashboard', 'caddy'];
 
 /** Debounce timer for text-filter re-renders (~120ms). */
 let logTextFilterTimer = null;
@@ -1974,8 +1972,8 @@ function renderSyncProgress(stateStr) {
 // containers aren't reachable at all — the miner alone is degraded, not fine.
 function statusFromStack(minerRunning) {
   if (!minerRunning) {
-    // The miner is down, but support services (validator, postgres, caddy,
-    // dashboard) can still be up — a partially started stack, which is what
+    // The miner is down, but support services (validator, dashboard) can
+    // still be up — a partially started stack, which is what
     // you get after a miner crash, a profile switch, or a Start that only
     // brought up part of the stack. Reporting that as STOPPED hid a live
     // stack from the UI and left Stop disabled with no way to shut it down.
@@ -2002,7 +2000,7 @@ function refreshStatusPill() {
 async function pollStatus() {
   try {
     // Stack status is valid in both Docker and Native modes (Native still
-    // runs the validator/dashboard/postgres/caddy support services).
+    // runs the validator/dashboard support services).
     try {
       state.stack = await invoke('get_stack_status');
     } catch {
@@ -2098,15 +2096,6 @@ async function setupListeners() {
     if (!success) {
       appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${error || 'unknown error'}` });
     }
-  });
-
-  // Postgres rejected the dashboard's password — surface the actionable error
-  // and the Reset button on the Dashboard tab.
-  await listen('dashboard-db-mismatch', (event) => {
-    const { message } = event.payload || {};
-    state.dashboardDbError = message || 'Dashboard database password mismatch.';
-    appendLog({ timestamp: '', level: 'ERROR', message: state.dashboardDbError });
-    refreshDashboardTab();
   });
 
   // Update notifications

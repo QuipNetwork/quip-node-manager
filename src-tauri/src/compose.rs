@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `docker compose`-based stack orchestration.
 //!
-//! Docker mode drives the full v0.2 stack (miner + validator + dashboard +
-//! postgres + caddy). Native mode starts the host miner plus Docker-side
-//! validator/dashboard support services.
+//! Docker mode drives the full stack (miner + validator + dashboard, which
+//! embeds Caddy and the log collector). Native mode starts the host miner
+//! plus the Docker-side validator/dashboard support services.
 
 use crate::log_stream::LogStreamState;
 use crate::progress::{ProgressSink, TauriSink};
@@ -33,18 +33,12 @@ static PULL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Host uid/gid for the PUID/PGID env vars passed to containers that need
 /// to chown bind-mounted `/data` to the host user.
-///
-/// Gids below 1000 are clamped up to 1000 — macOS users default to gid 20
-/// (staff), which collides with Alpine's `games` group inside the node
-/// image and breaks the entrypoint's `groupmod`. Keeping the real uid
-/// preserves host-side ownership; the gid just won't have a friendly name.
 pub(crate) fn host_uid_gid() -> (u32, u32) {
     #[cfg(unix)]
     {
         // SAFETY: getuid/getgid take no arguments and cannot fail per POSIX.
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        (uid, gid.max(1000))
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        runtime_ids(uid, gid)
     }
     #[cfg(not(unix))]
     {
@@ -52,11 +46,22 @@ pub(crate) fn host_uid_gid() -> (u32, u32) {
     }
 }
 
+/// Container-safe PUID/PGID for a host uid/gid.
+///
+/// Root maps to 1000, because the dashboard image refuses PUID or PGID 0 and
+/// exits. Gids below 1000 are clamped up to 1000: macOS users default to gid
+/// 20 (staff), which collides with Alpine's `games` group inside the node
+/// image and breaks the entrypoint's `groupmod`.
+fn runtime_ids(uid: u32, gid: u32) -> (u32, u32) {
+    let uid = if uid == 0 { 1000 } else { uid };
+    (uid, gid.max(1000))
+}
+
 // ── profile + services selection ───────────────────────────────────────────
 
 /// Compose profile name for v0.2 — the same string as the image's service
-/// name. The standard upstream profiles always include dashboard, postgres,
-/// Caddy, the selected miner, and validator.
+/// name. The standard upstream profiles always include the validator, the
+/// dashboard, and the selected miner.
 pub fn compose_profile(image_tag: ImageTag) -> &'static str {
     image_tag.service()
 }
@@ -72,17 +77,10 @@ pub fn compose_profile(image_tag: ImageTag) -> &'static str {
 pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
     match run_mode {
         RunMode::Docker => &[],
-        // quip-syslog is named explicitly, not left to the profile: Native
-        // passes a service list, and compose starts only what that list names.
-        // Without it every service here forwards stdout to a port nothing is
-        // listening on, and the merged log is never written.
-        RunMode::Native => &[
-            "quip-syslog",
-            "quip-validator",
-            "dashboard",
-            "postgres",
-            "caddy",
-        ],
+        // The log collector runs inside the dashboard container, so Native
+        // must name it explicitly: Native passes a service list, and compose
+        // starts only what that list names.
+        RunMode::Native => &["quip-validator", "dashboard"],
     }
 }
 
@@ -93,14 +91,7 @@ pub fn compose_services(run_mode: &RunMode) -> &'static [&'static str] {
 /// current configuration actually starts.
 pub fn expected_services(run_mode: &RunMode, image_tag: ImageTag) -> Vec<&'static str> {
     match run_mode {
-        RunMode::Docker => vec![
-            image_tag.service(),
-            "quip-syslog",
-            "quip-validator",
-            "dashboard",
-            "postgres",
-            "caddy",
-        ],
+        RunMode::Docker => vec![image_tag.service(), "quip-validator", "dashboard"],
         RunMode::Native => compose_services(&RunMode::Native).to_vec(),
     }
 }
@@ -181,22 +172,6 @@ fn force_stop_hint() -> String {
     )
 }
 
-// ── postgres identity ──────────────────────────────────────────────────────
-
-/// Postgres role + database the dashboard authenticates as. These mirror the
-/// compose defaults (`${POSTGRES_USER:-quip}` / `${POSTGRES_DB:-quip}`); the
-/// manager never overrides them in `.env`.
-const PG_USER: &str = "quip";
-const PG_DB: &str = "quip";
-/// Fixed container name from the compose `container_name:` directive.
-const PG_CONTAINER: &str = "quip-postgres";
-/// Project-scoped Postgres data volume. Compose names volumes `<project>_<key>`
-/// and we run under `--project-name quip` with a `pgdata` volume key (the fixed
-/// global `name:` is stripped at stage time — see `stack_assets`), so the data
-/// lands in `quip_pgdata`. Resetting this volume forces Postgres to
-/// re-initialise with the current `POSTGRES_PASSWORD`.
-pub const PGDATA_VOLUME: &str = "quip_pgdata";
-
 // ── .env generation ────────────────────────────────────────────────────────
 
 /// One image's tag on each channel, resolved from that image's own registry.
@@ -262,7 +237,13 @@ pub(crate) async fn resolve_channel_image_tags(
             "QUIP_VALIDATOR_TAG",
             Some(crate::stack_assets::MIN_VALIDATOR_TAG)
         ),
-        resolve_pair(&client, DASHBOARD_IMAGE, "QUIP_DASHBOARD_TAG", None),
+        // The compose file expects Caddy and the collector inside this image.
+        resolve_pair(
+            &client,
+            DASHBOARD_IMAGE,
+            "QUIP_DASHBOARD_TAG",
+            Some(crate::stack_assets::MIN_DASHBOARD_TAG)
+        ),
     );
 
     Ok(ResolvedImageTags {
@@ -278,7 +259,7 @@ pub(crate) async fn resolve_channel_image_tags(
 ///
 /// `min_tag`, when set, is a compatibility floor: tags below it are dropped
 /// before either channel is picked, and the `.env` fallback is held to it too.
-/// See `stack_assets::MIN_VALIDATOR_TAG`.
+/// See `stack_assets::MIN_VALIDATOR_TAG` and `stack_assets::MIN_DASHBOARD_TAG`.
 async fn resolve_pair(
     client: &reqwest::Client,
     image: &str,
@@ -375,13 +356,12 @@ pub(crate) fn write_env_file(
     tags: &ResolvedImageTags,
 ) -> Result<(), String> {
     let (puid, pgid) = host_uid_gid();
-    let pg_password = crate::settings::postgres_password();
-    let lines = render_env_lines(settings, puid, pgid, &pg_password, tags);
+    let lines = render_env_lines(settings, puid, pgid, tags);
 
     let path = stack_project_dir().join(".env");
     fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("write .env: {e}"))?;
 
-    // Best-effort 0600: DWAVE_API_TOKEN and POSTGRES_PASSWORD shouldn't be
+    // Best-effort 0600: DWAVE_API_TOKEN and ZEROSSL_API_KEY shouldn't be
     // world-readable on shared systems.
     #[cfg(unix)]
     {
@@ -403,7 +383,6 @@ fn render_env_lines(
     settings: &AppSettings,
     puid: u32,
     pgid: u32,
-    pg_password: &str,
     tags: &ResolvedImageTags,
 ) -> Vec<String> {
     // Written blank without a [dwave] config so a stale token does not linger.
@@ -443,7 +422,6 @@ fn render_env_lines(
     ];
     lines.extend(dwave_env);
     lines.extend([
-        format!("POSTGRES_PASSWORD={pg_password}"),
         // CHANNEL names the moving tag the compose file falls back to. The
         // pins below win over it: the manager resolves an exact version per
         // image so the update monitor can compare a fixed tag, which a moving
@@ -464,6 +442,10 @@ fn render_env_lines(
         ),
         format!("VALIDATOR_NAME={validator_name}"),
         format!("QUIP_GPU_UTILIZATION={gpu_utilization}"),
+        format!(
+            "QUIP_LOG_PORT={}",
+            settings.node_config.service_ports.log_collector.host_port
+        ),
     ]);
 
     // Miner memory ceiling. Omitted when unset so compose's own `:-16g`
@@ -477,11 +459,22 @@ fn render_env_lines(
     // env contract: the compose cpu/cuda services no longer read QUIP_VALIDATORS
     // (it lives in config.toml's [miner].validators), so we don't write it.
     //
-    // QUIP_VALIDATOR_RPC_URLS is intentionally NOT set here. The dashboard uses
-    // it for both the chain RPC and (by stripping /rpc) the local miner REST,
-    // so it must resolve both from one host — Caddy's internal :8088 listener.
-    // We defer to the compose default (`ws://quip-caddy:8088/rpc`) so there's a
-    // single source of truth in the upstream nodes.quip.network config.
+    // QUIP_VALIDATOR_RPC_URLS is not written. Its compose default,
+    // ws://quip-validator:9944, is correct in both modes, because the
+    // validator is a container in both.
+
+    // Native runs the miner on the host. The dashboard backend dials its REST
+    // listener directly, and Caddy proxies /api/v1/* to it, so both go
+    // through the Docker host gateway. Docker mode keeps the compose defaults.
+    if settings.run_mode == RunMode::Native {
+        let rest_port = crate::config::native_rest_port(&settings.node_config);
+        lines.push(format!(
+            "QUIP_MINER_REST_URL=http://host.docker.internal:{rest_port}"
+        ));
+        lines.push(format!(
+            "QUIP_MINER_UPSTREAM=host.docker.internal:{rest_port}"
+        ));
+    }
 
     lines
 }
@@ -798,7 +791,7 @@ async fn ensure_mps_daemon(sink: Arc<dyn ProgressSink>) {
 ///   2. auto-detect public_host when unset, then refuse to start if it is
 ///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
-///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   4. sync_stack_assets (staging + compose patches)
 ///   5. write .env
 ///   6. write_config_toml
 ///   7. docker compose down  (clean slate; no-op on first start)
@@ -820,7 +813,7 @@ pub async fn start_stack(app: AppHandle) -> Result<(), String> {
 ///   2. auto-detect public_host when unset, then refuse to start if it is
 ///      still empty or not advertisable
 ///   3. force native miner REST settings when Native mode is used
-///   4. sync_stack_assets (staging + Caddyfile/public-addr patches)
+///   4. sync_stack_assets (staging + compose patches)
 ///   5. write .env
 ///   6. write_config_toml
 ///   7. docker compose --profile <p> pull
@@ -847,8 +840,8 @@ pub(crate) async fn start_stack_core(
     // (2) Auto-detect public_host when the user has not set one. An empty
     // public_host means "automatic", not "omit".
     //
-    // This runs in both modes. The validator, dashboard, caddy and postgres
-    // are containers whichever mode we are in, and step (4) feeds public_host
+    // This runs in both modes. The validator and dashboard are containers
+    // whichever mode we are in, and step (4) feeds public_host
     // into the staged assets that set the validator's advertised address.
     // Gating this on Docker left the Native validator advertising nothing,
     // even though the Native miner detects its own IP in `start_native_node_core`.
@@ -879,8 +872,8 @@ pub(crate) async fn start_stack_core(
     let rest_port = crate::config::native_rest_port(&settings.node_config);
 
     // (3) Materialise the resolved native REST port so config rendering and the
-    // staged Caddyfile both publish the same port. (rest_host is forced to
-    // loopback inside the config renderer.)
+    // dashboard's `.env` miner URLs both publish the same port. (rest_host is
+    // forced to loopback inside the config renderer.)
     if settings.run_mode == RunMode::Native {
         settings.node_config.rest_insecure_port = i32::from(rest_port);
     }
@@ -967,55 +960,7 @@ pub(crate) async fn start_stack_core(
     if up_result.is_ok() {
         verify_stack_networking(Arc::clone(&sink), &settings).await;
     }
-
-    // (10) Confirm the dashboard can actually authenticate to Postgres. A stale
-    // or foreign data volume keeps an old password and would otherwise leave
-    // the dashboard crash-looping behind a silent 502.
-    if up_result.is_ok() {
-        verify_dashboard_db(Arc::clone(&sink)).await;
-    }
     up_result
-}
-
-/// Result of probing the dashboard's Postgres credentials against the live
-/// volume.
-enum PgAuthProbe {
-    /// The current password authenticated successfully.
-    Ok,
-    /// Postgres rejected the current password (`28P01`) — the data volume was
-    /// initialised with a different one.
-    AuthFailed,
-    /// Postgres never became ready in time, or failed for a non-auth reason.
-    /// We don't raise the mismatch alarm in this case to avoid false positives.
-    Inconclusive,
-}
-
-/// After the stack is up, confirm the dashboard's Postgres credentials match
-/// the existing data volume. Postgres only applies `POSTGRES_PASSWORD` when it
-/// first initialises a data dir, so a volume left over from another stack (or a
-/// lost bootstrap.json) keeps its original password and the dashboard's startup
-/// migration crash-loops with `28P01 password authentication failed` — which
-/// the user only sees as a 502 behind Caddy. Surface it explicitly via the
-/// `dashboard-db-mismatch` event instead. Non-fatal: the validator and miner
-/// are unaffected, so we don't abort the whole start.
-async fn verify_dashboard_db(sink: Arc<dyn ProgressSink>) {
-    let password = crate::settings::postgres_password();
-    let outcome = tokio::task::spawn_blocking(move || probe_postgres_auth(&password))
-        .await
-        .unwrap_or(PgAuthProbe::Inconclusive);
-    match outcome {
-        PgAuthProbe::Ok | PgAuthProbe::Inconclusive => {}
-        PgAuthProbe::AuthFailed => {
-            let msg = format!(
-                "Dashboard database password mismatch: the existing `{PGDATA_VOLUME}` volume \
-                 was initialised with a different password (e.g. by another Quip stack), so the \
-                 dashboard can't start. Use \u{201c}Reset dashboard database\u{201d} on the \
-                 Dashboard tab to recreate it."
-            );
-            sink.log("ERROR", &msg);
-            sink.dashboard_db_mismatch(&msg);
-        }
-    }
 }
 
 /// Container name for a compose service. Every service in the upstream compose
@@ -1112,8 +1057,8 @@ fn is_wiring_broken(wiring: &ContainerWiring) -> bool {
     !wiring.attached
 }
 
-/// Post-`up` invariant check, sibling to `verify_dashboard_db`: confirm Docker
-/// actually wired up every expected service, and recreate the ones it did not.
+/// Post-`up` invariant check: confirm Docker actually wired up every expected
+/// service, and recreate the ones it did not.
 ///
 /// `docker compose up` exiting zero only means "the containers are running",
 /// never "the containers are reachable". This closes that gap.
@@ -1211,136 +1156,46 @@ async fn broken_services(services: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Wait (bounded) for `quip-postgres` to accept connections, then attempt an
-/// authenticated TCP query with the current password. TCP (`-h 127.0.0.1`)
-/// exercises the same password path the dashboard uses, unlike the local socket
-/// which the official image leaves as `trust`. `PGPASSWORD` is passed via the
-/// environment so it never lands in logs or `ps`.
-fn probe_postgres_auth(password: &str) -> PgAuthProbe {
-    let mut ready = false;
-    for _ in 0..30 {
-        let r = crate::cmd::new("docker")
-            .args([
-                "exec",
-                PG_CONTAINER,
-                "pg_isready",
-                "-U",
-                PG_USER,
-                "-d",
-                PG_DB,
-            ])
-            .output();
-        if matches!(r, Ok(ref o) if o.status.success()) {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    if !ready {
-        return PgAuthProbe::Inconclusive;
-    }
-
-    let pgpass = format!("PGPASSWORD={password}");
-    let output = crate::cmd::new("docker")
-        .args([
-            "exec",
-            "-e",
-            pgpass.as_str(),
-            PG_CONTAINER,
-            "psql",
-            "-h",
-            "127.0.0.1",
-            "-U",
-            PG_USER,
-            "-d",
-            PG_DB,
-            "-tAc",
-            "select 1",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => PgAuthProbe::Ok,
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            if err.contains("password authentication failed") || err.contains("28P01") {
-                PgAuthProbe::AuthFailed
-            } else {
-                PgAuthProbe::Inconclusive
-            }
-        }
-        Err(_) => PgAuthProbe::Inconclusive,
-    }
-}
-
 /// Delete the dashboard's database + indexer state. Used to clear stale
-/// dashboard data (e.g. a cached node identity) or recover from a Postgres
-/// password mismatch (see `verify_dashboard_db`).
+/// dashboard data, e.g. a cached node identity.
 ///
-/// This ONLY deletes data — it does not run `docker compose up` or start
-/// anything. It force-removes the dashboard + Postgres containers (by their
-/// fixed names) so the data volume is free, deletes that volume, and clears the
-/// dashboard's bind-mounted data folder. The validator, miner and Caddy are
-/// left as-is. The dashboard comes back, empty, on the next Start.
-///
-/// In v0.2 the dashboard keeps everything in Postgres (`quip_pgdata`) — chain
-/// index, indexer state, and the cached `self_address`; the `dashboard-data`
-/// folder is unused but cleared for good measure.
+/// This only deletes data. It does not run `docker compose up` and it does
+/// not start anything. It force-removes `quip-dashboard` so nothing holds the
+/// database open, then clears the bind-mounted `dashboard-data` folder. The
+/// validator and the miner stay as they are. The dashboard comes back, empty,
+/// on the next Start.
 #[tauri::command]
 pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
     reset_dashboard_database_core(Arc::new(TauriSink::new(app))).await
 }
 
+/// Delete the dashboard's index. The dashboard rebuilds it from genesis on the
+/// next Start.
+///
+/// This only deletes data. It force-removes `quip-dashboard` so nothing holds
+/// the database open, then clears the bind-mounted `dashboard-data` folder.
+/// The Caddy certificates live in the `caddy-data` and `caddy-config` named
+/// volumes, which this does not touch.
 pub(crate) async fn reset_dashboard_database_core(
     sink: Arc<dyn ProgressSink>,
 ) -> Result<(), String> {
     sink.log("INFO", "$ Resetting dashboard database");
-
-    // Force-remove only the dashboard + Postgres containers (by fixed name) so
-    // the data volume is free to delete. Best-effort: missing containers just
-    // error per-name, which we ignore. Deliberately no `compose up`.
-    sink.log("INFO", "$ docker rm -f quip-postgres quip-dashboard");
+    sink.log("INFO", "$ docker rm -f quip-dashboard");
     let _ = tokio::task::spawn_blocking(|| {
         crate::cmd::new("docker")
-            .args(["rm", "-f", PG_CONTAINER, "quip-dashboard"])
+            .args(["rm", "-f", "quip-dashboard"])
             .output()
     })
     .await;
 
-    // Delete the Postgres data volume (the database + indexer state, including
-    // the cached self identity).
-    sink.log("INFO", &format!("$ docker volume rm {PGDATA_VOLUME}"));
-    let rm = tokio::task::spawn_blocking(|| {
-        crate::cmd::new("docker")
-            .args(["volume", "rm", PGDATA_VOLUME])
-            .output()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    match rm {
-        Ok(o) if o.status.success() => {}
-        // "No such volume" means there's nothing to delete — fine.
-        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("No such volume") => {}
-        Ok(o) => {
-            return Err(format!(
-                "failed to remove {PGDATA_VOLUME}: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ))
-        }
-        Err(e) => return Err(format!("failed to remove {PGDATA_VOLUME}: {e}")),
-    }
-
-    // Clear the dashboard's bind-mounted data folder, then recreate it so the
-    // mount target exists and stays host-owned on the next Start.
     let dash_data = crate::settings::data_dir().join("dashboard-data");
     if let Err(e) = std::fs::remove_dir_all(&dash_data) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            sink.log(
-                "ERROR",
-                &format!("Warning: clearing {} failed: {e}", dash_data.display()),
-            );
+            return Err(format!("clearing {} failed: {e}", dash_data.display()));
         }
     }
-    let _ = std::fs::create_dir_all(&dash_data);
+    std::fs::create_dir_all(&dash_data)
+        .map_err(|e| format!("recreating {} failed: {e}", dash_data.display()))?;
 
     sink.log(
         "INFO",
@@ -1351,7 +1206,7 @@ pub(crate) async fn reset_dashboard_database_core(
 
 /// Stop the compose stack. Uses `docker compose stop`, which halts the
 /// containers but leaves them — and the project network and named volumes
-/// (quip-pgdata, quip-caddy-data, quip-caddy-config) — in place. Stop must not
+/// (quip_caddy-data, quip_caddy-config) — in place. Stop must not
 /// destroy containers; recreating from a clean slate is the Start path's job
 /// (`down` + name reap).
 ///
@@ -1424,14 +1279,16 @@ const KNOWN_CONTAINER_NAMES: &[&str] = &[
     "quip-cuda",
     "quip-validator",
     "quip-dashboard",
-    "quip-postgres",
-    "quip-caddy",
-    "quip-syslog",
     // Removed in v0.2 — the cpu/cuda miners self-bootstrap (faucet + miner +
     // descriptor registration), so the one-shot bootstrap container is gone.
     "quip-bootstrap",
     // Legacy one-container TUI path.
     "quip-node",
+    // Removed when the dashboard image took over Caddy, the collector, and the
+    // database.
+    "quip-postgres",
+    "quip-caddy",
+    "quip-syslog",
 ];
 
 /// Force-remove every container the compose file declares by name. Runs
@@ -1744,11 +1601,8 @@ mod tests {
         let services = vec![
             svc("cpu", false, None),
             svc("cuda", true, None),
-            svc("quip-syslog", true, None),
             svc("quip-validator", true, None),
             svc("dashboard", true, Some("healthy")),
-            svc("postgres", true, Some("healthy")),
-            svc("caddy", true, None),
         ];
         let expected = expected_services(&RunMode::Docker, ImageTag::Cuda);
         assert_eq!(roll_up_health(&services, &expected), StackHealth::Running);
@@ -1762,13 +1616,7 @@ mod tests {
     fn missing_expected_service_is_degraded() {
         // Dashboard container never created — the stack is not fully Running.
         // Everything else is present so the dashboard is the only thing missing.
-        let services = vec![
-            svc("cpu", true, None),
-            svc("quip-syslog", true, None),
-            svc("quip-validator", true, None),
-            svc("postgres", true, Some("healthy")),
-            svc("caddy", true, None),
-        ];
+        let services = vec![svc("cpu", true, None), svc("quip-validator", true, None)];
         let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
         assert_eq!(roll_up_health(&services, &expected), StackHealth::Degraded);
     }
@@ -1778,15 +1626,13 @@ mod tests {
         let expected = expected_services(&RunMode::Docker, ImageTag::Cpu);
         assert_eq!(roll_up_health(&[], &expected), StackHealth::Stopped);
 
-        let stopped = vec![svc("cpu", false, None), svc("caddy", false, None)];
+        let stopped = vec![svc("cpu", false, None), svc("dashboard", false, None)];
         assert_eq!(roll_up_health(&stopped, &expected), StackHealth::Stopped);
 
         let unhealthy = vec![
             svc("cpu", true, None),
             svc("quip-validator", true, None),
             svc("dashboard", true, Some("unhealthy")),
-            svc("postgres", true, Some("healthy")),
-            svc("caddy", true, None),
         ];
         assert_eq!(
             roll_up_health(&unhealthy, &expected),
@@ -1807,32 +1653,24 @@ mod tests {
 
     #[test]
     fn compose_services_native_runs_only_support_services() {
-        let services = compose_services(&RunMode::Native);
         assert_eq!(
-            services,
-            [
-                "quip-syslog",
-                "quip-validator",
-                "dashboard",
-                "postgres",
-                "caddy"
-            ]
+            compose_services(&RunMode::Native),
+            ["quip-validator", "dashboard"]
         );
-        assert!(!services.contains(&"cpu"));
-        assert!(!services.contains(&"cuda"));
-        assert!(!services.contains(&"quip-bootstrap"));
     }
 
-    /// Native names its services explicitly, so compose starts only what the
-    /// list holds. Dropping the collector would leave every service forwarding
-    /// stdout to a port nothing listens on, and quip-node.log would stay empty
-    /// with no error anywhere — UDP does not report a missing receiver.
+    /// The collector runs inside the dashboard container. Native names its
+    /// services explicitly, so leaving out the dashboard would leave every
+    /// service logging to a port that nothing listens on.
     #[test]
     fn the_log_collector_starts_in_both_run_modes() {
-        assert!(compose_services(&RunMode::Native).contains(&"quip-syslog"));
+        assert!(compose_services(&RunMode::Native).contains(&"dashboard"));
         for tag in [ImageTag::Cpu, ImageTag::Cuda] {
-            assert!(expected_services(&RunMode::Docker, tag).contains(&"quip-syslog"));
-            assert!(expected_services(&RunMode::Native, tag).contains(&"quip-syslog"));
+            assert_eq!(
+                expected_services(&RunMode::Docker, tag),
+                [tag.service(), "quip-validator", "dashboard"]
+            );
+            assert!(expected_services(&RunMode::Native, tag).contains(&"dashboard"));
         }
     }
 
@@ -1873,7 +1711,7 @@ mod tests {
             miner_mem_limit_gb: None,
             ..AppSettings::default()
         };
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
         assert!(!env.contains("QUIP_MINER_MEM_LIMIT"), "{env}");
     }
 
@@ -1883,7 +1721,7 @@ mod tests {
             miner_mem_limit_gb: Some(48),
             ..AppSettings::default()
         };
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("QUIP_MINER_MEM_LIMIT=48g"), "{env}");
     }
 
@@ -1899,13 +1737,7 @@ mod tests {
         settings.node_config.node_name = "validator-home".to_string();
         settings.node_config.num_cpus = 4;
 
-        let lines = render_env_lines(
-            &settings,
-            501,
-            1000,
-            "postgres-secret",
-            &uniform_tags("v0.3.0"),
-        );
+        let lines = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0"));
         let env = lines.join("\n");
 
         assert!(env.contains("PUID=501"));
@@ -1913,15 +1745,14 @@ mod tests {
         assert!(env.contains("QUIP_HOSTNAME=:20049"));
         assert!(env.contains("CERT_EMAIL=ops@example.com"));
         assert!(env.contains("ZEROSSL_API_KEY=zero"));
-        assert!(env.contains("POSTGRES_PASSWORD=postgres-secret"));
+        assert!(!env.contains("POSTGRES"));
         assert!(env.contains("CHANNEL=beta"));
         assert!(env.contains("QUIP_MINER_CPUSET=0-3"));
         assert!(env.contains("VALIDATOR_NAME=validator-home"));
         // QUIP_VALIDATORS is no longer written — the miner is config-driven and
         // the upstream compose dropped it from the cpu/cuda env contract.
         assert!(!env.contains("QUIP_VALIDATORS"));
-        // QUIP_VALIDATOR_RPC_URLS is deferred to the compose default
-        // (ws://quip-caddy:8088/rpc), not written into .env.
+        // Deferred to the compose default, ws://quip-validator:9944.
         assert!(!env.contains("QUIP_VALIDATOR_RPC_URLS"));
         assert!(!env.contains("QUIP_NODE_URL"));
         assert!(!env.contains("QUIP_NODE_TOKEN"));
@@ -1938,14 +1769,14 @@ mod tests {
             update_channel: crate::settings::UpdateChannel::Beta,
             ..AppSettings::default()
         };
-        let env = render_env_lines(&beta, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&beta, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("CHANNEL=beta"));
 
         let release = AppSettings {
             update_channel: crate::settings::UpdateChannel::Release,
             ..beta.clone()
         };
-        let env = render_env_lines(&release, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&release, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("CHANNEL=stable"));
 
         // The compose file falls back to the moving `${CHANNEL:-beta}` tag when
@@ -1966,11 +1797,11 @@ mod tests {
                 prod: "v0.2.2".into(),
             },
         };
-        let beta_env = render_env_lines(&beta, 501, 1000, "pg", &tags).join("\n");
+        let beta_env = render_env_lines(&beta, 501, 1000, &tags).join("\n");
         assert!(beta_env.contains("QUIP_MINER_TAG=v0.3.1-rc7"));
         assert!(beta_env.contains("QUIP_VALIDATOR_TAG=v0.3.0-rc1"));
 
-        let release_env = render_env_lines(&release, 501, 1000, "pg", &tags).join("\n");
+        let release_env = render_env_lines(&release, 501, 1000, &tags).join("\n");
         assert!(release_env.contains("QUIP_MINER_TAG=v0.3.0"));
         assert!(release_env.contains("QUIP_VALIDATOR_TAG=v0.2.2"));
     }
@@ -1981,7 +1812,7 @@ mod tests {
         settings.node_config.public_host = "node.example.com".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=node.example.com, node.example.com:20049"));
     }
@@ -1992,7 +1823,7 @@ mod tests {
         settings.node_config.public_host = "203.0.113.9".to_string();
         settings.hostname = "dashboard.example.com".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("QUIP_HOSTNAME=dashboard.example.com"));
     }
@@ -2005,7 +1836,7 @@ mod tests {
             ..crate::settings::DwaveConfig::default()
         });
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
         assert!(env.contains("DWAVE_API_TOKEN=dwave-token\n"));
         assert!(env.contains("DWAVE_API_SOLVER=Advantage2_System1.13\n"));
         assert!(env.contains("DWAVE_API_REGION=na-west-1\n"));
@@ -2020,7 +1851,7 @@ mod tests {
         };
         settings.node_config.node_name = "physical-miner-validator".to_string();
 
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
 
         assert!(!env.contains("QUIP_VALIDATORS="));
         // Deferred to the compose default in both modes (see above).
@@ -2030,17 +1861,64 @@ mod tests {
     #[test]
     fn env_lines_default_validator_name_and_single_cpu_cpuset() {
         let settings = AppSettings::default();
-        let env = render_env_lines(&settings, 501, 1000, "pg", &uniform_tags("v0.3.0")).join("\n");
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
 
         assert!(env.contains("VALIDATOR_NAME=quip-validator"));
         assert!(env.contains("QUIP_MINER_CPUSET=0"));
+    }
+
+    /// The logging driver of every service and the collector's published port
+    /// both read QUIP_LOG_PORT. A mismatch drops every log line silently.
+    #[test]
+    fn env_lines_write_the_log_collector_port() {
+        let mut settings = AppSettings::default();
+        settings.node_config.service_ports.log_collector.host_port = 15514;
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
+        assert!(env.contains("QUIP_LOG_PORT=15514"), "{env}");
+    }
+
+    /// Docker mode keeps the compose defaults, which name the miner container.
+    #[test]
+    fn env_lines_docker_defers_miner_urls_to_compose() {
+        let env = render_env_lines(&AppSettings::default(), 501, 1000, &uniform_tags("v0.3.0"))
+            .join("\n");
+        assert!(!env.contains("QUIP_MINER_REST_URL"), "{env}");
+        assert!(!env.contains("QUIP_MINER_UPSTREAM"), "{env}");
+    }
+
+    /// In Native mode the miner runs on the host. The dashboard backend and
+    /// Caddy both reach it through the Docker host gateway.
+    #[test]
+    fn env_lines_native_point_the_dashboard_at_the_host_miner() {
+        let mut settings = AppSettings {
+            run_mode: RunMode::Native,
+            ..AppSettings::default()
+        };
+        settings.node_config.rest_insecure_port = 20111;
+        let env = render_env_lines(&settings, 501, 1000, &uniform_tags("v0.3.0")).join("\n");
+        assert!(
+            env.contains("QUIP_MINER_REST_URL=http://host.docker.internal:20111"),
+            "{env}"
+        );
+        assert!(
+            env.contains("QUIP_MINER_UPSTREAM=host.docker.internal:20111"),
+            "{env}"
+        );
+    }
+
+    /// The dashboard image exits when PUID or PGID is 0.
+    #[test]
+    fn runtime_ids_never_pass_root_to_the_containers() {
+        assert_eq!(runtime_ids(0, 0), (1000, 1000));
+        assert_eq!(runtime_ids(501, 20), (501, 1000));
+        assert_eq!(runtime_ids(1001, 1001), (1001, 1001));
     }
 
     // ── post-up wiring check ───────────────────────────────────────────────
 
     #[test]
     fn container_names_prefix_services_once() {
-        assert_eq!(container_name_for_service("caddy"), "quip-caddy");
+        assert_eq!(container_name_for_service("dashboard"), "quip-dashboard");
         assert_eq!(container_name_for_service("cpu"), "quip-cpu");
         // Already prefixed in the compose file — must not double up.
         assert_eq!(

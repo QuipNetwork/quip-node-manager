@@ -23,8 +23,9 @@ pub(crate) const DOCKER_SIGNER_KEY: &str = "/data/keystore.json";
 // neither mode can use loopback. See the `dashboard` field in
 // `ConfigToml::from_node_config`.
 pub(crate) const MINER_REST_HOST: &str = "0.0.0.0";
-// Container-internal miner REST port. Must match the upstream Caddyfile's
-// `reverse_proxy quip-miner:8086`; the miner publishes no host port.
+// Container-internal miner REST port. Must match the compose defaults for
+// QUIP_MINER_REST_URL and QUIP_MINER_UPSTREAM. The miner publishes no host
+// port.
 pub(crate) const DOCKER_MINER_REST_PORT: u16 = 8086;
 pub(crate) const DEFAULT_NATIVE_REST_PORT: u16 = 20100;
 // Where the coordinator writes `<qblock_id>/attempts.jsonl`. In Docker this is
@@ -381,7 +382,7 @@ impl ConfigToml {
             // Native.
             //
             // Native binds all interfaces too, not loopback. The connection
-            // from the Caddy container arrives on the host's Docker gateway
+            // from the dashboard container arrives on the host's Docker gateway
             // address, not on 127.0.0.1, so a loopback bind refuses it and
             // every `/api/v1/*` request 502s. Binding wider exposes nothing
             // new: Caddy already proxies these same routes on the public API

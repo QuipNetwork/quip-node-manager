@@ -30,6 +30,14 @@ export function applyPortEdits(config, controls, edits) {
   return next;
 }
 
+// Why a required row has no working switch. The collector receives every
+// service's log, so it is on in both modes and bound to loopback.
+export function requiredNote(control) {
+  if (!control.required) return "";
+  if (control.id === "log_collector") return " (always on; listens on 127.0.0.1 only)";
+  return " (required in Native mode; this is a host port)";
+}
+
 export function renderPortControls(container, controls) {
   container.replaceChildren();
   let service;
@@ -56,9 +64,7 @@ export function renderPortControls(container, controls) {
     const portLabel =
       control.id === "miner_rest" && control.required ? "native" : control.container_port;
     name.textContent = `${control.label} (${portLabel}/${control.protocols.join("+")})`;
-    if (control.required) {
-      name.textContent += " (required in Native mode; this is a host port)";
-    }
+    name.textContent += requiredNote(control);
     label.append(toggle, name);
     const input = document.createElement("input");
     input.type = "number";
@@ -80,13 +86,6 @@ export function renderPortControls(container, controls) {
       group.append(renderPublicAccessToggle(control));
     }
     group.append(row);
-    if (control.id === "caddy_admin") {
-      const note = document.createElement("p");
-      note.className = "service-port-note";
-      note.textContent =
-        "The admin API can change Caddy configuration. Enable only on a trusted network.";
-      group.append(note);
-    }
   }
 }
 

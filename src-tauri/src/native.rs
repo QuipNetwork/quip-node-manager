@@ -1112,7 +1112,7 @@ pub(crate) async fn start_native_node_core(
     }
 
     // Write config.toml for native mode. The renderer derives the miner's REST
-    // bind address from the run mode (all interfaces, so the Caddy container
+    // bind address from the run mode (all interfaces, so the dashboard container
     // can reach it via host.docker.internal), so no rest_host override is
     // needed here. This follows provisioning so a first start resolves unset
     // solvers against the bundle it just installed.

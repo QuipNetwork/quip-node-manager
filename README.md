@@ -50,16 +50,16 @@ To check a signature or a checksum by hand, see the verification steps on the
 
 ## Features
 
-- **Full compose stack** -- runs miner + validator + dashboard + postgres behind a Caddy front door via Docker Compose; dashboard UI is embedded in the app's Dashboard tab
-- **Two run modes** -- Docker (default on Windows/Linux) drives the full container stack; Native (macOS) runs a standalone binary on the host and still runs the validator/dashboard/postgres/caddy containers, wired to the host via `host.docker.internal`
+- **Full compose stack** -- runs miner, validator, and dashboard containers via Docker Compose; the dashboard image embeds the Caddy front door and the log collector, and its UI is embedded in the app's Dashboard tab
+- **Two run modes** -- Docker (default on Windows/Linux) drives the full container stack; Native (macOS) runs a standalone binary on the host and still runs the validator and dashboard containers, wired to the host via `host.docker.internal`
 - **CPU or CUDA image** -- chosen automatically from the GPU device toggles (CUDA whenever an NVIDIA device is enabled); D-Wave mining runs on the CPU image via the `[dwave]` config section
-- **TLS toggle** -- the dashboard (Postgres-backed telemetry UI) and Caddy front door are always part of the stack; TLS is optional, with automatic Let's Encrypt or ZeroSSL certificates
+- **TLS toggle** -- the dashboard, with its embedded Caddy front door, is always part of the stack; TLS is optional, with automatic Let's Encrypt or ZeroSSL certificates
 - **Pre-flight checklist** -- verifies Docker + Compose v2 availability (plus WSL on Windows, the miner binary in Native mode, and the D-Wave token when QPU mining is configured), node secret, public IP, hostname, and external port reachability before starting (images aren't pre-checked -- Start always pulls them)
 - **Live log streaming** -- tails `docker compose logs -f <node>` in a collapsible drawer; switches to `data/node.log` once the node writes to it
 - **GPU configuration** -- detects CUDA and Metal devices, per-device enable/disable, utilization slider, yielding mode
 - **D-Wave QPU support** -- optional quantum processing unit configuration with a monthly QPU time budget
 - **Background update monitor** -- checks for new node + dashboard image digests and manager app releases every 30 minutes; optional auto-restart on digest change
-- **TLS certificate guidance** -- Caddy's ACME (Let's Encrypt or ZeroSSL) is wired up out of the box; set a DNS name + email and TLS "just works"
+- **TLS certificate guidance** -- the dashboard's embedded Caddy ACME (Let's Encrypt or ZeroSSL) is wired up out of the box; set a DNS name + email and TLS "just works"
 
 ## Development
 
@@ -114,17 +114,17 @@ the desktop app.
 
 - **Frontend**: `src/` -- vanilla HTML/CSS/JS with Tauri IPC (`withGlobalTauri: true`). Dashboard tab embeds the running dashboard container in an iframe.
 - **Backend**: `src-tauri/src/` -- Rust + Tauri v2 commands. `compose.rs` drives the stack via `docker compose`; `stack_assets.rs` stages the bundled compose files into `~/quip-data/`.
-- **Stack definition**: `vendor/nodes.quip.network/` -- git submodule tracking the upstream Docker Compose setup (miner + validator + dashboard + postgres + caddy).
+- **Stack definition**: `vendor/nodes.quip.network/` -- git submodule tracking the upstream Docker Compose setup (miner, validator, dashboard).
 - **Config**: TOML generation matching quip-protocol format; `.env` generated from settings on every Start.
 - **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files.
 
 Advanced settings in both interfaces group host ports by service. Each port has
 an on/off switch and a host port field. Internal Docker addresses stay fixed,
-including `quip-validator:9944`, `postgres:5432`, and `quip-miner:8086`.
+including `quip-validator:9944` and `quip-miner:8086`.
 
 Native mode requires validator RPC on a host port, which defaults to 9944.
 It stays on loopback unless you select public access. The native miner REST API
-binds to `0.0.0.0:20100` by default so Caddy can reach it through the Docker host gateway.
+binds to `0.0.0.0:20100` by default so the dashboard's embedded Caddy can reach it through the Docker host gateway.
 Its host port is also editable in advanced settings.
 
 Container logs attach before stack startup. Logs remain visible if startup fails or waits

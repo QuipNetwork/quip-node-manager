@@ -80,10 +80,6 @@ impl ProgressSink for TuiSink {
             }
         }
     }
-
-    fn dashboard_db_mismatch(&self, message: &str) {
-        self.push("ERROR", message.to_string());
-    }
 }
 
 #[cfg(test)]
