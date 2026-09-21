@@ -209,17 +209,15 @@ struct DwaveToml {
 #[derive(Default, Serialize)]
 struct MarkerToml {}
 
-/// v0.2 `[metal]` section. Carries shared GPU keys (`utilization`,
-/// `yielding`) plus the Metal-only adaptive-cap knobs directly, rather
-/// than relying on a shared `[gpu]` block.
+/// `[metal]` section. `utilization` and `yielding` are the only governor
+/// keys the backend reads, and it carries them directly rather than
+/// relying on a shared `[gpu]` block.
 #[derive(Serialize)]
 struct MetalToml {
     #[serde(skip_serializing_if = "String::is_empty")]
     binary: String,
     utilization: u8,
     yielding: bool,
-    active_util: u8,
-    idle_after_s: u32,
 }
 
 #[derive(Serialize)]
@@ -293,8 +291,7 @@ impl ConfigToml {
             .unwrap_or((100, false));
 
         // [gpu] holds shared defaults for the CUDA-style backends only. Metal
-        // carries its own tuning in [metal] (the protocol keeps Metal's
-        // adaptive-cap keys out of [gpu] inheritance), so MPS never emits it.
+        // carries its own tuning in [metal], so MPS never emits it.
         let gpu = if matches!(
             effective_backend,
             Some(GpuBackend::Local) | Some(GpuBackend::Modal)
@@ -340,8 +337,6 @@ impl ConfigToml {
                     ),
                     utilization: config.metal_config.utilization,
                     yielding: config.metal_config.yielding,
-                    active_util: config.metal_config.active_util,
-                    idle_after_s: config.metal_config.idle_after_s,
                 })
             }
             Some(GpuBackend::Modal) => modal = Some(MarkerToml::default()),
@@ -852,16 +847,14 @@ mod tests {
 
     #[test]
     fn mps_backend_writes_tuning_into_metal_section() {
-        // v0.2 [metal] carries its own utilization/yielding plus the
-        // Metal-only adaptive-cap keys; it does NOT rely on a shared [gpu]
-        // block (which the protocol reserves for CUDA inheritance).
+        // [metal] carries its own utilization/yielding; it does NOT rely on a
+        // shared [gpu] block (which the protocol reserves for CUDA
+        // inheritance).
         let cfg = NodeConfig {
             gpu_backend: GpuBackend::Mps,
             metal_config: MetalConfig {
                 utilization: 5,
                 yielding: true,
-                active_util: 70,
-                idle_after_s: 30,
             },
             ..NodeConfig::default()
         };
@@ -873,8 +866,36 @@ mod tests {
         );
         assert!(toml[metal..].contains("utilization = 5"));
         assert!(toml[metal..].contains("yielding = true"));
-        assert!(toml[metal..].contains("active_util = 70"));
-        assert!(toml[metal..].contains("idle_after_s = 30"));
+    }
+
+    /// `utilization` and `yielding` are the only governor keys the Metal
+    /// backend reads. Anything else draws an "unknown field ... (ignored)"
+    /// warning from quip_solver_core and configures nothing, so the manager
+    /// must not write the keys it used to.
+    #[test]
+    fn metal_section_writes_no_keys_the_miner_rejects() {
+        let cfg = NodeConfig {
+            gpu_backend: GpuBackend::Mps,
+            metal_config: MetalConfig {
+                utilization: 50,
+                yielding: true,
+            },
+            ..NodeConfig::default()
+        };
+        let toml = render_config_toml(&cfg, &RunMode::Native);
+        let parsed: toml::Value = toml::from_str(&toml).expect("valid toml");
+        let keys: Vec<&str> = parsed["metal"]
+            .as_table()
+            .expect("[metal] is a table")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            assert!(
+                matches!(*key, "binary" | "utilization" | "yielding"),
+                "[metal] carries {key}, which the miner ignores; keys={keys:?}"
+            );
+        }
     }
 
     #[test]
@@ -892,8 +913,6 @@ mod tests {
             metal_config: MetalConfig {
                 utilization: 42,
                 yielding: true,
-                active_util: 85,
-                idle_after_s: 60,
             },
             ..NodeConfig::default()
         };
@@ -1013,8 +1032,6 @@ mod tests {
             metal_config: MetalConfig {
                 utilization: 45,
                 yielding: true,
-                active_util: 70,
-                idle_after_s: 120,
             },
             ..NodeConfig::default()
         };
@@ -1023,8 +1040,6 @@ mod tests {
         let section = &parsed["metal"];
         assert_eq!(section["utilization"].as_integer(), Some(45));
         assert_eq!(section["yielding"].as_bool(), Some(true));
-        assert_eq!(section["active_util"].as_integer(), Some(70));
-        assert_eq!(section["idle_after_s"].as_integer(), Some(120));
     }
 
     #[test]

@@ -489,12 +489,6 @@ function renderGpuDevices() {
   // On macOS the Metal toggle IS the run-mode selector: native = Metal on.
   const metalEnabled = (state.settings?.run_mode || 'docker') === 'native';
 
-  // Metal exposes adaptive-cap knobs, but only while it's enabled; CUDA never.
-  const metalExtra = document.getElementById('metal-extra-settings');
-  if (metalExtra) {
-    metalExtra.style.display = isMetal && metalEnabled ? '' : 'none';
-  }
-
   list.replaceChildren();
 
   if (devices.length === 0) {
@@ -653,12 +647,6 @@ document.getElementById('gpu-utilization').addEventListener('input', () => {
   document.getElementById('gpu-util-display').textContent = `${val}%`;
 });
 
-// ─── Metal active-utilization slider ─────────────────────────────────────────
-document.getElementById('metal-active-util').addEventListener('input', () => {
-  const val = document.getElementById('metal-active-util').value;
-  document.getElementById('metal-active-util-display').textContent = `${val}%`;
-});
-
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
 function collectConfig() {
   const gpuUtilization = parseInt(document.getElementById('gpu-utilization')?.value) || 80;
@@ -684,14 +672,12 @@ function collectConfig() {
     });
   });
 
-  // Metal tuning is a standalone single-GPU config (the [metal] section);
-  // utilization/yielding are shared with the slider above, active_util and
-  // idle_after_s are Metal-only adaptive-cap knobs.
+  // Metal tuning is a standalone single-GPU config (the [metal] section).
+  // utilization and yielding are shared with the slider above, and are the
+  // only two keys the Metal backend reads.
   const metalConfig = {
     utilization: gpuUtilization,
     yielding: gpuYielding,
-    active_util: parseInt(document.getElementById('metal-active-util')?.value) || 85,
-    idle_after_s: parseInt(document.getElementById('metal-idle-after')?.value) || 60,
   };
 
   const qpuToken = document.getElementById('qpu-api-key')?.value?.trim() ?? '';
@@ -809,12 +795,6 @@ function populateGpuTuning(c) {
   document.getElementById('gpu-yielding').checked = isMetal
     ? (metalCfg.yielding ?? true)
     : (gpuCfg?.yielding ?? false);
-
-  // Metal-only adaptive-cap knobs
-  const activeUtil = metalCfg.active_util ?? 85;
-  document.getElementById('metal-active-util').value = activeUtil;
-  document.getElementById('metal-active-util-display').textContent = `${activeUtil}%`;
-  document.getElementById('metal-idle-after').value = metalCfg.idle_after_s ?? 60;
 }
 
 async function populateForm(settings) {

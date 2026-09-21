@@ -215,16 +215,6 @@ fn activate(app: &mut TuiApp) -> Action {
             app.dirty = true;
             Action::None
         }
-        // Same stepping as the utilization cap, and the same 1-100 range.
-        FocusId::MetalActiveUtil => {
-            app.form.metal_active_util = if app.form.metal_active_util >= 100 {
-                10
-            } else {
-                app.form.metal_active_util + 10
-            };
-            app.dirty = true;
-            Action::None
-        }
         FocusId::GpuDevice(index) => {
             crate::tui_app::toggle_gpu_device(
                 &mut app.settings.node_config.gpu_device_configs,
@@ -272,7 +262,6 @@ fn activate(app: &mut TuiApp) -> Action {
         | FocusId::PublicHostInput
         | FocusId::PublicPortInput
         | FocusId::CpuCores
-        | FocusId::MetalIdleAfter
         | FocusId::QpuApiKey
         | FocusId::QpuBudget
         | FocusId::QpuBudgetResetDay
@@ -304,7 +293,6 @@ fn start_edit(app: &mut TuiApp) {
         FocusId::PublicHostInput => app.form.public_host.clone(),
         FocusId::PublicPortInput => app.form.public_port.clone(),
         FocusId::CpuCores => app.form.cpu_cores.clone(),
-        FocusId::MetalIdleAfter => app.form.metal_idle_after.clone(),
         FocusId::QpuApiKey => app.form.qpu_api_key.clone(),
         FocusId::QpuBudget => app.form.qpu_budget.clone(),
         FocusId::QpuBudgetResetDay => app.form.qpu_budget_reset_day.clone(),
@@ -343,7 +331,6 @@ fn commit_edit(app: &mut TuiApp) {
             FocusId::PublicHostInput => app.form.public_host = buf,
             FocusId::PublicPortInput => app.form.public_port = buf,
             FocusId::CpuCores => app.form.cpu_cores = buf,
-            FocusId::MetalIdleAfter => app.form.metal_idle_after = buf,
             FocusId::QpuApiKey => app.form.qpu_api_key = buf,
             FocusId::QpuBudget => app.form.qpu_budget = buf,
             FocusId::QpuBudgetResetDay => app.form.qpu_budget_reset_day = buf,

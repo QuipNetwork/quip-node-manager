@@ -126,6 +126,27 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## Unreleased
+
+### The Metal settings no longer offer two knobs the miner ignores
+
+The GPU settings offered an "Active utilization" slider and an "Idle after"
+field for Apple Metal. The miner never read either one. It logged
+`unknown field 'active_util' for metal (ignored)` at every start and mined at
+the main utilization cap instead.
+
+- The desktop app and the terminal UI no longer show either control, and the
+  manager no longer writes `active_util` or `idle_after_s` to `config.toml`.
+- Utilization and Yielding are unchanged. They are the only two keys the
+  Metal backend reads.
+- Metal still adapts to other load while Yielding is on. The miner returns
+  headroom against outside demand down to half the utilization cap. The miner
+  does this on its own, and no setting ever controlled it.
+- An existing `config.toml` keeps the two dead keys until the next Start
+  rewrites it. They do nothing in the meantime.
+
+---
+
 ## v0.2.10-rc3
 
 ### The dashboard runs the front door and the log collector

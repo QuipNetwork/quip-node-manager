@@ -611,25 +611,6 @@ fn render_config_section(app: &TuiApp, lines: &mut Vec<Line>) {
                 focus_style(app, &FocusId::GpuYielding),
             ),
         ]));
-        // Metal adaptive cap, on the machines whose miner reads it.
-        if app.metal_knobs_apply() {
-            lines.push(Line::from(Span::styled(
-                "      Metal adaptive cap: active only while Yielding is on",
-                Style::default().fg(DIM),
-            )));
-            lines.push(field_line(
-                app,
-                &FocusId::MetalActiveUtil,
-                "  Active util",
-                &format!("{}%", app.form.metal_active_util),
-            ));
-            lines.push(field_line(
-                app,
-                &FocusId::MetalIdleAfter,
-                "  Idle after (s)",
-                &field_value(app, &FocusId::MetalIdleAfter, &app.form.metal_idle_after),
-            ));
-        }
     }
 
     // D-Wave mining toggle
