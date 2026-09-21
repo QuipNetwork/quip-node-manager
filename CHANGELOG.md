@@ -145,6 +145,23 @@ the main utilization cap instead.
 - An existing `config.toml` keeps the two dead keys until the next Start
   rewrites it. They do nothing in the meantime.
 
+### CUDA devices now carry their own utilization and yielding
+
+The manager wrote a `[gpu]` table and gave each `[cuda.N]` section only the
+values that differed from it. The miner reads no `[gpu]` table, so any device
+matching that table reached the miner with no governor keys and ran at the
+miner defaults: utilization 100, yielding off.
+
+This hit every box whose GPUs share one setting, including every box with a
+single GPU. A ceiling of 50 percent with yielding on produced a miner running
+flat out and yielding to nothing.
+
+- Each `[cuda.N]` section now carries `utilization` and `yielding` outright.
+- The manager writes no `[gpu]` table. A `[gpu]` table in a config carried
+  over from v0.1 or v0.2 still has no effect. Delete it.
+- The next Start rewrites `config.toml`. Check the values afterward if you
+  edited that file by hand.
+
 ---
 
 ## v0.2.10-rc3
