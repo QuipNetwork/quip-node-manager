@@ -126,7 +126,7 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## Unreleased
+## v0.2.10-rc4
 
 ### The Metal settings no longer offer two knobs the miner ignores
 
