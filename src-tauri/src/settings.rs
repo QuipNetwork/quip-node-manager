@@ -627,7 +627,11 @@ pub fn load_settings() -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
-    crate::service_ports::validate(&settings.node_config, &settings.run_mode)?;
+    crate::service_ports::validate(
+        &settings.node_config,
+        &settings.run_mode,
+        settings.tls_enabled,
+    )?;
     ensure_data_dir()?;
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(settings_path(), content).map_err(|e| e.to_string())

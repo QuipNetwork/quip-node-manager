@@ -145,6 +145,24 @@ the main utilization cap instead.
 - An existing `config.toml` keeps the two dead keys until the next Start
   rewrites it. They do nothing in the meantime.
 
+### HTTP/3 follows TLS instead of asking
+
+The port settings listed "HTTP/3" and "Public API HTTP/3" as two more rows
+with their own checkboxes and their own host ports. The settings no longer
+list either row.
+
+HTTP/3 is QUIC, which has no plaintext mode. It runs only on a site that
+serves TLS. It answers on that site's own port, because the `Alt-Svc` header
+advertises that port. Neither value was ever a choice.
+
+- Turn TLS on and the Public API and HTTPS ports also publish UDP, on the same
+  host port each already uses. Turn TLS off and neither does.
+- The old rows could point HTTP/3 at a different host port from the site that
+  advertised it. Nothing rejected that, and the result served nothing. Moving
+  HTTPS to host port 8443 while HTTP/3 stayed on 443 was enough to do it.
+- The manager drops any saved HTTP/3 port setting, because no row holds it
+  any more.
+
 ### CUDA devices now carry their own utilization and yielding
 
 The manager wrote a `[gpu]` table and gave each `[cuda.N]` section only the

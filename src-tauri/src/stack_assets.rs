@@ -136,8 +136,8 @@ pub fn stack_project_dir() -> PathBuf {
 /// The port settings control only host publications. All internal ports stay fixed.
 /// `config.public_host`, when set and P2P publishing is enabled, is converted
 /// into a Substrate public multiaddr using `config.validator_port`.
-pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), String> {
-    crate::service_ports::validate(config, run_mode)?;
+pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig, tls: bool) -> Result<(), String> {
+    crate::service_ports::validate(config, run_mode, tls)?;
     let base = data_dir();
     for sub in [
         "data",
@@ -180,7 +180,7 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig) -> Result<(), 
         ],
     )?;
 
-    let compose_out = patch_compose_file(COMPOSE_YML, config, run_mode)?;
+    let compose_out = patch_compose_file(COMPOSE_YML, config, run_mode, tls)?;
     fs::write(stack_compose_file(), compose_out)
         .map_err(|e| format!("write docker-compose.yml: {e}"))?;
 
@@ -294,9 +294,10 @@ fn apply_port_publications(
     src: &str,
     config: &NodeConfig,
     mode: &RunMode,
+    tls: bool,
 ) -> Result<String, String> {
-    use crate::service_ports::{PortId, PORT_SPECS};
-    crate::service_ports::validate(config, mode)?;
+    use crate::service_ports::{published_protocols, PortId, PORT_SPECS};
+    crate::service_ports::validate(config, mode, tls)?;
     let mut output = src.to_string();
     for (service, name) in [
         ("quip-validator", "quip-validator"),
@@ -320,7 +321,7 @@ fn apply_port_publications(
                 } else {
                     ""
                 };
-                for protocol in spec.protocols {
+                for protocol in published_protocols(spec, tls) {
                     mappings.push(format!(
                         "{address}{}:{}/{protocol}",
                         binding.host_port, spec.container_port
@@ -406,8 +407,13 @@ fn write_healthcheck_script() -> Result<(), String> {
     Ok(())
 }
 
-fn patch_compose_file(src: &str, config: &NodeConfig, mode: &RunMode) -> Result<String, String> {
-    let patched = apply_port_publications(src, config, mode)?;
+fn patch_compose_file(
+    src: &str,
+    config: &NodeConfig,
+    mode: &RunMode,
+    tls: bool,
+) -> Result<String, String> {
+    let patched = apply_port_publications(src, config, mode, tls)?;
     let public_host = if config.validator_p2p_enabled {
         &config.public_host
     } else {
@@ -538,7 +544,8 @@ mod tests {
     #[test]
     fn unpublished_docker_rpc_has_no_host_binding() {
         let output =
-            apply_port_publications(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+            apply_port_publications(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker, false)
+                .unwrap();
         assert!(!output.contains(":9944\""));
         assert!(output.contains("\"20049:20049/tcp\""));
     }
@@ -549,7 +556,8 @@ mod tests {
             validator_rpc_port: 29944,
             ..NodeConfig::default()
         };
-        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Native).unwrap();
+        let output =
+            apply_port_publications(COMPOSE_YML, &config, &RunMode::Native, false).unwrap();
         assert!(output.contains("\"127.0.0.1:29944:9944/tcp\""));
         assert!(!output.contains(":8086/tcp\""));
     }
@@ -561,7 +569,8 @@ mod tests {
             validator_rpc_port: 29944,
             ..NodeConfig::default()
         };
-        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Native).unwrap();
+        let output =
+            apply_port_publications(COMPOSE_YML, &config, &RunMode::Native, false).unwrap();
         assert!(output.contains("\"29944:9944/tcp\""));
         assert!(!output.contains("0.0.0.0:"));
         assert!(!output.contains("127.0.0.1:29944"));
@@ -581,7 +590,8 @@ mod tests {
                 },
             );
         }
-        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        let output =
+            apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker, false).unwrap();
         for expected in [
             "40000:30333/tcp",
             "40000:30333/udp",
@@ -591,15 +601,42 @@ mod tests {
             "40004:20049/tcp",
             "40005:80/tcp",
             "40006:443/tcp",
-            "40007:443/udp",
-            "40008:8088/tcp",
-            "40009:20049/udp",
-            "127.0.0.1:40010:5514/udp",
+            "40007:8088/tcp",
+            "127.0.0.1:40008:5514/udp",
         ] {
             assert!(output.contains(expected), "missing mapping {expected}");
         }
+        // No TLS, so neither site publishes a QUIC listener.
+        assert!(!output.contains("40004:20049/udp"));
+        assert!(!output.contains("40006:443/udp"));
         assert_eq!(output.matches("40003:8086/tcp").count(), 2, "CPU and CUDA");
         assert!(output.contains("--rpc-port=9944"));
+    }
+
+    /// HTTP/3 has no row of its own. Turning TLS on publishes the UDP leg of
+    /// each TLS site on that site's own host port, and turning it off removes
+    /// both. Nothing else in the mapping set moves.
+    #[test]
+    fn tls_publishes_http3_on_the_tls_sites_own_ports() {
+        use crate::service_ports::{PortBinding, PORT_SPECS};
+        let mut config = NodeConfig::default();
+        for (index, spec) in PORT_SPECS.iter().enumerate() {
+            spec.id.set_binding(
+                &mut config,
+                &RunMode::Docker,
+                PortBinding {
+                    enabled: true,
+                    host_port: 40000 + index as u16,
+                },
+            );
+        }
+        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker, true).unwrap();
+        // The Public API and HTTPS rows gain a UDP leg on their own port.
+        assert!(output.contains("40004:20049/udp"));
+        assert!(output.contains("40006:443/udp"));
+        // Plaintext HTTP and the internal route stay TCP only.
+        assert!(!output.contains("40005:80/udp"));
+        assert!(!output.contains("40007:8088/udp"));
     }
 
     #[test]
@@ -611,7 +648,8 @@ mod tests {
             binding.enabled = false;
             spec.id.set_binding(&mut config, &RunMode::Docker, binding);
         }
-        let output = apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        let output =
+            apply_port_publications(COMPOSE_YML, &config, &RunMode::Docker, false).unwrap();
         assert_eq!(output.lines().filter(|l| l.trim() == "ports:").count(), 1);
         assert!(output.contains("\"127.0.0.1:5514:5514/udp\""));
         assert!(output.contains("--rpc-port=9944"));
@@ -625,7 +663,7 @@ mod tests {
         let mut config = NodeConfig::default();
         config.service_ports.log_collector.host_port = 15514;
         for mode in [RunMode::Docker, RunMode::Native] {
-            let output = apply_port_publications(COMPOSE_YML, &config, &mode).unwrap();
+            let output = apply_port_publications(COMPOSE_YML, &config, &mode, false).unwrap();
             assert!(output.contains("\"127.0.0.1:15514:5514/udp\""), "{mode:?}");
         }
         assert!(COMPOSE_YML.contains("udp://127.0.0.1:${QUIP_LOG_PORT:-5514}"));
@@ -672,7 +710,7 @@ mod tests {
             public_host: "node.example.com".into(),
             ..NodeConfig::default()
         };
-        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker, false).unwrap();
         assert!(patched.contains("      - --public-addr=/dns4/node.example.com/tcp/30033\n"));
     }
 
@@ -683,7 +721,7 @@ mod tests {
             public_host: "1.2.3.4".into(),
             ..NodeConfig::default()
         };
-        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker, false).unwrap();
         assert!(patched.contains("      - --public-addr=/ip4/1.2.3.4/tcp/30033\n"));
 
         let config = NodeConfig {
@@ -691,14 +729,15 @@ mod tests {
             public_host: "[2001:db8::1]".into(),
             ..NodeConfig::default()
         };
-        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker).unwrap();
+        let patched = patch_compose_file(COMPOSE_YML, &config, &RunMode::Docker, false).unwrap();
         assert!(patched.contains("      - --public-addr=/ip6/2001:db8::1/tcp/30033\n"));
     }
 
     #[test]
     fn patch_compose_file_omits_public_addr_when_public_host_is_empty() {
         let patched =
-            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker, false)
+                .unwrap();
         assert!(!patched.contains("--public-addr"));
     }
 
@@ -707,7 +746,8 @@ mod tests {
     #[test]
     fn ungating_relaxes_every_validator_dependency() {
         let patched =
-            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker, false)
+                .unwrap();
         assert!(!patched.contains("quip-validator:\n        condition: service_healthy"));
         assert_eq!(
             COMPOSE_YML.matches("condition: service_healthy").count(),
@@ -776,7 +816,8 @@ mod tests {
     #[test]
     fn dashboard_receives_the_caddy_miner_upstream() {
         let patched =
-            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker).unwrap();
+            patch_compose_file(COMPOSE_YML, &NodeConfig::default(), &RunMode::Docker, false)
+                .unwrap();
         assert_eq!(
             patched
                 .matches("      QUIP_MINER_UPSTREAM: ${QUIP_MINER_UPSTREAM:-quip-miner:8086}\n")
