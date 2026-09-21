@@ -126,7 +126,7 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## v0.2.10-rc2
+## v0.2.10-rc3
 
 ### The dashboard runs the front door and the log collector
 
