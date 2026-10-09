@@ -233,6 +233,25 @@ rustfmt:
         - src-tauri/**/*
         - .gitlab-ci.yml
 
+# scripts/ holds the published install path for every user. An unchecked
+# command substitution shipped in v0.2.9 and broke the installer's signature
+# gate (QUI-1376); shellcheck flags that shape. `make lint-shell` runs the
+# same command.
+shellcheck:
+  stage: lint
+  image: koalaman/shellcheck-alpine:v0.11.0
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - shellcheck --version
+    - shellcheck scripts/*.sh
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - scripts/*.sh
+        - .gitlab-ci.yml
+
 # ---------------------------------------------------------------------------
 # macOS Universal (ARM64 + x86_64 fat binary)
 # ---------------------------------------------------------------------------

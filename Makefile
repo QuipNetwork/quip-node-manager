@@ -21,3 +21,17 @@ builder-image:
 		--tag $(BUILDER_IMAGE) \
 		--push \
 		.gitlab/
+
+# -- Script lint and tests ----------------------------------------------------
+# The same checks the `shellcheck` and `powershell-lint` CI jobs run. The
+# PowerShell targets run in the CI image through Docker, so no local pwsh is
+# needed. Each run installs the two modules from the PowerShell Gallery at
+# the pinned versions.
+POWERSHELL_IMAGE ?= mcr.microsoft.com/powershell:7.5-debian-12
+PSSCRIPTANALYZER_VERSION ?= 1.25.0
+PESTER_VERSION ?= 6.2.0
+
+.PHONY: lint-shell lint-powershell test-powershell
+
+lint-shell:
+	shellcheck scripts/*.sh
