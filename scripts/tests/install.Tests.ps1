@@ -57,6 +57,13 @@ Describe 'install.ps1 as a file' {
         $pinned = [regex]::Match($script:ScriptText, '(?m)^\$ExpectedSigner = "(.+)"$').Groups[1].Value
         $pinned | Should -BeExactly $expected
     }
+    It 'pins the same release key fingerprint install.sh verifies' {
+        $sh = Get-Content -LiteralPath (Join-Path $script:ScriptsDir 'install.sh') -Raw
+        $expected = [regex]::Match($sh, '(?m)^RELEASE_KEY_FINGERPRINT="([0-9A-F]{40})"$').Groups[1].Value
+        $expected | Should -Not -BeNullOrEmpty
+        $pinned = [regex]::Match($script:ScriptText, '(?m)^\$ReleaseKeyFingerprint = "([0-9A-F]{40})"$').Groups[1].Value
+        $pinned | Should -BeExactly $expected
+    }
 }
 
 Describe 'Get-ExpectedSha256' {
@@ -219,5 +226,86 @@ Describe 'Confirm-AuthenticodeSigner' {
         $script:FakeSignature = New-FakeSignature 'Valid' "O=$script:CN, L=`"Acme, CN=Decoy`", C=US" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+}
+
+Describe 'Confirm-SumsSignature' {
+    BeforeAll {
+        $script:FPR = 'A63860E21E7070C2C26FDA5DC85BEAB01AD9FEE3'
+        # Stubs stand in for the gpg and gpgconf executables. A function wins
+        # over an executable of the same name, so `& gpg` reaches the stub.
+        # $script:GpgExit maps a sub-command (import, list-keys, verify) to the
+        # exit code the stub reports; $script:GpgFprLine is what --list-keys
+        # prints.
+        function script:gpg {
+            $cmd = ($args | Where-Object { $_ -in '--import', '--list-keys', '--verify' } | Select-Object -First 1)
+            $script:GpgCalls += ($args -join ' ')
+            $global:LASTEXITCODE = if ($script:GpgExit.ContainsKey($cmd)) { $script:GpgExit[$cmd] } else { 0 }
+            if ($cmd -eq '--list-keys' -and $global:LASTEXITCODE -eq 0) {
+                'tru::1:1700000000:0:3:1:5'
+                'pub:u:255:22:C85BEAB01AD9FEE3:1700000000:::u:::scESC:::::ed25519:::0:'
+                $script:GpgFprLine
+            }
+        }
+        function script:gpgconf { $script:GpgconfCalls += ($args -join ' '); $global:LASTEXITCODE = 0 }
+        $script:Sums = Join-Path $script:Work 'SHA256SUMS'
+        Set-Content -LiteralPath $script:Sums -Value "$script:ExeHash  $script:Artifact"
+        $script:Sig = Join-Path $script:Work 'SHA256SUMS.asc'
+        Set-Content -LiteralPath $script:Sig -Value '-----BEGIN PGP SIGNATURE-----'
+        $script:Key = Join-Path $script:Work 'key.asc'
+        Set-Content -LiteralPath $script:Key -Value '-----BEGIN PGP PUBLIC KEY BLOCK-----'
+    }
+    BeforeEach {
+        $script:GpgCalls = @()
+        $script:GpgconfCalls = @()
+        $script:GpgExit = @{}
+        $script:GpgFprLine = "fpr:::::::::$($script:FPR):"
+    }
+    It 'passes when the key fingerprint matches and the signature verifies' {
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Not -Throw
+        @($script:GpgCalls | Where-Object { $_ -match '--verify' }).Count | Should -Be 1
+    }
+    It 'reads the primary key fingerprint, not a subkey, when both are listed' {
+        $script:GpgFprLine = @(
+            "fpr:::::::::$($script:FPR):",
+            'sub:u:255:18:0123456789ABCDEF:1700000000::::::e::::::cv25519::',
+            'fpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:')
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Not -Throw
+    }
+    It 'throws when the key cannot be imported' {
+        $script:GpgExit['--import'] = 2
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*Could not read the release signing key*'
+    }
+    It 'throws when the key cannot be listed back' {
+        $script:GpgExit['--list-keys'] = 2
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*read the release key back*'
+    }
+    It 'throws when the fingerprint differs, naming both' {
+        $script:GpgFprLine = 'fpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:'
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage "*DEADBEEF*expected $script:FPR*"
+        @($script:GpgCalls | Where-Object { $_ -match '--verify' }).Count | Should -Be 0
+    }
+    It 'throws when gpg reports no fingerprint' {
+        $script:GpgFprLine = 'uid:u::::1700000000::ABCDEF::Quip Release::::::::::0:'
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*no fingerprint*'
+    }
+    It 'throws when the signature does not verify' {
+        $script:GpgExit['--verify'] = 1
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*not valid*'
+    }
+    It 'stops the gpg daemons and removes the temporary home on failure' {
+        $script:GpgExit['--verify'] = 1
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } | Should -Throw -ExpectedMessage '*not valid*'
+        $script:GpgconfCalls.Count | Should -Be 1
+        $gpgHome = ($script:GpgCalls[0] -split ' ')[1]
+        $gpgHome | Should -Match 'quip-gnupg-'
+        Test-Path -LiteralPath $gpgHome | Should -BeFalse
     }
 }
