@@ -67,13 +67,13 @@ function Confirm-AuthenticodeSigner([string]$Path, [string]$ExpectedCN) {
         throw "The Authenticode signature on $Path is $($sig.Status), not Valid."
     }
     $subject = "$($sig.SignerCertificate.Subject)"
-    # Parse the distinguished name rather than splitting on commas: a quoted
-    # RDN value may itself contain ", CN=...". Format($true) returns one RDN
-    # per line with the quoting intact.
-    $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName($subject)
-    $cnLine = @($dn.Format($true) -split "`r?`n") | Where-Object { $_ -clike 'CN=*' } | Select-Object -First 1
-    $cn = if ($cnLine) { "$cnLine".Substring(3).Trim().Trim('"') } else { "" }
-    if ($cn -cne $ExpectedCN) {
+    # Ask the certificate for its common name instead of parsing the Subject
+    # string, so quoting, escaping and newlines in other RDNs never reach the
+    # comparison. SimpleName falls back to OU, O or email when the leaf has
+    # no CN, so also require that a CN exists.
+    $cn = "$($sig.SignerCertificate.GetNameInfo('SimpleName', $false))"
+    $hasCN = $subject -cmatch '(^|, )CN='
+    if (-not $hasCN -or $cn -cne $ExpectedCN) {
         throw "The binary is signed by '$subject', not by $ExpectedCN."
     }
 }

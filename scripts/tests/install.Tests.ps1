@@ -123,55 +123,74 @@ Describe 'Confirm-FileSha256' {
 Describe 'Confirm-AuthenticodeSigner' {
     BeforeAll {
         # Get-AuthenticodeSignature exists only on Windows. The stub returns
-        # whatever $script:FakeSignature holds, so each test shapes the answer.
+        # whatever $script:FakeSignature holds. The fake certificate carries
+        # the Subject string the message quotes and answers GetNameInfo with
+        # the CN that .NET would decode from the real certificate.
         function script:Get-AuthenticodeSignature { return $script:FakeSignature }
-        function script:New-FakeSignature([string]$Status, [string]$Subject) {
+        function script:New-FakeSignature([string]$Status, [string]$Subject, [string]$CN) {
+            $cert = [pscustomobject]@{ Subject = $Subject } |
+                Add-Member -MemberType ScriptMethod -Name GetNameInfo -Value { $CN }.GetNewClosure() -PassThru
             [pscustomobject]@{
                 Status            = $Status
-                SignerCertificate = [pscustomobject]@{ Subject = $Subject }
+                SignerCertificate = $cert
             }
         }
         $script:CN = 'HADAMARD GATE INCORPORATED'
     }
     It 'passes a valid signature whose leaf CN matches' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN, O=$script:CN, L=Baltimore, S=Maryland, C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN, O=$script:CN, L=Baltimore, S=Maryland, C=US" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
     }
     It 'passes when CN is the last RDN' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "C=US, CN=$script:CN"
+        $script:FakeSignature = New-FakeSignature 'Valid' "C=US, CN=$script:CN" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
     }
     It 'passes when the CN value is quoted' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=`"$script:CN`", C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=`"$script:CN`", C=US" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
     }
     It 'throws when the file is unsigned' {
-        $script:FakeSignature = New-FakeSignature 'NotSigned' ''
+        $script:FakeSignature = New-FakeSignature 'NotSigned' '' ''
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage '*NotSigned*'
     }
     It 'throws when the chain does not verify (sandbox signature)' {
-        $script:FakeSignature = New-FakeSignature 'UnknownError' "CN=Esigner LLC, C=US"
+        $script:FakeSignature = New-FakeSignature 'UnknownError' "CN=Esigner LLC, C=US" 'Esigner LLC'
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage '*UnknownError*'
     }
     It 'throws when a valid signature names another publisher' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Somebody Else, O=Somebody Else, C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Somebody Else, O=Somebody Else, C=US" 'Somebody Else'
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*Somebody Else*not by $script:CN*"
     }
     It 'rejects a CN that merely starts with the expected name' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN LLC, C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN LLC, C=US" "$script:CN LLC"
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
     It 'rejects the expected name when it appears only in O, not CN' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=$script:CN, C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=$script:CN, C=US" 'Reseller'
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
     It 'rejects the expected name hidden inside a quoted O value' {
-        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=`"Acme, CN=$script:CN, Support`", C=US"
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=`"Acme, CN=$script:CN, Support`", C=US" 'Reseller'
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+    It 'rejects a CN whose literal value carries quotes' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=`"`"`"$script:CN`"`"`", C=US" "`"$script:CN`""
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+    It 'rejects the expected name on a line inside a quoted O value' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=`"Acme`nCN=$script:CN`nSupport`", C=US" 'Reseller'
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+    It 'rejects a leaf with no CN even when SimpleName falls back to a matching O' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "O=$script:CN, C=US" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
