@@ -59,6 +59,23 @@ function Confirm-FileSha256([string]$Path, [string]$SumsPath, [string]$Name) {
     }
 }
 
+# True when the subject string has a top-level CN attribute. Walks the string
+# so a comma or "CN=" inside a quoted value does not count; both .NET and
+# CryptoAPI render such values in double quotes.
+function Test-SubjectHasCN([string]$Subject) {
+    $inQuotes = $false
+    $start = 0
+    for ($i = 0; $i -le $Subject.Length; $i++) {
+        $atEnd = ($i -eq $Subject.Length)
+        if (-not $atEnd -and $Subject[$i] -eq '"') { $inQuotes = -not $inQuotes; continue }
+        if ($atEnd -or ($Subject[$i] -eq ',' -and -not $inQuotes)) {
+            if ($Subject.Substring($start, $i - $start).Trim() -clike 'CN=*') { return $true }
+            $start = $i + 1
+        }
+    }
+    return $false
+}
+
 # The Windows analogue of the key pin in install.sh: Windows itself checks the
 # chain, and this checks that the leaf names the expected publisher.
 function Confirm-AuthenticodeSigner([string]$Path, [string]$ExpectedCN) {
@@ -72,7 +89,7 @@ function Confirm-AuthenticodeSigner([string]$Path, [string]$ExpectedCN) {
     # comparison. SimpleName falls back to OU, O or email when the leaf has
     # no CN, so also require that a CN exists.
     $cn = "$($sig.SignerCertificate.GetNameInfo('SimpleName', $false))"
-    $hasCN = $subject -cmatch '(^|, )CN='
+    $hasCN = Test-SubjectHasCN $subject
     if (-not $hasCN -or $cn -cne $ExpectedCN) {
         throw "The binary is signed by '$subject', not by $ExpectedCN."
     }

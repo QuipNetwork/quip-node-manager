@@ -120,6 +120,27 @@ Describe 'Confirm-FileSha256' {
     }
 }
 
+Describe 'Test-SubjectHasCN' {
+    It 'is true when CN is the first RDN' {
+        Test-SubjectHasCN 'CN=Acme, O=Acme, C=US' | Should -BeTrue
+    }
+    It 'is true when CN is the last RDN' {
+        Test-SubjectHasCN 'C=US, O=Acme, CN=Acme' | Should -BeTrue
+    }
+    It 'is false when the subject has no CN' {
+        Test-SubjectHasCN 'O=Acme, C=US' | Should -BeFalse
+    }
+    It 'is false when CN= appears only inside a quoted value' {
+        Test-SubjectHasCN 'O=Acme, L="Town, CN=Decoy", C=US' | Should -BeFalse
+    }
+    It 'is false when CN= appears on a line inside a quoted value' {
+        Test-SubjectHasCN "O=`"Acme`nCN=Decoy`nSupport`", C=US" | Should -BeFalse
+    }
+    It 'is true when a quoted value with doubled quotes precedes the CN' {
+        Test-SubjectHasCN 'O="He said ""CN=x""", CN=Acme' | Should -BeTrue
+    }
+}
+
 Describe 'Confirm-AuthenticodeSigner' {
     BeforeAll {
         # Get-AuthenticodeSignature exists only on Windows. The stub returns
@@ -191,6 +212,11 @@ Describe 'Confirm-AuthenticodeSigner' {
     }
     It 'rejects a leaf with no CN even when SimpleName falls back to a matching O' {
         $script:FakeSignature = New-FakeSignature 'Valid' "O=$script:CN, C=US" $script:CN
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+    It 'rejects a leaf with no CN when a quoted attribute contains CN=' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "O=$script:CN, L=`"Acme, CN=Decoy`", C=US" $script:CN
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
             Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
