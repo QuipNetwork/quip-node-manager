@@ -252,6 +252,25 @@ shellcheck:
         - scripts/*.sh
         - .gitlab-ci.yml
 
+# Lints every PowerShell file under scripts/. The image carries no modules, so
+# PSScriptAnalyzer comes from the PowerShell Gallery at a pinned version.
+# `make lint-powershell` runs the same command in the same image.
+powershell-lint:
+  stage: lint
+  image: mcr.microsoft.com/powershell:7.5-debian-12
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - pwsh -NoLogo -NoProfile -Command "Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser"
+  script:
+    - pwsh -NoLogo -NoProfile -Command "Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1 -EnableExit"
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - scripts/**/*
+        - .gitlab-ci.yml
+
 # ---------------------------------------------------------------------------
 # macOS Universal (ARM64 + x86_64 fat binary)
 # ---------------------------------------------------------------------------

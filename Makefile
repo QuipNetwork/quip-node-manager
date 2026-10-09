@@ -35,3 +35,8 @@ PESTER_VERSION ?= 6.2.0
 
 lint-shell:
 	shellcheck scripts/*.sh
+
+lint-powershell:
+	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \
+	  "Install-Module -Name PSScriptAnalyzer -RequiredVersion $(PSSCRIPTANALYZER_VERSION) -Force -Scope CurrentUser; \
+	   Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1 -EnableExit"

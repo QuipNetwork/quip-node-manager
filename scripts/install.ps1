@@ -8,30 +8,35 @@ $Repo = "quip.network%2Fquip-node-manager"
 $Api = "https://gitlab.com/api/v4/projects/$Repo/releases"
 
 function Info($msg)  { Write-Host "> $msg" -ForegroundColor Cyan }
-function Error($msg) { Write-Host "! $msg" -ForegroundColor Red; exit 1 }
+# throw, not exit. Under `irm | iex` the script runs inside the user's own
+# session, and exit ends that session before the message can be read.
+function Fail($msg) {
+    Write-Host "! $msg" -ForegroundColor Red
+    throw $msg
+}
 
-# ── Fetch latest release tag ────────────────────────────────────────────────
+# -- Fetch latest release tag ------------------------------------------------
 Info "Fetching latest release..."
 try {
     $releases = Invoke-RestMethod -Uri $Api -UseBasicParsing
 } catch {
-    Error "Failed to query releases: $_"
+    Fail "Failed to query releases: $_"
 }
 
 if (-not $releases -or $releases.Count -eq 0) {
-    Error "No releases found."
+    Fail "No releases found."
 }
 
 $Tag = $releases[0].tag_name
-if (-not $Tag) { Error "Could not determine latest release tag." }
+if (-not $Tag) { Fail "Could not determine latest release tag." }
 Info "Latest release: $Tag"
 
-# ── Build artifact URL ──────────────────────────────────────────────────────
+# -- Build artifact URL ------------------------------------------------------
 $Base = "https://gitlab.com/quip.network/quip-node-manager/-/jobs/artifacts/$Tag/raw/dist"
 $Artifact = "quip-node-manager-windows-x86_64.exe"
 $Url = "$Base/$Artifact`?job=build-windows-x86_64"
 
-# ── Download ────────────────────────────────────────────────────────────────
+# -- Download ----------------------------------------------------------------
 $InstallDir = Join-Path $env:LOCALAPPDATA "QuipNodeManager"
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -42,10 +47,10 @@ Info "Downloading $Artifact..."
 try {
     Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
 } catch {
-    Error "Download failed: $_"
+    Fail "Download failed: $_"
 }
 
-# ── Add to PATH (user scope) ───────────────────────────────────────────────
+# -- Add to PATH (user scope) -----------------------------------------------
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($UserPath -notlike "*$InstallDir*") {
     Info "Adding $InstallDir to user PATH..."
