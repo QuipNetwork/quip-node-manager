@@ -138,6 +138,10 @@ signtool verify /pa /v .\quip-node-manager-windows-x86_64.exe
 CI checks that same name through `verify-windows-signing.sh`. A sandbox-signed file reports
 `UnknownError` or `NotTrusted`. That is expected.
 
+`scripts/install.ps1` makes this check on every install and refuses a file
+whose status is not `Valid` or whose signer is not that name. A sandbox-signed
+release candidate does not install through the script for that reason.
+
 ## SmartScreen Reputation
 
 Windows SmartScreen protects users from unknown software:

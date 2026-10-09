@@ -58,7 +58,9 @@ across enough downloads. Click **More info**, then **Run anyway**.
 ## Verify Your Download
 
 `scripts/install.sh` checks the checksum on every run, and checks the signature
-as well when `gpg` is installed. To check a download by hand instead, expand the
+as well when `gpg` is installed. `scripts/install.ps1` checks the checksum and
+the Authenticode signature on every run, and the OpenPGP signature as well
+when `gpg` is installed. To check a download by hand instead, expand the
 section below.
 
 <details>
@@ -123,6 +125,33 @@ The `.deb` and the AppImage carry no embedded signature. Check those two
 against `SHA256SUMS` as shown above.
 
 </details>
+
+---
+
+## Unreleased
+
+### The Windows installer verifies what it downloads
+
+`scripts/install.ps1` downloaded the executable straight to its final path
+and checked nothing. It also fetched the build job's artifact, which is the
+copy that exists before signing.
+
+- The installer now downloads the signed executable and `SHA256SUMS` into a
+  scratch directory and compares the SHA-256 digest. It then checks that the
+  Authenticode signature is valid and issued to HADAMARD GATE INCORPORATED.
+  Only then does it move the file into place.
+- When `gpg` is installed, the installer also checks the OpenPGP signature on
+  `SHA256SUMS` against the pinned release key, the same check `install.sh`
+  makes.
+- Any failed check removes the download and stops the install with a
+  message. The PowerShell window stays open so that you can read the message.
+- A release candidate signed with the SSL.com sandbox does not install, because
+  Windows does not trust that certificate chain.
+
+### CI lints the install scripts
+
+- `shellcheck` runs on `scripts/*.sh`, and PSScriptAnalyzer and Pester run on
+  `scripts/*.ps1`, in the `lint` stage of every pipeline that touches them.
 
 ---
 
@@ -226,7 +255,7 @@ index database. The next Start removes the `quip-caddy`, `quip-postgres`, and
 
 - **Linux releases publish a signed RPM**: Fedora, RHEL and openSUSE users can install an RPM and check it with `rpm --checksig`, after importing the release key.
 
-- **Every release publishes SHA256SUMS and a signature over it**: the install script checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
+- **Every release publishes SHA256SUMS and a signature over it**: `install.sh` checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
 
 - **Release tags must be signed**: CI verifies the signature on each `v*` tag against a list of keys tracked in the repository, and refuses to build a release from a tag it cannot verify.
 
@@ -236,7 +265,7 @@ index database. The next Start removes the `quip-caddy`, `quip-postgres`, and
 
 - **Linux releases publish a signed RPM**: Fedora, RHEL and openSUSE users can install an RPM and check it with `rpm --checksig`, after importing the release key.
 
-- **Every release publishes SHA256SUMS and a signature over it**: the install script checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
+- **Every release publishes SHA256SUMS and a signature over it**: `install.sh` checks the checksum of what it downloaded, and checks the signature as well when `gpg` is installed. A mismatch deletes the download and stops the install.
 
 - **Release tags must be signed**: CI verifies the signature on each `v*` tag against a list of keys tracked in the repository, and refuses to build a release from a tag it cannot verify.
 
