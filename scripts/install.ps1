@@ -2,14 +2,6 @@
 # Quip Node Manager installer for Windows.
 # Usage: irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
 
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-    'PSUseDeclaredVarsMoreThanAssignments', 'ExpectedSigner',
-    Justification = 'This task defines the signer pin before download verification is connected.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-    'PSUseDeclaredVarsMoreThanAssignments', 'ReleaseKeyFingerprint',
-    Justification = 'The release key pin is used once Task 6 connects download verification.')]
-param()
-
 $ErrorActionPreference = "Stop"
 
 $Repo = "quip.network%2Fquip-node-manager"
@@ -159,22 +151,66 @@ $Tag = $releases[0].tag_name
 if (-not $Tag) { Fail "Could not determine latest release tag." }
 Info "Latest release: $Tag"
 
-# -- Build artifact URL ------------------------------------------------------
+# -- Build artifact URLs ------------------------------------------------------
+# The exe comes from sign-windows-x86_64, the job that holds the signed
+# binary. build-windows-x86_64 publishes the same file name unsigned, and
+# SHA256SUMS is computed after signing, so that copy passes neither check.
 $Base = "https://gitlab.com/quip.network/quip-node-manager/-/jobs/artifacts/$Tag/raw/dist"
-$Url = "$Base/$Artifact`?job=build-windows-x86_64"
+$Url = "$Base/$Artifact`?job=sign-windows-x86_64"
+$SumsUrl = "$Base/SHA256SUMS?job=sign-artifacts"
+$SigUrl = "$Base/SHA256SUMS.asc?job=sign-artifacts"
+$KeyUrl = "https://gitlab.com/quip.network/quip-node-manager/-/raw/$Tag/.gitlab/release-signing-key.asc"
 
-# -- Download ----------------------------------------------------------------
 $InstallDir = Join-Path $env:LOCALAPPDATA "QuipNodeManager"
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 $Dest = Join-Path $InstallDir "quip-node-manager.exe"
 
-Info "Downloading $Artifact..."
+# -- Download into a scratch directory, verify, then move into place ---------
+# Nothing reaches $Dest until every check has passed. Every failure below
+# discards the scratch directory: an unverified binary left in TEMP is worse
+# than no binary at all.
+$Work = Join-Path ([System.IO.Path]::GetTempPath()) `
+    ("quip-install-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $Work | Out-Null
+$Tmp = Join-Path $Work $Artifact
+$Sums = Join-Path $Work "SHA256SUMS"
+
 try {
-    Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+    Info "Downloading $Artifact..."
+    Get-ReleaseFile -Url $Url -OutFile $Tmp -What $Artifact
+    Get-ReleaseFile -Url $SumsUrl -OutFile $Sums -What "SHA256SUMS"
+
+    Info "Verifying checksum..."
+    Confirm-FileSha256 -Path $Tmp -SumsPath $Sums -Name $Artifact
+    Info "Checksum matches."
+
+    # gpg is not normally present on Windows, so the OpenPGP check over
+    # SHA256SUMS is conditional, the same as in install.sh. The Authenticode
+    # check below is mandatory and covers the binary itself.
+    if (Get-Command gpg -CommandType Application -ErrorAction SilentlyContinue) {
+        Info "Verifying signature..."
+        $Sig = Join-Path $Work "SHA256SUMS.asc"
+        $Key = Join-Path $Work "release-signing-key.asc"
+        Get-ReleaseFile -Url $SigUrl -OutFile $Sig -What "SHA256SUMS.asc"
+        Get-ReleaseFile -Url $KeyUrl -OutFile $Key -What "the release signing key"
+        Confirm-SumsSignature -SumsPath $Sums -SigPath $Sig -KeyPath $Key `
+            -Fingerprint $ReleaseKeyFingerprint
+        Info "Signature verified."
+    } else {
+        Info "gpg is not installed, so the signature on SHA256SUMS was not checked. The checksum was."
+    }
+
+    Info "Verifying Authenticode signature..."
+    Confirm-AuthenticodeSigner -Path $Tmp -ExpectedCN $ExpectedSigner
+    Info "Signed by $ExpectedSigner."
+
+    Move-Item -Force -LiteralPath $Tmp -Destination $Dest
 } catch {
-    Fail "Download failed: $_"
+    Fail $_.Exception.Message
+} finally {
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Work
 }
 
 # -- Add to PATH (user scope) -----------------------------------------------

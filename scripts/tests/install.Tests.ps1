@@ -40,6 +40,10 @@ AfterAll {
 }
 
 Describe 'install.ps1 as a file' {
+    It 'downloads the exe from the signing job, not the build job' {
+        $script:ScriptText | Should -Match '\?job=sign-windows-x86_64'
+        $script:ScriptText | Should -Not -Match 'job=build-windows-x86_64'
+    }
     It 'parses without errors' {
         $script:ParseErrors.Count | Should -Be 0
     }
