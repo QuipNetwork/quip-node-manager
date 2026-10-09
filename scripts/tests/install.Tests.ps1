@@ -141,6 +141,10 @@ Describe 'Confirm-AuthenticodeSigner' {
         $script:FakeSignature = New-FakeSignature 'Valid' "C=US, CN=$script:CN"
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
     }
+    It 'passes when the CN value is quoted' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=`"$script:CN`", C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
+    }
     It 'throws when the file is unsigned' {
         $script:FakeSignature = New-FakeSignature 'NotSigned' ''
         { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
@@ -158,10 +162,17 @@ Describe 'Confirm-AuthenticodeSigner' {
     }
     It 'rejects a CN that merely starts with the expected name' {
         $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN LLC, C=US"
-        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Throw
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
     It 'rejects the expected name when it appears only in O, not CN' {
         $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=$script:CN, C=US"
-        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Throw
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
+    }
+    It 'rejects the expected name hidden inside a quoted O value' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=`"Acme, CN=$script:CN, Support`", C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*not by $script:CN*"
     }
 }

@@ -67,8 +67,13 @@ function Confirm-AuthenticodeSigner([string]$Path, [string]$ExpectedCN) {
         throw "The Authenticode signature on $Path is $($sig.Status), not Valid."
     }
     $subject = "$($sig.SignerCertificate.Subject)"
-    $cn = [regex]::Escape($ExpectedCN)
-    if ($subject -notmatch "(^|,\s*)CN=$cn(,|$)") {
+    # Parse the distinguished name rather than splitting on commas: a quoted
+    # RDN value may itself contain ", CN=...". Format($true) returns one RDN
+    # per line with the quoting intact.
+    $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName($subject)
+    $cnLine = @($dn.Format($true) -split "`r?`n") | Where-Object { $_ -clike 'CN=*' } | Select-Object -First 1
+    $cn = if ($cnLine) { "$cnLine".Substring(3).Trim().Trim('"') } else { "" }
+    if ($cn -cne $ExpectedCN) {
         throw "The binary is signed by '$subject', not by $ExpectedCN."
     }
 }
