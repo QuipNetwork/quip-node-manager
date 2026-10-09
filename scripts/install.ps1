@@ -131,7 +131,7 @@ function Confirm-SumsSignature(
         if (Get-Command gpgconf -ErrorAction SilentlyContinue) {
             & gpgconf --homedir $gpgHome --kill all | Out-Null
         }
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $gpgHome
+        Remove-Item -LiteralPath $gpgHome -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -210,7 +210,7 @@ try {
 } catch {
     Fail $_.Exception.Message
 } finally {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Work
+    Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # -- Add to PATH (user scope) -----------------------------------------------

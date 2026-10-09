@@ -44,6 +44,11 @@ Describe 'install.ps1 as a file' {
         $script:ScriptText | Should -Match '\?job=sign-windows-x86_64'
         $script:ScriptText | Should -Not -Match 'job=build-windows-x86_64'
     }
+    It 'removes temporary directories by literal path, so brackets in TEMP do not defeat cleanup' {
+        $removals = @($script:ScriptText -split "`n" | Where-Object { $_ -match '\bRemove-Item\b' })
+        $removals.Count | Should -Be 2
+        foreach ($line in $removals) { $line | Should -Match '-LiteralPath\s' }
+    }
     It 'parses without errors' {
         $script:ParseErrors.Count | Should -Be 0
     }
@@ -320,6 +325,26 @@ Describe 'Confirm-SumsSignature' {
         $first = $script:GpgCalls[0]
         $gpgHome = $first[[array]::IndexOf($first, '--homedir') + 1]
         $gpgHome | Should -Match 'quip-gnupg-'
+        Test-Path -LiteralPath $gpgHome | Should -BeFalse
+    }
+    It 'removes the temporary home when the temp path contains brackets' {
+        $bracketTemp = Join-Path $script:Work 'tmp[1]'
+        New-Item -ItemType Directory -Path $bracketTemp | Out-Null
+        $savedTmpdir = $env:TMPDIR
+        $savedTemp = $env:TEMP
+        try {
+            $env:TMPDIR = $bracketTemp
+            $env:TEMP = $bracketTemp
+            $script:GpgExit['--verify'] = 1
+            { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+                Should -Throw -ExpectedMessage '*not valid*'
+        } finally {
+            $env:TMPDIR = $savedTmpdir
+            $env:TEMP = $savedTemp
+        }
+        $first = $script:GpgCalls[0]
+        $gpgHome = $first[[array]::IndexOf($first, '--homedir') + 1]
+        $gpgHome | Should -BeLike '*tmp`[1`]*'
         Test-Path -LiteralPath $gpgHome | Should -BeFalse
     }
 }
