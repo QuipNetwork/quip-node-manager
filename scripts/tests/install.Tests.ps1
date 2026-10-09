@@ -50,6 +50,13 @@ Describe 'install.ps1 as a file' {
     It 'contains only ASCII, so Windows PowerShell 5.1 reads it without a BOM' {
         $script:ScriptText | Should -Not -Match '[^\x00-\x7F]'
     }
+    It 'pins the same Authenticode signer CI verifies' {
+        $verify = Get-Content -LiteralPath (Join-Path $script:ScriptsDir 'verify-windows-signing.sh') -Raw
+        $expected = [regex]::Match($verify, "(?m)^EXPECTED_CN_PROD='(.+)'$").Groups[1].Value
+        $expected | Should -Not -BeNullOrEmpty
+        $pinned = [regex]::Match($script:ScriptText, '(?m)^\$ExpectedSigner = "(.+)"$').Groups[1].Value
+        $pinned | Should -BeExactly $expected
+    }
 }
 
 Describe 'Get-ExpectedSha256' {
@@ -110,5 +117,51 @@ Describe 'Confirm-FileSha256' {
         $sums = Write-SumsFile @("$script:ExeHash  something-else.exe")
         { Confirm-FileSha256 -Path $script:Exe -SumsPath $sums -Name $script:Artifact } |
             Should -Throw -ExpectedMessage '*no entry*'
+    }
+}
+
+Describe 'Confirm-AuthenticodeSigner' {
+    BeforeAll {
+        # Get-AuthenticodeSignature exists only on Windows. The stub returns
+        # whatever $script:FakeSignature holds, so each test shapes the answer.
+        function script:Get-AuthenticodeSignature { return $script:FakeSignature }
+        function script:New-FakeSignature([string]$Status, [string]$Subject) {
+            [pscustomobject]@{
+                Status            = $Status
+                SignerCertificate = [pscustomobject]@{ Subject = $Subject }
+            }
+        }
+        $script:CN = 'HADAMARD GATE INCORPORATED'
+    }
+    It 'passes a valid signature whose leaf CN matches' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN, O=$script:CN, L=Baltimore, S=Maryland, C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
+    }
+    It 'passes when CN is the last RDN' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "C=US, CN=$script:CN"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Not -Throw
+    }
+    It 'throws when the file is unsigned' {
+        $script:FakeSignature = New-FakeSignature 'NotSigned' ''
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage '*NotSigned*'
+    }
+    It 'throws when the chain does not verify (sandbox signature)' {
+        $script:FakeSignature = New-FakeSignature 'UnknownError' "CN=Esigner LLC, C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage '*UnknownError*'
+    }
+    It 'throws when a valid signature names another publisher' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Somebody Else, O=Somebody Else, C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } |
+            Should -Throw -ExpectedMessage "*Somebody Else*not by $script:CN*"
+    }
+    It 'rejects a CN that merely starts with the expected name' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=$script:CN LLC, C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Throw
+    }
+    It 'rejects the expected name when it appears only in O, not CN' {
+        $script:FakeSignature = New-FakeSignature 'Valid' "CN=Reseller, O=$script:CN, C=US"
+        { Confirm-AuthenticodeSigner -Path $script:Exe -ExpectedCN $script:CN } | Should -Throw
     }
 }

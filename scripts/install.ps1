@@ -2,10 +2,22 @@
 # Quip Node Manager installer for Windows.
 # Usage: irm https://gitlab.com/quip.network/quip-node-manager/-/raw/main/scripts/install.ps1 | iex
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSUseDeclaredVarsMoreThanAssignments', 'ExpectedSigner',
+    Justification = 'This task defines the signer pin before download verification is connected.')]
+param()
+
 $ErrorActionPreference = "Stop"
 
 $Repo = "quip.network%2Fquip-node-manager"
 $Api = "https://gitlab.com/api/v4/projects/$Repo/releases"
+$Artifact = "quip-node-manager-windows-x86_64.exe"
+
+# The common name on the Authenticode certificate, as SSL.com issued it. Keep
+# it equal to EXPECTED_CN_PROD in scripts/verify-windows-signing.sh: CI refuses
+# to publish a binary whose signer differs, and this script refuses to install
+# one. scripts/tests/install.Tests.ps1 checks that the two agree.
+$ExpectedSigner = "HADAMARD GATE INCORPORATED"
 
 function Info($msg)  { Write-Host "> $msg" -ForegroundColor Cyan }
 # throw, not exit. Under `irm | iex` the script runs inside the user's own
@@ -47,6 +59,20 @@ function Confirm-FileSha256([string]$Path, [string]$SumsPath, [string]$Name) {
     }
 }
 
+# The Windows analogue of the key pin in install.sh: Windows itself checks the
+# chain, and this checks that the leaf names the expected publisher.
+function Confirm-AuthenticodeSigner([string]$Path, [string]$ExpectedCN) {
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ("$($sig.Status)" -cne 'Valid') {
+        throw "The Authenticode signature on $Path is $($sig.Status), not Valid."
+    }
+    $subject = "$($sig.SignerCertificate.Subject)"
+    $cn = [regex]::Escape($ExpectedCN)
+    if ($subject -notmatch "(^|,\s*)CN=$cn(,|$)") {
+        throw "The binary is signed by '$subject', not by $ExpectedCN."
+    }
+}
+
 # -- Fetch latest release tag ------------------------------------------------
 Info "Fetching latest release..."
 try {
@@ -65,7 +91,6 @@ Info "Latest release: $Tag"
 
 # -- Build artifact URL ------------------------------------------------------
 $Base = "https://gitlab.com/quip.network/quip-node-manager/-/jobs/artifacts/$Tag/raw/dist"
-$Artifact = "quip-node-manager-windows-x86_64.exe"
 $Url = "$Base/$Artifact`?job=build-windows-x86_64"
 
 # -- Download ----------------------------------------------------------------
