@@ -239,7 +239,7 @@ Describe 'Confirm-SumsSignature' {
         # prints.
         function script:gpg {
             $cmd = ($args | Where-Object { $_ -in '--import', '--list-keys', '--verify' } | Select-Object -First 1)
-            $script:GpgCalls += ($args -join ' ')
+            $script:GpgCalls += , @($args)
             $global:LASTEXITCODE = if ($script:GpgExit.ContainsKey($cmd)) { $script:GpgExit[$cmd] } else { 0 }
             if ($cmd -eq '--list-keys' -and $global:LASTEXITCODE -eq 0) {
                 'tru::1:1700000000:0:3:1:5'
@@ -264,7 +264,7 @@ Describe 'Confirm-SumsSignature' {
     It 'passes when the key fingerprint matches and the signature verifies' {
         { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
             Should -Not -Throw
-        @($script:GpgCalls | Where-Object { $_ -match '--verify' }).Count | Should -Be 1
+        @($script:GpgCalls | Where-Object { $_ -contains '--verify' }).Count | Should -Be 1
     }
     It 'reads the primary key fingerprint, not a subkey, when both are listed' {
         $script:GpgFprLine = @(
@@ -273,6 +273,15 @@ Describe 'Confirm-SumsSignature' {
             'fpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:')
         { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
             Should -Not -Throw
+    }
+    It 'rejects a key file that carries a second primary key' {
+        $script:GpgFprLine = @(
+            "fpr:::::::::$($script:FPR):",
+            'pub:u:255:22:DEADBEEFDEADBEEF:1700000000:::u:::scESC:::::ed25519:::0:',
+            'fpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:')
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*2 primary keys, expected 1*'
+        @($script:GpgCalls | Where-Object { $_ -contains '--verify' }).Count | Should -Be 0
     }
     It 'throws when the key cannot be imported' {
         $script:GpgExit['--import'] = 2
@@ -288,7 +297,7 @@ Describe 'Confirm-SumsSignature' {
         $script:GpgFprLine = 'fpr:::::::::DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF:'
         { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
             Should -Throw -ExpectedMessage "*DEADBEEF*expected $script:FPR*"
-        @($script:GpgCalls | Where-Object { $_ -match '--verify' }).Count | Should -Be 0
+        @($script:GpgCalls | Where-Object { $_ -contains '--verify' }).Count | Should -Be 0
     }
     It 'throws when gpg reports no fingerprint' {
         $script:GpgFprLine = 'uid:u::::1700000000::ABCDEF::Quip Release::::::::::0:'
@@ -304,7 +313,8 @@ Describe 'Confirm-SumsSignature' {
         $script:GpgExit['--verify'] = 1
         { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } | Should -Throw -ExpectedMessage '*not valid*'
         $script:GpgconfCalls.Count | Should -Be 1
-        $gpgHome = ($script:GpgCalls[0] -split ' ')[1]
+        $first = $script:GpgCalls[0]
+        $gpgHome = $first[[array]::IndexOf($first, '--homedir') + 1]
         $gpgHome | Should -Match 'quip-gnupg-'
         Test-Path -LiteralPath $gpgHome | Should -BeFalse
     }

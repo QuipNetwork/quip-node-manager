@@ -115,8 +115,15 @@ function Confirm-SumsSignature(
         & gpg --homedir $gpgHome --batch --quiet --import $KeyPath
         if ($LASTEXITCODE -ne 0) { throw "Could not read the release signing key." }
 
-        $listing = & gpg --homedir $gpgHome --batch --list-keys --with-colons
+        $listing = @(& gpg --homedir $gpgHome --batch --list-keys --with-colons)
         if ($LASTEXITCODE -ne 0) { throw "Could not read the release key back from gpg." }
+        # The fingerprint below pins the first key. A key file that carries a
+        # second primary key would let gpg accept a signature from that one,
+        # so the pinned key must be the only primary key gpg can use.
+        $primaries = @($listing | Where-Object { "$_" -clike 'pub:*' })
+        if ($primaries.Count -ne 1) {
+            throw "The release key file holds $($primaries.Count) primary keys, expected 1."
+        }
         $fprLine = @($listing) | Where-Object { "$_" -like 'fpr:*' } | Select-Object -First 1
         $found = if ($fprLine) { ("$fprLine" -split ':')[9] } else { $null }
         if (-not $found) { throw "gpg reported no fingerprint for the release key." }
