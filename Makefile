@@ -40,3 +40,8 @@ lint-powershell:
 	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \
 	  "Install-Module -Name PSScriptAnalyzer -RequiredVersion $(PSSCRIPTANALYZER_VERSION) -Force -Scope CurrentUser; \
 	   Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1 -EnableExit"
+
+test-powershell:
+	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \
+	  "Install-Module -Name Pester -RequiredVersion $(PESTER_VERSION) -Force -Scope CurrentUser; \
+	   pwsh -NoLogo -NoProfile -File scripts/tests/run.ps1"

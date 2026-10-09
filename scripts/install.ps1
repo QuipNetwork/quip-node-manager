@@ -15,6 +15,38 @@ function Fail($msg) {
     throw $msg
 }
 
+# -- Helpers. scripts/tests/install.Tests.ps1 loads these without running the
+# -- installer, so keep every function free of side effects on the session.
+
+function Get-ReleaseFile([string]$Url, [string]$OutFile, [string]$What) {
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    } catch {
+        throw "Could not download ${What}: $($_.Exception.Message)"
+    }
+}
+
+# The SHA-256 digest SHA256SUMS lists for $Name, lowercase, or $null when the
+# file has no entry. sha256sum writes "<hex>  <name>", or "<hex> *<name>" in
+# binary mode; both forms are accepted, the same as install.sh.
+function Get-ExpectedSha256([string]$SumsPath, [string]$Name) {
+    foreach ($line in Get-Content -LiteralPath $SumsPath) {
+        if ($line -match '^([0-9A-Fa-f]{64})\s+\*?(\S+)\s*$' -and $Matches[2] -ceq $Name) {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+    return $null
+}
+
+function Confirm-FileSha256([string]$Path, [string]$SumsPath, [string]$Name) {
+    $expected = Get-ExpectedSha256 -SumsPath $SumsPath -Name $Name
+    if (-not $expected) { throw "SHA256SUMS lists no entry for $Name." }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -cne $expected) {
+        throw "Checksum mismatch for $Name. The download is not the released file."
+    }
+}
+
 # -- Fetch latest release tag ------------------------------------------------
 Info "Fetching latest release..."
 try {
