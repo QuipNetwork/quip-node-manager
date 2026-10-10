@@ -149,9 +149,17 @@ if command -v gpg >/dev/null 2>&1; then
 
   # Same reason as the checksum tool above: take the exit status, so a gpg
   # that cannot answer is reported as a broken gpg and not as the wrong signer.
-  FOUND=$(GNUPGHOME="$GPGHOME" gpg --batch --list-keys --with-colons) \
+  LISTING=$(GNUPGHOME="$GPGHOME" gpg --batch --list-keys --with-colons) \
     || { discard; error "Could not read the release key back from gpg."; }
-  FOUND=$(printf '%s\n' "$FOUND" | awk -F: '/^fpr/ {print $10; exit}')
+  # The fingerprint below pins the first key. A key file that carries a
+  # second primary key would let gpg accept a signature from that one, so the
+  # pinned key must be the only primary key gpg can use. Subkeys are fine.
+  PRIMARIES=$(printf '%s\n' "$LISTING" | awk -F: '/^pub:/ {n++} END {print n+0}')
+  if [ "$PRIMARIES" -ne 1 ]; then
+    discard
+    error "The release key file holds ${PRIMARIES} primary keys, expected 1."
+  fi
+  FOUND=$(printf '%s\n' "$LISTING" | awk -F: '/^fpr/ {print $10; exit}')
   [ -n "$FOUND" ] \
     || { discard; error "gpg reported no fingerprint for the release key."; }
 
