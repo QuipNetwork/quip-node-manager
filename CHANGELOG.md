@@ -148,6 +148,14 @@ copy that exists before signing.
 - A release candidate signed with the SSL.com sandbox does not install, because
   Windows does not trust that certificate chain.
 
+### Both installers require a single release key
+
+`install.sh` and `install.ps1` compare the pinned fingerprint with the first
+key in the downloaded key file. A key file that carried a second key could
+then pass that comparison, and gpg would accept a signature from the second
+key. Both installers now stop when the key file holds more than one primary
+key.
+
 ### CI lints the install scripts
 
 - `shellcheck` runs on `scripts/*.sh`, and PSScriptAnalyzer and Pester run on
