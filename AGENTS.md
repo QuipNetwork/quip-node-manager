@@ -452,7 +452,7 @@ bun run build
 # Install dependencies
 bun install
 
-# Lint the install scripts the way CI does (the PowerShell targets use Docker)
+# Lint the install scripts the way CI does (all three targets use Docker)
 make lint-shell
 make lint-powershell
 make test-powershell

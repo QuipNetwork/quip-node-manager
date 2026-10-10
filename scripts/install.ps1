@@ -129,7 +129,14 @@ function Confirm-SumsSignature(
         # gpg 2.4+ starts keyboxd and gpg-agent against the home; stop them
         # before the directory goes, or they outlive it.
         if (Get-Command gpgconf -ErrorAction SilentlyContinue) {
-            & gpgconf --homedir $gpgHome --kill all | Out-Null
+            # Best effort: a daemon left running does not change the verdict,
+            # and an error here must not skip the removal below or replace
+            # the error that brought us here.
+            try {
+                & gpgconf --homedir $gpgHome --kill all | Out-Null
+            } catch {
+                Write-Verbose "gpgconf could not stop the gpg daemons: $($_.Exception.Message)"
+            }
         }
         Remove-Item -LiteralPath $gpgHome -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -206,11 +213,18 @@ try {
     Confirm-AuthenticodeSigner -Path $Tmp -ExpectedCN $ExpectedSigner
     Info "Signed by $ExpectedSigner."
 
-    Move-Item -Force -LiteralPath $Tmp -Destination $Dest
+    try {
+        Move-Item -Force -LiteralPath $Tmp -Destination $Dest
+    } catch {
+        throw "Could not replace $Dest. Close Quip Node Manager if it is running, then run the installer again. $($_.Exception.Message)"
+    }
 } catch {
     Fail $_.Exception.Message
 } finally {
     Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Work) {
+        Write-Host "! Could not remove the temporary directory $Work. Delete it by hand." -ForegroundColor Yellow
+    }
 }
 
 # -- Add to PATH (user scope) -----------------------------------------------

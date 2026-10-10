@@ -11,6 +11,7 @@ BeforeAll {
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
         $script:ScriptPath, [ref]$tokens, [ref]$errors)
+    $script:Ast = $ast
     $script:ParseErrors = @($errors)
 
     # Load only the function definitions. Dot-sourcing the file would run the
@@ -36,7 +37,7 @@ BeforeAll {
 }
 
 AfterAll {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $script:Work
+    Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Describe 'install.ps1 as a file' {
@@ -53,8 +54,9 @@ Describe 'install.ps1 as a file' {
         $script:ParseErrors.Count | Should -Be 0
     }
     It 'never calls exit, which under irm | iex would close the user session' {
-        $script:ScriptText | Should -Not -Match '(?m)^\s*exit\b'
-        $script:ScriptText | Should -Not -Match ';\s*exit\b'
+        $exits = $script:Ast.FindAll(
+            { $args[0] -is [System.Management.Automation.Language.ExitStatementAst] }, $true)
+        @($exits).Count | Should -Be 0
     }
     It 'contains only ASCII, so Windows PowerShell 5.1 reads it without a BOM' {
         $script:ScriptText | Should -Not -Match '[^\x00-\x7F]'
@@ -256,7 +258,7 @@ Describe 'Confirm-SumsSignature' {
                 $script:GpgFprLine
             }
         }
-        function script:gpgconf { $script:GpgconfCalls += ($args -join ' '); $global:LASTEXITCODE = 0 }
+        function script:gpgconf { $script:GpgconfCalls += ($args -join ' '); if ($script:GpgconfThrows) { throw 'gpgconf could not start' }; $global:LASTEXITCODE = 0 }
         $script:Sums = Join-Path $script:Work 'SHA256SUMS'
         Set-Content -LiteralPath $script:Sums -Value "$script:ExeHash  $script:Artifact"
         $script:Sig = Join-Path $script:Work 'SHA256SUMS.asc'
@@ -267,6 +269,7 @@ Describe 'Confirm-SumsSignature' {
     BeforeEach {
         $script:GpgCalls = @()
         $script:GpgconfCalls = @()
+        $script:GpgconfThrows = $false
         $script:GpgExit = @{}
         $script:GpgFprLine = "fpr:::::::::$($script:FPR):"
     }
@@ -345,6 +348,16 @@ Describe 'Confirm-SumsSignature' {
         $first = $script:GpgCalls[0]
         $gpgHome = $first[[array]::IndexOf($first, '--homedir') + 1]
         $gpgHome | Should -BeLike '*tmp`[1`]*'
+        Test-Path -LiteralPath $gpgHome | Should -BeFalse
+    }
+    It 'removes the temporary home and keeps the original error when gpgconf fails' {
+        $script:GpgconfThrows = $true
+        $script:GpgExit['--verify'] = 1
+        { Confirm-SumsSignature -SumsPath $script:Sums -SigPath $script:Sig -KeyPath $script:Key -Fingerprint $script:FPR } |
+            Should -Throw -ExpectedMessage '*not valid*'
+        $script:GpgconfCalls.Count | Should -Be 1
+        $first = $script:GpgCalls[0]
+        $gpgHome = $first[[array]::IndexOf($first, '--homedir') + 1]
         Test-Path -LiteralPath $gpgHome | Should -BeFalse
     }
 }

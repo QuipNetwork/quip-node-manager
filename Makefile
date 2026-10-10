@@ -28,13 +28,14 @@ builder-image:
 # needed. Each run installs the two modules from the PowerShell Gallery at
 # the pinned versions.
 POWERSHELL_IMAGE ?= mcr.microsoft.com/powershell:7.5-debian-12
+SHELLCHECK_IMAGE ?= koalaman/shellcheck-alpine:v0.11.0
 PSSCRIPTANALYZER_VERSION ?= 1.25.0
 PESTER_VERSION ?= 6.2.0
 
 .PHONY: lint-shell lint-powershell test-powershell
 
 lint-shell:
-	shellcheck scripts/*.sh
+	docker run --rm -v "$(CURDIR)":/work -w /work $(SHELLCHECK_IMAGE) shellcheck scripts/*.sh
 
 lint-powershell:
 	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \

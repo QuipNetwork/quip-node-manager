@@ -3,6 +3,7 @@
 # Needs Pester 6.2.0 or later:
 #   Install-Module -Name Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser
 # MinimumVersion keeps Windows' bundled Pester 3.4.0 from being picked up.
+$ErrorActionPreference = 'Stop'
 Import-Module Pester -MinimumVersion 6.2.0
 $config = New-PesterConfiguration
 $config.Run.Path = $PSScriptRoot
