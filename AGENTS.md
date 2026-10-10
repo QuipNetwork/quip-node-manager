@@ -451,6 +451,11 @@ bun run build
 
 # Install dependencies
 bun install
+
+# Lint the install scripts the way CI does (all three targets use Docker)
+make lint-shell
+make lint-powershell
+make test-powershell
 ```
 
 ## Versioning & Release Tags

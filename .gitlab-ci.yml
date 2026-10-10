@@ -233,6 +233,45 @@ rustfmt:
         - src-tauri/**/*
         - .gitlab-ci.yml
 
+# scripts/ holds the published install path for every user. An unchecked
+# command substitution shipped in v0.2.9 and broke the installer's signature
+# gate (QUI-1376); shellcheck flags that shape. `make lint-shell` runs the
+# same command.
+shellcheck:
+  stage: lint
+  image: koalaman/shellcheck-alpine:v0.11.0
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - shellcheck --version
+    - shellcheck scripts/*.sh
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - scripts/*.sh
+        - .gitlab-ci.yml
+
+# Lints every PowerShell file under scripts/ and runs the Pester tests for
+# install.ps1. Both modules come from the PowerShell Gallery at pinned versions.
+# `make lint-powershell` and `make test-powershell` are the local equivalents.
+powershell-lint:
+  stage: lint
+  image: mcr.microsoft.com/powershell:7.5-debian-12
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - pwsh -NoLogo -NoProfile -Command "Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser; Install-Module -Name Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser"
+  script:
+    - pwsh -NoLogo -NoProfile -Command "Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1 -EnableExit"
+    - pwsh -NoLogo -NoProfile -File scripts/tests/run.ps1
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - scripts/**/*
+        - .gitlab-ci.yml
+
 # ---------------------------------------------------------------------------
 # macOS Universal (ARM64 + x86_64 fat binary)
 # ---------------------------------------------------------------------------

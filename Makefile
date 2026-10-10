@@ -21,3 +21,28 @@ builder-image:
 		--tag $(BUILDER_IMAGE) \
 		--push \
 		.gitlab/
+
+# -- Script lint and tests ----------------------------------------------------
+# The same checks the `shellcheck` and `powershell-lint` CI jobs run. The
+# PowerShell targets run in the CI image through Docker, so no local pwsh is
+# needed. Each run installs the two modules from the PowerShell Gallery at
+# the pinned versions.
+POWERSHELL_IMAGE ?= mcr.microsoft.com/powershell:7.5-debian-12
+SHELLCHECK_IMAGE ?= koalaman/shellcheck-alpine:v0.11.0
+PSSCRIPTANALYZER_VERSION ?= 1.25.0
+PESTER_VERSION ?= 6.2.0
+
+.PHONY: lint-shell lint-powershell test-powershell
+
+lint-shell:
+	docker run --rm -v "$(CURDIR)":/work -w /work $(SHELLCHECK_IMAGE) shellcheck scripts/*.sh
+
+lint-powershell:
+	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \
+	  "Install-Module -Name PSScriptAnalyzer -RequiredVersion $(PSSCRIPTANALYZER_VERSION) -Force -Scope CurrentUser; \
+	   Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings scripts/PSScriptAnalyzerSettings.psd1 -EnableExit"
+
+test-powershell:
+	docker run --rm -v "$(CURDIR)":/work -w /work $(POWERSHELL_IMAGE) pwsh -NoLogo -NoProfile -Command \
+	  "Install-Module -Name Pester -RequiredVersion $(PESTER_VERSION) -Force -Scope CurrentUser; \
+	   pwsh -NoLogo -NoProfile -File scripts/tests/run.ps1"
