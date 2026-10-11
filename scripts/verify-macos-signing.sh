@@ -34,7 +34,7 @@ codesign --verify --deep --strict --verbose=2 "$APP" ||
 DETAILS=$(codesign --display --verbose=4 "$APP" 2>&1)
 printf '%s\n' "$DETAILS"
 
-printf '%s' "$DETAILS" | grep -q "Authority=$EXPECTED_AUTHORITY" ||
+printf '%s\n' "$DETAILS" | grep -qxF "Authority=$EXPECTED_AUTHORITY" ||
     fail "the signer is not a $EXPECTED_AUTHORITY certificate"
 
 printf '%s' "$DETAILS" | grep -q '^Timestamp=' ||
