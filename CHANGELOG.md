@@ -161,6 +161,13 @@ key.
 - `shellcheck` runs on `scripts/*.sh`, and PSScriptAnalyzer and Pester run on
   `scripts/*.ps1`, in the `lint` stage of every pipeline that touches them.
 
+### The macOS release check matches the signer exactly
+
+`scripts/verify-macos-signing.sh` accepted any signer name that started with
+the pinned Developer ID name, and it read a `.` in that name as any
+character. The check now requires the whole `Authority=` line to equal the
+pinned name, character for character.
+
 ---
 
 ## v0.2.10-rc4
