@@ -16,9 +16,11 @@ frontend.
 ```
 quip-node-manager/
 ├── src/                           # Frontend (vanilla HTML/CSS/JS)
-│   ├── index.html
-│   ├── styles.css
-│   └── app.js
+│   ├── index.html                 # Overview, Settings (sections), Dashboard, log bar
+│   ├── styles.css                 # design tokens (dark and light) and components
+│   ├── app.js
+│   ├── fonts/                     # JetBrains Mono, Instrument Sans (OFL, bundled)
+│   └── assets/                    # lockups and the Overview's chip image
 ├── vendor/
 │   └── nodes.quip.network/        # git submodule — upstream compose stack
 │                                  # (docker-compose.yml,
@@ -72,7 +74,7 @@ quip-node-manager/
 - **Tauri version**: v2
 - **JS tooling**: Bun
 - **App version**: 0.3.2-rc2
-- **Window size**: 900×700
+- **Window size**: 1280×800 by default, 760×560 at the smallest
 - **Data directory**: `~/quip-data/` by default (bind-mount root for the compose
   stack). Overridable via `set_data_dir` → the `data_dir` key in
   `~/.config/quip-node-manager/bootstrap.json`; `~/quip-data` is only the

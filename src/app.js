@@ -217,11 +217,17 @@ async function refreshChannelInfo() {
   if (caption) {
     // Each image resolves its own tag from its own registry — they can differ.
     const parts = (info.images || []).map(
-      ([name, tag]) => `${name} ${tag ?? '—'}`,
+      ([name, tag]) => `${name} ${tag ?? 'none'}`,
     );
-    caption.textContent = parts.length
-      ? parts.join('  ·  ')
-      : 'No published builds on this channel yet.';
+    if (!parts.length) {
+      caption.textContent = 'No published builds on this channel yet.';
+    } else {
+      caption.replaceChildren(...parts.map((p) => {
+        const line = document.createElement('span');
+        line.textContent = p;
+        return line;
+      }));
+    }
   }
 }
 
@@ -342,14 +348,50 @@ function activateTab(tab) {
 document.querySelectorAll('.tab-btn').forEach((btn) => {
   btn.addEventListener('click', () => activateTab(btn.dataset.tab));
 });
+document.getElementById('status-pill').addEventListener('click', () => activateTab('status'));
 
-// ─── Configuration section toggle ────────────────────────────────────────────
-document.getElementById('btn-config-toggle').addEventListener('click', () => {
-  const btn = document.getElementById('btn-config-toggle');
-  const section = document.getElementById('config-section');
-  const expanded = btn.getAttribute('aria-expanded') === 'true';
-  btn.setAttribute('aria-expanded', String(!expanded));
-  section.style.display = expanded ? 'none' : '';
+// ─── Settings sections ───────────────────────────────────────────────────────
+// Every section stays in the DOM (collectConfig reads them all); only the
+// chosen one is shown.
+document.querySelector('.snav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-sec]');
+  if (!btn) return;
+  const sec = btn.dataset.sec;
+  document.querySelectorAll('.snav button').forEach((b) => {
+    if (b === btn) b.setAttribute('aria-current', 'true');
+    else b.removeAttribute('aria-current');
+  });
+  document.querySelectorAll('.spane .sec').forEach((el) => {
+    el.classList.toggle('active', el.dataset.sec === sec);
+  });
+  document.querySelector('.spane').scrollTop = 0;
+});
+
+// ─── Unsaved changes ─────────────────────────────────────────────────────────
+// Edits collect until Save, Save and restart, or Discard. Controls that save
+// themselves (the channel buttons, the Metal toggle, Regenerate) do not count.
+function setSettingsDirty(dirty) {
+  state.settingsDirty = dirty;
+  const bar = document.querySelector('.savebar');
+  const msg = document.getElementById('save-msg');
+  if (!bar || !msg) return;
+  bar.classList.toggle('dirty', dirty);
+  msg.firstChild.textContent = dirty ? 'You have unsaved changes. ' : 'Changes are kept until you save. ';
+}
+for (const type of ['input', 'change']) {
+  document.querySelector('.spane').addEventListener(type, (e) => {
+    if (e.target.closest('.metal-enable-toggle, #data-dir')) return;
+    setSettingsDirty(true);
+  });
+}
+document.getElementById('btn-discard').addEventListener('click', async () => {
+  if (!state.settings) return;
+  try {
+    state.settings = await invoke('get_settings');
+  } catch { /* keep the copy we have */ }
+  await populateForm(state.settings);
+  renderGpuDevices();
+  setSettingsDirty(false);
 });
 
 // ─── Dashboard database reset ─────────────────────────────────────────────────
@@ -396,15 +438,6 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   const expanded = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!expanded));
   list.style.display = expanded ? 'none' : '';
-});
-
-// ─── Custom settings toggle ───────────────────────────────────────────────────
-document.getElementById('btn-custom-toggle').addEventListener('click', () => {
-  const btn = document.getElementById('btn-custom-toggle');
-  const section = document.getElementById('custom-settings-section');
-  const expanded = btn.getAttribute('aria-expanded') === 'true';
-  btn.setAttribute('aria-expanded', String(!expanded));
-  section.style.display = expanded ? 'none' : '';
 });
 
 // ─── Storage directory ───────────────────────────────────────────────────────
@@ -507,11 +540,11 @@ function renderGpuDevices() {
   devices.forEach((dev) => {
     const saved = savedConfigs.find((c) => c.index === dev.index);
     const enabled = saved ? saved.enabled : false;
-    const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
+    const mem = dev.memory_mb ? `, ${dev.memory_mb} MB` : '';
     const backendLabel = isMetal ? 'Metal' : 'CUDA';
 
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
+    row.className = 'device-row';
 
     const label = document.createElement('label');
     label.className = 'toggle-switch';
@@ -538,20 +571,23 @@ function renderGpuDevices() {
     row.appendChild(label);
 
     const text = document.createElement('span');
-    text.style.fontSize = '13px';
-    text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
+    text.className = 'device-name';
+    text.textContent = dev.name;
+    const meta = document.createElement('span');
+    meta.className = 'device-meta';
+    meta.textContent = `GPU ${dev.index}, ${backendLabel}${mem}`;
 
-    row.appendChild(text);
+    row.append(text, meta);
     list.appendChild(row);
   });
 
   // Make the Metal on/off → mining-mode consequence explicit.
   if (isMetal) {
     const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:12px;color:var(--text-faint);padding:2px 0 0 0;';
+    hint.className = 'sd';
     hint.textContent = metalEnabled
-      ? 'Metal GPU mining enabled — runs the native miner.'
-      : 'Metal off — the node runs CPU mining via Docker.';
+      ? 'Metal GPU mining is on. The node runs the native miner.'
+      : 'Metal is off. The node mines with the CPU through Docker.';
     list.appendChild(hint);
   }
 }
@@ -833,17 +869,6 @@ async function populateForm(settings) {
     settings.zerossl_api_key ?? '';
   updateStackUiVisibility();
 
-  // Auto-expand custom settings if any non-default values are set
-  const hasCustom =
-    publicHost || publicPort ||
-    c.log_level !== 'info' ||
-    (c.node_log ?? '') ||
-    (c.http_log ?? '');
-  if (hasCustom) {
-    document.getElementById('btn-custom-toggle').setAttribute('aria-expanded', 'true');
-    document.getElementById('custom-settings-section').style.display = '';
-  }
-
   // CPU Miner
   document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
@@ -879,15 +904,15 @@ function updateStartStopState() {
     startBtn.disabled = true;
   } else if (pendingUpdate && running) {
     // Node running + update pending: btn-start becomes the apply action.
-    startBtn.textContent = 'Restart to Update';
+    startBtn.textContent = 'Restart to update';
     startBtn.disabled = !state.checksPassed;
   } else {
     // Stopped (with or without update) or running with no update: normal Start.
-    startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+    startBtn.textContent = state.starting ? 'Starting…' : 'Start node';
     startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
   }
 
-  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop node';
   // Stop is gated on "is there anything to stop", not on `running`. `running`
   // tracks the *miner* only, so a partially started stack — validator and
   // dashboard up with no miner container — left Stop disabled while the
@@ -897,11 +922,29 @@ function updateStartStopState() {
     state.starting ||
     state.stopping ||
     state.updating;
-  document.getElementById('btn-apply').disabled =
+  const applyBtn = document.getElementById('btn-apply');
+  applyBtn.disabled =
     !state.checksPassed || state.starting || state.stopping || state.updating;
+  applyBtn.textContent = running ? 'Save and restart node' : 'Save and start node';
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
+// The top-bar pill and the hero read the same state. Colour keeps one meaning:
+// green is a running node, red needs attention, neutral otherwise.
+const PILL_CLASS = {
+  running: 'c-ours', degraded: 'c-alert', partial: 'c-alert', unhealthy: 'c-alert',
+};
+function paintPill(stateStr, word) {
+  document.body.dataset.node = stateStr;
+  const pill = document.getElementById('status-pill');
+  const dot = document.getElementById('status-pill-dot');
+  const text = document.getElementById('status-pill-text');
+  if (!pill || !dot || !text) return;
+  pill.className = `pill ${PILL_CLASS[stateStr] || ''}`;
+  dot.className = `dot${stateStr === 'stopped' ? ' hollow' : ''}`;
+  text.textContent = word;
+}
+
 function setStatus(stateStr) {
   const dot = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
@@ -914,7 +957,7 @@ function setStatus(stateStr) {
     dot.classList.add('status-running', 'active');
     text.classList.add('status-running');
     text.textContent = 'RUNNING';
-    sub.textContent = 'Node is running';
+    sub.textContent = 'Your node is running and mining.';
   } else if (stateStr === 'syncing') {
     // Blue, not amber: replaying the chain is expected work on a fresh node,
     // not a fault. The bar below carries the actual progress.
@@ -926,26 +969,30 @@ function setStatus(stateStr) {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
-    sub.textContent = 'Running, but some stack services are down or unhealthy';
+    sub.textContent = 'Running, but some services are down or unhealthy.';
   } else if (stateStr === 'partial') {
     // Amber, like degraded: the stack is up but not mining. Name the running
     // services so the state is actionable rather than just "not stopped".
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
-    text.textContent = 'PARTIAL';
+    text.textContent = 'NOT MINING';
     sub.textContent = partialSubtext();
   } else if (stateStr === 'unhealthy') {
     dot.classList.add('status-unhealthy', 'active');
     text.classList.add('status-unhealthy');
     text.textContent = 'UNHEALTHY';
-    sub.textContent = 'Node health checks failing';
+    sub.textContent = 'Health checks are failing. Open the logs to see why.';
   } else {
     dot.classList.add('status-stopped');
     text.classList.add('status-stopped');
     text.textContent = 'STOPPED';
-    sub.textContent = 'Node not running';
+    const n = state.requiredFailing || 0;
+    sub.textContent = n
+      ? `${n === 1 ? 'One check needs' : `${n} checks need`} your attention before the node can start.`
+      : 'Your node is off.';
   }
   renderSyncProgress(stateStr);
+  paintPill(stateStr, text.textContent);
 }
 
 // ─── Checklist render (FSM) ──────────────────────────────────────────────────
@@ -995,7 +1042,12 @@ function renderChecklistItem(item) {
   const label = document.createElement('span');
   label.className = 'check-label';
   label.textContent = item.label;
-  if (item.detail) label.title = item.detail;
+  if (item.detail) {
+    const detail = document.createElement('span');
+    detail.className = 'check-detail';
+    detail.textContent = item.detail;
+    label.appendChild(detail);
+  }
 
   const actions = document.createElement('div');
   actions.className = 'check-actions';
@@ -1004,9 +1056,9 @@ function renderChecklistItem(item) {
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
   recheckBtn.dataset.action = 'recheck';
-  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Retry';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Check again';
   recheckBtn.disabled = item.state === 'running';
-  actions.appendChild(recheckBtn);
+  if (item.state !== 'pass' && item.state !== 'skip') actions.appendChild(recheckBtn);
 
   // For checks whose fix is folded into Retry (Retry runs the fix, then
   // rechecks) we drop the dedicated fix button entirely.
@@ -1047,14 +1099,14 @@ function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
   const validatorPort = state.settings?.node_config?.validator_port ?? 30333;
   switch (id) {
-    case 'docker':            return 'Docker installed & running';
+    case 'docker':            return 'Docker installed and running';
     case 'docker-compose':    return 'Docker Compose v2 available';
     case 'wsl':               return 'WSL installed with distro';
     case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Public API port ${port} — press Retry to test`;
+    case 'port':              return `Public API port ${port}. Press Check again to test it`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
@@ -1074,6 +1126,7 @@ function updateChecklistSummary(visibleIds) {
   ).length;
 
   state.checksPassed = allRun && requiredFailing === 0;
+  state.requiredFailing = allRun ? requiredFailing : 0;
 
   const summary = document.getElementById('checklist-summary');
   const checklistEl = document.getElementById('checklist');
@@ -1102,6 +1155,7 @@ function updateChecklistSummary(visibleIds) {
   }
 
   updateStartStopState();
+  refreshStatusPill();
 }
 
 function mergeCheckUpdate(item) {
@@ -1270,7 +1324,7 @@ function updateLogMatchCount(visibleCount, totalCount) {
     el.textContent = '';
     return;
   }
-  el.textContent = `${state.logVisibleCount} / ${total}`;
+  el.textContent = `${state.logVisibleCount} of ${total}`;
 }
 
 function updateLogFilterClearButton() {
@@ -1397,6 +1451,8 @@ function setLogTextFilter(value, { immediate = false } = {}) {
 function appendLog(entry) {
   const normalized = normalizeLogEntry(entry);
   const src = normalized.source;
+  const last = document.getElementById('log-last');
+  if (last) last.textContent = `${src.toUpperCase()}  ${normalized.message}`;
   if (!state.logBuffers[src]) {
     state.logBuffers[src] = [];
     // Default: all sources visible.
@@ -1666,16 +1722,6 @@ function isDockerMode() {
   return (state.settings?.run_mode ?? 'docker') === 'docker';
 }
 
-function collapseConfig() {
-  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'false');
-  document.getElementById('config-section').style.display = 'none';
-}
-
-function expandConfig() {
-  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'true');
-  document.getElementById('config-section').style.display = '';
-}
-
 async function runRestartToUpdate() {
   const applyStatus = document.getElementById('apply-status');
   state.updating = true;
@@ -1708,7 +1754,6 @@ async function startNode() {
     await invoke('start_stack');
     await invoke('start_native_node');
   }
-  collapseConfig();
 }
 
 async function stopNode() {
@@ -1760,7 +1805,6 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     state.health = null;
     setStatus('stopped');
     updateStartStopState();
-    expandConfig();
     applyStatus.textContent = 'Node stopped.';
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
@@ -1781,6 +1825,7 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     if (!state.settings) throw new Error('settings are not loaded yet');
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
+    setSettingsDirty(false);
     const running = isDockerMode() ? state.containerRunning : state.nativeRunning;
     if (running) {
       applyStatus.textContent = 'Restarting\u2026';
@@ -1810,6 +1855,7 @@ document.getElementById('btn-save').addEventListener('click', async () => {
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     applyStatus.textContent = 'Settings saved.';
+    setSettingsDirty(false);
     setTimeout(() => { applyStatus.textContent = ''; }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
@@ -1880,8 +1926,8 @@ async function renderSolverPicker(backend, selected) {
   }
 
   const label = (s) => {
-    const track = s.track && s.track !== 'unknown' ? ` — ${s.track}` : '';
-    return s.algorithm ? `${s.binary} — ${s.algorithm}${track}` : `${s.binary}${track}`;
+    const track = s.track && s.track !== 'unknown' ? `, ${s.track}` : '';
+    return s.algorithm ? `${s.binary}, ${s.algorithm}${track}` : `${s.binary}${track}`;
   };
 
   // Option text is built with textContent below; nothing here parses HTML.
@@ -1927,7 +1973,7 @@ function syncSubtext() {
   if (!s) return 'Validator is catching up to the chain';
   return `Catching up: block ${s.current_block.toLocaleString()} of ${
     s.highest_block.toLocaleString()
-  } — ${s.behind.toLocaleString()} behind`;
+  }, ${s.behind.toLocaleString()} behind.`;
 }
 
 // Paint the initial-sync bar. Hidden unless the pill is SYNCING and the monitor
@@ -2024,8 +2070,10 @@ function renderHealth(report) {
   const paint = (id, dim) => {
     const el = document.getElementById(id);
     if (!el || !dim) return;
-    el.textContent = dim.state + (dim.detail ? ' — ' + dim.detail : '');
+    el.textContent = dim.state;
     el.dataset.state = dim.state;
+    const detail = document.getElementById(`${id}-detail`);
+    if (detail) detail.textContent = dim.detail || '';
     el.style.color = HEALTH_STATE_COLOR[dim.state] ?? 'var(--text-faint)';
   };
   paint('health-infra', report.infra);
@@ -2220,8 +2268,14 @@ async function checkFirstBoot() {
         resolve();
       } catch (e) {
         input.style.borderColor = 'var(--error)';
-        input.insertAdjacentHTML('afterend',
-          `<div style="color:var(--error);font-size:12px;margin-top:4px;">${e}</div>`);
+        let err = document.getElementById('first-boot-error');
+        if (!err) {
+          err = document.createElement('div');
+          err.id = 'first-boot-error';
+          err.className = 'first-boot-error';
+          input.insertAdjacentElement('afterend', err);
+        }
+        err.textContent = String(e);
       }
     });
   });
@@ -2347,7 +2401,6 @@ async function init() {
     // what feeds those chips when the miner container is absent.)
     const anythingRunning = minerRunning || anyStackServiceRunning();
     if (anythingRunning) {
-      collapseConfig();
       if (isDockerMode()) {
         invoke('start_log_stream').catch(console.error);
       } else if (minerRunning) {

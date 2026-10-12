@@ -11,8 +11,10 @@
     "windows": [
       {
         "title": "Quip Node Manager",
-        "width": 900,
-        "height": 700,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 760,
+        "minHeight": 560,
         "resizable": true,
         "label": "main"
       }
