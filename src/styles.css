@@ -323,6 +323,8 @@ body:is([data-node="running"], [data-node="syncing"], [data-node="degraded"], [d
 .check-label { font-size: 15px; color: var(--hi); line-height: 22px; min-width: 0; }
 .check-detail { display: block; font-size: 14px; color: var(--title); line-height: 1.45; margin-top: 2px; overflow-wrap: anywhere; }
 .check-actions { display: flex; gap: 8px; }
+.check-action.quiet { opacity: 0; transition: opacity 0.15s; }
+.checklist-item:hover .check-action.quiet, .checklist-item:focus-within .check-action.quiet { opacity: 1; }
 
 /* Image and native-miner downloads while the node starts. */
 .pull-progress-title { font-family: var(--mono); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--title); margin-bottom: 10px; }

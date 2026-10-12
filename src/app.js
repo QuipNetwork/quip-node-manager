@@ -1058,7 +1058,9 @@ function renderChecklistItem(item) {
   recheckBtn.dataset.action = 'recheck';
   recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Check again';
   recheckBtn.disabled = item.state === 'running';
-  if (item.state !== 'pass' && item.state !== 'skip') actions.appendChild(recheckBtn);
+  // Every check keeps its own recheck; on a passing row it shows on hover or focus.
+  if (item.state === 'pass' || item.state === 'skip') recheckBtn.classList.add('quiet');
+  actions.appendChild(recheckBtn);
 
   // For checks whose fix is folded into Retry (Retry runs the fix, then
   // rechecks) we drop the dedicated fix button entirely.
