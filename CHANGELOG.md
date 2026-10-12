@@ -128,7 +128,7 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## Unreleased
+## v0.3.0
 
 ### Start Node works again after the quip-solver rename
 
