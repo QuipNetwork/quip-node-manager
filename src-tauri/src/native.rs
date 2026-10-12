@@ -7,7 +7,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
-const MINER_PROJECT: &str = "quip.network%2Fquip-miner";
+const MINER_PROJECT: &str = "quip.network%2Fquip-solver";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -42,11 +42,18 @@ impl Default for NativeProcessState {
     }
 }
 
-/// The release asset Native mode installs. v0.3 ships one macOS bundle holding
-/// the coordinator and every darwin-arm64 miner, rather than the single
-/// `quip-miner-*` binary v0.2 published.
-pub fn bundle_asset_name() -> &'static str {
-    "quip-miner-darwin-arm64.tar.gz"
+/// The release assets Native mode installs, preferred first. v0.3 ships one
+/// macOS bundle holding the coordinator and every darwin-arm64 miner, rather
+/// than the single `quip-miner-*` binary v0.2 published.
+///
+/// The project was renamed from quip-miner to quip-solver at v0.3.5-rc12, which
+/// renamed the bundle. Releases before the rename, including every stable v0.3
+/// release so far, ship only the old name, so both are accepted.
+pub fn bundle_asset_names() -> &'static [&'static str] {
+    &[
+        "quip-solver-darwin-arm64.tar.gz",
+        "quip-miner-darwin-arm64.tar.gz",
+    ]
 }
 
 /// Native mode exists so Metal mining can reach the Apple Silicon GPU, which a
@@ -190,7 +197,7 @@ fn binary_release_marker_path() -> std::path::PathBuf {
     data_dir().join("bin").join("quip-miner.release")
 }
 
-/// Fetch the quip-miner releases list (GitLab returns them newest-first).
+/// Fetch the quip-solver releases list (GitLab returns them newest-first).
 /// Returns the URL it hit and the specific cause on failure so callers can show
 /// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
 /// than a generic "couldn't list releases".
@@ -216,7 +223,7 @@ pub(crate) async fn fetch_protocol_releases(
         .map_err(|e| format!("GET {url} returned unparseable JSON: {e}"))
 }
 
-/// (tag, asset_url, description) for every release that ships `asset_name` on
+/// (tag, asset_url, description) for every release that ships one of `asset_names` on
 /// the given channel, newest-first (GitLab returns releases newest-first). This
 /// tracks whatever the latest releases are tagged (`v0.2.1`, `v0.2.1-rc9`, …)
 /// and skips older releases that only carry the legacy asset name. On the
@@ -224,7 +231,7 @@ pub(crate) async fn fetch_protocol_releases(
 /// remain.
 fn binary_release_candidates(
     releases: &serde_json::Value,
-    asset_name: &str,
+    asset_names: &[&str],
     channel: crate::settings::UpdateChannel,
 ) -> Vec<(String, String, String)> {
     releases
@@ -236,7 +243,7 @@ fn binary_release_candidates(
             if !crate::update::tag_matches_channel(&tag, channel) {
                 return None;
             }
-            let url = release_asset_url(rel, asset_name)?;
+            let url = release_asset_url(rel, asset_names)?;
             let desc = rel["description"].as_str().unwrap_or("").to_string();
             Some((tag, url, desc))
         })
@@ -260,15 +267,15 @@ async fn asset_is_downloadable(client: &reqwest::Client, url: &str) -> bool {
     }
 }
 
-/// Newest release whose `asset_name` artifact is actually downloadable. Skips
+/// Newest release whose bundle artifact is actually downloadable. Skips
 /// just-tagged releases whose build hasn't produced the artifact yet.
 async fn resolve_latest_downloadable_release(
     client: &reqwest::Client,
     releases: &serde_json::Value,
-    asset_name: &str,
+    asset_names: &[&str],
     channel: crate::settings::UpdateChannel,
 ) -> Option<(String, String, String)> {
-    for candidate in binary_release_candidates(releases, asset_name, channel) {
+    for candidate in binary_release_candidates(releases, asset_names, channel) {
         if asset_is_downloadable(client, &candidate.1).await {
             return Some(candidate);
         }
@@ -276,13 +283,18 @@ async fn resolve_latest_downloadable_release(
     None
 }
 
-/// Direct download URL for `asset_name` within `release`. Prefers the stable
-/// `direct_asset_url` permalink, falling back to the job-artifact `url`.
-fn release_asset_url(release: &serde_json::Value, asset_name: &str) -> Option<String> {
-    release["assets"]["links"]
-        .as_array()?
+/// Direct download URL for the first of `asset_names` that `release` ships.
+/// Prefers the stable `direct_asset_url` permalink, falling back to the
+/// job-artifact `url`.
+fn release_asset_url(release: &serde_json::Value, asset_names: &[&str]) -> Option<String> {
+    let links = release["assets"]["links"].as_array()?;
+    asset_names
         .iter()
-        .find(|link| link["name"].as_str() == Some(asset_name))
+        .find_map(|name| {
+            links
+                .iter()
+                .find(|link| link["name"].as_str() == Some(name))
+        })
         .and_then(|link| {
             link["direct_asset_url"]
                 .as_str()
@@ -802,8 +814,6 @@ pub(crate) async fn download_native_binary_core(
 
     ensure_native_supported()?;
 
-    let name = bundle_asset_name();
-
     // Serialize downloads so concurrent callers coalesce instead of racing the
     // shared temp path (see `download_guard`). Held across the whole download.
     let _guard = download_guard().lock().await;
@@ -817,15 +827,17 @@ pub(crate) async fn download_native_binary_core(
     let channel = crate::settings::load_settings().update_channel;
     let releases = fetch_protocol_releases(&meta_client).await?;
     let (tag, url, _desc) =
-        resolve_latest_downloadable_release(&meta_client, &releases, name, channel)
+        resolve_latest_downloadable_release(&meta_client, &releases, bundle_asset_names(), channel)
             .await
             .ok_or_else(|| {
                 format!(
-                    "No downloadable quip-miner release ships {name} on the {channel:?} \
-                 channel yet — the build may still be running, or the channel has no \
-                 published builds. Try again shortly."
+                    "No downloadable quip-solver release ships the macOS bundle on the \
+                 {channel:?} channel yet — the build may still be running, or the channel \
+                 has no published builds. Try again shortly."
                 )
             })?;
+    // The asset file name, which differs on either side of the quip-solver rename.
+    let name = url.rsplit('/').next().unwrap_or(bundle_asset_names()[0]);
 
     // If a concurrent caller installed this version while we waited on the
     // lock, skip the redundant re-download.
@@ -857,7 +869,7 @@ pub(crate) async fn download_native_binary_core(
     if !resp.status().is_success() {
         return Err(format!(
             "Download failed: HTTP {}. No release found — \
-             a tagged release of quip-miner is required.",
+             a tagged release of quip-solver is required.",
             resp.status()
         ));
     }
@@ -962,7 +974,7 @@ pub async fn resolve_binary_versions() -> Result<BinaryVersions, String> {
             // Only offer an update we can actually install — a just-tagged
             // release whose artifact build hasn't finished is skipped until
             // it's downloadable.
-            resolve_latest_downloadable_release(&client, &releases, bundle_asset_name(), channel)
+            resolve_latest_downloadable_release(&client, &releases, bundle_asset_names(), channel)
                 .await
                 .filter(|(tag, _, _)| !tag.is_empty())
         }
@@ -1635,14 +1647,14 @@ mod tests {
                 "tag_name": "v0.2.0rc2",
                 "description": "rc2 notes",
                 "assets": { "links": [
-                    { "name": bundle_asset_name(),
+                    { "name": bundle_asset_names()[0],
                       "direct_asset_url": "https://example/releases/v0.2.0rc2/downloads/bin" }
                 ]}
             },
             {
                 "tag_name": "v0.2.0rc1",
                 "assets": { "links": [
-                    { "name": bundle_asset_name(),
+                    { "name": bundle_asset_names()[0],
                       "direct_asset_url": "https://example/releases/v0.2.0rc1/downloads/bin" }
                 ]}
             },
@@ -1654,7 +1666,7 @@ mod tests {
 
         let candidates = binary_release_candidates(
             &releases,
-            bundle_asset_name(),
+            bundle_asset_names(),
             crate::settings::UpdateChannel::Beta,
         );
         let tags: Vec<&str> = candidates.iter().map(|(t, _, _)| t.as_str()).collect();
@@ -1672,13 +1684,13 @@ mod tests {
         // A stable above the v0.2.0 Release floor, plus a newer rc.
         let releases = serde_json::json!([
             { "tag_name": "v0.2.2-rc1", "assets": { "links": [
-                { "name": bundle_asset_name(), "direct_asset_url": "https://example/rc" } ]}},
+                { "name": bundle_asset_names()[0], "direct_asset_url": "https://example/rc" } ]}},
             { "tag_name": "v0.2.1", "assets": { "links": [
-                { "name": bundle_asset_name(), "direct_asset_url": "https://example/stable" } ]}},
+                { "name": bundle_asset_names()[0], "direct_asset_url": "https://example/stable" } ]}},
         ]);
 
         let tags = |ch| -> Vec<String> {
-            binary_release_candidates(&releases, bundle_asset_name(), ch)
+            binary_release_candidates(&releases, bundle_asset_names(), ch)
                 .into_iter()
                 .map(|(t, _, _)| t)
                 .collect()
@@ -1697,7 +1709,7 @@ mod tests {
         ]);
         assert!(binary_release_candidates(
             &releases,
-            bundle_asset_name(),
+            bundle_asset_names(),
             crate::settings::UpdateChannel::Beta,
         )
         .is_empty());
@@ -1706,10 +1718,10 @@ mod tests {
     #[test]
     fn asset_url_falls_back_to_url_when_no_direct_asset_url() {
         let rel = serde_json::json!({
-            "assets": { "links": [ { "name": bundle_asset_name(), "url": "https://example/u" } ] }
+            "assets": { "links": [ { "name": bundle_asset_names()[0], "url": "https://example/u" } ] }
         });
         assert_eq!(
-            release_asset_url(&rel, bundle_asset_name()).as_deref(),
+            release_asset_url(&rel, bundle_asset_names()).as_deref(),
             Some("https://example/u")
         );
     }
@@ -1802,8 +1814,52 @@ mod tests {
     }
 
     #[test]
-    fn bundle_asset_is_the_macos_tarball() {
-        assert_eq!(bundle_asset_name(), "quip-miner-darwin-arm64.tar.gz");
+    fn bundle_assets_prefer_the_quip_solver_tarball() {
+        assert_eq!(
+            bundle_asset_names(),
+            [
+                "quip-solver-darwin-arm64.tar.gz",
+                "quip-miner-darwin-arm64.tar.gz"
+            ]
+        );
+    }
+
+    /// Stable releases before the quip-solver rename ship only the old bundle
+    /// name, so the Release channel must still find them.
+    #[test]
+    fn candidates_span_the_quip_solver_rename() {
+        use crate::settings::UpdateChannel;
+        let releases = serde_json::json!([
+            { "tag_name": "v0.3.5-rc13", "assets": { "links": [
+                { "name": "quip-solver-darwin-arm64.tar.gz",
+                  "direct_asset_url": "https://example/new" } ]}},
+            { "tag_name": "v0.3.4", "assets": { "links": [
+                { "name": "quip-miner-darwin-arm64.tar.gz",
+                  "direct_asset_url": "https://example/old" } ]}},
+        ]);
+        let urls = |ch| -> Vec<String> {
+            binary_release_candidates(&releases, bundle_asset_names(), ch)
+                .into_iter()
+                .map(|(_, url, _)| url)
+                .collect()
+        };
+        assert_eq!(
+            urls(UpdateChannel::Beta),
+            ["https://example/new", "https://example/old"]
+        );
+        assert_eq!(urls(UpdateChannel::Release), ["https://example/old"]);
+    }
+
+    #[test]
+    fn asset_url_prefers_the_first_listed_name() {
+        let rel = serde_json::json!({ "assets": { "links": [
+            { "name": "quip-miner-darwin-arm64.tar.gz", "url": "https://example/old" },
+            { "name": "quip-solver-darwin-arm64.tar.gz", "url": "https://example/new" }
+        ]}});
+        assert_eq!(
+            release_asset_url(&rel, bundle_asset_names()).as_deref(),
+            Some("https://example/new")
+        );
     }
 
     #[test]
