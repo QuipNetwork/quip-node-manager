@@ -130,6 +130,31 @@ against `SHA256SUMS` as shown above.
 
 ## Unreleased
 
+### Start Node works again after the quip-solver rename
+
+Upstream renamed the miner project from quip-miner to quip-solver. The rename
+moved its container images and changed the name of its macOS bundle. Earlier
+versions looked for tags at the old registry path, found none, and stopped
+with the message "Cannot determine which … quip-miner version to run."
+
+- Docker mode pulls the miner from
+  `registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver` (CPU) and
+  `…/quip-solver-cuda` (NVIDIA GPU).
+- Native mode downloads `quip-solver-darwin-arm64.tar.gz`. It still accepts
+  `quip-miner-darwin-arm64.tar.gz`, which every stable v0.3 release before the
+  rename ships.
+- The quip-solver registry has no stable tag yet, so the Release channel runs
+  the newest release candidate until upstream publishes a stable tag.
+
+### Start uses the local image cache when the registry fails
+
+- When the registry does not answer and `.env` pins no version, the manager
+  now takes the newest copy of the image already on the machine. Before, the
+  start stopped.
+- When `docker compose pull` fails but every image is already on the machine,
+  the stack starts from those images and the log shows a warning. Before, a
+  failed pull stopped the start even when the machine already had every image.
+
 ### The Windows installer verifies what it downloads
 
 `scripts/install.ps1` downloaded the executable straight to its final path

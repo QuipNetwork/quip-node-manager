@@ -115,15 +115,30 @@ advance on their own cadence, so the three tags often differ.
 
 When a registry does not answer, the manager holds the tag `.env` already pins,
 which keeps the stack on the version it runs instead of moving it backwards.
-When `.env` pins nothing either — a first start with no network — the start
-fails with a message. A compiled-in default tag cannot fill that gap: it ages
+When `.env` pins nothing either, it takes the newest tag of that image already
+in the local Docker cache. Only when all three are empty — a first start with
+no network — does the start fail with a message. A repository with no stable
+tag puts its newest beta in the Release slot, so Release never falls back to a
+pin that the repository does not carry.
+
+When `docker compose pull` fails but every image the stack needs is already
+local (`config --images` + `docker image inspect`), the start logs a warning
+and runs `up --pull never`. The start needs that flag because the compose file
+sets `pull_policy: always`, which would otherwise make `up` pull again and fail.
+
+A compiled-in default tag cannot fill that gap: it ages
 into a tag the registry no longer carries, which converts a passing network
 fault into a permanent `pull` failure. Falling through to the compose file's own
 `:-latest` default is also forbidden, because the update monitor compares
 digests tag by tag, and `latest` moves under it.
 
-- Miner (CPU): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner`
-- Miner (CUDA): `registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda`
+- Miner (CPU): `registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver`
+- Miner (CUDA): `registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver-cuda`
+
+  Upstream renamed the project from quip-miner to quip-solver at
+  `v0.3.5-rc12`. The old `quip-miner/v0.3/*` registry paths no longer exist.
+  A test (`embedded_compose_file_uses_the_resolved_image_paths`) fails when
+  these constants and the vendored compose file disagree.
 
   The v0.3 images are a **separate repository line**, not new tags on the v0.2
   paths, which stop at `v0.2.1-rc54`. The CPU image also dropped its `-cpu`

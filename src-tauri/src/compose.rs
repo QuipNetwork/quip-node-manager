@@ -213,8 +213,8 @@ pub(crate) struct ResolvedImageTags {
 ///
 /// A repository that does not answer falls back to the tag `.env` already pins,
 /// keeping the stack on the version it runs rather than moving it somewhere
-/// chosen elsewhere. With neither source there is no honest answer, so this
-/// fails and the caller surfaces it.
+/// chosen elsewhere, and then to the newest tag of that image in the local
+/// Docker cache. Only when all three come up empty does this fail.
 pub(crate) async fn resolve_channel_image_tags(
     settings: &AppSettings,
 ) -> Result<ResolvedImageTags, String> {
@@ -266,35 +266,94 @@ async fn resolve_pair(
     env_key: &str,
     min_tag: Option<&str>,
 ) -> Result<ChannelPair, String> {
-    use crate::settings::UpdateChannel;
-    let mut tags = crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image))
+    let registry = crate::registry::fetch_registry_tags(client, crate::registry::repo_path(image))
         .await
         .unwrap_or_default();
-    tags.retain(|t| tag_meets_floor(t, min_tag));
+    let pinned = current_pinned_tag(env_key);
 
-    // A pin written by an older manager can name an image this chain spec
-    // rejects, so the fallback is held to the floor as well. Without this a
-    // machine that upgraded from the retired network keeps re-pinning the
-    // image that cannot run the current one.
-    let pinned = current_pinned_tag(env_key).filter(|t| tag_meets_floor(t, min_tag));
+    // The local cache costs a `docker image ls`, so it is read only when the
+    // registry and the pin leave a slot empty.
+    let (beta, prod) = channel_picks(&registry, min_tag);
+    let pin_ok = pinned
+        .as_deref()
+        .is_some_and(|t| tag_meets_floor(t, min_tag));
+    let cached = if (beta.is_some() && prod.is_some()) || pin_ok {
+        Vec::new()
+    } else {
+        local_image_tags(image).await
+    };
 
-    let beta = crate::registry::pick_channel_tag(&tags, UpdateChannel::Beta);
-    let mut prod = crate::registry::pick_channel_tag(&tags, UpdateChannel::Release);
-    // A floored image can run out of stable tags entirely: upstream has not cut
-    // a stable release above the floor yet, and the stable tags below it are the
-    // ones that crash-loop. Take the newest compatible tag rather than leave the
-    // Release slot to a `.env` pin that may itself predate the floor.
-    // `ChannelInfo` reports the substitution, and the settings pane grays
-    // Release out and moves the selection to Beta. Unfloored images keep the
-    // original behaviour, where an absent stable tag falls through to the pin.
-    if prod.is_none() && min_tag.is_some() {
-        prod = beta.clone();
-    }
+    choose_pair(image, &registry, pinned, &cached, min_tag)
+}
 
+/// Decide both channel slots for one image. Each slot takes the first answer
+/// from: the registry, the `.env` pin, then the local Docker cache.
+///
+/// The pin and the cache are held to `min_tag` too. A pin written by an older
+/// manager can name an image this chain spec rejects, and without the floor a
+/// machine that upgraded from the retired network keeps re-pinning the image
+/// that cannot run the current one.
+fn choose_pair(
+    image: &str,
+    registry: &[String],
+    pinned: Option<String>,
+    cached: &[String],
+    min_tag: Option<&str>,
+) -> Result<ChannelPair, String> {
+    let pinned = pinned.filter(|t| tag_meets_floor(t, min_tag));
+    let (registry_beta, registry_prod) = channel_picks(registry, min_tag);
+    let (cached_beta, cached_prod) = channel_picks(cached, min_tag);
+
+    let pick = |registry: Option<String>, cached: Option<String>| {
+        registry
+            .or_else(|| pinned.clone())
+            .or(cached)
+            .ok_or_else(|| unresolvable_image_error(image))
+    };
     Ok(ChannelPair {
-        beta: pin_tag(image, beta, pinned.clone())?,
-        prod: pin_tag(image, prod, pinned)?,
+        beta: pick(registry_beta, cached_beta)?,
+        prod: pick(registry_prod, cached_prod)?,
     })
+}
+
+/// Newest `(beta, prod)` tags in `tags` at or above `min_tag`.
+///
+/// A repository can have no stable tag at all: a renamed project restarts its
+/// registry at the current `-rc`, and a floored image may have no stable release
+/// above the floor yet. The Release slot then takes the newest beta, so it never
+/// falls through to an older source that names an image that cannot run, or
+/// one that no longer exists. For the validator and dashboard, `ChannelInfo`
+/// reports the substitution, and the settings pane grays Release out.
+fn channel_picks(tags: &[String], min_tag: Option<&str>) -> (Option<String>, Option<String>) {
+    use crate::settings::UpdateChannel;
+    let tags: Vec<String> = tags
+        .iter()
+        .filter(|t| tag_meets_floor(t, min_tag))
+        .cloned()
+        .collect();
+    let beta = crate::registry::pick_channel_tag(&tags, UpdateChannel::Beta);
+    let prod = crate::registry::pick_channel_tag(&tags, UpdateChannel::Release).or(beta.clone());
+    (beta, prod)
+}
+
+/// Every tag of `image` in the local Docker cache. Empty when Docker is not
+/// answering, which leaves the caller with its own error.
+async fn local_image_tags(image: &str) -> Vec<String> {
+    let image = image.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        crate::cmd::new("docker")
+            .args(["image", "ls", "--format", "{{.Tag}}", &image])
+            .output()
+    })
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether `tag` is at or above the compatibility floor `min_tag` names.
@@ -310,19 +369,12 @@ fn tag_meets_floor(tag: &str, min_tag: Option<&str>) -> bool {
     }
 }
 
-/// Registry answer first, else whatever `.env` already pins.
-fn pin_tag(
-    image: &str,
-    resolved: Option<String>,
-    staged: Option<String>,
-) -> Result<String, String> {
-    resolved.or(staged).ok_or_else(|| {
-        format!(
-            "Cannot determine which {image} version to run: the container registry did not \
-             answer and no previous version is staged. Check the network connection and \
-             start again."
-        )
-    })
+fn unresolvable_image_error(image: &str) -> String {
+    format!(
+        "Cannot determine which {image} version to run: the container registry did not \
+         answer, no previous version is staged, and no copy is cached locally. Check the \
+         network connection and start again."
+    )
 }
 
 /// The tag an image actually runs under. The manager pins every image in
@@ -621,9 +673,10 @@ async fn run_compose_streaming_mode(
 // every miner it supports, so the image tag is the single version the manager
 // tracks — the miners inside move on their own cadence. The v0.2 images
 // (`quip-miner/quip-miner-{cpu,cuda}`) are a separate repository line and stop
-// at v0.2.1.
-pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner";
-pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda";
+// at v0.2.1. The upstream project was renamed from quip-miner to quip-solver,
+// which moved the v0.3 images; the old `quip-miner/v0.3/*` paths no longer exist.
+pub const CPU_IMAGE: &str = "registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver";
+pub const CUDA_IMAGE: &str = "registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver-cuda";
 pub const VALIDATOR_IMAGE: &str =
     "registry.gitlab.com/quip.network/quip-validator/quip-network-node";
 pub const DASHBOARD_IMAGE: &str = "registry.gitlab.com/quip.network/dashboard.quip.network";
@@ -743,6 +796,45 @@ async fn pull_compose_images_for_settings(
         &result.as_ref().err().cloned().unwrap_or_default(),
     );
     result
+}
+
+/// Images the stack's services need that are not in the local Docker cache.
+/// `config --images` prints each reference with its `.env` tag substituted.
+async fn missing_local_images(settings: &AppSettings) -> Result<Vec<String>, String> {
+    let profile = compose_profile(settings.image_tag);
+    let services = compose_services(&settings.run_mode);
+    let out = tokio::task::spawn_blocking(move || {
+        compose_cmd()
+            .args(["--profile", profile, "config", "--images"])
+            .args(services)
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+
+    let mut missing = Vec::new();
+    for image in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+        if image.is_empty() {
+            continue;
+        }
+        let reference = image.to_string();
+        let present = tokio::task::spawn_blocking(move || {
+            crate::cmd::new("docker")
+                .args(["image", "inspect", "--format", "{{.Id}}", &reference])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+        .await
+        .unwrap_or(false);
+        if !present {
+            missing.push(image.to_string());
+        }
+    }
+    Ok(missing)
 }
 
 /// Best-effort start of the per-user NVIDIA MPS control daemon so the cuda
@@ -908,7 +1000,31 @@ pub(crate) async fn start_stack_core(
     let profile = compose_profile(settings.image_tag);
 
     // (7) Pull the configured v0.2 tags (also drives the pull-progress panel).
-    pull_compose_images_for_settings(Arc::clone(&sink), &settings).await?;
+    // A failed pull is not fatal when every image is already on this machine:
+    // the stack starts from the local cache instead of refusing to start
+    // because the registry is unreachable or has moved.
+    let use_local_images =
+        match pull_compose_images_for_settings(Arc::clone(&sink), &settings).await {
+            Ok(()) => false,
+            Err(e) => match missing_local_images(&settings).await {
+                Ok(missing) if missing.is_empty() => {
+                    sink.log(
+                        "WARN",
+                        &format!(
+                        "Image pull failed ({e}); starting with the images already on this machine."
+                    ),
+                    );
+                    true
+                }
+                Ok(missing) => {
+                    return Err(format!(
+                        "{e} — and these images are not on this machine yet: {}",
+                        missing.join(", ")
+                    ))
+                }
+                Err(_) => return Err(e),
+            },
+        };
 
     // Start the host NVIDIA MPS daemon before the cuda container so it can
     // attach (native Linux GPU hosts only; no-op everywhere else).
@@ -924,6 +1040,8 @@ pub(crate) async fn start_stack_core(
     // `--remove-orphans` reaps containers for services the current compose no
     // longer declares (e.g. the removed quip-bootstrap) without destroying the
     // rest.
+    // The compose file sets `pull_policy: always`, so after a failed pull `up`
+    // must be told not to pull again; `--pull never` overrides the policy.
     let mut up_args: Vec<String> = vec![
         "--profile".into(),
         profile.into(),
@@ -931,20 +1049,13 @@ pub(crate) async fn start_stack_core(
         "-d".into(),
         "--remove-orphans".into(),
     ];
+    if use_local_images {
+        up_args.extend(["--pull".into(), "never".into()]);
+    }
     for s in compose_services(&settings.run_mode) {
         up_args.push((*s).into());
     }
-    sink.log(
-        "INFO",
-        &format!(
-            "$ docker compose --profile {profile} up -d --remove-orphans{}",
-            if up_args.len() > 5 {
-                format!(" {}", up_args[5..].join(" "))
-            } else {
-                String::new()
-            }
-        ),
-    );
+    sink.log("INFO", &format!("$ docker compose {}", up_args.join(" ")));
     let mut up_result = run_compose_streaming(Arc::clone(&sink), up_args.clone()).await;
 
     // `up` only fails like this when a leftover container is holding one of our
@@ -1694,11 +1805,11 @@ mod tests {
     fn miner_image_paths_use_v03_names() {
         assert_eq!(
             image_for_tag(ImageTag::Cpu),
-            "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner"
+            "registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver"
         );
         assert_eq!(
             image_for_tag(ImageTag::Cuda),
-            "registry.gitlab.com/quip.network/quip-miner/v0.3/quip-miner-cuda"
+            "registry.gitlab.com/quip.network/quip-solver/v0.3/quip-solver-cuda"
         );
         assert_eq!(
             VALIDATOR_IMAGE,
@@ -2049,6 +2160,99 @@ mod tests {
     fn absent_floor_admits_every_tag() {
         for tag in ["v0.1.0", "v9.9.9-rc1", "latest"] {
             assert!(tag_meets_floor(tag, None));
+        }
+    }
+
+    fn tags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn pair(beta: &str, prod: &str) -> ChannelPair {
+        ChannelPair {
+            beta: beta.into(),
+            prod: prod.into(),
+        }
+    }
+
+    #[test]
+    fn registry_answer_wins_over_pin_and_cache() {
+        let got = choose_pair(
+            CPU_IMAGE,
+            &tags(&["v0.3.4", "v0.3.5-rc13", "beta", "v0.3.5-rc13-amd64"]),
+            Some("v0.3.3".into()),
+            &tags(&["v0.3.2"]),
+            None,
+        );
+        assert_eq!(got, Ok(pair("v0.3.5-rc13", "v0.3.4")));
+    }
+
+    /// The quip-solver registry restarted at v0.3.5-rc12 with no stable tag.
+    /// The Release slot must take the newest beta rather than fail, or fall
+    /// back to a pin that names a tag the new repository does not have.
+    #[test]
+    fn registry_without_stable_tag_fills_release_with_newest_beta() {
+        let got = choose_pair(
+            CPU_IMAGE,
+            &tags(&["beta", "v0.3.5-rc12", "v0.3.5-rc13"]),
+            Some("v0.3.4".into()),
+            &[],
+            None,
+        );
+        assert_eq!(got, Ok(pair("v0.3.5-rc13", "v0.3.5-rc13")));
+    }
+
+    #[test]
+    fn unreachable_registry_falls_back_to_pin_before_cache() {
+        let got = choose_pair(
+            CPU_IMAGE,
+            &[],
+            Some("v0.3.4".into()),
+            &tags(&["v0.3.5-rc13"]),
+            None,
+        );
+        assert_eq!(got, Ok(pair("v0.3.4", "v0.3.4")));
+    }
+
+    #[test]
+    fn unreachable_registry_without_pin_uses_newest_cached_tag() {
+        let got = choose_pair(
+            CPU_IMAGE,
+            &[],
+            None,
+            &tags(&["v0.3.5-rc12", "v0.3.4", "beta", "<none>"]),
+            None,
+        );
+        assert_eq!(got, Ok(pair("v0.3.5-rc12", "v0.3.4")));
+    }
+
+    #[test]
+    fn cached_tags_below_the_floor_are_ignored() {
+        let got = choose_pair(
+            VALIDATOR_IMAGE,
+            &[],
+            None,
+            &tags(&["v0.2.2"]),
+            Some("v0.3.0-rc1"),
+        );
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn nothing_anywhere_is_an_error_naming_the_image() {
+        let err = choose_pair(CPU_IMAGE, &[], None, &[], None).unwrap_err();
+        assert!(err.contains(CPU_IMAGE), "{err}");
+    }
+
+    /// The image constants drive tag resolution and the update monitor; the
+    /// embedded compose file decides what actually runs. If they disagree, the
+    /// manager resolves tags for one repository and pulls from another.
+    #[test]
+    fn embedded_compose_file_uses_the_resolved_image_paths() {
+        for image in [CPU_IMAGE, CUDA_IMAGE, VALIDATOR_IMAGE, DASHBOARD_IMAGE] {
+            assert!(
+                crate::stack_assets::COMPOSE_YML.contains(&format!("image: {image}:")),
+                "{image} is not referenced by the embedded docker-compose.yml"
+            );
         }
     }
 }
