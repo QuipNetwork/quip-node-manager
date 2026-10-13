@@ -266,7 +266,9 @@ input[type="checkbox"] { accent-color: var(--hi); }
 /* ──────────────────────────────────────────────────────────── overview ── */
 .hero {
   position: relative; height: clamp(250px, 44vh, 400px); isolation: isolate;
-  display: flex; flex-direction: column; justify-content: flex-end; padding: 22px 24px 24px;
+  /* Anchored from the top so the state word stays in place when the state changes. */
+  display: flex; flex-direction: column; justify-content: flex-start;
+  padding: clamp(20px, calc(44vh - 270px), 120px) 24px 24px;
 }
 /* The chip, still for now; the live chip replaces this layer in a later phase. */
 .hero::after {
