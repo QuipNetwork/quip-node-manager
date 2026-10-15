@@ -128,6 +128,21 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## Unreleased
+
+### The macOS release build checks the signing certificate chain
+
+`codesign` uses only a signing identity that passes trust evaluation. A
+runner without Apple's Developer ID intermediate certificate failed the
+v0.3.1 tag build with `no identity found`.
+
+- When the identity fails trust evaluation, the build adds Apple's
+  intermediate certificates to the runner's login keychain and checks again.
+- If the identity still fails, the build stops before it compiles and
+  prints the command that installs the intermediate.
+
+---
+
 ## v0.3.1
 
 ### The stack joins the spec-119 Aglais relaunch
