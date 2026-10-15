@@ -128,7 +128,7 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## Unreleased
+## v0.3.2-rc1
 
 ### The macOS release build checks the signing certificate chain
 
