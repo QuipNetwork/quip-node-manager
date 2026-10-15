@@ -128,7 +128,7 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## Unreleased
+## v0.3.1
 
 ### The stack joins the spec-119 Aglais relaunch
 
