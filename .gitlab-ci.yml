@@ -436,22 +436,8 @@ build-macos-universal:
           > "$CODESIGN_WRAPPER/codesign"
         chmod +x "$CODESIGN_WRAPPER/codesign"
 
-        # Gate on the identity being present, not on macOS calling it valid.
-        #
-        # An identity is a certificate plus its private key. `-v` adds a full
-        # trust evaluation on top, and on roman-mac-native that evaluation
-        # returns 0 while the keychain holds the key and the whole chain:
-        #
-        #   certificates in keychain: 3
-        #   1) BFEE... "Developer ID Application: ..."   1 identities found
-        #   Valid identities only                        0 valid identities found
-        #
-        # Signing does not need that evaluation to pass, and gating on it
-        # blocked a runner that has everything signing requires. The real
-        # check is verify-macos-signing.sh after the build: it reads the
-        # notarization ticket and the authority chain off the finished DMG, so
-        # a chain that genuinely cannot be built fails there, on evidence,
-        # rather than here on a proxy for it.
+        # First gate: the identity is present. An identity is a certificate
+        # plus its private key, and this check runs no trust evaluation.
         if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
           echo "the signing identity is not in this runner's keychain" >&2
           echo "wanted: $APPLE_SIGNING_IDENTITY" >&2
@@ -460,16 +446,43 @@ build-macos-universal:
           echo "certificates present but no identity means the .p12 carried no private key." >&2
           exit 1
         fi
-        # Informational: record why the trust evaluation is unhappy, without
-        # blocking on it. Nothing here may fail the job.
+        # Second gate: the identity passes trust evaluation.
+        #
+        # `codesign -s <name>` matches only valid identities, so an identity
+        # that fails trust evaluation fails the build as "no identity found".
+        # Trust evaluation builds the chain from the keychain search list.
+        # The job keychain is not on that list, so the intermediates added to
+        # it above do not count. tesla-arm has the Developer ID intermediate
+        # in its login keychain, from Xcode. roman-mac-native has only the
+        # Command Line Tools and had no copy, which failed v0.3.1 there.
+        #
+        # When the identity is not valid, add the downloaded Apple
+        # intermediates to the login keychain, which is on the search list.
+        # This adds public certificates, the same ones Xcode installs, and
+        # changes no keychain preference. A runner that already passes never
+        # reaches the write.
         if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
-          echo "note: the identity is present but does not pass trust evaluation" >&2
+          LOGIN_KEYCHAIN=$(security login-keychain 2>/dev/null | tr -d '" ')
+          [ -n "$LOGIN_KEYCHAIN" ] || LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+          echo "the signing identity fails trust evaluation; adding the Apple intermediates to $LOGIN_KEYCHAIN"
+          for cer in "$CERT_DIR_CA"/*.cer; do
+            [ -f "$cer" ] || continue
+            # An intermediate the keychain already holds fails as a duplicate.
+            # The re-check below decides the outcome, not this exit status.
+            security add-certificates -k "$LOGIN_KEYCHAIN" "$cer" 2>/dev/null || true
+          done
+        fi
+        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
+          echo "the signing identity still fails trust evaluation, so codesign cannot use it" >&2
           security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" \
             > "$CERT_DIR_CA/leaf.pem" 2>/dev/null || true
-          security verify-cert -c "$CERT_DIR_CA/leaf.pem" -p codeSign -k "$KEYCHAIN" >&2 2>&1 || true
+          security verify-cert -c "$CERT_DIR_CA/leaf.pem" -p codeSign >&2 2>&1 || true
           openssl x509 -in "$CERT_DIR_CA/leaf.pem" -noout -dates -issuer >&2 2>/dev/null || true
           security list-keychains >&2 2>&1 || true
-          echo "note: continuing; verify-macos-signing.sh gates the finished DMG" >&2
+          echo "install the intermediate on this runner, then retry the job:" >&2
+          echo "  curl -fsSO https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" >&2
+          echo "  sudo security add-certificates -k /Library/Keychains/System.keychain DeveloperIDG2CA.cer" >&2
+          exit 1
         fi
         unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
       else
