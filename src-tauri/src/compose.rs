@@ -1280,7 +1280,7 @@ async fn broken_services(services: &[String]) -> Vec<String> {
 ///
 /// This only deletes data. It does not run `docker compose up` and it does
 /// not start anything. It force-removes `quip-dashboard` so nothing holds the
-/// database open, then clears the bind-mounted `dashboard-data` folder. The
+/// database open, then clears the bind-mounted `DASHBOARD_DATA_DIR` folder. The
 /// validator and the miner stay as they are. The dashboard comes back, empty,
 /// on the next Start.
 #[tauri::command]
@@ -1292,7 +1292,7 @@ pub async fn reset_dashboard_database(app: AppHandle) -> Result<(), String> {
 /// next Start.
 ///
 /// This only deletes data. It force-removes `quip-dashboard` so nothing holds
-/// the database open, then clears the bind-mounted `dashboard-data` folder.
+/// the database open, then clears the bind-mounted `DASHBOARD_DATA_DIR` folder.
 /// The Caddy certificates live in the `caddy-data` and `caddy-config` named
 /// volumes, which this does not touch.
 pub(crate) async fn reset_dashboard_database_core(
@@ -1307,7 +1307,7 @@ pub(crate) async fn reset_dashboard_database_core(
     })
     .await;
 
-    let dash_data = crate::settings::data_dir().join("dashboard-data");
+    let dash_data = crate::settings::data_dir().join(crate::stack_assets::DASHBOARD_DATA_DIR);
     if let Err(e) = std::fs::remove_dir_all(&dash_data) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("clearing {} failed: {e}", dash_data.display()));
@@ -2134,21 +2134,31 @@ mod tests {
     }
 
     /// The pre-Aglais validator is the image the bug report saw crash-looping:
-    /// `v0.2.2` is the newest *stable* tag in the validator registry, so before
+    /// `v0.2.2` was the newest *stable* tag in the validator registry, so before
     /// the floor existed the Release channel resolved straight to it while the
-    /// compose file mounted the Aglais spec regardless.
+    /// compose file mounted the Aglais spec regardless. The spec-119 relaunch
+    /// moved the floor again, past every v0.3 build.
     #[test]
-    fn validator_floor_rejects_pre_aglais_tags() {
+    fn validator_floor_rejects_tags_before_the_spec_119_genesis() {
         let floor = Some(crate::stack_assets::MIN_VALIDATOR_TAG);
-        for tag in ["v0.2.0", "v0.2.1", "v0.2.2", "v0.2.2-rc7", "v0.1.9"] {
+        for tag in [
+            "v0.1.9",
+            "v0.2.2",
+            "v0.2.2-rc7",
+            "v0.3.0-rc1",
+            "v0.3.2",
+            "v0.4.0-rc1",
+        ] {
             assert!(
                 !tag_meets_floor(tag, floor),
-                "{tag} predates the Aglais genesis and must not be pinned"
+                "{tag} predates the spec-119 genesis and must not be pinned"
             );
         }
-        // The floor is itself an `-rc`, so it and everything after it qualify.
-        for tag in ["v0.3.0-rc1", "v0.3.0-rc2", "v0.3.0", "v0.4.0"] {
-            assert!(tag_meets_floor(tag, floor), "{tag} can run the Aglais spec");
+        for tag in ["v0.4.0", "v0.4.1-rc1", "v0.4.1", "v0.5.0"] {
+            assert!(
+                tag_meets_floor(tag, floor),
+                "{tag} can run the spec-119 Aglais spec"
+            );
         }
         // Registry noise (`latest`, `sha-…`) parses to (0,0,0,_) and drops out.
         assert!(!tag_meets_floor("latest", floor));
