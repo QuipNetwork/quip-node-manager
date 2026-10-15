@@ -128,6 +128,26 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.3.1
+
+### The stack joins the spec-119 Aglais relaunch
+
+Aglais restarted from a fresh genesis on runtime spec 119. The chain name and
+chain ID do not change.
+
+- The manager ships the new chain spec and requires validator `v0.4.0` or
+  later. Both channels resolve to `v0.4.0` today.
+- The validator keeps its database in `data/aglais-119-chain-db` and the
+  dashboard keeps its index in `dashboard-data-119`. The old chain cannot
+  serve the new genesis, so the next Start syncs the validator and rebuilds
+  the dashboard index from block 0.
+- The manager does not delete `data/aglais-chain-db` or `dashboard-data`.
+  Delete them yourself to recover the disk space.
+- The miner funds and registers its account again on the new chain, through
+  the faucet, on its first start.
+
+---
+
 ## v0.3.0
 
 ### Start Node works again after the quip-solver rename

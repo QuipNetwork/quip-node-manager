@@ -71,7 +71,7 @@ quip-node-manager/
 
 - **Tauri version**: v2
 - **JS tooling**: Bun
-- **App version**: 0.3.0
+- **App version**: 0.3.1
 - **Window size**: 900×700
 - **Data directory**: `~/quip-data/` by default (bind-mount root for the compose
   stack). Overridable via `set_data_dir` → the `data_dir` key in
@@ -153,6 +153,11 @@ v0.2.3-rc2` (`stack_assets.rs`). `v0.2.3-rc1` is the first tag with Caddy
 embedded in the image, and `v0.2.3-rc2` is the first tag with the `/files`
 allowlist the upstream changelog requires.
 
+The validator has a floor too, `MIN_VALIDATOR_TAG = v0.4.0`. The embedded chain
+spec is the v0.4.0 export for the spec-119 Aglais relaunch. Move the floor, the
+spec, and the two per-genesis directories (`VALIDATOR_DB_DIR`,
+`DASHBOARD_DATA_DIR`) together at the next relaunch.
+
 Selected by `AppSettings`:
 - `image_tag: ImageTag` — `Cpu` | `Cuda`. D-Wave QPU mining is not a separate
   image: it rides on the CPU image via the `[dwave]` section in `config.toml`.
@@ -199,8 +204,8 @@ eligibility while positional args restrict what actually starts.
 | `docker-compose.yml` | stack_assets.rs (embedded copy + patch) | Upstream compose with the dashboard's public API port → `<port>:20049`, validator libp2p → `<validator_port>:30333/tcp+udp`, `--public-addr` injected when `public_host` set, (Native) validator RPC published on `127.0.0.1:<validator_rpc_port>:9944`, and the `QUIP_MINER_UPSTREAM` patch that adds the dashboard's embedded Caddy upstream, which upstream compose does not pass |
 | `chain-specs/aglais-network.json` | stack_assets.rs (embedded copy) | Quip Testnet chain spec mounted into the validator container |
 | `keystore.json` | native.rs (Native mode) | Native miner signer keystore (generated via `quip-miner keygen`) |
-| `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/validator-data/` (mounted as the validator container's `/data`) |
-| `dashboard-data/` | bind-mount target for the dashboard | the dashboard index (`dashboard.db`) and collector state |
+| `data/` | bind-mount target for the miner's `/data` (Docker) and host config.toml path (Native) | miner runtime `config.toml`, `keystore.json`; the validator's state lives under `data/aglais-119-chain-db/` (`stack_assets::VALIDATOR_DB_DIR`, mounted as the validator container's `/data`) |
+| `dashboard-data-119/` | bind-mount target for the dashboard | the dashboard index (`dashboard.db`) and collector state |
 | `node-secret.json` | secret.rs | `{ "secret": "<64-hex>" }` — read by secret.rs and gates the `secret` pre-flight check, but NOT written into config.toml in v0.2. The node's actual signing identity is `keystore.json` (Docker `/data/keystore.json`, Native `keystore.json`). |
 | `bin/quip-miner-*` | native.rs | Downloaded native miner binary (`quip-miner-macos-arm64` / `-x86_64`). Legacy pre-v0.2 `quip-network-node-*` binaries here are auto-deleted on launch. |
 

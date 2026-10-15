@@ -41,10 +41,21 @@ use std::path::PathBuf;
 pub(crate) const COMPOSE_YML: &str =
     include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
 
-/// Aglais chain spec — the live Quip test network (runtime spec 117). Replaces
-/// the retired `quip-testnet.json`, which upstream deleted at the relaunch.
+/// Aglais chain spec — the live Quip test network (runtime spec 119, relaunched
+/// from a fresh genesis). Replaces the retired `quip-testnet.json`, which
+/// upstream deleted at the first Aglais launch.
 const CHAIN_SPEC: &str =
     include_str!("../../vendor/nodes.quip.network/chain-specs/aglais-network.json");
+
+/// The validator's base path, relative to the data dir: one directory per
+/// genesis. Every Aglais relaunch keeps the chain id `quip_testnet`, so a
+/// reused directory would hand the old chain's database to the new spec.
+/// Older directories stay in place for the operator to delete.
+pub(crate) const VALIDATOR_DB_DIR: &str = "data/aglais-119-chain-db";
+
+/// The dashboard's data directory, relative to the data dir: one directory per
+/// genesis, because the dashboard index binds to the first genesis it sees.
+pub(crate) const DASHBOARD_DATA_DIR: &str = "dashboard-data-119";
 
 /// Oldest validator image that can run `CHAIN_SPEC`.
 ///
@@ -57,7 +68,10 @@ const CHAIN_SPEC: &str =
 ///
 /// Lives beside `CHAIN_SPEC` because the two move together: re-point the spec
 /// at a new network and this floor is what stops the old images coming with it.
-pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.3.0-rc1";
+///
+/// The spec-119 relaunch is a v0.4.0 chain spec export, so the floor is the
+/// first validator built for that runtime.
+pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.4.0";
 
 /// Oldest dashboard image that can run `COMPOSE_YML`.
 ///
@@ -141,15 +155,11 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig, tls: bool) -> 
     let base = data_dir();
     for sub in [
         "data",
-        // The validator's base path. Aglais kept the chain id `quip_testnet`,
-        // so its database lands in the same `chains/quip_testnet` subdirectory
-        // the retired network used; a separate host directory is what keeps an
-        // Aglais node from opening the old network's database and failing with
-        // a GRANDPA decode error. Created here rather than left to Docker,
+        // The validator's base path. Created here rather than left to Docker,
         // which fabricates a missing bind-mount source owned by root while the
         // validator runs as PUID/PGID.
-        "data/aglais-chain-db",
-        "dashboard-data",
+        VALIDATOR_DB_DIR,
+        DASHBOARD_DATA_DIR,
         "chain-specs",
         "config",
         "scripts",
@@ -172,12 +182,7 @@ pub fn sync_stack_assets(run_mode: &RunMode, config: &NodeConfig, tls: bool) -> 
     // directories as the uid its own containers then run as.
     chown_staged_bind_mounts(
         &base,
-        [
-            "data",
-            "data/aglais-chain-db",
-            "dashboard-data",
-            "data/logs",
-        ],
+        ["data", VALIDATOR_DB_DIR, DASHBOARD_DATA_DIR, "data/logs"],
     )?;
 
     let compose_out = patch_compose_file(COMPOSE_YML, config, run_mode, tls)?;
@@ -770,10 +775,12 @@ mod tests {
     /// the miner, dashboard, and faucet all gate on it being healthy.
     #[test]
     fn every_relative_bind_mount_has_a_staged_source() {
+        let validator_db = format!("./{VALIDATOR_DB_DIR}");
+        let dashboard_data = format!("./{DASHBOARD_DATA_DIR}");
         let staged = [
             "./data",
-            "./data/aglais-chain-db",
-            "./dashboard-data",
+            validator_db.as_str(),
+            dashboard_data.as_str(),
             "./chain-specs/aglais-network.json",
             "./config/quip-miner.toml",
             "./scripts/validator-healthcheck.sh",
@@ -874,12 +881,7 @@ mod tests {
     fn chown_staged_bind_mounts_is_a_noop_for_a_non_root_caller() {
         use std::os::unix::fs::MetadataExt;
         let dir = unique_temp_dir("chown-noop");
-        for sub in [
-            "data",
-            "data/aglais-chain-db",
-            "dashboard-data",
-            "data/logs",
-        ] {
+        for sub in ["data", VALIDATOR_DB_DIR, DASHBOARD_DATA_DIR, "data/logs"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
 
@@ -889,12 +891,7 @@ mod tests {
 
         chown_staged_bind_mounts(
             &dir,
-            [
-                "data",
-                "data/aglais-chain-db",
-                "dashboard-data",
-                "data/logs",
-            ],
+            ["data", VALIDATOR_DB_DIR, DASHBOARD_DATA_DIR, "data/logs"],
         )
         .unwrap();
 
@@ -909,12 +906,7 @@ mod tests {
             assert_eq!(before.gid(), after.gid());
         }
 
-        for sub in [
-            "data",
-            "data/aglais-chain-db",
-            "dashboard-data",
-            "data/logs",
-        ] {
+        for sub in ["data", VALIDATOR_DB_DIR, DASHBOARD_DATA_DIR, "data/logs"] {
             assert!(dir.join(sub).is_dir(), "{sub} missing after chown step");
         }
 
