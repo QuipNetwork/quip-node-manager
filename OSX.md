@@ -117,22 +117,23 @@ variables only when `$CI_COMMIT_TAG` is set, then calls
 
 On a tag build the job imports the certificate into its own keychain,
 `~/Library/Keychains/quip-ci.keychain-db`, and unsets `APPLE_CERTIFICATE` so
-Tauri does not build a second one. The job never makes that keychain the
-default and never adds it to the user search list, because both are account
-preferences that outlive the job. Every `security` call names the keychain
+Tauri does not build a second one. Every `security` call names the keychain
 with `-k`. Tauri runs `codesign` without `--keychain` on this path, so the
 job puts a wrapper first on `PATH` for the build step that adds
-`--keychain quip-ci.keychain-db` to each call. `after_script` deletes the
-keychain when the job ends, on success or failure.
+`--keychain quip-ci.keychain-db` to each call. The job never makes that
+keychain the default keychain.
 
-`codesign` uses only an identity that passes trust evaluation, and trust
-evaluation reads the search list, not the job keychain. The runner must
-hold Apple's Developer ID intermediate certificate in a keychain on its search
-list. Xcode installs that certificate, but the Command Line Tools do not. When the
-identity fails trust evaluation, the job adds the intermediates it downloads
-from apple.com to the login keychain and checks again. If the identity still
-fails, the job stops before the build and prints the command that installs
-the intermediate in the System keychain.
+`codesign` finds an identity only in keychains on the user search list. Its
+`--keychain` option selects one of those keychains, but it cannot add a
+keychain that is off the list. For the build, the job runs
+`scripts/macos-keychain-search-list.sh`, which saves the search list and puts
+the job keychain first. The step after the build writes the saved list back,
+and `after_script` does the same if the build failed. `after_script` then deletes the keychain.
+
+The job also downloads Apple's Developer ID intermediate certificates into
+its keychain, because the Command Line Tools do not install them. If the
+identity still fails trust evaluation, the job stops before the build and
+prints the command that installs the intermediate in the System keychain.
 
 ### Required CI/CD variables
 
