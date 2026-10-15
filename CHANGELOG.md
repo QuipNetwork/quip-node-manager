@@ -128,6 +128,25 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.3.2-rc2
+
+### The macOS release build puts its keychain on the search list
+
+`codesign` finds a signing identity only in keychains on the user's keychain
+search list. Its `--keychain` option cannot add a keychain that is off that
+list. The release build kept its keychain off the list, so v0.3.2-rc1 failed
+with `no identity found` on a runner whose own keychains hold no identity.
+
+- `scripts/macos-keychain-search-list.sh` saves the search list and puts the
+  build keychain first while Tauri signs.
+- The step after the build writes the saved list back. `after_script` does
+  the same when the build fails or someone cancels the job.
+- The build no longer adds Apple's intermediate certificates to the runner's
+  login keychain. The copies in the build keychain count while that keychain
+  sits on the search list.
+
+---
+
 ## v0.3.2-rc1
 
 ### The macOS release build checks the signing certificate chain

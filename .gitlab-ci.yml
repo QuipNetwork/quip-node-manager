@@ -398,13 +398,11 @@ build-macos-universal:
         # A Developer ID leaf chains through Apple's Developer ID
         # Certification Authority to the Apple Root CA. The root ships in
         # System Roots, but the intermediate arrives with Xcode. A runner with
-        # only the Command Line Tools has no copy, so the chain cannot be
-        # built and the certificate counts as invalid however well it
-        # imported. That is the difference between the two runners: tesla-arm
-        # holds one in its login keychain, roman-mac-native holds nothing.
+        # only the Command Line Tools, such as roman-mac-native, has no copy,
+        # so the job brings its own. The copy counts once the job keychain is
+        # on the search list, below.
         #
-        # Non-fatal: if the identity turns out to be usable anyway, the check
-        # below says so, and it gives the real verdict either way.
+        # Non-fatal: the trust gate below gives the real verdict.
         for ca in DeveloperIDG2CA DeveloperIDCA; do
           if curl -fsS --max-time 30 -o "$CERT_DIR_CA/$ca.cer" \
             "https://www.apple.com/certificateauthority/$ca.cer"; then
@@ -422,12 +420,11 @@ build-macos-universal:
         #
         # Tauri passes --keychain to codesign only when it built the keychain
         # itself from APPLE_CERTIFICATE. On the identity-only path used here
-        # it runs a bare `codesign -s <identity>`, which resolves the identity
-        # through the user's keychain search list. Registering the job
-        # keychain there is a per-account preference write, and the one thing
-        # this job must not do. Tauri spawns `codesign` by name through PATH,
-        # so a wrapper ahead of it on PATH adds --keychain to every call and
-        # hands off to the real binary. The exec keeps the keychain's access
+        # it runs a bare `codesign -s <identity>`. Tauri spawns `codesign` by
+        # name through PATH, so a wrapper ahead of it on PATH adds --keychain
+        # to every call and hands off to the real binary. This only picks the
+        # job keychain out of the search list; it does not replace the
+        # search-list entry below. The exec keeps the keychain's access
         # control intact: the ACL set by `security import -T` names
         # /usr/bin/codesign, and that is still the process that touches the
         # key. The wrapper is on PATH only for the build step; the signing
@@ -446,34 +443,24 @@ build-macos-universal:
           echo "certificates present but no identity means the .p12 carried no private key." >&2
           exit 1
         fi
+        # Put the job keychain on the user's keychain search list for the
+        # build. codesign finds an identity only in keychains on that list,
+        # and its --keychain option cannot add one: v0.3.2-rc1 failed on
+        # roman-mac-native with "no identity found" while the identity sat
+        # trusted in the job keychain. tesla-arm signed only because its own
+        # login keychain is on the list. Tauri's own keychain path makes the
+        # same entry. The list is a per-account preference, so the script
+        # saves it, and the step after the build and after_script restore it.
+        ./scripts/macos-keychain-search-list.sh push "$KEYCHAIN" "$CI_PROJECT_DIR/.keychain-search-list"
+
         # Second gate: the identity passes trust evaluation.
         #
         # `codesign -s <name>` matches only valid identities, so an identity
         # that fails trust evaluation fails the build as "no identity found".
-        # Trust evaluation builds the chain from the keychain search list.
-        # The job keychain is not on that list, so the intermediates added to
-        # it above do not count. tesla-arm has the Developer ID intermediate
-        # in its login keychain, from Xcode. roman-mac-native has only the
-        # Command Line Tools and had no copy, which failed v0.3.1 there.
-        #
-        # When the identity is not valid, add the downloaded Apple
-        # intermediates to the login keychain, which is on the search list.
-        # This adds public certificates, the same ones Xcode installs, and
-        # changes no keychain preference. A runner that already passes never
-        # reaches the write.
+        # Trust evaluation builds the chain from the search list, which now
+        # includes the job keychain and the intermediates in it.
         if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
-          LOGIN_KEYCHAIN=$(security login-keychain 2>/dev/null | tr -d '" ')
-          [ -n "$LOGIN_KEYCHAIN" ] || LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
-          echo "the signing identity fails trust evaluation; adding the Apple intermediates to $LOGIN_KEYCHAIN"
-          for cer in "$CERT_DIR_CA"/*.cer; do
-            [ -f "$cer" ] || continue
-            # An intermediate the keychain already holds fails as a duplicate.
-            # The re-check below decides the outcome, not this exit status.
-            security add-certificates -k "$LOGIN_KEYCHAIN" "$cer" 2>/dev/null || true
-          done
-        fi
-        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$APPLE_SIGNING_IDENTITY"; then
-          echo "the signing identity still fails trust evaluation, so codesign cannot use it" >&2
+          echo "the signing identity fails trust evaluation, so codesign cannot use it" >&2
           security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" \
             > "$CERT_DIR_CA/leaf.pem" 2>/dev/null || true
           security verify-cert -c "$CERT_DIR_CA/leaf.pem" -p codeSign >&2 2>&1 || true
@@ -492,6 +479,9 @@ build-macos-universal:
     # CODESIGN_WRAPPER is set only on a tag build; the expansion is empty
     # otherwise and PATH is unchanged.
     - PATH="${CODESIGN_WRAPPER:+$CODESIGN_WRAPPER:}$PATH" bun run tauri build --target universal-apple-darwin
+    # Signing is over, so take the job keychain off the search list now
+    # rather than at the end of the job. A no-op on an untagged build.
+    - ./scripts/macos-keychain-search-list.sh restore "$CI_PROJECT_DIR/.keychain-search-list"
     - mkdir -p dist
     - cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/quip-node-manager-macos-universal.dmg
     # Tauri does not notarize the DMG, and it treats absent credentials as a
@@ -510,8 +500,10 @@ build-macos-universal:
       fi
   # Runs after success, failure, and cancellation. The job keychain holds the
   # private key from APPLE_CERTIFICATE, so it must not outlive the job; an
-  # untagged build never created it and the delete is a no-op.
+  # untagged build never created it and the delete is a no-op. The search
+  # list goes back first, in case the build failed before the restore step.
   after_script:
+    - ./scripts/macos-keychain-search-list.sh restore "$CI_PROJECT_DIR/.keychain-search-list" || true
     - security delete-keychain "$HOME/Library/Keychains/quip-ci.keychain-db" 2>/dev/null || true
   artifacts:
     paths:
