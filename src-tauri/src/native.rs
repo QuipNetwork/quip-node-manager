@@ -7,7 +7,10 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
-const MINER_PROJECT: &str = "quip.network%2Fquip-miner";
+/// GitLab project ID of `quip.network/quip-solver`, formerly `quip-miner`.
+/// The ID survives renames. The rename left the old path answering the
+/// releases API with a malformed redirect.
+const MINER_PROJECT: &str = "71492472";
 const NATIVE_MINER_VALIDATOR_RPC_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -44,9 +47,11 @@ impl Default for NativeProcessState {
 
 /// The release asset Native mode installs. v0.3 ships one macOS bundle holding
 /// the coordinator and every darwin-arm64 miner, rather than the single
-/// `quip-miner-*` binary v0.2 published.
+/// `quip-miner-*` binary v0.2 published. Releases from v0.3.5-rc12 on carry the
+/// quip-solver name; older releases, named `quip-miner-darwin-arm64.tar.gz`,
+/// drop out of the candidate list.
 pub fn bundle_asset_name() -> &'static str {
-    "quip-miner-darwin-arm64.tar.gz"
+    "quip-solver-darwin-arm64.tar.gz"
 }
 
 /// Native mode exists so Metal mining can reach the Apple Silicon GPU, which a
@@ -190,7 +195,7 @@ fn binary_release_marker_path() -> std::path::PathBuf {
     data_dir().join("bin").join("quip-miner.release")
 }
 
-/// Fetch the quip-miner releases list (GitLab returns them newest-first).
+/// Fetch the quip-solver releases list (GitLab returns them newest-first).
 /// Returns the URL it hit and the specific cause on failure so callers can show
 /// the user what was tried (transport error vs. HTTP status vs. bad JSON) rather
 /// than a generic "couldn't list releases".
@@ -821,7 +826,7 @@ pub(crate) async fn download_native_binary_core(
             .await
             .ok_or_else(|| {
                 format!(
-                    "No downloadable quip-miner release ships {name} on the {channel:?} \
+                    "No downloadable quip-solver release ships {name} on the {channel:?} \
                  channel yet — the build may still be running, or the channel has no \
                  published builds. Try again shortly."
                 )
@@ -857,7 +862,7 @@ pub(crate) async fn download_native_binary_core(
     if !resp.status().is_success() {
         return Err(format!(
             "Download failed: HTTP {}. No release found — \
-             a tagged release of quip-miner is required.",
+             a tagged release of quip-solver is required.",
             resp.status()
         ));
     }
@@ -1803,7 +1808,7 @@ mod tests {
 
     #[test]
     fn bundle_asset_is_the_macos_tarball() {
-        assert_eq!(bundle_asset_name(), "quip-miner-darwin-arm64.tar.gz");
+        assert_eq!(bundle_asset_name(), "quip-solver-darwin-arm64.tar.gz");
     }
 
     #[test]
@@ -1823,17 +1828,17 @@ mod tests {
     fn extract_bundle_flattens_and_marks_executable() {
         let tmp = std::env::temp_dir().join(format!("quip-bundle-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let src = tmp.join("quip-miner-darwin-arm64");
+        let src = tmp.join("quip-solver-darwin-arm64");
         std::fs::create_dir_all(&src).expect("setup dir");
         std::fs::write(src.join("quip-coordinator"), b"#!/bin/sh\nexit 0\n").expect("w1");
         std::fs::write(src.join("quip-cpu-sa"), b"#!/bin/sh\nexit 0\n").expect("w2");
-        std::fs::write(src.join("MANIFEST"), b"quip-miner v0.3.0-rc3\n").expect("w3");
+        std::fs::write(src.join("MANIFEST"), b"quip-solver v0.3.5\n").expect("w3");
 
         let tarball = tmp.join("b.tar.gz");
         let f = std::fs::File::create(&tarball).expect("create tarball");
         let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
         let mut ar = tar::Builder::new(enc);
-        ar.append_dir_all("quip-miner-darwin-arm64", &src)
+        ar.append_dir_all("quip-solver-darwin-arm64", &src)
             .expect("append");
         ar.into_inner().expect("inner").finish().expect("finish");
 
@@ -1844,7 +1849,7 @@ mod tests {
         assert!(dest.join("quip-cpu-sa").is_file());
         assert!(dest.join("MANIFEST").is_file(), "MANIFEST is unpacked");
         assert!(
-            !dest.join("quip-miner-darwin-arm64").exists(),
+            !dest.join("quip-solver-darwin-arm64").exists(),
             "archive top-level dir must be flattened away"
         );
         assert_eq!(installed.len(), 2, "MANIFEST is not an installed binary");
