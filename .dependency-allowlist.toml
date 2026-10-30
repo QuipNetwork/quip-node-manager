@@ -1,0 +1,6 @@
+[[allow]]
+ecosystem = "cargo"
+name = "kuchikiki"
+version = "0.8.8-speedreader"
+commit = "2aade9dd598ec6dea5307d2ae9ad0017962c200d"
+reason = "tauri-utils 2.8.3 requires this exact prerelease. The newest stable kuchikiki release is 0.8.2, and no tauri-utils release avoids the dependency. Remove when tauri-utils moves to a stable kuchikiki or to a replacement crate."

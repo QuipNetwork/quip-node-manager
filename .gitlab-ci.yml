@@ -1,6 +1,11 @@
 # GitLab CI/CD for Quip Node Manager
 # Tauri v2 desktop app builds for macOS (universal), Linux, Windows
 
+include:
+  - project: quip.network/ci-templates
+    ref: v1.1.0
+    file: templates/dependency-gate.yml
+
 stages:
   - toolchain
   - lint
@@ -58,7 +63,9 @@ variables:
 # on a rebuild it cannot use until the digest is bumped.
 build-toolchain-image:
   stage: toolchain
-  needs: []
+  needs:
+    - job: dependency-gate
+      optional: true
   # `docker` pins this to a container executor, which honours `image:` and can
   # run kaniko. lovelace, finney and watch all carry docker + amd64; the macOS
   # shell runners ignore `image:` and cannot run it. The executor comes from
@@ -643,6 +650,8 @@ sign-windows-x86_64:
   image: eclipse-temurin@sha256:5726444f65e67c407bac4ff1e036b475051f50bb3840273e81814e77c6fa8ee3
   tags: [linux, x86_64]
   needs:
+    - job: dependency-gate
+      optional: true
     - build-windows-x86_64
   variables:
     GIT_SUBMODULE_STRATEGY: none
@@ -707,6 +716,8 @@ sign-artifacts:
   image: debian:bookworm-slim
   tags: [linux, x86_64]
   needs:
+    - job: dependency-gate
+      optional: true
     - build-macos-universal
     - build-linux-x86_64
     - sign-windows-x86_64
@@ -777,6 +788,8 @@ release-binaries:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
+    - job: dependency-gate
+      optional: true
     - build-macos-universal
     - build-linux-x86_64
     - sign-windows-x86_64
