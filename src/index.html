@@ -25,11 +25,10 @@
       <div class="band" aria-hidden="true"></div>
       <div class="inner">
         <h1>Set up your Quip node</h1>
-        <p class="lead">Choose where the node keeps its data: configuration, keys, downloaded
-          binaries and the chain database. You can move it later in Settings.</p>
+        <p class="lead">Pick the folder where the node keeps its configuration, keys, downloaded binaries and chain database. You can move it later in Settings.</p>
         <label class="field-label" for="first-boot-dir">Storage folder</label>
         <input type="text" id="first-boot-dir" class="input mono wide" />
-        <p class="hint">The checks and mining settings come next, on the Overview and in Settings.</p>
+        <p class="hint">Next, the Overview checks this computer. You can change which hardware mines in Settings.</p>
         <div class="nav2">
           <button id="btn-first-boot-continue" class="btn btn-primary btn-lg">Continue</button>
         </div>
@@ -80,7 +79,7 @@
           <div class="actions">
             <button id="btn-start" class="btn btn-primary btn-lg" disabled>Start node</button>
             <button id="btn-stop" class="btn btn-ghost btn-lg" disabled>Stop node</button>
-            <span id="update-badge" class="tag" title="A node update is available. Restart to update."
+            <span id="update-badge" class="tag" title="A node update is ready. Restart to install it."
               style="display:none;">Update ready</span>
           </div>
         </div>
@@ -126,11 +125,11 @@
           <!-- Node -->
           <div class="sec active" data-sec="node">
             <h1>Node</h1>
-            <p class="lead">Where the node keeps its data, its key, and the name other people see.</p>
+            <p class="lead">Your node's data folder, its key, and the name others see.</p>
             <div class="sgroup">
               <div class="setting stack">
                 <div><label class="sl" for="data-dir">Storage folder</label>
-                  <div class="sd">Changing it creates a new folder and restarts the app. The old folder stays where it is.</div></div>
+                  <div class="sd">If you change the storage folder, the app creates the new one and restarts. Your old folder is left where it is.</div></div>
                 <div class="inrow">
                   <input type="text" id="data-dir" class="input mono grow" />
                   <button id="btn-data-dir-restart" class="btn btn-ghost btn-sm" style="display:none;">Save and restart app</button>
@@ -138,7 +137,7 @@
               </div>
               <div class="setting stack">
                 <div><span class="sl">Node key</span>
-                  <div class="sd">A private secret that identifies this node. Keep it to yourself.</div></div>
+                  <div class="sd">This private key is how peers know your node. Anyone who has it can pose as your node.</div></div>
                 <div class="inrow secret-row">
                   <input type="password" id="secret-display" class="input mono grow" readonly placeholder="No key set" />
                   <button id="btn-show-secret" class="btn btn-ghost btn-sm">Show</button>
@@ -147,7 +146,7 @@
               </div>
               <div class="setting stack">
                 <div><label class="sl" for="node-name">Node name</label>
-                  <div class="sd">Optional. Shown to other validators.</div></div>
+                  <div class="sd">Optional. Other validators see this name.</div></div>
                 <input type="text" id="node-name" class="input" placeholder="my-quip-node" />
               </div>
             </div>
@@ -156,7 +155,7 @@
           <!-- Mining -->
           <div class="sec" data-sec="mining">
             <h1>Mining</h1>
-            <p class="lead">What this computer mines with. Changes apply when the node restarts.</p>
+            <p class="lead">Choose what this computer mines with. Changes take effect when the node restarts.</p>
             <div class="sgroup">
               <div class="gt"><h2>CPU</h2></div>
               <div class="setting">
@@ -166,7 +165,7 @@
               <div id="cpu-subsettings" class="subset">
                 <div class="setting">
                   <div><label class="sl" for="num-cpus">CPU cores</label>
-                    <div class="sd">How many cores the miner may use.</div></div>
+                    <div class="sd">How many CPU cores the miner can use.</div></div>
                   <input type="number" id="num-cpus" class="input mono num" min="1" max="64" value="1" />
                 </div>
                 <!-- Populated from the miner image at runtime, not from a list
@@ -185,16 +184,16 @@
               <div id="gpu-no-devices" class="empty" style="display:none;">No GPUs found on this computer.</div>
               <div id="gpu-global-settings">
                 <div class="setting">
-                  <div><label class="sl" for="gpu-utilization">Use up to</label>
-                    <div class="sd">The share of the GPU the miner may take.</div></div>
+                  <div><label class="sl" for="gpu-utilization">GPU limit</label>
+                    <div class="sd">How much of this GPU the miner can use.</div></div>
                   <div class="range">
                     <input type="range" id="gpu-utilization" min="0" max="100" value="80" />
                     <span id="gpu-util-display" class="v">80%</span>
                   </div>
                 </div>
                 <div class="setting">
-                  <div><label class="sl" for="gpu-yielding">Step aside for other apps</label>
-                    <div class="sd">The GPU yields when other programs need it.</div></div>
+                  <div><label class="sl" for="gpu-yielding">Give other apps priority</label>
+                    <div class="sd">The miner slows down whenever another app needs the GPU.</div></div>
                   <label class="switch"><input type="checkbox" id="gpu-yielding" /><span></span></label>
                 </div>
                 <!-- CUDA / Metal solver pickers. Only the one matching the
@@ -216,7 +215,7 @@
             <div class="sgroup">
               <div class="gt"><h2>D-Wave quantum computer</h2>
                 <button id="btn-qpu-toggle" class="btn btn-ghost btn-sm">Configure D-Wave Access</button></div>
-              <p class="gd">Runs on top of CPU mining and needs a D-Wave Leap account.</p>
+              <p class="gd">This runs on top of CPU mining and needs a D-Wave Leap account.</p>
               <div id="qpu-section" style="display:none;">
                 <div class="fields qpu-facts">
                   <span class="field"><span class="l">Solver</span><span class="v">Advantage2_System1.13</span></span>
@@ -228,12 +227,12 @@
                 </div>
                 <div class="setting">
                   <div><label class="sl" for="qpu-budget">Monthly budget</label>
-                    <div class="sd">QPU time, for example 40h.</div></div>
+                    <div class="sd">How much quantum computer time to use, for example 40h.</div></div>
                   <input type="text" id="qpu-budget" class="input mono num" placeholder="40h" />
                 </div>
                 <div class="setting">
                   <div><label class="sl" for="qpu-budget-reset-day">Budget resets on day</label>
-                    <div class="sd">Day of the month, UTC.</div></div>
+                    <div class="sd">A day of the month, counted in UTC.</div></div>
                   <input type="number" id="qpu-budget-reset-day" class="input mono num" min="1" max="31" value="1" />
                 </div>
               </div>
@@ -243,7 +242,7 @@
           <!-- Network -->
           <div class="sec" data-sec="network">
             <h1>Network</h1>
-            <p class="lead">The address other nodes use to reach yours, and secure connections for the dashboard.</p>
+            <p class="lead">How other nodes reach yours, and whether the dashboard uses secure connections.</p>
             <div class="sgroup">
               <div class="gt"><h2>Public address</h2></div>
               <div class="setting">
@@ -265,10 +264,8 @@
                   <div><label class="sl" for="public-port">Port</label></div>
                   <input type="number" id="public-port" class="input mono num" min="1024" max="65535" placeholder="20049" />
                 </div>
-                <p class="sd">This changes only the address peers are told to dial. Use it when your router forwards a
-                  different external port to this computer. To change the port the node listens on, edit Public API
-                  under Advanced.</p>
-                <p class="note-alert">Make sure this address is reachable from the internet.</p>
+                <p class="sd">This changes only the address peers are told to dial. Use it when your router forwards a different outside port to this computer. To change the port the node listens on, edit Public API under Advanced.</p>
+                <p class="note-alert">Check that this address can be reached from the internet.</p>
               </div>
             </div>
 
@@ -276,25 +273,24 @@
               <div class="gt"><h2>Secure connections</h2></div>
               <div class="setting">
                 <div><label class="sl" for="tls-enabled">Turn on TLS</label>
-                  <div class="sd">Needs ports 80 and 443.</div></div>
+                  <div class="sd">This needs ports 80 and 443.</div></div>
                 <label class="switch"><input type="checkbox" id="tls-enabled" /><span></span></label>
               </div>
               <div id="tls-subsettings" class="subset" style="display:none;">
                 <div class="setting stack">
                   <div><label class="sl" for="hostname">Dashboard hostname</label>
                     <div class="sd"><code>:20049</code> for local HTTP, or <code>example.com, example.com:20049</code>
-                      for public TLS. The port inside the container is always 20049. To move the public port, edit
-                      Public API under Advanced.</div></div>
+                      for public TLS. Inside the container the port stays 20049. To change the public port, edit Public API under Advanced.</div></div>
                   <input type="text" id="hostname" class="input mono" placeholder=":20049" />
                 </div>
                 <div class="setting stack">
                   <div><label class="sl" for="cert-email">Certificate email</label>
-                    <div class="sd">Needed for Let's Encrypt.</div></div>
+                    <div class="sd">Let's Encrypt needs this address.</div></div>
                   <input type="email" id="cert-email" class="input" placeholder="you@example.com" />
                 </div>
                 <div class="setting stack">
                   <div><label class="sl" for="zerossl-api-key">ZeroSSL API key</label>
-                    <div class="sd">Optional fallback. Leave it empty to use Let's Encrypt.</div></div>
+                    <div class="sd">This is an optional fallback. Leave it empty to use Let's Encrypt.</div></div>
                   <input type="password" id="zerossl-api-key" class="input mono" />
                 </div>
               </div>
@@ -304,7 +300,7 @@
           <!-- Updates -->
           <div class="sec" data-sec="updates">
             <h1>Updates</h1>
-            <p class="lead">Which builds the node runs, and checking for a newer manager.</p>
+            <p class="lead">Choose which builds the node runs and check for a newer manager.</p>
             <div class="sgroup">
               <div class="setting stack">
                 <div><span class="sl">Update channel</span></div>
@@ -316,7 +312,7 @@
               </div>
               <div class="setting">
                 <div><span class="sl">Check for updates</span>
-                  <div class="sd">The manager also checks every 30 minutes.</div></div>
+                  <div class="sd">The manager also checks on its own every 30 minutes.</div></div>
                 <button id="btn-check-updates" type="button" class="btn btn-ghost btn-sm">Check for updates</button>
               </div>
             </div>
@@ -325,10 +321,10 @@
           <!-- Advanced -->
           <div class="sec" data-sec="advanced">
             <h1>Advanced</h1>
-            <p class="lead">Ports and logging. Wrong values here can cut your node off from the network.</p>
+            <p class="lead">Ports and logging settings. A wrong value here can cut your node off from the network.</p>
             <div class="sgroup">
               <div class="gt"><h2>Service ports</h2></div>
-              <p class="gd service-port-note">Turn a port on to publish it on this computer. Addresses inside the stack stay fixed.</p>
+              <p class="gd service-port-note">Turn a port on to make it reachable on this computer. Addresses inside the stack don't change.</p>
               <div id="service-port-controls"></div>
             </div>
             <div class="sgroup">
@@ -358,15 +354,15 @@
             <h1>About</h1>
             <p class="lead">Quip Node Manager runs and monitors a Quip node: the miner, the validator and the dashboard.</p>
             <div class="sgroup">
-              <p class="gd">Free software under the GNU Affero General Public License, version 3 or later.</p>
+              <p class="gd">Quip Node Manager is free software, licensed under the GNU Affero General Public License, version 3 or later.</p>
               <p class="gd"><a href="https://gitlab.com/quip.network/quip-node-manager">Source code</a></p>
-              <p class="gd">Type set in JetBrains Mono and Instrument Sans, both under the SIL Open Font License.</p>
+              <p class="gd">The type is JetBrains Mono and Instrument Sans, both under the SIL Open Font License.</p>
             </div>
           </div>
         </div>
 
         <div class="savebar">
-          <div class="msg" id="save-msg">Changes are kept until you save. <span>Mining settings apply when the node restarts.</span></div>
+          <div class="msg" id="save-msg">Your changes stay here until you save them. <span>Mining changes take effect when the node restarts.</span></div>
           <button id="btn-discard" class="btn btn-ghost">Discard</button>
           <button id="btn-save" class="btn btn-ghost">Save</button>
           <button id="btn-apply" class="btn btn-primary" disabled>Save and start node</button>
@@ -377,8 +373,8 @@
       <section id="tab-dashboard" class="tab-content screen">
         <div id="dashboard-empty" class="dash-empty" style="display:none;">
           <div>
-            <h2>The dashboard appears here once it is running</h2>
-            <p>It shows your node's own telemetry: rounds, proofs and service logs.</p>
+            <h2>The dashboard shows up here once it's running</h2>
+            <p>It shows your node's rounds, proofs and service logs.</p>
             <p id="dashboard-empty-msg" class="note-alert"></p>
             <button id="dashboard-reset-btn" class="btn btn-ghost" style="display:none;">Reset dashboard database</button>
           </div>

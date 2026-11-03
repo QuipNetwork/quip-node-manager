@@ -199,7 +199,7 @@ async function refreshChannelInfo() {
       channel: state.settings.update_channel,
     });
   } catch {
-    if (caption) caption.textContent = 'Could not reach the release feed.';
+    if (caption) caption.textContent = 'Couldn\'t reach the release feed.';
     return;
   }
   // Gray out Release until a stable (non-rc) release exists; force Beta.
@@ -207,7 +207,7 @@ async function refreshChannelInfo() {
     releaseBtn.disabled = !info.stable_available;
     releaseBtn.title = info.stable_available
       ? ''
-      : 'No stable release published yet — Beta only';
+      : 'No stable release yet — only Beta builds';
   }
   if (!info.stable_available && state.settings.update_channel === 'release') {
     await setUpdateChannel('beta');
@@ -220,7 +220,7 @@ async function refreshChannelInfo() {
       ([name, tag]) => `${name} ${tag ?? 'none'}`,
     );
     if (!parts.length) {
-      caption.textContent = 'No published builds on this channel yet.';
+      caption.textContent = 'Nothing has been published on this channel yet.';
     } else {
       caption.replaceChildren(...parts.map((p) => {
         const line = document.createElement('span');
@@ -376,7 +376,7 @@ function setSettingsDirty(dirty) {
   const msg = document.getElementById('save-msg');
   if (!bar || !msg) return;
   bar.classList.toggle('dirty', dirty);
-  msg.firstChild.textContent = dirty ? 'You have unsaved changes. ' : 'Changes are kept until you save. ';
+  msg.firstChild.textContent = dirty ? 'You have unsaved changes.' : 'Your changes stay here until you save them.';
 }
 for (const type of ['input', 'change']) {
   document.querySelector('.spane').addEventListener(type, (e) => {
@@ -586,8 +586,8 @@ function renderGpuDevices() {
     const hint = document.createElement('div');
     hint.className = 'sd';
     hint.textContent = metalEnabled
-      ? 'Metal GPU mining is on. The node runs the native miner.'
-      : 'Metal is off. The node mines with the CPU through Docker.';
+      ? 'Metal GPU mining is on, so the node runs its native miner.'
+      : 'Metal is off, so the node mines on the CPU in Docker.';
     list.appendChild(hint);
   }
 }
@@ -969,7 +969,7 @@ function setStatus(stateStr) {
     dot.classList.add('status-degraded', 'active');
     text.classList.add('status-degraded');
     text.textContent = 'DEGRADED';
-    sub.textContent = 'Running, but some services are down or unhealthy.';
+    sub.textContent = 'Your node is running, but some services are down or failing.';
   } else if (stateStr === 'partial') {
     // Amber, like degraded: the stack is up but not mining. Name the running
     // services so the state is actionable rather than just "not stopped".
@@ -1398,7 +1398,7 @@ function renderLogOutput() {
   if (visible.length === 0 && total > 0) {
     const empty = document.createElement('p');
     empty.className = 'log-empty-filter';
-    empty.textContent = 'No lines match the current filter';
+    empty.textContent = 'No lines match this filter';
     frag.appendChild(empty);
   } else {
     for (const entry of visible) {
@@ -1729,13 +1729,13 @@ async function runRestartToUpdate() {
   state.updating = true;
   updateStartStopState();
   applyStatus.textContent = 'Updating…';
-  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting node to apply update…' });
+  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting the node to install the update…' });
   try {
     if (state.settings) { applyFormToSettings(); await invoke('update_settings', { settings: state.settings }); }
     await invoke('restart_to_update');
     state.updateAvailable = null;
     document.getElementById('update-badge').style.display = 'none';
-    applyStatus.textContent = 'Node updated and started.';
+    applyStatus.textContent = 'The node is updated and running again.';
     await pollStatus();
   } catch (e) {
     // Keep the update flagged so the button stays actionable.
@@ -1972,7 +1972,7 @@ function renderSolverPickers(config) {
 // were not readable this poll — say so rather than showing a stale bar.
 function syncSubtext() {
   const s = state.health?.sync;
-  if (!s) return 'Validator is catching up to the chain';
+  if (!s) return 'The validator is catching up with the chain';
   return `Catching up: block ${s.current_block.toLocaleString()} of ${
     s.highest_block.toLocaleString()
   }, ${s.behind.toLocaleString()} behind.`;
@@ -2130,7 +2130,7 @@ async function setupListeners() {
 
   // Update notifications
   await listen('image-update-available', () => {
-    appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+    appendLog({ timestamp: '', level: 'INFO', message: 'A new Docker image is ready. Restart to install it.' });
     state.updateAvailable = { kind: 'image' };
     document.getElementById('update-badge').style.display = '';
     updateStartStopState();
@@ -2196,7 +2196,7 @@ document.getElementById('btn-check-updates')?.addEventListener('click', async ()
     let level = 'INFO';
     if (status === 'check_failed') level = 'WARN';
     const message = (outcome && outcome.message)
-      || (status === 'up_to_date' ? 'You are up to date.' : 'Update check finished.');
+      || (status === 'up_to_date' ? 'You\'re up to date.' : 'Done checking for updates.');
     appendLog({ timestamp: '', level, message, source: 'app' });
   } catch (e) {
     appendLog({
