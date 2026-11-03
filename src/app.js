@@ -1014,10 +1014,16 @@ function heroFor(stateStr) {
       // Not a fault: replaying the chain is expected work on a fresh node.
       // The bar below carries the actual progress.
       return { word: 'Syncing', cls: 'status-syncing', say: syncSubtext() };
+    case 'warming':
+      return {
+        word: 'Warming up', cls: 'status-syncing',
+        say: 'Your node is mining. The chain hasn\'t recorded this node\'s first round yet.',
+      };
     case 'degraded':
       return {
         word: 'Degraded', cls: 'status-degraded', logs: true,
-        say: 'Your node is running, but some services are down or failing.',
+        say: 'Your node is running, but one health check needs attention. '
+          + 'The Node health panel names it.',
       };
     case 'partial':
       // The stack is up but not mining. Name the running services so the
@@ -2140,9 +2146,22 @@ function statusFromStack(minerRunning) {
   if (state.starting || state.stopping || state.updating) return 'running';
   // When the health monitor has reported, use its verdict directly so the
   // pill reflects the three-dimensional check (infra + chain + participation).
-  if (state.health?.overall) return state.health.overall;
+  if (state.health?.overall) {
+    return state.health.overall === 'degraded' && onlyWarmingUp(state.health)
+      ? 'warming'
+      : state.health.overall;
+  }
   const overall = state.stack?.overall ?? 'stopped';
   return overall === 'running' ? 'running' : 'degraded';
+}
+
+// Right after a start the miner is fine but has no participation marker on
+// chain yet. Health calls that Warn, which rolls up to degraded; the hero
+// shouldn't tell someone their services are failing when they're warming up.
+function onlyWarmingUp(h) {
+  return h.infra?.state === 'ok' && h.chain?.state === 'ok'
+    && h.participation?.state === 'warn'
+    && /^warming up/.test(h.participation.detail || '');
 }
 
 // Re-paint the status pill from current state without a full poll round-trip.

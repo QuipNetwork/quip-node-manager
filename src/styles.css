@@ -636,6 +636,7 @@ input[type="checkbox"] { accent-color: var(--cta); }
 }
 body[data-node="running"] .hero::after { filter: var(--live); }
 body[data-node="syncing"] .hero::after,
+body[data-node="warming"] .hero::after,
 body[data-node="degraded"] .hero::after,
 body[data-node="partial"] .hero::after,
 body[data-node="unhealthy"] .hero::after { filter: var(--waking); }
@@ -671,7 +672,7 @@ body[data-node="unhealthy"] .hero::after { filter: var(--waking); }
   text-shadow: 0 0 14px rgb(var(--page-rgb) / 0.9), 0 0 3px rgb(var(--page-rgb) / 0.6);
 }
 /* While the node runs, Start has nothing to do unless it becomes Restart to update. */
-body:is([data-node="running"], [data-node="syncing"],
+body:is([data-node="running"], [data-node="syncing"], [data-node="warming"],
   [data-node="degraded"], [data-node="unhealthy"]) #btn-start:disabled {
   display: none;
 }
