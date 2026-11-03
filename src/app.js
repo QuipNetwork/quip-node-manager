@@ -2285,7 +2285,9 @@ async function setupListeners() {
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {
-      if (statusEl) statusEl.textContent = 'Installing native miner\u2026';
+      // done arrives after the install has finished, so clear the progress text
+      // instead of leaving "Installing" up until the next status message.
+      if (statusEl && /native miner/.test(statusEl.textContent)) statusEl.textContent = '';
     } else if (total) {
       const pct = Math.round((downloaded / total) * 100);
       if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
