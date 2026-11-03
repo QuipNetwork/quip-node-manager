@@ -328,6 +328,9 @@ const FIX_LABELS = {
 // itself on recheck, so their Retry is just a plain recheck.
 const FIX_FOLDED_INTO_RETRY = new Set(['secret']);
 
+// Checks that test a port from outside; a failing one offers the router steps.
+const PORT_CHECKS = new Set(['port', 'port-validator']);
+
 // ─── Tab switching ──────────────────────────────────────────────────────────
 // Activate a tab by name (e.g. 'status', 'dashboard'). Used by the tab buttons
 // and by flows that need to navigate the user programmatically.
@@ -1112,6 +1115,8 @@ function renderChecklistItem(item) {
   const li = document.createElement('li');
   li.className = 'checklist-item';
   li.dataset.id = item.id;
+  const failing = item.state === 'fail' || item.state === 'warn';
+  li.classList.toggle('needs-you', failing);
 
   const icon = document.createElement('span');
   icon.className = `check-icon state-${item.state}`;
@@ -1153,6 +1158,16 @@ function renderChecklistItem(item) {
     fixBtn.dataset.action = 'fix';
     fixBtn.textContent = FIX_LABELS[item.fixable.kind] || 'Fix';
     actions.appendChild(fixBtn);
+  }
+
+  // A port that can't be reached from outside: the router steps, one click away.
+  if (failing && PORT_CHECKS.has(item.id)) {
+    const help = document.createElement('button');
+    help.type = 'button';
+    help.className = 'btn btn-sm btn-secondary check-action';
+    help.dataset.action = 'portfwd';
+    help.textContent = 'How to forward a port';
+    actions.prepend(help);
   }
 
   li.append(icon, label, actions);
@@ -1301,6 +1316,8 @@ document.getElementById('checklist').addEventListener('click', (e) => {
     }
   } else if (btn.dataset.action === 'fix') {
     runFix(id);
+  } else if (btn.dataset.action === 'portfwd') {
+    showPortForwardHelp();
   }
 });
 
@@ -1611,7 +1628,7 @@ function appendLog(entry) {
   }
 }
 
-document.getElementById('btn-copy-log').addEventListener('click', () => {
+document.getElementById('btn-copy-log').addEventListener('click', (e) => {
   // Export exactly the lines currently visible under both filters.
   const text = visibleLogEntries()
     .map((e) => {
@@ -1619,7 +1636,8 @@ document.getElementById('btn-copy-log').addEventListener('click', () => {
       return `${ts}[${e.source}] ${e.level} ${e.message}`;
     })
     .join('\n');
-  navigator.clipboard.writeText(text).catch(console.error);
+  if (!text) return flashLabel(e.currentTarget, 'Nothing to copy');
+  copyText(text, e.currentTarget);
 });
 
 document.getElementById('btn-clear-log').addEventListener('click', () => {
@@ -2503,6 +2521,37 @@ document.getElementById('dlg-scrim').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeDialog();
 });
 
+// The router steps, with the ports this node actually uses.
+function showPortForwardHelp() {
+  const ports = [...PORT_CHECKS]
+    .filter((id) => ['fail', 'warn'].includes(state.checks.get(id)?.state))
+    .map((id) => (id === 'port'
+      ? state.settings?.node_config?.port ?? 20049
+      : state.settings?.node_config?.validator_port ?? 30333));
+  if (!ports.length) ports.push(state.settings?.node_config?.port ?? 20049);
+  const steps = [
+    'Open your router\'s admin page. It\'s usually at 192.168.1.1 or 192.168.0.1, '
+      + 'and the password is often printed on the router.',
+    'Find the port forwarding settings. Some routers call them Virtual server or NAT.',
+    ports.length > 1
+      ? `Add a rule that sends TCP port ${ports[0]} to this computer. `
+        + `Add a second rule for TCP port ${ports[1]}.`
+      : `Add a rule that sends TCP port ${ports[0]} to this computer.`,
+    'Save the rules, then click Check again.',
+  ];
+  const ol = document.createElement('ol');
+  ol.append(...steps.map((t) => {
+    const li = document.createElement('li');
+    li.textContent = t;
+    return li;
+  }));
+  openDialog({
+    title: 'Forward a port on your router',
+    body: [ol],
+    actions: [{ label: 'Done', cls: 'btn-primary' }],
+  });
+}
+
 // ─── Hero actions ─────────────────────────────────────────────────────────────
 document.getElementById('btn-hero-logs').addEventListener('click', () => {
   setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
@@ -2511,6 +2560,19 @@ document.getElementById('btn-hero-logs').addEventListener('click', () => {
 document.getElementById('btn-change-port').addEventListener('click', () => {
   activateTab('settings');
   showSettingsSection('advanced');
+});
+
+// ─── Escape ───────────────────────────────────────────────────────────────────
+// Closes the topmost layer: the dialog, then the update offer, then the logs.
+// The log filter handles its own Escape (it clears the text) and stops it there.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const tooltip = document.getElementById('update-tooltip');
+  if (dialogOpen()) closeDialog();
+  else if (tooltip && tooltip.style.display !== 'none') tooltip.style.display = 'none';
+  else if (document.getElementById('log-drawer').classList.contains('expanded')) setLogsOpen(false);
+  else return;
+  e.preventDefault();
 });
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
