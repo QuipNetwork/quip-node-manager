@@ -147,11 +147,13 @@
           <!-- Node -->
           <div class="sec active" data-sec="node">
             <h1>Node</h1>
-            <p class="lead">Your node's data folder, its key, and the name others see.</p>
+            <p class="lead">Your node's key and data folder.</p>
             <div class="sgroup">
               <div class="setting stack">
                 <div><label class="sl" for="data-dir">Storage folder</label>
-                  <div class="sd">If you change the storage folder, the app creates the new one and restarts. Your old folder is left where it is.</div></div>
+                  <div class="sd">Holds the configuration, keys, binaries and chain database. If you
+                    move it, the app creates the new folder and restarts, and your old folder stays
+                    where it is.</div></div>
                 <div class="inrow">
                   <input type="text" id="data-dir" class="input mono grow" />
                   <button id="btn-data-dir-restart" class="btn btn-ghost btn-sm" style="display:none;">Save and restart app</button>
@@ -159,11 +161,13 @@
               </div>
               <div class="setting stack">
                 <div><span class="sl">Node key</span>
-                  <div class="sd">This private key is how peers know your node. Anyone who has it can pose as your node.</div></div>
+                  <div class="sd">This private key is how peers know your node, and anyone who has
+                    it can pose as your node. Keep a copy somewhere safe.</div></div>
                 <div class="inrow secret-row">
                   <input type="password" id="secret-display" class="input mono grow" readonly placeholder="No key set" />
                   <button id="btn-show-secret" class="btn btn-ghost btn-sm">Show</button>
-                  <button id="btn-regen-secret" class="btn btn-ghost btn-sm">Regenerate</button>
+                  <button id="btn-copy-secret" class="btn btn-ghost btn-sm">Copy</button>
+                  <button id="btn-regen-secret" class="btn btn-ghost btn-sm">Make a new key</button>
                 </div>
               </div>
               <div class="setting stack">
@@ -181,14 +185,21 @@
             <div class="sgroup">
               <div class="gt"><h2>CPU</h2></div>
               <div class="setting">
-                <div><label class="sl" for="cpu-enabled">Mine with the CPU</label></div>
+                <div><label class="sl" for="cpu-enabled">Mine on the CPU</label></div>
                 <label class="switch"><input type="checkbox" id="cpu-enabled" checked /><span></span></label>
               </div>
               <div id="cpu-subsettings" class="subset">
                 <div class="setting">
                   <div><label class="sl" for="num-cpus">CPU cores</label>
                     <div class="sd">How many CPU cores the miner can use.</div></div>
-                  <input type="number" id="num-cpus" class="input mono num" min="1" max="64" value="1" />
+                  <div class="stepper" role="group" aria-label="CPU cores">
+                    <button type="button" data-step="-1" data-for="num-cpus"
+                      aria-label="Fewer cores">−</button>
+                    <input type="number" id="num-cpus" class="input mono" min="1" max="64" value="1"
+                      aria-label="CPU cores" />
+                    <button type="button" data-step="1" data-for="num-cpus"
+                      aria-label="More cores">+</button>
+                  </div>
                 </div>
                 <!-- Populated from the miner image at runtime, not from a list
                      compiled into the app — see solvers::list_solvers. -->
@@ -236,7 +247,8 @@
 
             <div class="sgroup">
               <div class="gt"><h2>D-Wave quantum computer</h2>
-                <button id="btn-qpu-toggle" class="btn btn-ghost btn-sm">Configure D-Wave Access</button></div>
+                <button id="btn-qpu-toggle" class="btn btn-ghost btn-sm" aria-expanded="false"
+                  aria-controls="qpu-section">Set up D-Wave access</button></div>
               <p class="gd">This runs on top of CPU mining and needs a D-Wave Leap account.</p>
               <div id="qpu-section" style="display:none;">
                 <div class="fields qpu-facts">
@@ -264,11 +276,12 @@
           <!-- Network -->
           <div class="sec" data-sec="network">
             <h1>Network</h1>
-            <p class="lead">How other nodes reach yours, and whether the dashboard uses secure connections.</p>
+            <p class="lead">How peers reach your node. Once you forward two ports on your router,
+              the defaults work for most home networks.</p>
             <div class="sgroup">
               <div class="gt"><h2>Public address</h2></div>
               <div class="setting">
-                <div><label class="sl" for="public-host-enable">Advertise a different address</label>
+                <div><label class="sl" for="public-host-enable">Use a different address</label>
                   <div class="sd" id="public-host-detected">Advertising the detected address
                     <span id="public-host-detected-value" class="mono">detecting…</span></div></div>
                 <label class="switch"><input type="checkbox" id="public-host-enable" /><span></span></label>
@@ -286,16 +299,20 @@
                   <div><label class="sl" for="public-port">Port</label></div>
                   <input type="number" id="public-port" class="input mono num" min="1024" max="65535" placeholder="20049" />
                 </div>
-                <p class="sd">This changes only the address peers are told to dial. Use it when your router forwards a different outside port to this computer. To change the port the node listens on, edit Public API under Advanced.</p>
-                <p class="note-alert">Check that this address can be reached from the internet.</p>
+                <p class="sd">This sets the address peers are told to dial. Use it if your router
+                  forwards a different outside port, or if you have a DNS name. The port the node
+                  listens on is set separately, in Public API under Advanced.</p>
+                <p class="note-plain">Other nodes will connect to this address as written, so check
+                  that they can reach this computer from outside your network.</p>
               </div>
             </div>
 
             <div class="sgroup">
-              <div class="gt"><h2>Secure connections</h2></div>
+              <div class="gt"><h2>HTTPS</h2></div>
               <div class="setting">
-                <div><label class="sl" for="tls-enabled">Turn on TLS</label>
-                  <div class="sd">This needs ports 80 and 443.</div></div>
+                <div><label class="sl" for="tls-enabled">Serve the dashboard over HTTPS</label>
+                  <div class="sd">This needs ports 80 and 443 and a DNS name that points at this
+                    computer. Certificates renew on their own.</div></div>
                 <label class="switch"><input type="checkbox" id="tls-enabled" /><span></span></label>
               </div>
               <div id="tls-subsettings" class="subset" style="display:none;">
@@ -306,13 +323,14 @@
                   <input type="text" id="hostname" class="input mono" placeholder=":20049" />
                 </div>
                 <div class="setting stack">
-                  <div><label class="sl" for="cert-email">Certificate email</label>
+                  <div><label class="sl" for="cert-email">Email for certificates</label>
                     <div class="sd">Let's Encrypt needs this address.</div></div>
                   <input type="email" id="cert-email" class="input" placeholder="you@example.com" />
                 </div>
                 <div class="setting stack">
-                  <div><label class="sl" for="zerossl-api-key">ZeroSSL API key</label>
-                    <div class="sd">This is an optional fallback. Leave it empty to use Let's Encrypt.</div></div>
+                  <div><label class="sl" for="zerossl-api-key">ZeroSSL key</label>
+                    <div class="sd">Optional. The node uses this key only if Let's Encrypt
+                      fails.</div></div>
                   <input type="password" id="zerossl-api-key" class="input mono" />
                 </div>
               </div>
@@ -322,10 +340,13 @@
           <!-- Updates -->
           <div class="sec" data-sec="updates">
             <h1>Updates</h1>
-            <p class="lead">Choose which builds the node runs and check for a newer manager.</p>
+            <p class="lead">Choose which builds the node runs. The app checks for new versions every
+              30 minutes.</p>
             <div class="sgroup">
               <div class="setting stack">
-                <div><span class="sl">Update channel</span></div>
+                <div><span class="sl">Channel</span>
+                  <div class="sd">Release runs only stable builds. Beta also runs release
+                    candidates.</div></div>
                 <div class="segmented seg" id="update-channel-toggle" role="group" aria-label="Update channel">
                   <button type="button" class="segmented-btn" id="channel-release" data-channel="release">Release</button>
                   <button type="button" class="segmented-btn" id="channel-beta" data-channel="beta">Beta</button>
@@ -334,8 +355,8 @@
               </div>
               <div class="setting">
                 <div><span class="sl">Check for updates</span>
-                  <div class="sd">The manager also checks on its own every 30 minutes.</div></div>
-                <button id="btn-check-updates" type="button" class="btn btn-ghost btn-sm">Check for updates</button>
+                  <div class="sd">Checks the app, the node images and the native miner.</div></div>
+                <button id="btn-check-updates" type="button" class="btn btn-ghost btn-sm">Check
                   now</button>
               </div>
             </div>
@@ -405,7 +426,8 @@
         </div>
 
         <div class="savebar">
-          <div class="msg" id="save-msg">Your changes stay here until you save them. <span>Mining changes take effect when the node restarts.</span></div>
+          <div class="msg" id="save-msg" role="status">You have unsaved changes. <span>They take
+            effect the next time the node starts.</span></div>
           <button id="btn-discard" class="btn btn-ghost">Discard</button>
           <button id="btn-save" class="btn btn-ghost">Save</button>
           <button id="btn-apply" class="btn btn-primary" disabled>Save and start node</button>
@@ -454,6 +476,15 @@
         <div id="log-output" class="log-output"></div>
       </div>
     </footer>
+  </div>
+  <!-- One dialog, filled by app.js (the router steps for a port that can't be reached). -->
+  <div id="dlg-scrim" class="scrim" hidden>
+    <div id="dlg" class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"
+      tabindex="-1">
+      <h2 id="dlg-title"></h2>
+      <div id="dlg-body"></div>
+      <div class="dacts" id="dlg-acts"></div>
+    </div>
   </div>
   <script type="module" src="app.js"></script>
 </body>

@@ -370,13 +370,17 @@ document.querySelector('.snav').addEventListener('click', (e) => {
 // ─── Unsaved changes ─────────────────────────────────────────────────────────
 // Edits collect until Save, Save and restart, or Discard. Controls that save
 // themselves (the channel buttons, the Metal toggle, Regenerate) do not count.
+// The save bar appears with the first change and counts the fields changed.
+const dirtyFields = new Set();
 function setSettingsDirty(dirty) {
   state.settingsDirty = dirty;
+  if (!dirty) dirtyFields.clear();
   const bar = document.querySelector('.savebar');
   const msg = document.getElementById('save-msg');
   if (!bar || !msg) return;
   bar.classList.toggle('dirty', dirty);
-  msg.firstChild.textContent = dirty ? 'You have unsaved changes.' : 'Your changes stay here until you save them.';
+  const n = Math.max(1, dirtyFields.size);
+  msg.firstChild.textContent = `${n} unsaved ${n === 1 ? 'change' : 'changes'} `;
 }
 for (const type of ['input', 'change']) {
   document.querySelector('.spane').addEventListener(type, (e) => {
@@ -460,7 +464,7 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
   } catch (e) {
     appendLog({ timestamp: '', level: 'ERROR', message: `Failed to set storage dir: ${e}` });
     btn.disabled = false;
-    btn.textContent = 'Save & Restart';
+    btn.textContent = 'Save and restart app';
   }
 });
 
@@ -615,7 +619,25 @@ document.getElementById('btn-show-secret').addEventListener('click', () => {
   }
 });
 
-document.getElementById('btn-regen-secret').addEventListener('click', async () => {
+document.getElementById('btn-copy-secret').addEventListener('click', (e) => {
+  const value = document.getElementById('secret-display').value;
+  if (!value) return flashLabel(e.currentTarget, 'No key yet');
+  copyText(value, e.currentTarget);
+});
+
+document.getElementById('btn-regen-secret').addEventListener('click', () => {
+  openDialog({
+    title: 'Make a new node key?',
+    danger: true,
+    body: [para('Your node gets a new private key that replaces the current one. You can\'t undo this.')],
+    actions: [
+      { label: 'Keep the current key', cls: 'btn-ghost' },
+      { label: 'Make a new key', cls: 'btn-dangerfill', run: regenerateSecret },
+    ],
+  });
+});
+
+async function regenerateSecret() {
   try {
     const secret = await invoke('generate_node_secret');
     document.getElementById('secret-display').value = secret;
@@ -626,8 +648,9 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
     await invoke('recheck', { ids: ['secret'] }).catch(console.error);
   } catch (e) {
     console.error('Failed to regenerate secret:', e);
+    appendLog({ timestamp: '', level: 'ERROR', message: `Couldn't make a new key: ${e}`, source: 'app' });
   }
-});
+}
 
 // ─── Public host override ─────────────────────────────────────────────────────
 //
@@ -668,20 +691,26 @@ document.getElementById('public-host-enable').addEventListener('change', () => {
 });
 
 // ─── D-Wave section toggle ───────────────────────────────────────────────────
-document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
-  const section = document.getElementById('qpu-section');
+function setQpuOpen(open) {
+  document.getElementById('qpu-section').style.display = open ? 'block' : 'none';
   const btn = document.getElementById('btn-qpu-toggle');
-  const isVisible = section.style.display !== 'none';
-  section.style.display = isVisible ? 'none' : 'block';
-  btn.textContent = isVisible
-    ? 'Configure D-Wave Access'
-    : 'Hide D-Wave Configuration';
+  btn.textContent = open ? 'Hide D-Wave settings' : 'Set up D-Wave access';
+  btn.setAttribute('aria-expanded', String(open));
+}
+document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
+  setQpuOpen(document.getElementById('qpu-section').style.display === 'none');
 });
 
 // ─── GPU utilization slider ──────────────────────────────────────────────────
+function paintRange(input) {
+  const min = Number(input.min) || 0;
+  const max = Number(input.max) || 100;
+  input.style.setProperty('--p', `${((Number(input.value) - min) / (max - min)) * 100}%`);
+}
 document.getElementById('gpu-utilization').addEventListener('input', () => {
-  const val = document.getElementById('gpu-utilization').value;
-  document.getElementById('gpu-util-display').textContent = `${val}%`;
+  const input = document.getElementById('gpu-utilization');
+  document.getElementById('gpu-util-display').textContent = `${input.value}%`;
+  paintRange(input);
 });
 
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
@@ -829,6 +858,7 @@ function populateGpuTuning(c) {
   const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
+  paintRange(document.getElementById('gpu-utilization'));
   document.getElementById('gpu-yielding').checked = isMetal
     ? (metalCfg.yielding ?? true)
     : (gpuCfg?.yielding ?? false);
@@ -873,6 +903,7 @@ async function populateForm(settings) {
   // CPU Miner
   document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  paintSteppers();
   renderSolverPickers(c);
   updateCpuUiVisibility();
 
@@ -885,9 +916,7 @@ async function populateForm(settings) {
     document.getElementById('qpu-budget').value = dw.budget ?? '';
     document.getElementById('qpu-budget-reset-day').value = dw.budget_reset_day ?? 1;
     if (dw.token) {
-      document.getElementById('qpu-section').style.display = 'block';
-      document.getElementById('btn-qpu-toggle').textContent =
-        'Hide D-Wave Configuration';
+      setQpuOpen(true);
     }
   }
   // GPU device list rendered after list_gpu_devices call in init
@@ -2337,6 +2366,85 @@ document.getElementById('theme-choice').addEventListener('click', (e) => {
 systemLight.addEventListener('change', paintThemeControls);
 if (!['light', 'dark'].includes(storedTheme())) delete document.documentElement.dataset.theme;
 paintThemeControls();
+
+// ─── Small UI helpers ─────────────────────────────────────────────────────────
+// Show a short result on a button, then put its label back.
+function flashLabel(btn, text) {
+  const was = btn.dataset.label || btn.textContent;
+  btn.dataset.label = was;
+  btn.textContent = text;
+  clearTimeout(btn._flash);
+  btn._flash = setTimeout(() => { btn.textContent = was; delete btn.dataset.label; }, 1800);
+}
+// Copy text and say on the button whether it worked. Success is only claimed
+// once the clipboard write resolves.
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    flashLabel(btn, 'Copied');
+  } catch (e) {
+    console.error('copy failed:', e);
+    flashLabel(btn, 'Copying failed');
+  }
+}
+function para(text) {
+  const p = document.createElement('p');
+  p.textContent = text;
+  return p;
+}
+
+// ─── Steppers ─────────────────────────────────────────────────────────────────
+// − and + beside a number field; the field stays the source of truth.
+function paintSteppers() {
+  document.querySelectorAll('.stepper').forEach((st) => {
+    const input = st.querySelector('input');
+    const v = Number(input.value);
+    st.querySelector('[data-step="-1"]').disabled = input.min !== '' && v <= Number(input.min);
+    st.querySelector('[data-step="1"]').disabled = input.max !== '' && v >= Number(input.max);
+  });
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('.stepper [data-step]');
+  if (!b || b.disabled) return;
+  const input = document.getElementById(b.dataset.for);
+  if (b.dataset.step === '1') input.stepUp(); else input.stepDown();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  paintSteppers();
+});
+document.addEventListener('input', (e) => { if (e.target.closest('.stepper')) paintSteppers(); });
+
+// ─── Dialog ───────────────────────────────────────────────────────────────────
+// One dialog element, filled per use. Built from DOM nodes, never innerHTML.
+let dialogReturnFocus = null;
+function openDialog({ title, body, actions, danger = false }) {
+  const scrim = document.getElementById('dlg-scrim');
+  const box = document.getElementById('dlg');
+  document.getElementById('dlg-title').textContent = title;
+  box.classList.toggle('danger-dlg', danger);
+  document.getElementById('dlg-body').replaceChildren(...body);
+  const acts = actions.map(({ label, cls, run }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `btn ${cls}`;
+    b.textContent = label;
+    b.addEventListener('click', () => { closeDialog(); if (run) run(); });
+    return b;
+  });
+  document.getElementById('dlg-acts').replaceChildren(...acts);
+  dialogReturnFocus = document.activeElement;
+  scrim.hidden = false;
+  (acts[acts.length - 1] || box).focus();
+}
+function closeDialog() {
+  document.getElementById('dlg-scrim').hidden = true;
+  if (dialogReturnFocus?.isConnected) dialogReturnFocus.focus();
+  dialogReturnFocus = null;
+}
+const dialogOpen = () => !document.getElementById('dlg-scrim').hidden;
+document.getElementById('dlg-scrim').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeDialog();
+});
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
 async function init() {
