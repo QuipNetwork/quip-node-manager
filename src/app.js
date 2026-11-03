@@ -1824,10 +1824,20 @@ function isDockerMode() {
   return (state.settings?.run_mode ?? 'docker') === 'docker';
 }
 
+// A success message in the top bar clears itself after a few seconds, unless
+// something newer has replaced it. Errors stay until the next action.
+function flashStatus(el, text, ms = 4000) {
+  el.textContent = text;
+  setTimeout(() => {
+    if (el.textContent === text) el.textContent = '';
+  }, ms);
+}
+
 async function runRestartToUpdate() {
   const applyStatus = document.getElementById('apply-status');
   state.updating = true;
   updateStartStopState();
+  refreshStatusPill();
   applyStatus.textContent = 'Updating…';
   appendLog({ timestamp: '', level: 'INFO', message: 'Restarting the node to install the update…' });
   try {
@@ -1839,7 +1849,7 @@ async function runRestartToUpdate() {
     await invoke('restart_to_update');
     state.updateAvailable = null;
     document.getElementById('update-badge').style.display = 'none';
-    applyStatus.textContent = 'The node is updated and running again.';
+    flashStatus(applyStatus, 'The node is updated and running again.');
     await pollStatus();
   } catch (e) {
     // Keep the update flagged so the button stays actionable.
@@ -1848,6 +1858,7 @@ async function runRestartToUpdate() {
   } finally {
     state.updating = false;
     updateStartStopState();
+    refreshStatusPill();
   }
 }
 
@@ -1890,7 +1901,7 @@ document.getElementById('btn-start').addEventListener('click', async () => {
     await invoke('update_settings', { settings: state.settings });
     setSettingsDirty(false);
     await startNode();
-    applyStatus.textContent = 'Node started.';
+    flashStatus(applyStatus, 'Node started.');
     await pollStatus();
   } catch (e) {
     state.startError = String(e);
@@ -1916,7 +1927,7 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     state.startError = null;
     setStatus('stopped');
     updateStartStopState();
-    applyStatus.textContent = 'Node stopped.';
+    flashStatus(applyStatus, 'Node stopped.');
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
     appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${e}` });
@@ -1945,7 +1956,7 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     }
     applyStatus.textContent = running ? 'Restarting\u2026' : 'Starting\u2026';
     await startNode();
-    applyStatus.textContent = 'Node running.';
+    flashStatus(applyStatus, 'Node running.');
     await pollStatus();
     setTimeout(() => {
       applyStatus.textContent = '';
@@ -2115,7 +2126,7 @@ function renderSyncProgress(stateStr) {
 // containers aren't reachable at all — the miner alone is degraded, not fine.
 function statusFromStack(minerRunning) {
   if (!minerRunning) {
-    if (state.starting) return 'starting';
+    if (state.starting || state.updating) return 'starting';
     if (state.startError) return 'failed';
     // The miner is down, but support services (validator, dashboard) can
     // still be up — a partially started stack, which is what
@@ -2126,7 +2137,7 @@ function statusFromStack(minerRunning) {
   }
   // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
   // while the transition is still in flight.
-  if (state.starting || state.stopping) return 'running';
+  if (state.starting || state.stopping || state.updating) return 'running';
   // When the health monitor has reported, use its verdict directly so the
   // pill reflects the three-dimensional check (infra + chain + participation).
   if (state.health?.overall) return state.health.overall;
