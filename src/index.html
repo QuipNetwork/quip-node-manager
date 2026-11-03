@@ -152,7 +152,7 @@
           <!-- Node -->
           <div class="sec active" data-sec="node">
             <h1>Node</h1>
-            <p class="lead">Your node's key and data folder.</p>
+            <p class="lead">Your node's name, secret and storage folder.</p>
             <div class="sgroup">
               <div class="setting stack">
                 <div><label class="sl" for="data-dir">Storage folder</label>
@@ -165,14 +165,17 @@
                 </div>
               </div>
               <div class="setting stack">
-                <div><span class="sl">Node key</span>
-                  <div class="sd">This private key is how peers know your node, and anyone who has
-                    it can pose as your node. Keep a copy somewhere safe.</div></div>
+                <div><span class="sl">Node secret</span>
+                  <div class="sd">The app checks for this secret before the node starts.
+                    Your node's signing key is a separate file, keystore.json, in the
+                    storage folder.</div></div>
                 <div class="inrow secret-row">
-                  <input type="password" id="secret-display" class="input mono grow" readonly placeholder="No key set" />
+                  <input type="password" id="secret-display" class="input mono grow" readonly
+                    placeholder="No secret set" />
                   <button id="btn-show-secret" class="btn btn-ghost btn-sm">Show</button>
                   <button id="btn-copy-secret" class="btn btn-ghost btn-sm">Copy</button>
-                  <button id="btn-regen-secret" class="btn btn-ghost btn-sm">Make a new key</button>
+                  <button id="btn-regen-secret" class="btn btn-ghost btn-sm">
+                    Make a new secret</button>
                 </div>
               </div>
               <div class="setting stack">
@@ -465,7 +468,7 @@
         <span class="t">Logs</span>
         <span id="log-last" class="last"></span>
       </div>
-      <div class="logbody">
+      <div class="logbody" inert>
         <div class="logtools">
           <div id="log-source-filters" class="log-source-filters" aria-label="Log source filters"></div>
           <div class="log-text-filter-wrap">

@@ -446,8 +446,12 @@ document.getElementById('log-drawer-handle').addEventListener('keydown', (e) => 
   setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
 });
 function setLogsOpen(open) {
-  document.getElementById('log-drawer').classList.toggle('expanded', open);
+  const drawer = document.getElementById('log-drawer');
+  const body = drawer.querySelector('.logbody');
   const handle = document.getElementById('log-drawer-handle');
+  if (!open && body.contains(document.activeElement)) handle.focus();
+  drawer.classList.toggle('expanded', open);
+  body.inert = !open;
   handle.setAttribute('aria-expanded', String(open));
   handle.title = open ? 'Hide logs' : 'Show logs';
   document.getElementById('btn-hero-logs').textContent = open ? 'Hide logs' : 'Show logs';
@@ -638,18 +642,19 @@ document.getElementById('btn-show-secret').addEventListener('click', () => {
 
 document.getElementById('btn-copy-secret').addEventListener('click', (e) => {
   const value = document.getElementById('secret-display').value;
-  if (!value) return flashLabel(e.currentTarget, 'No key yet');
+  if (!value) return flashLabel(e.currentTarget, 'No secret yet');
   copyText(value, e.currentTarget);
 });
 
 document.getElementById('btn-regen-secret').addEventListener('click', () => {
   openDialog({
-    title: 'Make a new node key?',
+    title: 'Make a new node secret?',
     danger: true,
-    body: [para('Your node gets a new private key that replaces the current one. You can\'t undo this.')],
+    body: [para('The app replaces the secret in node-secret.json with a new random one. '
+      + 'You can\'t undo this.')],
     actions: [
-      { label: 'Keep the current key', cls: 'btn-ghost' },
-      { label: 'Make a new key', cls: 'btn-dangerfill', run: regenerateSecret },
+      { label: 'Keep the current secret', cls: 'btn-ghost' },
+      { label: 'Make a new secret', cls: 'btn-dangerfill', run: regenerateSecret },
     ],
   });
 });
@@ -665,7 +670,9 @@ async function regenerateSecret() {
     await invoke('recheck', { ids: ['secret'] }).catch(console.error);
   } catch (e) {
     console.error('Failed to regenerate secret:', e);
-    appendLog({ timestamp: '', level: 'ERROR', message: `Couldn't make a new key: ${e}`, source: 'app' });
+    appendLog({
+      timestamp: '', level: 'ERROR', message: `Couldn't make a new secret: ${e}`, source: 'app',
+    });
   }
 }
 
@@ -927,15 +934,12 @@ async function populateForm(settings) {
   populateGpuTuning(c);
 
   // D-Wave
+  // Always written, so Discard also clears fields that were never saved.
   const dw = c.dwave_config;
-  if (dw) {
-    document.getElementById('qpu-api-key').value = dw.token ?? '';
-    document.getElementById('qpu-budget').value = dw.budget ?? '';
-    document.getElementById('qpu-budget-reset-day').value = dw.budget_reset_day ?? 1;
-    if (dw.token) {
-      setQpuOpen(true);
-    }
-  }
+  document.getElementById('qpu-api-key').value = dw?.token ?? '';
+  document.getElementById('qpu-budget').value = dw?.budget ?? '';
+  document.getElementById('qpu-budget-reset-day').value = dw?.budget_reset_day ?? 1;
+  if (dw?.token) setQpuOpen(true);
   // GPU device list rendered after list_gpu_devices call in init
 }
 
@@ -1827,7 +1831,11 @@ async function runRestartToUpdate() {
   applyStatus.textContent = 'Updating…';
   appendLog({ timestamp: '', level: 'INFO', message: 'Restarting the node to install the update…' });
   try {
-    if (state.settings) { applyFormToSettings(); await invoke('update_settings', { settings: state.settings }); }
+    if (state.settings) {
+      applyFormToSettings();
+      await invoke('update_settings', { settings: state.settings });
+      setSettingsDirty(false);
+    }
     await invoke('restart_to_update');
     state.updateAvailable = null;
     document.getElementById('update-badge').style.display = 'none';
@@ -1880,6 +1888,7 @@ document.getElementById('btn-start').addEventListener('click', async () => {
     if (!state.settings) throw new Error('settings are not loaded yet');
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
+    setSettingsDirty(false);
     await startNode();
     applyStatus.textContent = 'Node started.';
     await pollStatus();
@@ -1890,6 +1899,7 @@ document.getElementById('btn-start').addEventListener('click', async () => {
   } finally {
     state.starting = false;
     refreshStatusPill();
+    showStartError(applyStatus);
   }
 });
 
@@ -1947,6 +1957,7 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
   } finally {
     state.starting = false;
     refreshStatusPill();
+    showStartError(applyStatus);
   }
 });
 
@@ -2123,6 +2134,15 @@ function statusFromStack(minerRunning) {
 // Re-paint the status pill from current state without a full poll round-trip.
 // Called by renderHealth() so an inbound health-changed event immediately
 // updates the pill without waiting for the next 10 s pollStatus tick.
+// A failed start or apply: the hero shows the error when the node is down.
+// If it is still running (say the new settings were rejected before the
+// restart), the error stays in the top bar instead, where polling won't clear it.
+function showStartError(applyStatus) {
+  if (!state.startError) return;
+  const heroShowsIt = document.body.dataset.node === 'failed';
+  applyStatus.textContent = heroShowsIt ? '' : `Error: ${state.startError}`;
+}
+
 function refreshStatusPill() {
   const minerRunning = state.containerRunning || state.nativeRunning;
   setStatus(statusFromStack(minerRunning));
@@ -2509,14 +2529,26 @@ function openDialog({ title, body, actions, danger = false }) {
   document.getElementById('dlg-acts').replaceChildren(...acts);
   dialogReturnFocus = document.activeElement;
   scrim.hidden = false;
+  document.getElementById('app').inert = true;
   (acts[acts.length - 1] || box).focus();
 }
 function closeDialog() {
   document.getElementById('dlg-scrim').hidden = true;
+  document.getElementById('app').inert = false;
   if (dialogReturnFocus?.isConnected) dialogReturnFocus.focus();
   dialogReturnFocus = null;
 }
 const dialogOpen = () => !document.getElementById('dlg-scrim').hidden;
+// Tab and Shift+Tab cycle inside the dialog (the app behind it is inert).
+document.getElementById('dlg').addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  const items = [...document.querySelectorAll('#dlg button, #dlg [href], #dlg input')];
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 document.getElementById('dlg-scrim').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeDialog();
 });
