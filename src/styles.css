@@ -4,6 +4,7 @@
    Colours never change meaning:
      off-white (ink in light)  primary actions and plain values
      green                     your node: running, healthy, a passing check
+     cyan                      work in progress: starting, warming up, syncing
      gold                      a qblock won by your node
      coral                     something needs your attention
    Type: Instrument Sans for headings, sentences and buttons; JetBrains Mono
@@ -50,6 +51,10 @@
   --lab: var(--zinc-400);
   --dim: var(--zinc-500);
   --ours: #67e347;
+  --prog: #4ce0ff;
+  /* The app icon's cyan and lavender, as a glow behind the Overview hero. */
+  --glow-a: rgb(76 224 255 / 0.5);
+  --glow-b: rgb(230 215 255 / 0.5);
   --win: #ffde53;
   --alert: var(--coral);
   --on-alert: var(--zinc-950);
@@ -97,6 +102,7 @@
     --text: var(--zinc-800);
     --title: var(--zinc-600);
     --lab: var(--zinc-600);
+    --prog: #0b7f99; /* darker cyan, readable on light */
     --dim: var(--zinc-500); --ours: #0a832e; --win: #9a5b00; --alert: #c93a3f; --on-alert: #ffffff;
     --ghost-bg: rgba(255, 255, 255, 0.7); --track: var(--zinc-150); --switch-off: var(--zinc-200);
     --knob-off: #ffffff; --knob-off-edge: var(--zinc-300); --hover: rgba(9, 9, 11, 0.045);
@@ -118,6 +124,7 @@
   --text: var(--zinc-800);
   --title: var(--zinc-600);
   --lab: var(--zinc-600);
+  --prog: #0b7f99;
   --dim: var(--zinc-500); --ours: #0a832e; --win: #9a5b00; --alert: #c93a3f; --on-alert: #ffffff;
   --ghost-bg: rgba(255, 255, 255, 0.7); --track: var(--zinc-150); --switch-off: var(--zinc-200);
   --knob-off: #ffffff; --knob-off-edge: var(--zinc-300); --hover: rgba(9, 9, 11, 0.045);
@@ -629,6 +636,8 @@ input[type="checkbox"] { accent-color: var(--cta); }
   content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
   /* the scrim follows the text column, so the sentence stays readable at every width */
   background:
+    radial-gradient(55% 95% at 88% 22%, var(--glow-a) 0%, transparent 62%),
+    radial-gradient(45% 80% at 100% 100%, var(--glow-b) 0%, transparent 60%),
     linear-gradient(90deg,
       rgb(var(--page-rgb) / 0.94) 0, rgb(var(--page-rgb) / 0.86) 380px,
       rgb(var(--page-rgb) / 0.55) 600px, rgb(var(--page-rgb) / 0) 900px),
@@ -665,6 +674,9 @@ body[data-node="unhealthy"] .hero::after { filter: var(--waking); }
   font-size: clamp(38px, 5.6vw, 64px); margin: 2px 0 12px; color: var(--hi);
 }
 .status-text.status-running { color: var(--ours); }
+.status-text.status-starting, .status-text.status-warming, .status-text.status-syncing {
+  color: var(--prog);
+}
 .status-text.status-degraded, .status-text.status-unhealthy, .status-text.status-failed {
   color: var(--alert);
 }
@@ -698,7 +710,7 @@ body:is([data-node="stopped"], [data-node="failed"]) #btn-stop:disabled { displa
 .sync-progress-fill {
   height: 100%;
   width: 0;
-  background: var(--hi);
+  background: var(--prog);
   border-radius: 0;
   transition: width 0.4s var(--ease);
 }
@@ -1249,3 +1261,9 @@ p.sd { margin: 8px 0 0; }
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 .dialog.danger-dlg h2 { color: var(--alert); }
+
+/* Settings › About: the app's icon, name and version as a header row. */
+.about-app { display: flex; align-items: center; gap: 16px; margin: 8px 0 16px; max-width: 640px; }
+.about-icon { width: 64px; height: 64px; flex: none; display: block; }
+.about-name { font-size: 20px; font-weight: 600; color: var(--text); }
+.about-ver { font-family: var(--mono); font-size: 13px; color: var(--title); margin-top: 2px; }

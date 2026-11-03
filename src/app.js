@@ -2331,12 +2331,19 @@ async function setupListeners() {
 }
 
 // ─── Version refresh ─────────────────────────────────────────────────────────
+// The top bar and Settings › About show the same version text.
+function showVersion(ver, nodeVer) {
+  const label = nodeVer ? `v${ver} (node ${nodeVer})` : `v${ver}`;
+  document.getElementById('app-version').childNodes[0].textContent = `${label} `;
+  const about = document.getElementById('about-version');
+  if (about) about.textContent = label;
+}
+
 async function refreshNodeVersion() {
   try {
     const ver = await invoke('get_app_version');
     const nodeVer = await invoke('get_node_version').catch(() => null);
-    const label = nodeVer ? `v${ver} (node ${nodeVer})` : `v${ver}`;
-    document.getElementById('app-version').childNodes[0].textContent = `${label} `;
+    showVersion(ver, nodeVer);
   } catch { /* ignore */ }
 }
 
@@ -2455,9 +2462,9 @@ document.addEventListener('click', (e) => {
 });
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
-// Follows the system until the top-bar button or Settings › Display picks one.
-// The pick lives in localStorage (a per-machine look, not a node setting);
-// index.html applies it before the first paint.
+// Dark by default. The top-bar button or Settings › Display can pick Light, or
+// System to follow the OS. The pick lives in localStorage (a per-machine look,
+// not a node setting); index.html applies it before the first paint.
 const systemLight = window.matchMedia('(prefers-color-scheme: light)');
 function storedTheme() {
   try { return localStorage.getItem('theme'); } catch { return null; }
@@ -2471,8 +2478,7 @@ function setTheme(pick) {
   if (pick === 'light' || pick === 'dark') document.documentElement.dataset.theme = pick;
   else delete document.documentElement.dataset.theme;
   try {
-    if (pick === 'light' || pick === 'dark') localStorage.setItem('theme', pick);
-    else localStorage.removeItem('theme');
+    localStorage.setItem('theme', pick === 'light' || pick === 'dark' ? pick : 'system');
   } catch { /* storage blocked: the pick lasts this session */ }
   paintThemeControls();
 }
@@ -2494,7 +2500,8 @@ document.getElementById('theme-choice').addEventListener('click', (e) => {
   if (b) setTheme(b.dataset.themePick);
 });
 systemLight.addEventListener('change', paintThemeControls);
-if (!['light', 'dark'].includes(storedTheme())) delete document.documentElement.dataset.theme;
+if (storedTheme() === 'system') delete document.documentElement.dataset.theme;
+else document.documentElement.dataset.theme = storedTheme() === 'light' ? 'light' : 'dark';
 paintThemeControls();
 
 // ─── Small UI helpers ─────────────────────────────────────────────────────────
@@ -2673,15 +2680,9 @@ async function init() {
   // Display app version
   invoke('get_app_version')
     .then((ver) => {
-      document.getElementById('app-version').childNodes[0].textContent =
-        `v${ver} `;
+      showVersion(ver, null);
       invoke('get_node_version')
-        .then((nodeVer) => {
-          if (nodeVer) {
-            document.getElementById('app-version').childNodes[0]
-              .textContent = `v${ver} (node ${nodeVer}) `;
-          }
-        })
+        .then((nodeVer) => { if (nodeVer) showVersion(ver, nodeVer); })
         .catch(() => {});
     })
     .catch(() => {});

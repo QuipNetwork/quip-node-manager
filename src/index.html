@@ -9,12 +9,12 @@
   <link rel="preload" href="fonts/instrument-sans-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="styles.css" />
   <script>
-    // Apply a theme picked earlier before the first paint, so the window never
-    // flashes the other one.
+    // Apply the theme before the first paint, so the window never flashes the
+    // other one. Dark unless Light or System was picked.
     try {
       const t = localStorage.getItem('theme');
-      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-    } catch { /* storage blocked */ }
+      if (t !== 'system') document.documentElement.dataset.theme = t === 'light' ? 'light' : 'dark';
+    } catch { document.documentElement.dataset.theme = 'dark'; }
   </script>
 </head>
 <body>
@@ -424,6 +424,13 @@
           <!-- About -->
           <div class="sec" data-sec="about">
             <h1>About</h1>
+            <div class="about-app">
+              <img class="about-icon" src="assets/app-icon.png" width="64" height="64" alt="">
+              <div>
+                <div class="about-name">Quip Node Manager</div>
+                <div class="about-ver" id="about-version"></div>
+              </div>
+            </div>
             <p class="lead">Quip Node Manager runs and monitors a Quip node: the miner, the validator and the dashboard.</p>
             <div class="sgroup">
               <p class="gd">Quip Node Manager is free software, licensed under the GNU Affero General Public License, version 3 or later.</p>
