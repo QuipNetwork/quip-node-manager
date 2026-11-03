@@ -1970,7 +1970,10 @@ document.getElementById('btn-save').addEventListener('click', async () => {
     await invoke('update_settings', { settings: state.settings });
     applyStatus.textContent = 'Settings saved.';
     setSettingsDirty(false);
-    setTimeout(() => { applyStatus.textContent = ''; }, 3000);
+    // Clear only this note, never a message a later action put there.
+    setTimeout(() => {
+      if (applyStatus.textContent === 'Settings saved.') applyStatus.textContent = '';
+    }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
   }
