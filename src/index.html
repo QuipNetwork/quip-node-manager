@@ -89,17 +89,22 @@
           <div class="eyebrow">Your node</div>
           <div class="statusline">
             <span id="status-dot" class="status-dot status-stopped" aria-hidden="true"></span>
-            <div id="status-text" class="status-word status-text status-stopped">STOPPED</div>
+            <div id="status-text" class="status-word status-text status-stopped">Stopped</div>
           </div>
-          <p id="status-subtext" class="say">Node not running</p>
+          <p id="status-subtext" class="say">Your node is off.</p>
+          <!-- Why the last start failed. Shown only in the failed state. -->
+          <div id="start-error" class="errbox" hidden></div>
           <!-- Initial-sync progress. Shown only while overall is 'syncing'. -->
           <div id="sync-progress" class="sync-progress" hidden
             role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Initial sync">
             <div id="sync-progress-fill" class="sync-progress-fill"></div>
           </div>
           <div class="actions">
+            <button id="btn-change-port" class="btn btn-primary btn-lg" hidden>Change the
+              port</button>
             <button id="btn-start" class="btn btn-primary btn-lg" disabled>Start node</button>
             <button id="btn-stop" class="btn btn-ghost btn-lg" disabled>Stop node</button>
+            <button id="btn-hero-logs" class="btn btn-ghost btn-lg" hidden>Show logs</button>
             <span id="update-badge" class="tag" title="A node update is ready. Restart to install it."
               style="display:none;">Update ready</span>
           </div>
@@ -454,7 +459,8 @@
 
     <!-- Logs: one line when closed, the full stream when open. -->
     <footer id="log-drawer" class="logbar">
-      <div id="log-drawer-handle" class="loghead" role="button" aria-label="Show or hide logs">
+      <div id="log-drawer-handle" class="loghead" role="button" tabindex="0" aria-expanded="false"
+        title="Show logs">
         <span id="log-drawer-chevron" class="chev" aria-hidden="true"></span>
         <span class="t">Logs</span>
         <span id="log-last" class="last"></span>

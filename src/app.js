@@ -353,18 +353,19 @@ document.getElementById('status-pill').addEventListener('click', () => activateT
 // ─── Settings sections ───────────────────────────────────────────────────────
 // Every section stays in the DOM (collectConfig reads them all); only the
 // chosen one is shown.
-document.querySelector('.snav').addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-sec]');
-  if (!btn) return;
-  const sec = btn.dataset.sec;
+function showSettingsSection(sec) {
   document.querySelectorAll('.snav button').forEach((b) => {
-    if (b === btn) b.setAttribute('aria-current', 'true');
+    if (b.dataset.sec === sec) b.setAttribute('aria-current', 'true');
     else b.removeAttribute('aria-current');
   });
   document.querySelectorAll('.spane .sec').forEach((el) => {
     el.classList.toggle('active', el.dataset.sec === sec);
   });
   document.querySelector('.spane').scrollTop = 0;
+}
+document.querySelector('.snav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-sec]');
+  if (btn) showSettingsSection(btn.dataset.sec);
 });
 
 // ─── Unsaved changes ─────────────────────────────────────────────────────────
@@ -433,8 +434,21 @@ document.getElementById('log-drawer-handle').addEventListener('click', (e) => {
   ) {
     return;
   }
-  document.getElementById('log-drawer').classList.toggle('expanded');
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
 });
+// Enter or Space on the focused header works like a click.
+document.getElementById('log-drawer-handle').addEventListener('keydown', (e) => {
+  if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+  e.preventDefault();
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
+});
+function setLogsOpen(open) {
+  document.getElementById('log-drawer').classList.toggle('expanded', open);
+  const handle = document.getElementById('log-drawer-handle');
+  handle.setAttribute('aria-expanded', String(open));
+  handle.title = open ? 'Hide logs' : 'Show logs';
+  document.getElementById('btn-hero-logs').textContent = open ? 'Hide logs' : 'Show logs';
+}
 
 // ─── Requirements toggle ─────────────────────────────────────────────────────
 document.getElementById('checklist-toggle').addEventListener('click', () => {
@@ -938,7 +952,8 @@ function updateStartStopState() {
     startBtn.disabled = !state.checksPassed;
   } else {
     // Stopped (with or without update) or running with no update: normal Start.
-    startBtn.textContent = state.starting ? 'Starting…' : 'Start node';
+    if (state.starting) startBtn.textContent = 'Starting…';
+    else startBtn.textContent = state.startError ? 'Try again' : 'Start node';
     startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
   }
 
@@ -962,7 +977,11 @@ function updateStartStopState() {
 // The top-bar pill and the hero read the same state. Colour keeps one meaning:
 // green is a running node, red needs attention, neutral otherwise.
 const PILL_CLASS = {
-  running: 'c-ours', degraded: 'c-alert', partial: 'c-alert', unhealthy: 'c-alert',
+  running: 'c-ours',
+  degraded: 'c-alert',
+  partial: 'c-alert',
+  unhealthy: 'c-alert',
+  failed: 'c-alert',
 };
 function paintPill(stateStr, word) {
   document.body.dataset.node = stateStr;
@@ -975,54 +994,83 @@ function paintPill(stateStr, word) {
   text.textContent = word;
 }
 
+// A start that failed because a port is taken: the fix is a different port.
+const PORT_IN_USE = /address already in use|port is already allocated|bind: /i;
+
+// The hero's words for each state. `cls` colours the word; `task` gives the
+// list below the room when the node needs something from you.
+function heroFor(stateStr) {
+  switch (stateStr) {
+    case 'running':
+      return { word: 'Running', cls: 'status-running', say: 'Your node is running and mining.' };
+    case 'syncing':
+      // Not a fault: replaying the chain is expected work on a fresh node.
+      // The bar below carries the actual progress.
+      return { word: 'Syncing', cls: 'status-syncing', say: syncSubtext() };
+    case 'degraded':
+      return {
+        word: 'Degraded', cls: 'status-degraded', logs: true,
+        say: 'Your node is running, but some services are down or failing.',
+      };
+    case 'partial':
+      // The stack is up but not mining. Name the running services so the
+      // state is actionable rather than just "not stopped".
+      return { word: 'Not mining', cls: 'status-degraded', say: partialSubtext(), logs: true };
+    case 'unhealthy':
+      return {
+        word: 'Unhealthy', cls: 'status-unhealthy', logs: true,
+        say: 'Health checks are failing. The logs show why.',
+      };
+    case 'starting':
+      return {
+        word: 'Starting', cls: 'status-starting',
+        say: 'Getting the miner, validator and dashboard ready. '
+          + 'The first start downloads them, which takes a few minutes.',
+      };
+    case 'failed':
+      return {
+        word: 'Didn\'t start', cls: 'status-failed', logs: true, task: true,
+        say: 'The node stopped during start-up with this error:',
+      };
+    default: {
+      const n = state.requiredFailing || 0;
+      return {
+        word: 'Stopped', cls: 'status-stopped', task: true,
+        say: n
+          ? `${n === 1 ? 'One check needs' : `${n} checks need`} your attention `
+            + 'before the node can start.'
+          : 'Your node is off.',
+      };
+    }
+  }
+}
+
 function setStatus(stateStr) {
   const dot = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
   const sub = document.getElementById('status-subtext');
+  const h = heroFor(stateStr);
 
-  dot.className = 'status-dot';
-  text.className = 'status-text';
+  dot.className = `status-dot ${h.cls}`;
+  text.className = `status-text ${h.cls}`;
+  text.textContent = h.word;
+  sub.textContent = h.say;
+  document.querySelector('.hero').classList.toggle('task', !!h.task);
 
-  if (stateStr === 'running') {
-    dot.classList.add('status-running', 'active');
-    text.classList.add('status-running');
-    text.textContent = 'RUNNING';
-    sub.textContent = 'Your node is running and mining.';
-  } else if (stateStr === 'syncing') {
-    // Blue, not amber: replaying the chain is expected work on a fresh node,
-    // not a fault. The bar below carries the actual progress.
-    dot.classList.add('status-syncing', 'active');
-    text.classList.add('status-syncing');
-    text.textContent = 'SYNCING';
-    sub.textContent = syncSubtext();
-  } else if (stateStr === 'degraded') {
-    dot.classList.add('status-degraded', 'active');
-    text.classList.add('status-degraded');
-    text.textContent = 'DEGRADED';
-    sub.textContent = 'Your node is running, but some services are down or failing.';
-  } else if (stateStr === 'partial') {
-    // Amber, like degraded: the stack is up but not mining. Name the running
-    // services so the state is actionable rather than just "not stopped".
-    dot.classList.add('status-degraded', 'active');
-    text.classList.add('status-degraded');
-    text.textContent = 'NOT MINING';
-    sub.textContent = partialSubtext();
-  } else if (stateStr === 'unhealthy') {
-    dot.classList.add('status-unhealthy', 'active');
-    text.classList.add('status-unhealthy');
-    text.textContent = 'UNHEALTHY';
-    sub.textContent = 'Health checks are failing. Open the logs to see why.';
-  } else {
-    dot.classList.add('status-stopped');
-    text.classList.add('status-stopped');
-    text.textContent = 'STOPPED';
-    const n = state.requiredFailing || 0;
-    sub.textContent = n
-      ? `${n === 1 ? 'One check needs' : `${n} checks need`} your attention before the node can start.`
-      : 'Your node is off.';
-  }
+  const err = document.getElementById('start-error');
+  const failed = stateStr === 'failed';
+  err.hidden = !failed;
+  err.textContent = failed ? state.startError : '';
+  // A port clash gets its fix as the primary action, and Start steps back to Try again.
+  const portClash = failed && PORT_IN_USE.test(state.startError || '');
+  document.getElementById('btn-change-port').hidden = !portClash;
+  document.getElementById('btn-start').classList.toggle('btn-primary', !portClash);
+  document.getElementById('btn-start').classList.toggle('btn-ghost', portClash);
+  document.getElementById('btn-hero-logs').hidden = !h.logs;
+
   renderSyncProgress(stateStr);
-  paintPill(stateStr, text.textContent);
+  paintPill(stateStr, h.word);
+  updateStartStopState();
 }
 
 // ─── Checklist render (FSM) ──────────────────────────────────────────────────
@@ -1806,7 +1854,8 @@ document.getElementById('btn-start').addEventListener('click', async () => {
   }
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
-  updateStartStopState();
+  state.startError = null;
+  refreshStatusPill();
   applyStatus.textContent = 'Starting\u2026';
   appendLog({ timestamp: '', level: 'INFO', message: 'Starting node manager stack…' });
   try {
@@ -1817,11 +1866,12 @@ document.getElementById('btn-start').addEventListener('click', async () => {
     applyStatus.textContent = 'Node started.';
     await pollStatus();
   } catch (e) {
-    applyStatus.textContent = `Error: ${e}`;
+    state.startError = String(e);
+    applyStatus.textContent = '';
     appendLog({ timestamp: '', level: 'ERROR', message: `Start failed: ${e}` });
   } finally {
     state.starting = false;
-    updateStartStopState();
+    refreshStatusPill();
   }
 });
 
@@ -1835,6 +1885,7 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     state.containerRunning = false;
     state.nativeRunning = false;
     state.health = null;
+    state.startError = null;
     setStatus('stopped');
     updateStartStopState();
     applyStatus.textContent = 'Node stopped.';
@@ -1851,6 +1902,7 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
 document.getElementById('btn-apply').addEventListener('click', async () => {
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
+  state.startError = null;
   updateStartStopState();
   applyStatus.textContent = 'Applying\u2026';
   try {
@@ -1871,11 +1923,12 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
       applyStatus.textContent = '';
     }, 3000);
   } catch (e) {
-    applyStatus.textContent = `Error: ${e}`;
+    state.startError = String(e);
+    applyStatus.textContent = '';
     appendLog({ timestamp: '', level: 'ERROR', message: `Apply failed: ${e}` });
   } finally {
     state.starting = false;
-    updateStartStopState();
+    refreshStatusPill();
   }
 });
 
@@ -2030,6 +2083,8 @@ function renderSyncProgress(stateStr) {
 // containers aren't reachable at all — the miner alone is degraded, not fine.
 function statusFromStack(minerRunning) {
   if (!minerRunning) {
+    if (state.starting) return 'starting';
+    if (state.startError) return 'failed';
     // The miner is down, but support services (validator, dashboard) can
     // still be up — a partially started stack, which is what
     // you get after a miner crash, a profile switch, or a Start that only
@@ -2070,11 +2125,13 @@ async function pollStatus() {
     if (isDockerMode()) {
       state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
+      if (state.containerRunning) state.startError = null;
       setStatus(statusFromStack(state.containerRunning));
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
       state.containerRunning = false;
+      if (status.running) state.startError = null;
       setStatus(statusFromStack(status.running));
     }
   } catch {
@@ -2444,6 +2501,16 @@ function closeDialog() {
 const dialogOpen = () => !document.getElementById('dlg-scrim').hidden;
 document.getElementById('dlg-scrim').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeDialog();
+});
+
+// ─── Hero actions ─────────────────────────────────────────────────────────────
+document.getElementById('btn-hero-logs').addEventListener('click', () => {
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
+});
+// Ports live under Advanced.
+document.getElementById('btn-change-port').addEventListener('click', () => {
+  activateTab('settings');
+  showSettingsSection('advanced');
 });
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
