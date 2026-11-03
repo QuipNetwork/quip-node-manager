@@ -380,7 +380,8 @@ function setSettingsDirty(dirty) {
 }
 for (const type of ['input', 'change']) {
   document.querySelector('.spane').addEventListener(type, (e) => {
-    if (e.target.closest('.metal-enable-toggle, #data-dir')) return;
+    if (e.target.closest('.metal-enable-toggle, #data-dir, #theme-choice')) return;
+    dirtyFields.add(e.target.id || e.target.dataset.index || e.target.name || e.target);
     setSettingsDirty(true);
   });
 }
@@ -2293,6 +2294,49 @@ document.addEventListener('click', (e) => {
     openUrl(href);
   }
 });
+
+// ─── Theme ────────────────────────────────────────────────────────────────────
+// Follows the system until the top-bar button or Settings › Display picks one.
+// The pick lives in localStorage (a per-machine look, not a node setting);
+// index.html applies it before the first paint.
+const systemLight = window.matchMedia('(prefers-color-scheme: light)');
+function storedTheme() {
+  try { return localStorage.getItem('theme'); } catch { return null; }
+}
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t === 'light' || t === 'dark') return t;
+  return systemLight.matches ? 'light' : 'dark';
+}
+function setTheme(pick) {
+  if (pick === 'light' || pick === 'dark') document.documentElement.dataset.theme = pick;
+  else delete document.documentElement.dataset.theme;
+  try {
+    if (pick === 'light' || pick === 'dark') localStorage.setItem('theme', pick);
+    else localStorage.removeItem('theme');
+  } catch { /* storage blocked: the pick lasts this session */ }
+  paintThemeControls();
+}
+function paintThemeControls() {
+  const next = currentTheme() === 'light' ? 'dark' : 'light';
+  const btn = document.getElementById('btn-theme');
+  btn.title = `Switch to ${next}`;
+  btn.setAttribute('aria-label', `Switch to ${next}`);
+  const pick = document.documentElement.dataset.theme || 'system';
+  document.querySelectorAll('[data-theme-pick]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.themePick === pick));
+  });
+}
+document.getElementById('btn-theme').addEventListener('click', () => {
+  setTheme(currentTheme() === 'light' ? 'dark' : 'light');
+});
+document.getElementById('theme-choice').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-theme-pick]');
+  if (b) setTheme(b.dataset.themePick);
+});
+systemLight.addEventListener('change', paintThemeControls);
+if (!['light', 'dark'].includes(storedTheme())) delete document.documentElement.dataset.theme;
+paintThemeControls();
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
 async function init() {

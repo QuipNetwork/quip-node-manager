@@ -8,6 +8,14 @@
   <link rel="preload" href="fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="preload" href="fonts/instrument-sans-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="styles.css" />
+  <script>
+    // Apply a theme picked earlier before the first paint, so the window never
+    // flashes the other one.
+    try {
+      const t = localStorage.getItem('theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch { /* storage blocked */ }
+  </script>
 </head>
 <body>
   <!-- First run: where the node keeps its data. Shown before anything else. -->
@@ -56,8 +64,20 @@
             </div>
           </span>
         </span>
-        <button id="status-pill" class="pill" type="button" data-tab="status" title="Node status">
-          <span id="status-pill-dot" class="dot hollow"></span><span id="status-pill-text">STOPPED</span>
+        <button id="btn-theme" class="themekey" type="button" title="Switch to light"
+          aria-label="Switch to light">
+          <svg class="ic-sun" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle
+            cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path
+            d="M8 0.8v2.2M8 13v2.2M0.8 8h2.2M13 8h2.2M2.9 2.9l1.6 1.6M11.5 11.5l1.6 1.6M2.9 13.1l1.6-1.6M11.5 4.5l1.6-1.6"
+            stroke="currentColor" stroke-width="1.5"/></svg>
+          <svg class="ic-moon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path
+            d="M13.6 10.2A6 6 0 0 1 5.8 2.4 6 6 0 1 0 13.6 10.2Z" fill="none" stroke="currentColor"
+            stroke-width="1.5"/></svg>
+        </button>
+        <button id="status-pill" class="pill" type="button" data-tab="status"
+          title="Go to the Overview">
+          <span id="status-pill-dot" class="dot hollow"></span><span
+            id="status-pill-text">Stopped</span>
         </button>
       </div>
     </header>
@@ -118,6 +138,7 @@
           <button data-sec="mining">Mining</button>
           <button data-sec="network">Network</button>
           <button data-sec="updates">Updates</button>
+          <button data-sec="display">Display</button>
           <button data-sec="advanced">Advanced</button>
           <button data-sec="about">About</button>
         </nav>
@@ -315,6 +336,27 @@
                 <div><span class="sl">Check for updates</span>
                   <div class="sd">The manager also checks on its own every 30 minutes.</div></div>
                 <button id="btn-check-updates" type="button" class="btn btn-ghost btn-sm">Check for updates</button>
+                  now</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Display -->
+          <div class="sec" data-sec="display">
+            <h1>Display</h1>
+            <p class="lead">How the app looks. None of these settings affect mining.</p>
+            <div class="sgroup">
+              <div class="gt"><h2>Appearance</h2></div>
+              <div class="setting">
+                <div><span class="sl">Theme</span>
+                  <div class="sd">System follows your computer's setting until you click the theme
+                    button in the top bar, which picks Dark or Light.</div></div>
+                <div class="segmented seg" id="theme-choice" role="group" aria-label="Theme">
+                  <button type="button" class="segmented-btn"
+                    data-theme-pick="system">System</button>
+                  <button type="button" class="segmented-btn" data-theme-pick="dark">Dark</button>
+                  <button type="button" class="segmented-btn" data-theme-pick="light">Light</button>
+                </div>
               </div>
             </div>
           </div>
