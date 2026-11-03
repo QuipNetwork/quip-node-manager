@@ -1066,8 +1066,9 @@ p.sd { margin: 8px 0 0; }
 /* ───────────────────────────────────────────────────────── dashboard ── */
 .dash-empty {
   min-height: 100%;
-  display: grid;
-  place-items: center;
+  display: flex; /* app.js shows it with style.display = 'flex' */
+  align-items: center;
+  justify-content: center;
   text-align: center;
   padding: 30px;
 }
