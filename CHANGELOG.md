@@ -128,6 +128,36 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.4.0-rc1
+
+### The desktop app has a new design and a new icon
+
+This release changes only the desktop window and the app icons. The Rust
+code, the terminal interface that `--cli` opens, the node configuration, and
+the Docker and Native stacks do not change.
+
+- The window uses zinc greys with a coral accent and square corners. It opens
+  in dark mode. The top bar and Settings › Display choose Dark, Light, or
+  System. The app stores the choice on the machine, not in the node settings.
+- The Overview shows Starting while the stack starts, and Warming up while the
+  miner has no participation marker yet. If Start fails, it shows the error.
+  If another program holds a port, it offers to change the port.
+- A failing port check has a guide to port forwarding. The guide shows the
+  ports from your node configuration.
+- Settings shows a change count on the save bar, and Discard reloads the saved
+  settings. CPU cores has − and + steppers. The node secret has Show and Copy,
+  and Make a new secret asks before it replaces the secret.
+- Escape closes the top dialog, then the update offer, then the logs. Dialogs
+  keep keyboard focus inside them.
+- The block butterfly icon replaces the old icon on every platform. The tray
+  icon now shows a badge when an update is available. Before, both tray images
+  were the same.
+- The status text "Installing native miner…" now clears when the install
+  finishes. Success messages clear after four seconds.
+- The window opens at 1280×800, and its smallest size is 760×560.
+
+---
+
 ## v0.3.2-rc2
 
 ### The macOS release build puts its keychain on the search list
