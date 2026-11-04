@@ -5,381 +5,502 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Quip Node Manager</title>
+  <link rel="preload" href="fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="fonts/instrument-sans-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="styles.css" />
+  <script>
+    // Apply the theme before the first paint, so the window never flashes the
+    // other one. Dark unless Light or System was picked.
+    try {
+      const t = localStorage.getItem('theme');
+      if (t !== 'system') document.documentElement.dataset.theme = t === 'light' ? 'light' : 'dark';
+    } catch { document.documentElement.dataset.theme = 'dark'; }
+  </script>
 </head>
 <body>
-  <!-- First-boot modal -->
-  <div id="first-boot-modal" class="modal-overlay" style="display:none;">
-    <div class="modal-card">
-      <div class="section-heading" style="margin-bottom:8px;">Welcome to Quip Node Manager</div>
-      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">
-        Choose where to store node data (config, secrets, binaries, trust database).
-        You can change this later in settings.
-      </p>
-      <div class="form-group" style="margin-bottom:16px;">
-        <label for="first-boot-dir">Storage Directory</label>
-        <input type="text" id="first-boot-dir" style="width:100%;" />
+  <!-- First run: where the node keeps its data. Shown before anything else. -->
+  <div id="first-boot-modal" class="onboard" style="display:none;">
+    <aside class="rail">
+      <img class="lockup lk-dark" src="assets/lockup.svg" alt="Quip Network" />
+      <img class="lockup lk-light" src="assets/lockup-ink.svg" alt="Quip Network" />
+      <ol class="steps">
+        <li class="step now"><span class="num">1</span><span class="lbl">Storage</span></li>
+        <li class="step"><span class="num">2</span><span class="lbl">This computer</span></li>
+        <li class="step"><span class="num">3</span><span class="lbl">Mining</span></li>
+      </ol>
+    </aside>
+    <div class="main">
+      <div class="band" aria-hidden="true"></div>
+      <div class="inner">
+        <h1>Set up your Quip node</h1>
+        <p class="lead">Pick the folder where the node keeps its configuration, keys, downloaded binaries and chain database. You can move it later in Settings.</p>
+        <label class="field-label" for="first-boot-dir">Storage folder</label>
+        <input type="text" id="first-boot-dir" class="input mono wide" />
+        <p class="hint">Next, the Overview checks this computer. You can change which hardware mines in Settings.</p>
+        <div class="spacer"></div>
+        <div class="nav2">
+          <button id="btn-first-boot-continue" class="btn btn-primary btn-lg">Continue</button>
+        </div>
       </div>
-      <button id="btn-first-boot-continue" class="btn btn-primary" style="width:100%;">Continue</button>
     </div>
   </div>
 
-  <div id="app">
-    <!-- Tab Bar -->
-    <div class="tab-bar">
-      <img src="quipv4.png" class="tab-logo" alt="Quip" />
-      <button class="tab-btn active" data-tab="status">Status Monitor</button>
-      <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-      <div class="app-version-wrap">
-        <span id="app-version" class="app-version">
-          v0.0.0
-          <span id="update-dot" class="update-dot" style="display:none;"></span>
-          <div id="update-tooltip" class="update-tooltip" style="display:none;">
-            <span id="update-tooltip-text"></span>
-            <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
-          </div>
+  <div id="app" class="app">
+    <header class="topbar">
+      <img class="lockup lk-dark" src="assets/lockup.svg" alt="Quip Network" />
+      <img class="lockup lk-light" src="assets/lockup-ink.svg" alt="Quip Network" />
+      <nav class="nav" aria-label="Sections">
+        <button class="tab-btn active" data-tab="status">Overview</button>
+        <button class="tab-btn" data-tab="settings">Settings</button>
+        <button class="tab-btn" data-tab="dashboard">Dashboard</button>
+      </nav>
+      <div class="right">
+        <span id="apply-status" class="topstatus" aria-live="polite"></span>
+        <span class="app-version-wrap">
+          <span id="app-version" class="app-version">v0.0.0 <span id="update-dot" class="update-dot" style="display:none;"></span>
+            <div id="update-tooltip" class="update-tooltip" style="display:none;">
+              <span id="update-tooltip-text"></span>
+              <a id="update-tooltip-link" href="#" target="_blank" rel="noopener">Download</a>
+            </div>
+          </span>
         </span>
-        <button id="btn-check-updates" type="button" class="btn btn-sm btn-secondary">Check for updates</button>
-      </div>
-    </div>
-
-    <!-- Status Monitor Tab -->
-    <div id="tab-status" class="tab-content active">
-
-      <!-- Node Status -->
-      <div class="card">
-        <div class="status-section">
-          <div id="status-dot" class="status-dot status-stopped"></div>
-          <div>
-            <div id="status-text" class="status-text status-stopped">STOPPED</div>
-            <div id="status-subtext" class="status-subtext" style="font-size:13px;color:var(--text-faint);margin-top:2px;">Node not running</div>
-            <!-- Initial-sync progress. Shown only while overall is 'syncing'. -->
-            <div id="sync-progress" class="sync-progress" hidden
-              role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Initial sync">
-              <div id="sync-progress-fill" class="sync-progress-fill"></div>
-            </div>
-            <span id="update-badge" title="A node update is available — Restart to Update"
-              style="display:none;margin-left:8px;padding:2px 8px;border-radius:10px;
-              background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Update</span>
-          </div>
-          <div style="margin-left:auto;display:flex;gap:8px;">
-            <button id="btn-start" class="btn btn-primary" disabled>Start Node</button>
-            <button id="btn-stop" class="btn btn-secondary" disabled>Stop Node</button>
-          </div>
-        </div>
-
-        <!-- Node Health -->
-        <div id="health-panel" class="config-section-divider">
-          <div class="section-heading">Node Health</div>
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">
-            <span style="font-size:13px;color:var(--text-dim);">Infrastructure</span>
-            <span id="health-infra" style="font-size:12px;font-weight:500;color:var(--text-faint);">&#8212;</span>
-          </div>
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">
-            <span style="font-size:13px;color:var(--text-dim);">Chain</span>
-            <span id="health-chain" style="font-size:12px;font-weight:500;color:var(--text-faint);">&#8212;</span>
-          </div>
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">
-            <span style="font-size:13px;color:var(--text-dim);">Participation</span>
-            <span id="health-participation" style="font-size:12px;font-weight:500;color:var(--text-faint);">&#8212;</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Requirements Checklist -->
-      <div class="card">
-        <div class="checklist-header">
-          <button id="checklist-toggle" class="checklist-toggle" aria-expanded="true">
-            <div class="section-heading" style="margin:0;">Requirements</div>
-            <div style="display:flex;align-items:center;gap:10px;">
-              <div id="checklist-summary" class="checklist-summary">Checking&hellip;</div>
-              <span class="checklist-chevron"></span>
-            </div>
-          </button>
-          <button id="btn-recheck-all" type="button" class="btn btn-sm btn-secondary">Retry All</button>
-        </div>
-        <ul id="checklist" class="checklist"></ul>
-      </div>
-
-      <!-- Configuration (collapsible) -->
-      <div class="card">
-        <button id="btn-config-toggle" class="checklist-toggle flush" aria-expanded="true">
-          <div class="section-heading" style="margin:0;">Configuration</div>
-          <span class="checklist-chevron"></span>
+        <button id="btn-theme" class="themekey" type="button" title="Switch to light"
+          aria-label="Switch to light">
+          <svg class="ic-sun" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle
+            cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path
+            d="M8 0.8v2.2M8 13v2.2M0.8 8h2.2M13 8h2.2M2.9 2.9l1.6 1.6M11.5 11.5l1.6 1.6M2.9 13.1l1.6-1.6M11.5 4.5l1.6-1.6"
+            stroke="currentColor" stroke-width="1.5"/></svg>
+          <svg class="ic-moon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path
+            d="M13.6 10.2A6 6 0 0 1 5.8 2.4 6 6 0 1 0 13.6 10.2Z" fill="none" stroke="currentColor"
+            stroke-width="1.5"/></svg>
         </button>
+        <button id="status-pill" class="pill" type="button" data-tab="status"
+          title="Go to the Overview">
+          <span id="status-pill-dot" class="dot hollow"></span><span
+            id="status-pill-text">Stopped</span>
+        </button>
+      </div>
+    </header>
 
-        <div id="config-section">
+    <main class="body">
+      <!-- ─────────────────────────────────────────────────────── Overview -->
+      <section id="tab-status" class="tab-content screen active">
+        <div class="hero">
+          <div class="eyebrow">Your node</div>
+          <div class="statusline">
+            <span id="status-dot" class="status-dot status-stopped" aria-hidden="true"></span>
+            <div id="status-text" class="status-word status-text status-stopped">Stopped</div>
+          </div>
+          <p id="status-subtext" class="say">Your node is off.</p>
+          <!-- Why the last start failed. Shown only in the failed state. -->
+          <div id="start-error" class="errbox" hidden></div>
+          <!-- Initial-sync progress. Shown only while overall is 'syncing'. -->
+          <div id="sync-progress" class="sync-progress" hidden
+            role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Initial sync">
+            <div id="sync-progress-fill" class="sync-progress-fill"></div>
+          </div>
+          <div class="actions">
+            <button id="btn-change-port" class="btn btn-primary btn-lg" hidden>Change the
+              port</button>
+            <button id="btn-start" class="btn btn-primary btn-lg" disabled>Start node</button>
+            <button id="btn-stop" class="btn btn-ghost btn-lg" disabled>Stop node</button>
+            <button id="btn-hero-logs" class="btn btn-ghost btn-lg" hidden>Show logs</button>
+            <span id="update-badge" class="tag" title="A node update is ready. Restart to install it."
+              style="display:none;">Update ready</span>
+          </div>
+        </div>
 
-          <!-- Validator / Miner Configuration -->
-          <div class="config-section-divider">
-            <div class="section-heading">Validator &amp; Miner</div>
-            <div class="form-group" style="margin-bottom:12px;">
-              <label for="data-dir">Storage Directory</label>
-              <div style="display:flex;gap:8px;align-items:center;">
-                <input type="text" id="data-dir" style="flex:1;" />
-                <button id="btn-data-dir-restart" class="btn btn-sm btn-secondary" style="display:none;">Save &amp; Restart</button>
-              </div>
-              <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">Changes will create a new directory. The previous directory will not be removed.</div>
-            </div>
-            <div class="form-group">
-              <label>Node Secret</label>
-              <div class="secret-row">
-                <input type="password" id="secret-display" readonly placeholder="No secret set" />
-                <button id="btn-show-secret" class="btn btn-sm btn-secondary">Show</button>
-                <button id="btn-regen-secret" class="btn btn-sm btn-secondary">Regenerate</button>
-              </div>
-            </div>
-            <div class="form-group" style="margin-bottom:0;">
-              <label for="node-name">Node Name <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-              <input type="text" id="node-name" placeholder="e.g. my-quip-node" />
-            </div>
-            <div style="margin-top:16px;">
-              <button id="btn-custom-toggle" class="checklist-toggle" aria-expanded="false">
-                <div style="display:flex;align-items:center;gap:10px;">
-                  <div class="section-heading" style="margin:0;">Custom Settings</div>
-                  <span style="font-size:11px;color:var(--warning);font-weight:500;">&#9888; incorrect settings can break connectivity</span>
-                </div>
-                <span class="checklist-chevron"></span>
+        <div class="grid ov-grid">
+          <section id="pull-progress-panel" class="panel span-all pull-progress-panel" style="display:none;"></section>
+
+          <section class="panel checks-panel">
+            <div class="ptitle">
+              <button id="checklist-toggle" class="ptoggle" aria-expanded="true">
+                <span class="t">Before you start</span>
+                <span id="checklist-summary" class="checklist-summary">Checking…</span>
+                <span class="chev" aria-hidden="true"></span>
               </button>
-              <div id="custom-settings-section" style="display:none;">
-                <div class="form-group">
-                  <label class="toggle-row" style="margin-bottom:6px;">
-                    <span class="toggle-switch"><input type="checkbox" id="public-host-enable" /><span class="toggle-slider"></span></span>
-                    <span>Override Public Host &amp; Port <span style="color:var(--text-faint);font-weight:400;">(advanced external address)</span></span>
-                  </label>
-                  <!-- Off: the node advertises the detected public IP and the
-                       Public API port; that pair is shown here so the operator
-                       can see what peers will be told. On: the fields appear,
-                       seeded with those values, and the entry replaces them. -->
-                  <div id="public-host-detected" style="font-size:12px;color:var(--text-faint);">Advertising the detected address: <span id="public-host-detected-value">detecting…</span></div>
-                  <div id="public-host-fields" style="display:none;">
-                    <div class="mining-config-grid">
-                      <div class="form-group" style="margin-bottom:0;">
-                        <label for="public-host">Host / IP</label>
-                        <input type="text" id="public-host" placeholder="1.2.3.4 or myhostname.com" />
-                      </div>
-                      <div class="form-group" style="margin-bottom:0;">
-                        <label for="public-port">Port</label>
-                        <input type="number" id="public-port" min="1024" max="65535" placeholder="20049" />
-                      </div>
-                    </div>
-                    <div style="font-size:12px;color:var(--text-faint);margin-top:4px;">This changes only the address peers are told to dial. Use it when your router forwards a different external port to this machine. To change the port the node itself listens on, edit Public API under Service Ports.</div>
-                    <div style="font-size:12px;color:var(--warning);margin-top:4px;">You are responsible for verifying this address is reachable from the internet.</div>
+              <button id="btn-recheck-all" type="button" class="btn btn-ghost btn-sm">Check again</button>
+            </div>
+            <ul id="checklist" class="checks"></ul>
+          </section>
+
+          <section id="health-panel" class="panel">
+            <div class="ptitle"><span class="t">Node health</span></div>
+            <div class="rows">
+              <div class="row"><span class="k">Services</span><span class="d" id="health-infra-detail"></span><span class="st" id="health-infra">—</span></div>
+              <div class="row"><span class="k">Chain</span><span class="d" id="health-chain-detail"></span><span class="st" id="health-chain">—</span></div>
+              <div class="row"><span class="k">Participation</span><span class="d" id="health-participation-detail"></span><span class="st" id="health-participation">—</span></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────────────────────────────────── Settings -->
+      <section id="tab-settings" class="tab-content screen settings">
+        <nav class="snav" aria-label="Settings sections">
+          <button data-sec="node" aria-current="true">Node</button>
+          <button data-sec="mining">Mining</button>
+          <button data-sec="network">Network</button>
+          <button data-sec="updates">Updates</button>
+          <button data-sec="display">Display</button>
+          <button data-sec="advanced">Advanced</button>
+          <button data-sec="about">About</button>
+        </nav>
+
+        <div class="spane">
+          <!-- Node -->
+          <div class="sec active" data-sec="node">
+            <h1>Node</h1>
+            <p class="lead">Your node's name, secret and storage folder.</p>
+            <div class="sgroup">
+              <div class="setting stack">
+                <div><label class="sl" for="data-dir">Storage folder</label>
+                  <div class="sd">Holds the configuration, keys, binaries and chain database. If you
+                    move it, the app creates the new folder and restarts, and your old folder stays
+                    where it is.</div></div>
+                <div class="inrow">
+                  <input type="text" id="data-dir" class="input mono grow" />
+                  <button id="btn-data-dir-restart" class="btn btn-ghost btn-sm" style="display:none;">Save and restart app</button>
+                </div>
+              </div>
+              <div class="setting stack">
+                <div><span class="sl">Node secret</span>
+                  <div class="sd">The app checks for this secret before the node starts.
+                    Your node's signing key is a separate file, keystore.json, in the
+                    storage folder.</div></div>
+                <div class="inrow secret-row">
+                  <input type="password" id="secret-display" class="input mono grow" readonly
+                    placeholder="No secret set" />
+                  <button id="btn-show-secret" class="btn btn-ghost btn-sm">Show</button>
+                  <button id="btn-copy-secret" class="btn btn-ghost btn-sm">Copy</button>
+                  <button id="btn-regen-secret" class="btn btn-ghost btn-sm">
+                    Make a new secret</button>
+                </div>
+              </div>
+              <div class="setting stack">
+                <div><label class="sl" for="node-name">Node name</label>
+                  <div class="sd">Optional. Other validators see this name.</div></div>
+                <input type="text" id="node-name" class="input" placeholder="my-quip-node" />
+              </div>
+            </div>
+          </div>
+
+          <!-- Mining -->
+          <div class="sec" data-sec="mining">
+            <h1>Mining</h1>
+            <p class="lead">Choose what this computer mines with. Changes take effect when the node restarts.</p>
+            <div class="sgroup">
+              <div class="gt"><h2>CPU</h2></div>
+              <div class="setting">
+                <div><label class="sl" for="cpu-enabled">Mine on the CPU</label></div>
+                <label class="switch"><input type="checkbox" id="cpu-enabled" checked /><span></span></label>
+              </div>
+              <div id="cpu-subsettings" class="subset">
+                <div class="setting">
+                  <div><label class="sl" for="num-cpus">CPU cores</label>
+                    <div class="sd">How many CPU cores the miner can use.</div></div>
+                  <div class="stepper" role="group" aria-label="CPU cores">
+                    <button type="button" data-step="-1" data-for="num-cpus"
+                      aria-label="Fewer cores">−</button>
+                    <input type="number" id="num-cpus" class="input mono" min="1" max="64" value="1"
+                      aria-label="CPU cores" />
+                    <button type="button" data-step="1" data-for="num-cpus"
+                      aria-label="More cores">+</button>
                   </div>
                 </div>
-                <p class="service-port-note">Enable a port to publish it on this host. Internal service addresses stay fixed.</p>
-                <div id="service-port-controls"></div>
-                <div class="mining-config-grid">
-                  <div class="form-group">
-                    <label for="log-level">Log Level</label>
-                    <select id="log-level">
-                      <option value="info">info</option>
-                      <option value="debug">debug</option>
-                      <option value="warn">warn</option>
-                      <option value="error">error</option>
-                    </select>
+                <!-- Populated from the miner image at runtime, not from a list
+                     compiled into the app — see solvers::list_solvers. -->
+                <div class="setting stack">
+                  <div><label class="sl" for="cpu-solver">CPU solver</label></div>
+                  <select id="cpu-solver" class="select"></select>
+                  <div id="cpu-solver-note" class="sd"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="sgroup">
+              <div class="gt"><h2>GPU</h2></div>
+              <div id="gpu-device-list"></div>
+              <div id="gpu-no-devices" class="empty" style="display:none;">No GPUs found on this computer.</div>
+              <div id="gpu-global-settings">
+                <div class="setting">
+                  <div><label class="sl" for="gpu-utilization">GPU limit</label>
+                    <div class="sd">How much of this GPU the miner can use.</div></div>
+                  <div class="range">
+                    <input type="range" id="gpu-utilization" min="0" max="100" value="80" />
+                    <span id="gpu-util-display" class="v">80%</span>
                   </div>
-                  <div class="form-group">
-                    <label for="node-log">Node Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                    <input type="text" id="node-log" placeholder="e.g. logs/quip-node.log" />
-                  </div>
-                  <div class="form-group">
-                    <label for="http-log">HTTP Log File <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-                    <input type="text" id="http-log" placeholder="e.g. logs/quip-http.log" />
-                  </div>
                 </div>
-
-              </div>
-            </div>
-          </div>
-
-          <!-- Stack Configuration -->
-          <div class="config-section-divider">
-            <div class="section-heading">Stack Configuration</div>
-            <div class="form-group">
-              <label style="display:block;margin-bottom:6px;">Update Channel</label>
-              <div class="segmented" id="update-channel-toggle" role="group" aria-label="Update channel">
-                <button type="button" class="segmented-btn" id="channel-release" data-channel="release">Release</button>
-                <button type="button" class="segmented-btn" id="channel-beta" data-channel="beta">Beta</button>
-              </div>
-              <div id="channel-caption" style="font-size:11px;color:var(--text-faint);margin-top:4px;">&nbsp;</div>
-            </div>
-            <div class="form-group">
-              <label class="toggle-row">
-                <span class="toggle-switch"><input type="checkbox" id="tls-enabled" /><span class="toggle-slider"></span></span>
-                <span>Enable TLS <span style="color:var(--text-faint);font-weight:400;">(ports 80 + 443 required)</span></span>
-              </label>
-            </div>
-            <div id="tls-subsettings" style="display:none;margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
-              <div class="form-group">
-                <label for="hostname">Caddy/API Hostname</label>
-                <input type="text" id="hostname" placeholder=":20049" />
-                <div style="font-size:11px;color:var(--text-faint);margin-top:4px;">
-                  <code>:20049</code> for local HTTP, or
-                  <code>example.com, example.com:20049</code> for public TLS.
-                  The port here is always 20049 inside the container and cannot be changed. To move the public port, edit Public API under Service Ports.
+                <div class="setting">
+                  <div><label class="sl" for="gpu-yielding">Give other apps priority</label>
+                    <div class="sd">The miner slows down whenever another app needs the GPU.</div></div>
+                  <label class="switch"><input type="checkbox" id="gpu-yielding" /><span></span></label>
+                </div>
+                <!-- CUDA / Metal solver pickers. Only the one matching the
+                     detected GPU backend is shown; both are populated from the
+                     image or bundle at runtime. -->
+                <div id="cuda-solver-group" class="setting stack" style="display:none;">
+                  <div><label class="sl" for="cuda-solver">CUDA solver</label></div>
+                  <select id="cuda-solver" class="select"></select>
+                  <div id="cuda-solver-note" class="sd"></div>
+                </div>
+                <div id="metal-solver-group" class="setting stack" style="display:none;">
+                  <div><label class="sl" for="metal-solver">Metal solver</label></div>
+                  <select id="metal-solver" class="select"></select>
+                  <div id="metal-solver-note" class="sd"></div>
                 </div>
               </div>
-              <div class="form-group">
-                <label for="cert-email">ACME Email <span style="color:var(--text-faint);font-weight:400;">(required for Let's Encrypt)</span></label>
-                <input type="email" id="cert-email" placeholder="you@example.com" />
-              </div>
-              <div class="form-group" style="margin-bottom:0;">
-                <label for="zerossl-api-key">ZeroSSL API Key <span style="color:var(--text-faint);font-weight:400;">(optional fallback)</span></label>
-                <input type="password" id="zerossl-api-key" placeholder="Leave empty to use Let's Encrypt" />
-              </div>
             </div>
-          </div>
 
-          <!-- CPU Miner Configuration -->
-          <div class="config-section-divider">
-            <div class="section-heading">CPU Miner Configuration</div>
-            <div class="form-group">
-              <label class="toggle-row">
-                <span class="toggle-switch"><input type="checkbox" id="cpu-enabled" checked /><span class="toggle-slider"></span></span>
-                <span>Enable CPU mining</span>
-              </label>
-            </div>
-            <div id="cpu-subsettings" style="margin-top:8px;padding:12px 16px;background:var(--bg-card);border-left:2px solid var(--border);border-radius:4px;">
-              <div class="form-group" style="max-width:160px;">
-                <label for="num-cpus">CPU Cores</label>
-                <input type="number" id="num-cpus" min="1" max="64" value="1" />
-              </div>
-              <!-- Populated from the miner image at runtime, not from a list
-                   compiled into the app — see solvers::list_solvers. -->
-              <div class="form-group" style="max-width:420px;margin-bottom:0;">
-                <label for="cpu-solver">CPU Solver</label>
-                <select id="cpu-solver"></select>
-                <div id="cpu-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
-              </div>
-            </div>
-          </div>
-
-          <!-- GPU Miner Configuration -->
-          <div class="config-section-divider">
-            <div class="section-heading">GPU Miner Configuration</div>
-            <div id="gpu-device-list"></div>
-            <div id="gpu-no-devices" style="display:none;color:var(--text-faint);font-size:13px;padding:8px 0;">
-              No GPUs detected
-            </div>
-            <div id="gpu-global-settings" style="margin-top:12px;">
-              <div class="gpu-setting-row" style="margin-bottom:12px;">
-                <label>Utilization</label>
-                <input type="range" id="gpu-utilization" min="0" max="100" value="80" />
-                <span id="gpu-util-display" class="gpu-util-display">80%</span>
-              </div>
-              <label class="gpu-yielding-row">
-                <input type="checkbox" id="gpu-yielding" style="width:15px;height:15px;accent-color:var(--warning);cursor:pointer;" />
-                <span class="gpu-yielding-flag">&#127987;&#65039;</span>
-                <span>Yielding &#8212; GPU will yield to other applications when under load</span>
-              </label>
-              <!-- CUDA / Metal solver pickers. Only the one matching the
-                   detected GPU backend is shown; both are populated from the
-                   image or bundle at runtime. -->
-              <div id="cuda-solver-group" class="form-group" style="display:none;max-width:420px;margin-top:12px;margin-bottom:0;">
-                <label for="cuda-solver">CUDA Solver</label>
-                <select id="cuda-solver"></select>
-                <div id="cuda-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
-              </div>
-              <div id="metal-solver-group" class="form-group" style="display:none;max-width:420px;margin-top:12px;margin-bottom:0;">
-                <label for="metal-solver">Metal Solver</label>
-                <select id="metal-solver"></select>
-                <div id="metal-solver-note" style="font-size:12px;color:var(--text-faint);margin-top:4px;"></div>
-              </div>
-            </div>
-          </div>
-
-          <!-- D-Wave Mining Configuration -->
-          <div class="config-section-divider">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-              <div class="section-heading" style="margin:0;">D-Wave Mining</div>
-              <button id="btn-qpu-toggle" class="btn btn-sm btn-secondary">Configure D-Wave Access</button>
-            </div>
-            <div id="qpu-section" style="display:none;margin-top:16px;">
-              <div style="font-size:12px;color:var(--text-faint);margin-bottom:12px;">
-                Runs on top of CPU miner mode. Solver: Advantage2_System1.13 &middot; Region: NA West 1
-              </div>
-              <div class="mining-config-grid">
-                <div class="form-group">
-                  <label for="qpu-api-key">D-Wave Token</label>
-                  <input type="password" id="qpu-api-key" placeholder="DEV-..." />
+            <div class="sgroup">
+              <div class="gt"><h2>D-Wave quantum computer</h2>
+                <button id="btn-qpu-toggle" class="btn btn-ghost btn-sm" aria-expanded="false"
+                  aria-controls="qpu-section">Set up D-Wave access</button></div>
+              <p class="gd">This runs on top of CPU mining and needs a D-Wave Leap account.</p>
+              <div id="qpu-section" style="display:none;">
+                <div class="fields qpu-facts">
+                  <span class="field"><span class="l">Solver</span><span class="v">Advantage2_System1.13</span></span>
+                  <span class="field"><span class="l">Region</span><span class="v">NA West 1</span></span>
                 </div>
-                <div class="form-group">
-                  <label for="qpu-budget">Monthly Budget <span style="color:var(--text-faint);font-weight:400;">(QPU time, e.g. 40h)</span></label>
-                  <input type="text" id="qpu-budget" placeholder="40h" />
+                <div class="setting stack">
+                  <div><label class="sl" for="qpu-api-key">D-Wave token</label></div>
+                  <input type="password" id="qpu-api-key" class="input mono" placeholder="DEV-..." />
                 </div>
-                <div class="form-group">
-                  <label for="qpu-budget-reset-day">Reset Day <span style="color:var(--text-faint);font-weight:400;">(day of month, UTC)</span></label>
-                  <input type="number" id="qpu-budget-reset-day" min="1" max="31" value="1" />
+                <div class="setting">
+                  <div><label class="sl" for="qpu-budget">Monthly budget</label>
+                    <div class="sd">How much quantum computer time to use, for example 40h.</div></div>
+                  <input type="text" id="qpu-budget" class="input mono num" placeholder="40h" />
+                </div>
+                <div class="setting">
+                  <div><label class="sl" for="qpu-budget-reset-day">Budget resets on day</label>
+                    <div class="sd">A day of the month, counted in UTC.</div></div>
+                  <input type="number" id="qpu-budget-reset-day" class="input mono num" min="1" max="31" value="1" />
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- Save / Apply & Restart -->
-          <div style="display:flex;gap:8px;align-items:center;padding-top:4px;">
-            <button id="btn-save" class="btn btn-secondary">Save</button>
-            <button id="btn-apply" class="btn btn-primary" disabled>Apply &amp; Restart</button>
-            <span id="apply-status" style="font-size:13px;color:var(--text-faint);"></span>
+          <!-- Network -->
+          <div class="sec" data-sec="network">
+            <h1>Network</h1>
+            <p class="lead">How peers reach your node. Once you forward two ports on your router,
+              the defaults work for most home networks.</p>
+            <div class="sgroup">
+              <div class="gt"><h2>Public address</h2></div>
+              <div class="setting">
+                <div><label class="sl" for="public-host-enable">Use a different address</label>
+                  <div class="sd" id="public-host-detected">Advertising the detected address
+                    <span id="public-host-detected-value" class="mono">detecting…</span></div></div>
+                <label class="switch"><input type="checkbox" id="public-host-enable" /><span></span></label>
+              </div>
+              <!-- Off: the node advertises the detected public IP and the
+                   Public API port; that pair is shown above so the operator
+                   can see what peers will be told. On: the fields appear,
+                   seeded with those values, and the entry replaces them. -->
+              <div id="public-host-fields" class="subset" style="display:none;">
+                <div class="setting stack">
+                  <div><label class="sl" for="public-host">Host or IP address</label></div>
+                  <input type="text" id="public-host" class="input mono" placeholder="1.2.3.4 or node.example.com" />
+                </div>
+                <div class="setting">
+                  <div><label class="sl" for="public-port">Port</label></div>
+                  <input type="number" id="public-port" class="input mono num" min="1024" max="65535" placeholder="20049" />
+                </div>
+                <p class="sd">This sets the address peers are told to dial. Use it if your router
+                  forwards a different outside port, or if you have a DNS name. The port the node
+                  listens on is set separately, in Public API under Advanced.</p>
+                <p class="note-plain">Other nodes will connect to this address as written, so check
+                  that they can reach this computer from outside your network.</p>
+              </div>
+            </div>
+
+            <div class="sgroup">
+              <div class="gt"><h2>HTTPS</h2></div>
+              <div class="setting">
+                <div><label class="sl" for="tls-enabled">Serve the dashboard over HTTPS</label>
+                  <div class="sd">This needs ports 80 and 443 and a DNS name that points at this
+                    computer. Certificates renew on their own.</div></div>
+                <label class="switch"><input type="checkbox" id="tls-enabled" /><span></span></label>
+              </div>
+              <div id="tls-subsettings" class="subset" style="display:none;">
+                <div class="setting stack">
+                  <div><label class="sl" for="hostname">Dashboard hostname</label>
+                    <div class="sd"><code>:20049</code> for local HTTP, or <code>example.com, example.com:20049</code>
+                      for public TLS. Inside the container the port stays 20049. To change the public port, edit Public API under Advanced.</div></div>
+                  <input type="text" id="hostname" class="input mono" placeholder=":20049" />
+                </div>
+                <div class="setting stack">
+                  <div><label class="sl" for="cert-email">Email for certificates</label>
+                    <div class="sd">Let's Encrypt needs this address.</div></div>
+                  <input type="email" id="cert-email" class="input" placeholder="you@example.com" />
+                </div>
+                <div class="setting stack">
+                  <div><label class="sl" for="zerossl-api-key">ZeroSSL key</label>
+                    <div class="sd">Optional. The node uses this key only if Let's Encrypt
+                      fails.</div></div>
+                  <input type="password" id="zerossl-api-key" class="input mono" />
+                </div>
+              </div>
+            </div>
           </div>
 
-        </div><!-- /config-section -->
+          <!-- Updates -->
+          <div class="sec" data-sec="updates">
+            <h1>Updates</h1>
+            <p class="lead">Choose which builds the node runs. The app checks for new versions every
+              30 minutes.</p>
+            <div class="sgroup">
+              <div class="setting stack">
+                <div><span class="sl">Channel</span>
+                  <div class="sd">Release runs only stable builds. Beta also runs release
+                    candidates.</div></div>
+                <div class="segmented seg" id="update-channel-toggle" role="group" aria-label="Update channel">
+                  <button type="button" class="segmented-btn" id="channel-release" data-channel="release">Release</button>
+                  <button type="button" class="segmented-btn" id="channel-beta" data-channel="beta">Beta</button>
+                </div>
+                <div id="channel-caption" class="channel-caption"></div>
+              </div>
+              <div class="setting">
+                <div><span class="sl">Check for updates</span>
+                  <div class="sd">Checks the app, the node images and the native miner.</div></div>
+                <button id="btn-check-updates" type="button" class="btn btn-ghost btn-sm">Check
+                  now</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Display -->
+          <div class="sec" data-sec="display">
+            <h1>Display</h1>
+            <p class="lead">How the app looks. None of these settings affect mining.</p>
+            <div class="sgroup">
+              <div class="gt"><h2>Appearance</h2></div>
+              <div class="setting">
+                <div><span class="sl">Theme</span>
+                  <div class="sd">System follows your computer's setting until you click the theme
+                    button in the top bar, which picks Dark or Light.</div></div>
+                <div class="segmented seg" id="theme-choice" role="group" aria-label="Theme">
+                  <button type="button" class="segmented-btn"
+                    data-theme-pick="system">System</button>
+                  <button type="button" class="segmented-btn" data-theme-pick="dark">Dark</button>
+                  <button type="button" class="segmented-btn" data-theme-pick="light">Light</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Advanced -->
+          <div class="sec" data-sec="advanced">
+            <h1>Advanced</h1>
+            <p class="lead">Ports and logging settings. A wrong value here can cut your node off from the network.</p>
+            <div class="sgroup">
+              <div class="gt"><h2>Service ports</h2></div>
+              <p class="gd service-port-note">Turn a port on to make it reachable on this computer. Addresses inside the stack don't change.</p>
+              <div id="service-port-controls"></div>
+            </div>
+            <div class="sgroup">
+              <div class="gt"><h2>Logging</h2></div>
+              <div class="setting">
+                <div><label class="sl" for="log-level">Log level</label></div>
+                <select id="log-level" class="select mono">
+                  <option value="info">info</option>
+                  <option value="debug">debug</option>
+                  <option value="warn">warn</option>
+                  <option value="error">error</option>
+                </select>
+              </div>
+              <div class="setting stack">
+                <div><label class="sl" for="node-log">Node log file</label><div class="sd">Optional.</div></div>
+                <input type="text" id="node-log" class="input mono" placeholder="logs/quip-node.log" />
+              </div>
+              <div class="setting stack">
+                <div><label class="sl" for="http-log">HTTP log file</label><div class="sd">Optional.</div></div>
+                <input type="text" id="http-log" class="input mono" placeholder="logs/quip-http.log" />
+              </div>
+            </div>
+          </div>
+
+          <!-- About -->
+          <div class="sec" data-sec="about">
+            <h1>About</h1>
+            <div class="about-app">
+              <img class="about-icon" src="assets/app-icon.png" width="64" height="64" alt="">
+              <div>
+                <div class="about-name">Quip Node Manager</div>
+                <div class="about-ver" id="about-version"></div>
+              </div>
+            </div>
+            <p class="lead">Quip Node Manager runs and monitors a Quip node: the miner, the validator and the dashboard.</p>
+            <div class="sgroup">
+              <p class="gd">Quip Node Manager is free software, licensed under the GNU Affero General Public License, version 3 or later.</p>
+              <p class="gd"><a href="https://gitlab.com/quip.network/quip-node-manager">Source code</a></p>
+              <p class="gd">The type is JetBrains Mono and Instrument Sans, both under the SIL Open Font License.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="savebar">
+          <div class="msg" id="save-msg" role="status">You have unsaved changes. <span>They take
+            effect the next time the node starts.</span></div>
+          <button id="btn-discard" class="btn btn-ghost">Discard</button>
+          <button id="btn-save" class="btn btn-ghost">Save</button>
+          <button id="btn-apply" class="btn btn-primary" disabled>Save and start node</button>
+        </div>
+      </section>
+
+      <!-- ────────────────────────────────────────────────────── Dashboard -->
+      <section id="tab-dashboard" class="tab-content screen">
+        <div id="dashboard-empty" class="dash-empty" style="display:none;">
+          <div>
+            <h2>The dashboard shows up here once it's running</h2>
+            <p>It shows your node's rounds, proofs and service logs.</p>
+            <p id="dashboard-empty-msg" class="note-alert"></p>
+            <button id="dashboard-reset-btn" class="btn btn-ghost" style="display:none;">Reset dashboard database</button>
+          </div>
+        </div>
+        <iframe
+          id="dashboard-frame"
+          title="Quip Dashboard"
+          sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
+          style="display:none;"></iframe>
+      </section>
+    </main>
+
+    <!-- Logs: one line when closed, the full stream when open. -->
+    <footer id="log-drawer" class="logbar">
+      <div id="log-drawer-handle" class="loghead" role="button" tabindex="0" aria-expanded="false"
+        title="Show logs">
+        <span id="log-drawer-chevron" class="chev" aria-hidden="true"></span>
+        <span class="t">Logs</span>
+        <span id="log-last" class="last"></span>
       </div>
-
-    </div>
-
-    <!-- Dashboard Tab -->
-    <div id="tab-dashboard" class="tab-content">
-      <div id="dashboard-empty" class="dashboard-placeholder" style="display:none;">
-        <span id="dashboard-empty-msg"></span>
-        <button id="dashboard-reset-btn" class="btn btn-secondary" style="display:none;margin-top:12px;">
-          Reset dashboard database
-        </button>
-      </div>
-      <iframe
-        id="dashboard-frame"
-        title="Quip Dashboard"
-        sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
-        style="display:none;width:100%;border:0;"></iframe>
-    </div>
-
-    <!-- Log Drawer (fixed bottom) -->
-    <div id="log-drawer">
-      <div id="log-drawer-handle" class="log-drawer-handle">
-        <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
-          <span id="log-drawer-chevron" class="log-drawer-chevron"></span>
-          <div class="section-heading" style="margin:0;">Node Logs</div>
+      <div class="logbody" inert>
+        <div class="logtools">
           <div id="log-source-filters" class="log-source-filters" aria-label="Log source filters"></div>
           <div class="log-text-filter-wrap">
-            <input
-              id="log-text-filter"
-              class="log-text-filter"
-              type="search"
-              placeholder="Filter logs…"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Filter logs"
-            />
-            <button
-              id="log-text-filter-clear"
-              class="log-text-filter-clear"
-              type="button"
-              title="Clear filter"
-              aria-label="Clear filter"
-              hidden
-            >&times;</button>
+            <input id="log-text-filter" class="log-text-filter input mono" type="search" placeholder="Filter logs"
+              autocomplete="off" spellcheck="false" aria-label="Filter logs" />
+            <button id="log-text-filter-clear" class="log-text-filter-clear" type="button" title="Clear filter"
+              aria-label="Clear filter" hidden>&times;</button>
           </div>
           <span id="log-match-count" class="log-match-count" aria-live="polite"></span>
+          <span class="grow"></span>
+          <button id="btn-copy-log" class="btn btn-ghost btn-sm">Copy</button>
+          <button id="btn-clear-log" class="btn btn-ghost btn-sm">Clear</button>
         </div>
-        <div style="display:flex;gap:8px;flex-shrink:0;">
-          <button id="btn-copy-log" class="btn btn-sm btn-secondary">Copy</button>
-          <button id="btn-clear-log" class="btn btn-sm btn-secondary">Clear</button>
-        </div>
+        <div id="log-output" class="log-output"></div>
       </div>
-      <div id="pull-progress-panel" class="pull-progress-panel" style="display:none;"></div>
-      <div id="log-output" class="log-output"></div>
+    </footer>
+  </div>
+  <!-- One dialog, filled by app.js (the router steps for a port that can't be reached). -->
+  <div id="dlg-scrim" class="scrim" hidden>
+    <div id="dlg" class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"
+      tabindex="-1">
+      <h2 id="dlg-title"></h2>
+      <div id="dlg-body"></div>
+      <div class="dacts" id="dlg-acts"></div>
     </div>
-
   </div>
   <script type="module" src="app.js"></script>
 </body>

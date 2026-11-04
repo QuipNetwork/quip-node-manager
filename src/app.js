@@ -199,7 +199,7 @@ async function refreshChannelInfo() {
       channel: state.settings.update_channel,
     });
   } catch {
-    if (caption) caption.textContent = 'Could not reach the release feed.';
+    if (caption) caption.textContent = 'Couldn\'t reach the release feed.';
     return;
   }
   // Gray out Release until a stable (non-rc) release exists; force Beta.
@@ -207,7 +207,7 @@ async function refreshChannelInfo() {
     releaseBtn.disabled = !info.stable_available;
     releaseBtn.title = info.stable_available
       ? ''
-      : 'No stable release published yet — Beta only';
+      : 'No stable release yet — only Beta builds';
   }
   if (!info.stable_available && state.settings.update_channel === 'release') {
     await setUpdateChannel('beta');
@@ -217,11 +217,17 @@ async function refreshChannelInfo() {
   if (caption) {
     // Each image resolves its own tag from its own registry — they can differ.
     const parts = (info.images || []).map(
-      ([name, tag]) => `${name} ${tag ?? '—'}`,
+      ([name, tag]) => `${name} ${tag ?? 'none'}`,
     );
-    caption.textContent = parts.length
-      ? parts.join('  ·  ')
-      : 'No published builds on this channel yet.';
+    if (!parts.length) {
+      caption.textContent = 'Nothing has been published on this channel yet.';
+    } else {
+      caption.replaceChildren(...parts.map((p) => {
+        const line = document.createElement('span');
+        line.textContent = p;
+        return line;
+      }));
+    }
   }
 }
 
@@ -322,6 +328,9 @@ const FIX_LABELS = {
 // itself on recheck, so their Retry is just a plain recheck.
 const FIX_FOLDED_INTO_RETRY = new Set(['secret']);
 
+// Checks that test a port from outside; a failing one offers the router steps.
+const PORT_CHECKS = new Set(['port', 'port-validator']);
+
 // ─── Tab switching ──────────────────────────────────────────────────────────
 // Activate a tab by name (e.g. 'status', 'dashboard'). Used by the tab buttons
 // and by flows that need to navigate the user programmatically.
@@ -342,14 +351,56 @@ function activateTab(tab) {
 document.querySelectorAll('.tab-btn').forEach((btn) => {
   btn.addEventListener('click', () => activateTab(btn.dataset.tab));
 });
+document.getElementById('status-pill').addEventListener('click', () => activateTab('status'));
 
-// ─── Configuration section toggle ────────────────────────────────────────────
-document.getElementById('btn-config-toggle').addEventListener('click', () => {
-  const btn = document.getElementById('btn-config-toggle');
-  const section = document.getElementById('config-section');
-  const expanded = btn.getAttribute('aria-expanded') === 'true';
-  btn.setAttribute('aria-expanded', String(!expanded));
-  section.style.display = expanded ? 'none' : '';
+// ─── Settings sections ───────────────────────────────────────────────────────
+// Every section stays in the DOM (collectConfig reads them all); only the
+// chosen one is shown.
+function showSettingsSection(sec) {
+  document.querySelectorAll('.snav button').forEach((b) => {
+    if (b.dataset.sec === sec) b.setAttribute('aria-current', 'true');
+    else b.removeAttribute('aria-current');
+  });
+  document.querySelectorAll('.spane .sec').forEach((el) => {
+    el.classList.toggle('active', el.dataset.sec === sec);
+  });
+  document.querySelector('.spane').scrollTop = 0;
+}
+document.querySelector('.snav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-sec]');
+  if (btn) showSettingsSection(btn.dataset.sec);
+});
+
+// ─── Unsaved changes ─────────────────────────────────────────────────────────
+// Edits collect until Save, Save and restart, or Discard. Controls that save
+// themselves (the channel buttons, the Metal toggle, Regenerate) do not count.
+// The save bar appears with the first change and counts the fields changed.
+const dirtyFields = new Set();
+function setSettingsDirty(dirty) {
+  state.settingsDirty = dirty;
+  if (!dirty) dirtyFields.clear();
+  const bar = document.querySelector('.savebar');
+  const msg = document.getElementById('save-msg');
+  if (!bar || !msg) return;
+  bar.classList.toggle('dirty', dirty);
+  const n = Math.max(1, dirtyFields.size);
+  msg.firstChild.textContent = `${n} unsaved ${n === 1 ? 'change' : 'changes'} `;
+}
+for (const type of ['input', 'change']) {
+  document.querySelector('.spane').addEventListener(type, (e) => {
+    if (e.target.closest('.metal-enable-toggle, #data-dir, #theme-choice')) return;
+    dirtyFields.add(e.target.id || e.target.dataset.index || e.target.name || e.target);
+    setSettingsDirty(true);
+  });
+}
+document.getElementById('btn-discard').addEventListener('click', async () => {
+  if (!state.settings) return;
+  try {
+    state.settings = await invoke('get_settings');
+  } catch { /* keep the copy we have */ }
+  await populateForm(state.settings);
+  renderGpuDevices();
+  setSettingsDirty(false);
 });
 
 // ─── Dashboard database reset ─────────────────────────────────────────────────
@@ -386,8 +437,25 @@ document.getElementById('log-drawer-handle').addEventListener('click', (e) => {
   ) {
     return;
   }
-  document.getElementById('log-drawer').classList.toggle('expanded');
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
 });
+// Enter or Space on the focused header works like a click.
+document.getElementById('log-drawer-handle').addEventListener('keydown', (e) => {
+  if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+  e.preventDefault();
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
+});
+function setLogsOpen(open) {
+  const drawer = document.getElementById('log-drawer');
+  const body = drawer.querySelector('.logbody');
+  const handle = document.getElementById('log-drawer-handle');
+  if (!open && body.contains(document.activeElement)) handle.focus();
+  drawer.classList.toggle('expanded', open);
+  body.inert = !open;
+  handle.setAttribute('aria-expanded', String(open));
+  handle.title = open ? 'Hide logs' : 'Show logs';
+  document.getElementById('btn-hero-logs').textContent = open ? 'Hide logs' : 'Show logs';
+}
 
 // ─── Requirements toggle ─────────────────────────────────────────────────────
 document.getElementById('checklist-toggle').addEventListener('click', () => {
@@ -396,15 +464,6 @@ document.getElementById('checklist-toggle').addEventListener('click', () => {
   const expanded = btn.getAttribute('aria-expanded') === 'true';
   btn.setAttribute('aria-expanded', String(!expanded));
   list.style.display = expanded ? 'none' : '';
-});
-
-// ─── Custom settings toggle ───────────────────────────────────────────────────
-document.getElementById('btn-custom-toggle').addEventListener('click', () => {
-  const btn = document.getElementById('btn-custom-toggle');
-  const section = document.getElementById('custom-settings-section');
-  const expanded = btn.getAttribute('aria-expanded') === 'true';
-  btn.setAttribute('aria-expanded', String(!expanded));
-  section.style.display = expanded ? 'none' : '';
 });
 
 // ─── Storage directory ───────────────────────────────────────────────────────
@@ -426,7 +485,7 @@ document.getElementById('btn-data-dir-restart').addEventListener('click', async 
   } catch (e) {
     appendLog({ timestamp: '', level: 'ERROR', message: `Failed to set storage dir: ${e}` });
     btn.disabled = false;
-    btn.textContent = 'Save & Restart';
+    btn.textContent = 'Save and restart app';
   }
 });
 
@@ -507,11 +566,11 @@ function renderGpuDevices() {
   devices.forEach((dev) => {
     const saved = savedConfigs.find((c) => c.index === dev.index);
     const enabled = saved ? saved.enabled : false;
-    const mem = dev.memory_mb ? ` (${dev.memory_mb} MB)` : '';
+    const mem = dev.memory_mb ? `, ${dev.memory_mb} MB` : '';
     const backendLabel = isMetal ? 'Metal' : 'CUDA';
 
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 0;';
+    row.className = 'device-row';
 
     const label = document.createElement('label');
     label.className = 'toggle-switch';
@@ -538,20 +597,23 @@ function renderGpuDevices() {
     row.appendChild(label);
 
     const text = document.createElement('span');
-    text.style.fontSize = '13px';
-    text.textContent = `GPU ${dev.index}: ${dev.name} (${backendLabel})${mem}`;
+    text.className = 'device-name';
+    text.textContent = dev.name;
+    const meta = document.createElement('span');
+    meta.className = 'device-meta';
+    meta.textContent = `GPU ${dev.index}, ${backendLabel}${mem}`;
 
-    row.appendChild(text);
+    row.append(text, meta);
     list.appendChild(row);
   });
 
   // Make the Metal on/off → mining-mode consequence explicit.
   if (isMetal) {
     const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:12px;color:var(--text-faint);padding:2px 0 0 0;';
+    hint.className = 'sd';
     hint.textContent = metalEnabled
-      ? 'Metal GPU mining enabled — runs the native miner.'
-      : 'Metal off — the node runs CPU mining via Docker.';
+      ? 'Metal GPU mining is on, so the node runs its native miner.'
+      : 'Metal is off, so the node mines on the CPU in Docker.';
     list.appendChild(hint);
   }
 }
@@ -578,7 +640,26 @@ document.getElementById('btn-show-secret').addEventListener('click', () => {
   }
 });
 
-document.getElementById('btn-regen-secret').addEventListener('click', async () => {
+document.getElementById('btn-copy-secret').addEventListener('click', (e) => {
+  const value = document.getElementById('secret-display').value;
+  if (!value) return flashLabel(e.currentTarget, 'No secret yet');
+  copyText(value, e.currentTarget);
+});
+
+document.getElementById('btn-regen-secret').addEventListener('click', () => {
+  openDialog({
+    title: 'Make a new node secret?',
+    danger: true,
+    body: [para('The app replaces the secret in node-secret.json with a new random one. '
+      + 'You can\'t undo this.')],
+    actions: [
+      { label: 'Keep the current secret', cls: 'btn-ghost' },
+      { label: 'Make a new secret', cls: 'btn-dangerfill', run: regenerateSecret },
+    ],
+  });
+});
+
+async function regenerateSecret() {
   try {
     const secret = await invoke('generate_node_secret');
     document.getElementById('secret-display').value = secret;
@@ -589,8 +670,11 @@ document.getElementById('btn-regen-secret').addEventListener('click', async () =
     await invoke('recheck', { ids: ['secret'] }).catch(console.error);
   } catch (e) {
     console.error('Failed to regenerate secret:', e);
+    appendLog({
+      timestamp: '', level: 'ERROR', message: `Couldn't make a new secret: ${e}`, source: 'app',
+    });
   }
-});
+}
 
 // ─── Public host override ─────────────────────────────────────────────────────
 //
@@ -631,20 +715,26 @@ document.getElementById('public-host-enable').addEventListener('change', () => {
 });
 
 // ─── D-Wave section toggle ───────────────────────────────────────────────────
-document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
-  const section = document.getElementById('qpu-section');
+function setQpuOpen(open) {
+  document.getElementById('qpu-section').style.display = open ? 'block' : 'none';
   const btn = document.getElementById('btn-qpu-toggle');
-  const isVisible = section.style.display !== 'none';
-  section.style.display = isVisible ? 'none' : 'block';
-  btn.textContent = isVisible
-    ? 'Configure D-Wave Access'
-    : 'Hide D-Wave Configuration';
+  btn.textContent = open ? 'Hide D-Wave settings' : 'Set up D-Wave access';
+  btn.setAttribute('aria-expanded', String(open));
+}
+document.getElementById('btn-qpu-toggle').addEventListener('click', () => {
+  setQpuOpen(document.getElementById('qpu-section').style.display === 'none');
 });
 
 // ─── GPU utilization slider ──────────────────────────────────────────────────
+function paintRange(input) {
+  const min = Number(input.min) || 0;
+  const max = Number(input.max) || 100;
+  input.style.setProperty('--p', `${((Number(input.value) - min) / (max - min)) * 100}%`);
+}
 document.getElementById('gpu-utilization').addEventListener('input', () => {
-  const val = document.getElementById('gpu-utilization').value;
-  document.getElementById('gpu-util-display').textContent = `${val}%`;
+  const input = document.getElementById('gpu-utilization');
+  document.getElementById('gpu-util-display').textContent = `${input.value}%`;
+  paintRange(input);
 });
 
 // ─── Collect form → NodeConfig ────────────────────────────────────────────────
@@ -792,6 +882,7 @@ function populateGpuTuning(c) {
   const savedUtil = isMetal ? (metalCfg.utilization ?? 100) : (gpuCfg?.utilization ?? 80);
   document.getElementById('gpu-utilization').value = savedUtil;
   document.getElementById('gpu-util-display').textContent = `${savedUtil}%`;
+  paintRange(document.getElementById('gpu-utilization'));
   document.getElementById('gpu-yielding').checked = isMetal
     ? (metalCfg.yielding ?? true)
     : (gpuCfg?.yielding ?? false);
@@ -833,37 +924,22 @@ async function populateForm(settings) {
     settings.zerossl_api_key ?? '';
   updateStackUiVisibility();
 
-  // Auto-expand custom settings if any non-default values are set
-  const hasCustom =
-    publicHost || publicPort ||
-    c.log_level !== 'info' ||
-    (c.node_log ?? '') ||
-    (c.http_log ?? '');
-  if (hasCustom) {
-    document.getElementById('btn-custom-toggle').setAttribute('aria-expanded', 'true');
-    document.getElementById('custom-settings-section').style.display = '';
-  }
-
   // CPU Miner
   document.getElementById('cpu-enabled').checked = c.cpu_enabled ?? true;
   document.getElementById('num-cpus').value = c.num_cpus ?? 1;
+  paintSteppers();
   renderSolverPickers(c);
   updateCpuUiVisibility();
 
   populateGpuTuning(c);
 
   // D-Wave
+  // Always written, so Discard also clears fields that were never saved.
   const dw = c.dwave_config;
-  if (dw) {
-    document.getElementById('qpu-api-key').value = dw.token ?? '';
-    document.getElementById('qpu-budget').value = dw.budget ?? '';
-    document.getElementById('qpu-budget-reset-day').value = dw.budget_reset_day ?? 1;
-    if (dw.token) {
-      document.getElementById('qpu-section').style.display = 'block';
-      document.getElementById('btn-qpu-toggle').textContent =
-        'Hide D-Wave Configuration';
-    }
-  }
+  document.getElementById('qpu-api-key').value = dw?.token ?? '';
+  document.getElementById('qpu-budget').value = dw?.budget ?? '';
+  document.getElementById('qpu-budget-reset-day').value = dw?.budget_reset_day ?? 1;
+  if (dw?.token) setQpuOpen(true);
   // GPU device list rendered after list_gpu_devices call in init
 }
 
@@ -879,15 +955,16 @@ function updateStartStopState() {
     startBtn.disabled = true;
   } else if (pendingUpdate && running) {
     // Node running + update pending: btn-start becomes the apply action.
-    startBtn.textContent = 'Restart to Update';
+    startBtn.textContent = 'Restart to update';
     startBtn.disabled = !state.checksPassed;
   } else {
     // Stopped (with or without update) or running with no update: normal Start.
-    startBtn.textContent = state.starting ? 'Starting…' : 'Start Node';
+    if (state.starting) startBtn.textContent = 'Starting…';
+    else startBtn.textContent = state.startError ? 'Try again' : 'Start node';
     startBtn.disabled = !state.checksPassed || running || state.starting || state.stopping;
   }
 
-  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop Node';
+  stopBtn.textContent = state.stopping ? 'Stopping…' : 'Stop node';
   // Stop is gated on "is there anything to stop", not on `running`. `running`
   // tracks the *miner* only, so a partially started stack — validator and
   // dashboard up with no miner container — left Stop disabled while the
@@ -897,55 +974,116 @@ function updateStartStopState() {
     state.starting ||
     state.stopping ||
     state.updating;
-  document.getElementById('btn-apply').disabled =
+  const applyBtn = document.getElementById('btn-apply');
+  applyBtn.disabled =
     !state.checksPassed || state.starting || state.stopping || state.updating;
+  applyBtn.textContent = running ? 'Save and restart node' : 'Save and start node';
 }
 
 // ─── Status circle ────────────────────────────────────────────────────────────
+// The top-bar pill and the hero read the same state. Colour keeps one meaning:
+// green is a running node, red needs attention, neutral otherwise.
+const PILL_CLASS = {
+  running: 'c-ours',
+  degraded: 'c-alert',
+  partial: 'c-alert',
+  unhealthy: 'c-alert',
+  failed: 'c-alert',
+};
+function paintPill(stateStr, word) {
+  document.body.dataset.node = stateStr;
+  const pill = document.getElementById('status-pill');
+  const dot = document.getElementById('status-pill-dot');
+  const text = document.getElementById('status-pill-text');
+  if (!pill || !dot || !text) return;
+  pill.className = `pill ${PILL_CLASS[stateStr] || ''}`;
+  dot.className = `dot${stateStr === 'stopped' ? ' hollow' : ''}`;
+  text.textContent = word;
+}
+
+// A start that failed because a port is taken: the fix is a different port.
+const PORT_IN_USE = /address already in use|port is already allocated|bind: /i;
+
+// The hero's words for each state. `cls` colours the word; `task` gives the
+// list below the room when the node needs something from you.
+function heroFor(stateStr) {
+  switch (stateStr) {
+    case 'running':
+      return { word: 'Running', cls: 'status-running', say: 'Your node is running and mining.' };
+    case 'syncing':
+      // Not a fault: replaying the chain is expected work on a fresh node.
+      // The bar below carries the actual progress.
+      return { word: 'Syncing', cls: 'status-syncing', say: syncSubtext() };
+    case 'warming':
+      return {
+        word: 'Warming up', cls: 'status-syncing',
+        say: 'Your node is mining. The chain hasn\'t recorded this node\'s first round yet.',
+      };
+    case 'degraded':
+      return {
+        word: 'Degraded', cls: 'status-degraded', logs: true,
+        say: 'Your node is running, but one health check needs attention. '
+          + 'The Node health panel names it.',
+      };
+    case 'partial':
+      // The stack is up but not mining. Name the running services so the
+      // state is actionable rather than just "not stopped".
+      return { word: 'Not mining', cls: 'status-degraded', say: partialSubtext(), logs: true };
+    case 'unhealthy':
+      return {
+        word: 'Unhealthy', cls: 'status-unhealthy', logs: true,
+        say: 'Health checks are failing. The logs show why.',
+      };
+    case 'starting':
+      return {
+        word: 'Starting', cls: 'status-starting',
+        say: 'Getting the miner, validator and dashboard ready. '
+          + 'The first start downloads them, which takes a few minutes.',
+      };
+    case 'failed':
+      return {
+        word: 'Didn\'t start', cls: 'status-failed', logs: true, task: true,
+        say: 'The node stopped during start-up with this error:',
+      };
+    default: {
+      const n = state.requiredFailing || 0;
+      return {
+        word: 'Stopped', cls: 'status-stopped', task: true,
+        say: n
+          ? `${n === 1 ? 'One check needs' : `${n} checks need`} your attention `
+            + 'before the node can start.'
+          : 'Your node is off.',
+      };
+    }
+  }
+}
+
 function setStatus(stateStr) {
   const dot = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
   const sub = document.getElementById('status-subtext');
+  const h = heroFor(stateStr);
 
-  dot.className = 'status-dot';
-  text.className = 'status-text';
+  dot.className = `status-dot ${h.cls}`;
+  text.className = `status-text ${h.cls}`;
+  text.textContent = h.word;
+  sub.textContent = h.say;
+  document.querySelector('.hero').classList.toggle('task', !!h.task);
 
-  if (stateStr === 'running') {
-    dot.classList.add('status-running', 'active');
-    text.classList.add('status-running');
-    text.textContent = 'RUNNING';
-    sub.textContent = 'Node is running';
-  } else if (stateStr === 'syncing') {
-    // Blue, not amber: replaying the chain is expected work on a fresh node,
-    // not a fault. The bar below carries the actual progress.
-    dot.classList.add('status-syncing', 'active');
-    text.classList.add('status-syncing');
-    text.textContent = 'SYNCING';
-    sub.textContent = syncSubtext();
-  } else if (stateStr === 'degraded') {
-    dot.classList.add('status-degraded', 'active');
-    text.classList.add('status-degraded');
-    text.textContent = 'DEGRADED';
-    sub.textContent = 'Running, but some stack services are down or unhealthy';
-  } else if (stateStr === 'partial') {
-    // Amber, like degraded: the stack is up but not mining. Name the running
-    // services so the state is actionable rather than just "not stopped".
-    dot.classList.add('status-degraded', 'active');
-    text.classList.add('status-degraded');
-    text.textContent = 'PARTIAL';
-    sub.textContent = partialSubtext();
-  } else if (stateStr === 'unhealthy') {
-    dot.classList.add('status-unhealthy', 'active');
-    text.classList.add('status-unhealthy');
-    text.textContent = 'UNHEALTHY';
-    sub.textContent = 'Node health checks failing';
-  } else {
-    dot.classList.add('status-stopped');
-    text.classList.add('status-stopped');
-    text.textContent = 'STOPPED';
-    sub.textContent = 'Node not running';
-  }
+  const err = document.getElementById('start-error');
+  const failed = stateStr === 'failed';
+  err.hidden = !failed;
+  err.textContent = failed ? state.startError : '';
+  // A port clash gets its fix as the primary action, and Start steps back to Try again.
+  const portClash = failed && PORT_IN_USE.test(state.startError || '');
+  document.getElementById('btn-change-port').hidden = !portClash;
+  document.getElementById('btn-start').classList.toggle('btn-primary', !portClash);
+  document.getElementById('btn-start').classList.toggle('btn-ghost', portClash);
+  document.getElementById('btn-hero-logs').hidden = !h.logs;
+
   renderSyncProgress(stateStr);
+  paintPill(stateStr, h.word);
+  updateStartStopState();
 }
 
 // ─── Checklist render (FSM) ──────────────────────────────────────────────────
@@ -987,6 +1125,8 @@ function renderChecklistItem(item) {
   const li = document.createElement('li');
   li.className = 'checklist-item';
   li.dataset.id = item.id;
+  const failing = item.state === 'fail' || item.state === 'warn';
+  li.classList.toggle('needs-you', failing);
 
   const icon = document.createElement('span');
   icon.className = `check-icon state-${item.state}`;
@@ -995,7 +1135,12 @@ function renderChecklistItem(item) {
   const label = document.createElement('span');
   label.className = 'check-label';
   label.textContent = item.label;
-  if (item.detail) label.title = item.detail;
+  if (item.detail) {
+    const detail = document.createElement('span');
+    detail.className = 'check-detail';
+    detail.textContent = item.detail;
+    label.appendChild(detail);
+  }
 
   const actions = document.createElement('div');
   actions.className = 'check-actions';
@@ -1004,8 +1149,10 @@ function renderChecklistItem(item) {
   recheckBtn.type = 'button';
   recheckBtn.className = 'btn btn-sm btn-secondary check-action';
   recheckBtn.dataset.action = 'recheck';
-  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Retry';
+  recheckBtn.textContent = item.state === 'running' ? 'Checking…' : 'Check again';
   recheckBtn.disabled = item.state === 'running';
+  // Every check keeps its own recheck; on a passing row it shows on hover or focus.
+  if (item.state === 'pass' || item.state === 'skip') recheckBtn.classList.add('quiet');
   actions.appendChild(recheckBtn);
 
   // For checks whose fix is folded into Retry (Retry runs the fix, then
@@ -1021,6 +1168,16 @@ function renderChecklistItem(item) {
     fixBtn.dataset.action = 'fix';
     fixBtn.textContent = FIX_LABELS[item.fixable.kind] || 'Fix';
     actions.appendChild(fixBtn);
+  }
+
+  // A port that can't be reached from outside: the router steps, one click away.
+  if (failing && PORT_CHECKS.has(item.id)) {
+    const help = document.createElement('button');
+    help.type = 'button';
+    help.className = 'btn btn-sm btn-secondary check-action';
+    help.dataset.action = 'portfwd';
+    help.textContent = 'How to forward a port';
+    actions.prepend(help);
   }
 
   li.append(icon, label, actions);
@@ -1047,14 +1204,14 @@ function defaultLabel(id) {
   const port = state.settings?.node_config?.port ?? 20049;
   const validatorPort = state.settings?.node_config?.validator_port ?? 30333;
   switch (id) {
-    case 'docker':            return 'Docker installed & running';
+    case 'docker':            return 'Docker installed and running';
     case 'docker-compose':    return 'Docker Compose v2 available';
     case 'wsl':               return 'WSL installed with distro';
     case 'binary':            return 'Native miner binary available';
     case 'secret':            return 'Node secret configured';
     case 'ip':                return 'Public IP reachable';
     case 'hostname':          return 'Hostname accessible to internet';
-    case 'port':              return `Public API port ${port} — press Retry to test`;
+    case 'port':              return `Public API port ${port}. Press Check again to test it`;
     case 'port-validator':    return `Validator P2P port ${validatorPort} reachable`;
     case 'dwave-key':         return 'D-Wave API token configured';
     default:                  return id;
@@ -1074,6 +1231,7 @@ function updateChecklistSummary(visibleIds) {
   ).length;
 
   state.checksPassed = allRun && requiredFailing === 0;
+  state.requiredFailing = allRun ? requiredFailing : 0;
 
   const summary = document.getElementById('checklist-summary');
   const checklistEl = document.getElementById('checklist');
@@ -1102,6 +1260,7 @@ function updateChecklistSummary(visibleIds) {
   }
 
   updateStartStopState();
+  refreshStatusPill();
 }
 
 function mergeCheckUpdate(item) {
@@ -1167,6 +1326,8 @@ document.getElementById('checklist').addEventListener('click', (e) => {
     }
   } else if (btn.dataset.action === 'fix') {
     runFix(id);
+  } else if (btn.dataset.action === 'portfwd') {
+    showPortForwardHelp();
   }
 });
 
@@ -1270,7 +1431,7 @@ function updateLogMatchCount(visibleCount, totalCount) {
     el.textContent = '';
     return;
   }
-  el.textContent = `${state.logVisibleCount} / ${total}`;
+  el.textContent = `${state.logVisibleCount} of ${total}`;
 }
 
 function updateLogFilterClearButton() {
@@ -1342,7 +1503,7 @@ function renderLogOutput() {
   if (visible.length === 0 && total > 0) {
     const empty = document.createElement('p');
     empty.className = 'log-empty-filter';
-    empty.textContent = 'No lines match the current filter';
+    empty.textContent = 'No lines match this filter';
     frag.appendChild(empty);
   } else {
     for (const entry of visible) {
@@ -1397,6 +1558,8 @@ function setLogTextFilter(value, { immediate = false } = {}) {
 function appendLog(entry) {
   const normalized = normalizeLogEntry(entry);
   const src = normalized.source;
+  const last = document.getElementById('log-last');
+  if (last) last.textContent = `${src.toUpperCase()}  ${normalized.message}`;
   if (!state.logBuffers[src]) {
     state.logBuffers[src] = [];
     // Default: all sources visible.
@@ -1475,7 +1638,7 @@ function appendLog(entry) {
   }
 }
 
-document.getElementById('btn-copy-log').addEventListener('click', () => {
+document.getElementById('btn-copy-log').addEventListener('click', (e) => {
   // Export exactly the lines currently visible under both filters.
   const text = visibleLogEntries()
     .map((e) => {
@@ -1483,7 +1646,8 @@ document.getElementById('btn-copy-log').addEventListener('click', () => {
       return `${ts}[${e.source}] ${e.level} ${e.message}`;
     })
     .join('\n');
-  navigator.clipboard.writeText(text).catch(console.error);
+  if (!text) return flashLabel(e.currentTarget, 'Nothing to copy');
+  copyText(text, e.currentTarget);
 });
 
 document.getElementById('btn-clear-log').addEventListener('click', () => {
@@ -1666,28 +1830,32 @@ function isDockerMode() {
   return (state.settings?.run_mode ?? 'docker') === 'docker';
 }
 
-function collapseConfig() {
-  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'false');
-  document.getElementById('config-section').style.display = 'none';
-}
-
-function expandConfig() {
-  document.getElementById('btn-config-toggle').setAttribute('aria-expanded', 'true');
-  document.getElementById('config-section').style.display = '';
+// A success message in the top bar clears itself after a few seconds, unless
+// something newer has replaced it. Errors stay until the next action.
+function flashStatus(el, text, ms = 4000) {
+  el.textContent = text;
+  setTimeout(() => {
+    if (el.textContent === text) el.textContent = '';
+  }, ms);
 }
 
 async function runRestartToUpdate() {
   const applyStatus = document.getElementById('apply-status');
   state.updating = true;
   updateStartStopState();
+  refreshStatusPill();
   applyStatus.textContent = 'Updating…';
-  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting node to apply update…' });
+  appendLog({ timestamp: '', level: 'INFO', message: 'Restarting the node to install the update…' });
   try {
-    if (state.settings) { applyFormToSettings(); await invoke('update_settings', { settings: state.settings }); }
+    if (state.settings) {
+      applyFormToSettings();
+      await invoke('update_settings', { settings: state.settings });
+      setSettingsDirty(false);
+    }
     await invoke('restart_to_update');
     state.updateAvailable = null;
     document.getElementById('update-badge').style.display = 'none';
-    applyStatus.textContent = 'Node updated and started.';
+    flashStatus(applyStatus, 'The node is updated and running again.');
     await pollStatus();
   } catch (e) {
     // Keep the update flagged so the button stays actionable.
@@ -1696,6 +1864,7 @@ async function runRestartToUpdate() {
   } finally {
     state.updating = false;
     updateStartStopState();
+    refreshStatusPill();
   }
 }
 
@@ -1708,7 +1877,6 @@ async function startNode() {
     await invoke('start_stack');
     await invoke('start_native_node');
   }
-  collapseConfig();
 }
 
 async function stopNode() {
@@ -1729,22 +1897,26 @@ document.getElementById('btn-start').addEventListener('click', async () => {
   }
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
-  updateStartStopState();
+  state.startError = null;
+  refreshStatusPill();
   applyStatus.textContent = 'Starting\u2026';
   appendLog({ timestamp: '', level: 'INFO', message: 'Starting node manager stack…' });
   try {
     if (!state.settings) throw new Error('settings are not loaded yet');
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
+    setSettingsDirty(false);
     await startNode();
-    applyStatus.textContent = 'Node started.';
+    flashStatus(applyStatus, 'Node started.');
     await pollStatus();
   } catch (e) {
-    applyStatus.textContent = `Error: ${e}`;
+    state.startError = String(e);
+    applyStatus.textContent = '';
     appendLog({ timestamp: '', level: 'ERROR', message: `Start failed: ${e}` });
   } finally {
     state.starting = false;
-    updateStartStopState();
+    refreshStatusPill();
+    showStartError(applyStatus);
   }
 });
 
@@ -1758,10 +1930,10 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
     state.containerRunning = false;
     state.nativeRunning = false;
     state.health = null;
+    state.startError = null;
     setStatus('stopped');
     updateStartStopState();
-    expandConfig();
-    applyStatus.textContent = 'Node stopped.';
+    flashStatus(applyStatus, 'Node stopped.');
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
     appendLog({ timestamp: '', level: 'ERROR', message: `Stop failed: ${e}` });
@@ -1775,12 +1947,14 @@ document.getElementById('btn-stop').addEventListener('click', async () => {
 document.getElementById('btn-apply').addEventListener('click', async () => {
   const applyStatus = document.getElementById('apply-status');
   state.starting = true;
+  state.startError = null;
   updateStartStopState();
   applyStatus.textContent = 'Applying\u2026';
   try {
     if (!state.settings) throw new Error('settings are not loaded yet');
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
+    setSettingsDirty(false);
     const running = isDockerMode() ? state.containerRunning : state.nativeRunning;
     if (running) {
       applyStatus.textContent = 'Restarting\u2026';
@@ -1788,17 +1962,19 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     }
     applyStatus.textContent = running ? 'Restarting\u2026' : 'Starting\u2026';
     await startNode();
-    applyStatus.textContent = 'Node running.';
+    flashStatus(applyStatus, 'Node running.');
     await pollStatus();
     setTimeout(() => {
       applyStatus.textContent = '';
     }, 3000);
   } catch (e) {
-    applyStatus.textContent = `Error: ${e}`;
+    state.startError = String(e);
+    applyStatus.textContent = '';
     appendLog({ timestamp: '', level: 'ERROR', message: `Apply failed: ${e}` });
   } finally {
     state.starting = false;
-    updateStartStopState();
+    refreshStatusPill();
+    showStartError(applyStatus);
   }
 });
 
@@ -1810,7 +1986,11 @@ document.getElementById('btn-save').addEventListener('click', async () => {
     applyFormToSettings();
     await invoke('update_settings', { settings: state.settings });
     applyStatus.textContent = 'Settings saved.';
-    setTimeout(() => { applyStatus.textContent = ''; }, 3000);
+    setSettingsDirty(false);
+    // Clear only this note, never a message a later action put there.
+    setTimeout(() => {
+      if (applyStatus.textContent === 'Settings saved.') applyStatus.textContent = '';
+    }, 3000);
   } catch (e) {
     applyStatus.textContent = `Error: ${e}`;
   }
@@ -1880,8 +2060,8 @@ async function renderSolverPicker(backend, selected) {
   }
 
   const label = (s) => {
-    const track = s.track && s.track !== 'unknown' ? ` — ${s.track}` : '';
-    return s.algorithm ? `${s.binary} — ${s.algorithm}${track}` : `${s.binary}${track}`;
+    const track = s.track && s.track !== 'unknown' ? `, ${s.track}` : '';
+    return s.algorithm ? `${s.binary}, ${s.algorithm}${track}` : `${s.binary}${track}`;
   };
 
   // Option text is built with textContent below; nothing here parses HTML.
@@ -1924,10 +2104,10 @@ function renderSolverPickers(config) {
 // were not readable this poll — say so rather than showing a stale bar.
 function syncSubtext() {
   const s = state.health?.sync;
-  if (!s) return 'Validator is catching up to the chain';
+  if (!s) return 'The validator is catching up with the chain';
   return `Catching up: block ${s.current_block.toLocaleString()} of ${
     s.highest_block.toLocaleString()
-  } — ${s.behind.toLocaleString()} behind`;
+  }, ${s.behind.toLocaleString()} behind.`;
 }
 
 // Paint the initial-sync bar. Hidden unless the pill is SYNCING and the monitor
@@ -1952,6 +2132,8 @@ function renderSyncProgress(stateStr) {
 // containers aren't reachable at all — the miner alone is degraded, not fine.
 function statusFromStack(minerRunning) {
   if (!minerRunning) {
+    if (state.starting || state.updating) return 'starting';
+    if (state.startError) return 'failed';
     // The miner is down, but support services (validator, dashboard) can
     // still be up — a partially started stack, which is what
     // you get after a miner crash, a profile switch, or a Start that only
@@ -1961,17 +2143,39 @@ function statusFromStack(minerRunning) {
   }
   // Mid-Start/Stop the services settle one at a time; don't flash DEGRADED
   // while the transition is still in flight.
-  if (state.starting || state.stopping) return 'running';
+  if (state.starting || state.stopping || state.updating) return 'running';
   // When the health monitor has reported, use its verdict directly so the
   // pill reflects the three-dimensional check (infra + chain + participation).
-  if (state.health?.overall) return state.health.overall;
+  if (state.health?.overall) {
+    return state.health.overall === 'degraded' && onlyWarmingUp(state.health)
+      ? 'warming'
+      : state.health.overall;
+  }
   const overall = state.stack?.overall ?? 'stopped';
   return overall === 'running' ? 'running' : 'degraded';
+}
+
+// Right after a start the miner is fine but has no participation marker on
+// chain yet. Health calls that Warn, which rolls up to degraded; the hero
+// shouldn't tell someone their services are failing when they're warming up.
+function onlyWarmingUp(h) {
+  return h.infra?.state === 'ok' && h.chain?.state === 'ok'
+    && h.participation?.state === 'warn'
+    && /^warming up/.test(h.participation.detail || '');
 }
 
 // Re-paint the status pill from current state without a full poll round-trip.
 // Called by renderHealth() so an inbound health-changed event immediately
 // updates the pill without waiting for the next 10 s pollStatus tick.
+// A failed start or apply: the hero shows the error when the node is down.
+// If it is still running (say the new settings were rejected before the
+// restart), the error stays in the top bar instead, where polling won't clear it.
+function showStartError(applyStatus) {
+  if (!state.startError) return;
+  const heroShowsIt = document.body.dataset.node === 'failed';
+  applyStatus.textContent = heroShowsIt ? '' : `Error: ${state.startError}`;
+}
+
 function refreshStatusPill() {
   const minerRunning = state.containerRunning || state.nativeRunning;
   setStatus(statusFromStack(minerRunning));
@@ -1992,11 +2196,13 @@ async function pollStatus() {
     if (isDockerMode()) {
       state.containerRunning = stackRunningInMode();
       state.nativeRunning = false;
+      if (state.containerRunning) state.startError = null;
       setStatus(statusFromStack(state.containerRunning));
     } else {
       const status = await invoke('get_native_node_status');
       state.nativeRunning = status.running;
       state.containerRunning = false;
+      if (status.running) state.startError = null;
       setStatus(statusFromStack(status.running));
     }
   } catch {
@@ -2024,8 +2230,10 @@ function renderHealth(report) {
   const paint = (id, dim) => {
     const el = document.getElementById(id);
     if (!el || !dim) return;
-    el.textContent = dim.state + (dim.detail ? ' — ' + dim.detail : '');
+    el.textContent = dim.state;
     el.dataset.state = dim.state;
+    const detail = document.getElementById(`${id}-detail`);
+    if (detail) detail.textContent = dim.detail || '';
     el.style.color = HEALTH_STATE_COLOR[dim.state] ?? 'var(--text-faint)';
   };
   paint('health-infra', report.infra);
@@ -2080,7 +2288,7 @@ async function setupListeners() {
 
   // Update notifications
   await listen('image-update-available', () => {
-    appendLog({ timestamp: '', level: 'INFO', message: 'New Docker image available. Restart to update.' });
+    appendLog({ timestamp: '', level: 'INFO', message: 'A new Docker image is ready. Restart to install it.' });
     state.updateAvailable = { kind: 'image' };
     document.getElementById('update-badge').style.display = '';
     updateStartStopState();
@@ -2107,7 +2315,9 @@ async function setupListeners() {
     const { downloaded, total, done } = event.payload;
     const statusEl = document.getElementById('apply-status');
     if (done) {
-      if (statusEl) statusEl.textContent = 'Installing native miner\u2026';
+      // done arrives after the install has finished, so clear the progress text
+      // instead of leaving "Installing" up until the next status message.
+      if (statusEl && /native miner/.test(statusEl.textContent)) statusEl.textContent = '';
     } else if (total) {
       const pct = Math.round((downloaded / total) * 100);
       if (statusEl) statusEl.textContent = `Downloading native miner: ${pct}%`;
@@ -2121,12 +2331,19 @@ async function setupListeners() {
 }
 
 // ─── Version refresh ─────────────────────────────────────────────────────────
+// The top bar and Settings › About show the same version text.
+function showVersion(ver, nodeVer) {
+  const label = nodeVer ? `v${ver} (node ${nodeVer})` : `v${ver}`;
+  document.getElementById('app-version').childNodes[0].textContent = `${label} `;
+  const about = document.getElementById('about-version');
+  if (about) about.textContent = label;
+}
+
 async function refreshNodeVersion() {
   try {
     const ver = await invoke('get_app_version');
     const nodeVer = await invoke('get_node_version').catch(() => null);
-    const label = nodeVer ? `v${ver} (node ${nodeVer})` : `v${ver}`;
-    document.getElementById('app-version').childNodes[0].textContent = `${label} `;
+    showVersion(ver, nodeVer);
   } catch { /* ignore */ }
 }
 
@@ -2146,7 +2363,7 @@ document.getElementById('btn-check-updates')?.addEventListener('click', async ()
     let level = 'INFO';
     if (status === 'check_failed') level = 'WARN';
     const message = (outcome && outcome.message)
-      || (status === 'up_to_date' ? 'You are up to date.' : 'Update check finished.');
+      || (status === 'up_to_date' ? 'You\'re up to date.' : 'Done checking for updates.');
     appendLog({ timestamp: '', level, message, source: 'app' });
   } catch (e) {
     appendLog({
@@ -2220,8 +2437,14 @@ async function checkFirstBoot() {
         resolve();
       } catch (e) {
         input.style.borderColor = 'var(--error)';
-        input.insertAdjacentHTML('afterend',
-          `<div style="color:var(--error);font-size:12px;margin-top:4px;">${e}</div>`);
+        let err = document.getElementById('first-boot-error');
+        if (!err) {
+          err = document.createElement('div');
+          err.id = 'first-boot-error';
+          err.className = 'first-boot-error';
+          input.insertAdjacentElement('afterend', err);
+        }
+        err.textContent = String(e);
       }
     });
   });
@@ -2236,6 +2459,194 @@ document.addEventListener('click', (e) => {
     e.preventDefault();
     openUrl(href);
   }
+});
+
+// ─── Theme ────────────────────────────────────────────────────────────────────
+// Dark by default. The top-bar button or Settings › Display can pick Light, or
+// System to follow the OS. The pick lives in localStorage (a per-machine look,
+// not a node setting); index.html applies it before the first paint.
+const systemLight = window.matchMedia('(prefers-color-scheme: light)');
+function storedTheme() {
+  try { return localStorage.getItem('theme'); } catch { return null; }
+}
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t === 'light' || t === 'dark') return t;
+  return systemLight.matches ? 'light' : 'dark';
+}
+function setTheme(pick) {
+  if (pick === 'light' || pick === 'dark') document.documentElement.dataset.theme = pick;
+  else delete document.documentElement.dataset.theme;
+  try {
+    localStorage.setItem('theme', pick === 'light' || pick === 'dark' ? pick : 'system');
+  } catch { /* storage blocked: the pick lasts this session */ }
+  paintThemeControls();
+}
+function paintThemeControls() {
+  const next = currentTheme() === 'light' ? 'dark' : 'light';
+  const btn = document.getElementById('btn-theme');
+  btn.title = `Switch to ${next}`;
+  btn.setAttribute('aria-label', `Switch to ${next}`);
+  const pick = document.documentElement.dataset.theme || 'system';
+  document.querySelectorAll('[data-theme-pick]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.themePick === pick));
+  });
+}
+document.getElementById('btn-theme').addEventListener('click', () => {
+  setTheme(currentTheme() === 'light' ? 'dark' : 'light');
+});
+document.getElementById('theme-choice').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-theme-pick]');
+  if (b) setTheme(b.dataset.themePick);
+});
+systemLight.addEventListener('change', paintThemeControls);
+if (storedTheme() === 'system') delete document.documentElement.dataset.theme;
+else document.documentElement.dataset.theme = storedTheme() === 'light' ? 'light' : 'dark';
+paintThemeControls();
+
+// ─── Small UI helpers ─────────────────────────────────────────────────────────
+// Show a short result on a button, then put its label back.
+function flashLabel(btn, text) {
+  const was = btn.dataset.label || btn.textContent;
+  btn.dataset.label = was;
+  btn.textContent = text;
+  clearTimeout(btn._flash);
+  btn._flash = setTimeout(() => { btn.textContent = was; delete btn.dataset.label; }, 1800);
+}
+// Copy text and say on the button whether it worked. Success is only claimed
+// once the clipboard write resolves.
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    flashLabel(btn, 'Copied');
+  } catch (e) {
+    console.error('copy failed:', e);
+    flashLabel(btn, 'Copying failed');
+  }
+}
+function para(text) {
+  const p = document.createElement('p');
+  p.textContent = text;
+  return p;
+}
+
+// ─── Steppers ─────────────────────────────────────────────────────────────────
+// − and + beside a number field; the field stays the source of truth.
+function paintSteppers() {
+  document.querySelectorAll('.stepper').forEach((st) => {
+    const input = st.querySelector('input');
+    const v = Number(input.value);
+    st.querySelector('[data-step="-1"]').disabled = input.min !== '' && v <= Number(input.min);
+    st.querySelector('[data-step="1"]').disabled = input.max !== '' && v >= Number(input.max);
+  });
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('.stepper [data-step]');
+  if (!b || b.disabled) return;
+  const input = document.getElementById(b.dataset.for);
+  if (b.dataset.step === '1') input.stepUp(); else input.stepDown();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  paintSteppers();
+});
+document.addEventListener('input', (e) => { if (e.target.closest('.stepper')) paintSteppers(); });
+
+// ─── Dialog ───────────────────────────────────────────────────────────────────
+// One dialog element, filled per use. Built from DOM nodes, never innerHTML.
+let dialogReturnFocus = null;
+function openDialog({ title, body, actions, danger = false }) {
+  const scrim = document.getElementById('dlg-scrim');
+  const box = document.getElementById('dlg');
+  document.getElementById('dlg-title').textContent = title;
+  box.classList.toggle('danger-dlg', danger);
+  document.getElementById('dlg-body').replaceChildren(...body);
+  const acts = actions.map(({ label, cls, run }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `btn ${cls}`;
+    b.textContent = label;
+    b.addEventListener('click', () => { closeDialog(); if (run) run(); });
+    return b;
+  });
+  document.getElementById('dlg-acts').replaceChildren(...acts);
+  dialogReturnFocus = document.activeElement;
+  scrim.hidden = false;
+  document.getElementById('app').inert = true;
+  (acts[acts.length - 1] || box).focus();
+}
+function closeDialog() {
+  document.getElementById('dlg-scrim').hidden = true;
+  document.getElementById('app').inert = false;
+  if (dialogReturnFocus?.isConnected) dialogReturnFocus.focus();
+  dialogReturnFocus = null;
+}
+const dialogOpen = () => !document.getElementById('dlg-scrim').hidden;
+// Tab and Shift+Tab cycle inside the dialog (the app behind it is inert).
+document.getElementById('dlg').addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  const items = [...document.querySelectorAll('#dlg button, #dlg [href], #dlg input')];
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+document.getElementById('dlg-scrim').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeDialog();
+});
+
+// The router steps, with the ports this node actually uses.
+function showPortForwardHelp() {
+  const ports = [...PORT_CHECKS]
+    .filter((id) => ['fail', 'warn'].includes(state.checks.get(id)?.state))
+    .map((id) => (id === 'port'
+      ? state.settings?.node_config?.port ?? 20049
+      : state.settings?.node_config?.validator_port ?? 30333));
+  if (!ports.length) ports.push(state.settings?.node_config?.port ?? 20049);
+  const steps = [
+    'Open your router\'s admin page. It\'s usually at 192.168.1.1 or 192.168.0.1, '
+      + 'and the password is often printed on the router.',
+    'Find the port forwarding settings. Some routers call them Virtual server or NAT.',
+    ports.length > 1
+      ? `Add a rule that sends TCP port ${ports[0]} to this computer. `
+        + `Add a second rule for TCP port ${ports[1]}.`
+      : `Add a rule that sends TCP port ${ports[0]} to this computer.`,
+    'Save the rules, then click Check again.',
+  ];
+  const ol = document.createElement('ol');
+  ol.append(...steps.map((t) => {
+    const li = document.createElement('li');
+    li.textContent = t;
+    return li;
+  }));
+  openDialog({
+    title: 'Forward a port on your router',
+    body: [ol],
+    actions: [{ label: 'Done', cls: 'btn-primary' }],
+  });
+}
+
+// ─── Hero actions ─────────────────────────────────────────────────────────────
+document.getElementById('btn-hero-logs').addEventListener('click', () => {
+  setLogsOpen(!document.getElementById('log-drawer').classList.contains('expanded'));
+});
+// Ports live under Advanced.
+document.getElementById('btn-change-port').addEventListener('click', () => {
+  activateTab('settings');
+  showSettingsSection('advanced');
+});
+
+// ─── Escape ───────────────────────────────────────────────────────────────────
+// Closes the topmost layer: the dialog, then the update offer, then the logs.
+// The log filter handles its own Escape (it clears the text) and stops it there.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const tooltip = document.getElementById('update-tooltip');
+  if (dialogOpen()) closeDialog();
+  else if (tooltip && tooltip.style.display !== 'none') tooltip.style.display = 'none';
+  else if (document.getElementById('log-drawer').classList.contains('expanded')) setLogsOpen(false);
+  else return;
+  e.preventDefault();
 });
 
 // ─── Initialize ───────────────────────────────────────────────────────────────
@@ -2269,15 +2680,9 @@ async function init() {
   // Display app version
   invoke('get_app_version')
     .then((ver) => {
-      document.getElementById('app-version').childNodes[0].textContent =
-        `v${ver} `;
+      showVersion(ver, null);
       invoke('get_node_version')
-        .then((nodeVer) => {
-          if (nodeVer) {
-            document.getElementById('app-version').childNodes[0]
-              .textContent = `v${ver} (node ${nodeVer}) `;
-          }
-        })
+        .then((nodeVer) => { if (nodeVer) showVersion(ver, nodeVer); })
         .catch(() => {});
     })
     .catch(() => {});
@@ -2347,7 +2752,6 @@ async function init() {
     // what feeds those chips when the miner container is absent.)
     const anythingRunning = minerRunning || anyStackServiceRunning();
     if (anythingRunning) {
-      collapseConfig();
       if (isDockerMode()) {
         invoke('start_log_stream').catch(console.error);
       } else if (minerRunning) {
