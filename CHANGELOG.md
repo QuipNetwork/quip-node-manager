@@ -149,6 +149,7 @@ name, chain ID, bootnodes, and faucet do not change.
   `dashboard-data-119`. Delete them yourself to recover the disk space.
 - The miner funds and registers its account again on the new chain, through
   the faucet, on its first start.
+- The embedded stack is nodes.quip.network v0.5.0.
 
 ### The desktop app has a new design and a new icon
 
