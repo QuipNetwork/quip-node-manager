@@ -128,12 +128,15 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## v0.4.0-rc2
+## v0.4.0
+
+This stable release contains the changes from `v0.4.0-rc1` and
+`v0.4.0-rc2`.
 
 ### The stack joins the Aglais relaunch on runtime 120
 
-Aglais restarted from a fresh genesis on runtime specification 120. The chain name,
-chain ID, bootnodes, and faucet do not change.
+Aglais restarted from a fresh genesis on runtime specification 120. The chain
+name, chain ID, bootnodes, and faucet do not change.
 
 - The manager ships the new chain specification and requires validator
   `v0.5.0-rc2` or later. The validator has no stable release at that version
@@ -147,13 +150,9 @@ chain ID, bootnodes, and faucet do not change.
 - The miner funds and registers its account again on the new chain, through
   the faucet, on its first start.
 
----
-
-## v0.4.0-rc1
-
 ### The desktop app has a new design and a new icon
 
-This release changes only the desktop window and the app icons. The Rust
+The redesign changes only the desktop window and the app icons. The Rust
 code, the terminal interface that `--cli` opens, the node configuration, and
 the Docker and Native stacks do not change.
 
