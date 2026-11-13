@@ -128,6 +128,27 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.4.0-rc2
+
+### The stack joins the Aglais relaunch on runtime 120
+
+Aglais restarted from a fresh genesis on runtime specification 120. The chain name,
+chain ID, bootnodes, and faucet do not change.
+
+- The manager ships the new chain specification and requires validator
+  `v0.5.0-rc2` or later. The validator has no stable release at that version
+  or later, so both channels resolve to `v0.5.0-rc2` today.
+- The validator keeps its database in `data/aglais-120-chain-db` and the
+  dashboard keeps its index in `dashboard-data-120`. The old chain cannot
+  serve the new genesis, so the next Start syncs the validator and rebuilds
+  the dashboard index from block 0.
+- The manager does not delete `data/aglais-119-chain-db` or
+  `dashboard-data-119`. Delete them yourself to recover the disk space.
+- The miner funds and registers its account again on the new chain, through
+  the faucet, on its first start.
+
+---
+
 ## v0.4.0-rc1
 
 ### The desktop app has a new design and a new icon

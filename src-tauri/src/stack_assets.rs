@@ -41,7 +41,7 @@ use std::path::PathBuf;
 pub(crate) const COMPOSE_YML: &str =
     include_str!("../../vendor/nodes.quip.network/docker-compose.yml");
 
-/// Aglais chain spec — the live Quip test network (runtime spec 119, relaunched
+/// Aglais chain spec — the live Quip test network (runtime spec 120, relaunched
 /// from a fresh genesis). Replaces the retired `quip-testnet.json`, which
 /// upstream deleted at the first Aglais launch.
 const CHAIN_SPEC: &str =
@@ -51,11 +51,11 @@ const CHAIN_SPEC: &str =
 /// genesis. Every Aglais relaunch keeps the chain id `quip_testnet`, so a
 /// reused directory would hand the old chain's database to the new spec.
 /// Older directories stay in place for the operator to delete.
-pub(crate) const VALIDATOR_DB_DIR: &str = "data/aglais-119-chain-db";
+pub(crate) const VALIDATOR_DB_DIR: &str = "data/aglais-120-chain-db";
 
 /// The dashboard's data directory, relative to the data dir: one directory per
 /// genesis, because the dashboard index binds to the first genesis it sees.
-pub(crate) const DASHBOARD_DATA_DIR: &str = "dashboard-data-119";
+pub(crate) const DASHBOARD_DATA_DIR: &str = "dashboard-data-120";
 
 /// Oldest validator image that can run `CHAIN_SPEC`.
 ///
@@ -69,9 +69,9 @@ pub(crate) const DASHBOARD_DATA_DIR: &str = "dashboard-data-119";
 /// Lives beside `CHAIN_SPEC` because the two move together: re-point the spec
 /// at a new network and this floor is what stops the old images coming with it.
 ///
-/// The spec-119 relaunch is a v0.4.0 chain spec export, so the floor is the
-/// first validator built for that runtime.
-pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.4.0";
+/// The spec-120 relaunch is built from the `v0.5.0-rc2` runtime, so the floor
+/// is the first validator built for that runtime.
+pub(crate) const MIN_VALIDATOR_TAG: &str = "v0.5.0-rc2";
 
 /// Oldest dashboard image that can run `COMPOSE_YML`.
 ///
