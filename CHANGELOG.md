@@ -128,6 +128,21 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.4.1-rc1
+
+### Dashboard log lines show plain text and their real level
+
+The dashboard writes colored log lines. The log pane showed the color codes
+as text, such as `[2m` and `[33m` around every field, and it labeled every
+dashboard warning `INFO`.
+
+- The manager removes color codes from every log line before the GUI log pane
+  or the `--cli` terminal interface shows it.
+- A dashboard line now shows its own level, one of `DEBUG`, `INFO`, `WARN`,
+  and `ERROR`, and its own timestamp.
+
+---
+
 ## v0.4.0
 
 This stable release contains the changes from `v0.4.0-rc1` and
