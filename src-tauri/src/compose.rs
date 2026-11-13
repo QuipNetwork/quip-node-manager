@@ -2136,28 +2136,28 @@ mod tests {
     /// The pre-Aglais validator is the image the bug report saw crash-looping:
     /// `v0.2.2` was the newest *stable* tag in the validator registry, so before
     /// the floor existed the Release channel resolved straight to it while the
-    /// compose file mounted the Aglais spec regardless. The spec-119 relaunch
-    /// moved the floor again, past every v0.3 build.
+    /// compose file mounted the Aglais spec regardless. The spec-120 relaunch
+    /// moved the floor again, past every v0.4 build and the first v0.5 rc.
     #[test]
-    fn validator_floor_rejects_tags_before_the_spec_119_genesis() {
+    fn validator_floor_rejects_tags_before_the_spec_120_genesis() {
         let floor = Some(crate::stack_assets::MIN_VALIDATOR_TAG);
         for tag in [
             "v0.1.9",
             "v0.2.2",
-            "v0.2.2-rc7",
-            "v0.3.0-rc1",
             "v0.3.2",
-            "v0.4.0-rc1",
+            "v0.4.0",
+            "v0.4.1",
+            "v0.5.0-rc1",
         ] {
             assert!(
                 !tag_meets_floor(tag, floor),
-                "{tag} predates the spec-119 genesis and must not be pinned"
+                "{tag} predates the spec-120 genesis and must not be pinned"
             );
         }
-        for tag in ["v0.4.0", "v0.4.1-rc1", "v0.4.1", "v0.5.0"] {
+        for tag in ["v0.5.0-rc2", "v0.5.0-rc3", "v0.5.0", "v0.5.1"] {
             assert!(
                 tag_meets_floor(tag, floor),
-                "{tag} can run the spec-119 Aglais spec"
+                "{tag} can run the spec-120 Aglais spec"
             );
         }
         // Registry noise (`latest`, `sha-…`) parses to (0,0,0,_) and drops out.
