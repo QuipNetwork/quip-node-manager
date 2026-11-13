@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use serde::Serialize;
+use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
@@ -90,6 +91,70 @@ impl LogStreamState {
     }
 }
 
+/// Remove ANSI escape sequences, such as the SGR colour codes `tracing` writes.
+///
+/// The dashboard logs with colour on, and the collector keeps control
+/// characters (`sanitize --no-ctrl-chars`), so the ESC bytes reach the merged
+/// file. The pane colours lines by level itself and would otherwise print
+/// `[2m…[0m` around every field.
+///
+/// A CSI sequence is `ESC [`, any parameter and intermediate bytes, then one
+/// final byte in `@`..=`~`. Any other ESC drops itself and the byte after it.
+/// A line with no ESC byte is returned borrowed and unchanged.
+fn strip_ansi(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            // Parameter and intermediate bytes end at the first final byte.
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Parse `tracing`'s default formatter output, after `strip_ansi`:
+/// `2026-11-13T20:36:33.840617Z  WARN target: message`. The level is padded to
+/// five characters, so INFO and WARN carry a leading space.
+///
+/// The target stays in the message, the way the Python branch keeps its module.
+fn parse_tracing_line(line: &str) -> Option<LogEntry> {
+    let (timestamp, rest) = line.split_once(' ')?;
+    // An RFC 3339 timestamp: a date, then `T`, then the time.
+    let looks_like_rfc3339 = timestamp.len() >= 20
+        && timestamp.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && timestamp.as_bytes()[10] == b'T';
+    if !looks_like_rfc3339 {
+        return None;
+    }
+    let (level, message) = rest.trim_start().split_once(' ')?;
+    let level = match level {
+        // The pane has no TRACE level; DEBUG is the nearest quieter one.
+        "TRACE" | "DEBUG" => "DEBUG",
+        "INFO" => "INFO",
+        "WARN" => "WARN",
+        "ERROR" => "ERROR",
+        _ => return None,
+    };
+    Some(LogEntry {
+        timestamp: timestamp.to_string(),
+        level: level.to_string(),
+        message: message.trim_start().to_string(),
+        source: default_log_source(),
+    })
+}
+
 /// Parse Caddy's console encoder output: tab-separated
 /// `ts<TAB>LEVEL<TAB>logger<TAB>message<TAB>{fields}`. The logger name and the
 /// field object are both optional, so everything past the level is kept as the
@@ -126,10 +191,17 @@ fn parse_caddy_console_line(line: &str) -> Option<LogEntry> {
 pub fn parse_log_line(line: &str) -> LogEntry {
     // Format: [file.py:123][node] 2026-01-01T12:00:00+00:00 LEVEL - message
     // Or Caddy console: ts<TAB>LEVEL<TAB>logger<TAB>message<TAB>{fields}
+    // Or tracing: 2026-01-01T12:00:00.000000Z  WARN target: message
     // Or Python: LEVEL:module:message
     // Otherwise: pass through verbatim.
+    // Every format can arrive wrapped in ANSI colour codes.
+    let stripped = strip_ansi(line);
+    let line = stripped.as_ref();
 
     if let Some(entry) = parse_caddy_console_line(line) {
+        return entry;
+    }
+    if let Some(entry) = parse_tracing_line(line) {
         return entry;
     }
 
@@ -803,6 +875,66 @@ mod tests {
             miner.message,
             "validators=ws://quip-validator:9944 dir=/data/logs"
         );
+    }
+
+    // ── ANSI colour and tracing lines ──────────────────────────────────────
+
+    /// A dashboard warning as the collector writes it. The dashboard logs
+    /// through `tracing`'s default formatter with colour on, and the
+    /// collector's `sanitize --no-ctrl-chars` keeps the ESC bytes, so before
+    /// this the pane showed `[2m…[0m` around every field and the line read as
+    /// INFO.
+    const MERGED_DASHBOARD_COLOURED: &str = "2026-11-13T20:36:33+00:00 quip-dashboard \
+        \x1b[2m2026-11-13T20:36:33.840617Z\x1b[0m \x1b[33m WARN\x1b[0m \
+        \x1b[2mquip_dashboard\x1b[0m\x1b[2m:\x1b[0m local miner status unavailable \
+        \x1b[3merror\x1b[0m\x1b[2m=\x1b[0mupstream unreachable: error sending request";
+
+    #[test]
+    fn merged_dashboard_line_drops_colour_and_keeps_the_level() {
+        let entry = entry_from_merged_line(MERGED_DASHBOARD_COLOURED);
+        assert_eq!(entry.source, "dashboard");
+        assert_eq!(entry.level, "WARN");
+        assert_eq!(entry.timestamp, "2026-11-13T20:36:33.840617Z");
+        assert_eq!(
+            entry.message,
+            "quip_dashboard: local miner status unavailable \
+             error=upstream unreachable: error sending request"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_sequences_only() {
+        assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m plain"), "red plain");
+        assert_eq!(strip_ansi("\x1b[38;5;208mcolour\x1b[m"), "colour");
+        // A line with no ESC byte is returned untouched, brackets included.
+        assert_eq!(strip_ansi("[a.py:1] [0m literal"), "[a.py:1] [0m literal");
+        // A truncated sequence at the end of a line is dropped, not echoed.
+        assert_eq!(strip_ansi("cut off\x1b[3"), "cut off");
+    }
+
+    #[test]
+    fn parse_tracing_levels() {
+        for (raw, level) in [
+            ("TRACE", "DEBUG"),
+            ("DEBUG", "DEBUG"),
+            ("INFO", "INFO"),
+            ("WARN", "WARN"),
+            ("ERROR", "ERROR"),
+        ] {
+            let e = parse_log_line(&format!("2026-11-13T20:36:33.840617Z {raw:>5} app: hi"));
+            assert_eq!(e.level, level, "{raw}");
+            assert_eq!(e.message, "app: hi");
+        }
+    }
+
+    /// A line that merely starts with a date is not a tracing line unless a
+    /// level follows it.
+    #[test]
+    fn date_prefixed_text_without_a_level_stays_plain() {
+        let e = parse_log_line("2026-11-13T20:36:33Z started up");
+        assert_eq!(e.level, "INFO");
+        assert_eq!(e.message, "2026-11-13T20:36:33Z started up");
+        assert!(e.timestamp.is_empty());
     }
 
     /// The tailer now waits for a file that does not exist yet, because the
