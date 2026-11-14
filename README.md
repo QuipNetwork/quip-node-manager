@@ -116,7 +116,7 @@ the desktop app.
 - **Backend**: `src-tauri/src/` -- Rust + Tauri v2 commands. `compose.rs` drives the stack via `docker compose`; `stack_assets.rs` stages the bundled compose files into `~/quip-data/`.
 - **Stack definition**: `vendor/nodes.quip.network/` -- git submodule tracking the upstream Docker Compose setup (miner, validator, dashboard).
 - **Config**: TOML generation matching quip-protocol format; `.env` generated from settings on every Start.
-- **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files.
+- **Data**: `~/quip-data/` (configurable at first boot) holds app settings, runtime config, secrets, native binaries, and the staged compose files. [docs/trimming-quip-data.md](docs/trimming-quip-data.md) lists what you can delete to get disk space back.
 
 Advanced settings in both interfaces group host ports by service. Each port has
 an on/off switch and a host port field. Internal Docker addresses stay fixed,
