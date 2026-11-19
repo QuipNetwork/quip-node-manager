@@ -146,6 +146,8 @@ build-toolchain-image-arm64:
     TOOLCHAIN_MOVING_TAG: arm64-latest
     TOOLCHAIN_TAG_PREFIX: arm64-
     TOOLCHAIN_PIN_VARIABLE: TOOLCHAIN_IMAGE_ARM64
+    FC_VCPUS: "4"
+    FC_MEM: "8192"
 
 # ---------------------------------------------------------------------------
 # Shared setup
@@ -605,7 +607,7 @@ build-linux-x86_64:
   # of which GIT_CLEAN_FLAGS could preserve, since only the project directory
   # survives a job and none of that setup lands there.
   image: $TOOLCHAIN_IMAGE
-  tags: [linux, x86_64]
+  tags: [linux, x86_64, amd64]
   variables:
     LINUX_ARCH: x86_64
   script:
