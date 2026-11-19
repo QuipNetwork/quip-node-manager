@@ -128,6 +128,30 @@ against `SHA256SUMS` as shown above.
 
 ---
 
+## v0.4.1-rc2
+
+### The log pane no longer grows without a limit
+
+The log pane keeps the newest 500 lines from each source. Older lines left
+the line count but stayed in the window, so the window grew for as long as
+the app ran. One operator measured about 1 GB of memory an hour.
+
+- The manager now removes a line from the window when the line leaves the
+  500-line history.
+- Memory use of the app and its window stays level while the node runs.
+
+### The install script stops on Linux arm64
+
+Each release carries a Linux build for x86_64 only. On Linux arm64,
+`scripts/install.sh` installed the x86_64 AppImage, which then failed to
+start with `Exec format error`.
+
+- The script now selects the Linux download from the machine architecture.
+- On a Linux architecture with no build, the script stops before it
+  downloads anything and reports that the architecture is not supported yet.
+
+---
+
 ## v0.4.1-rc1
 
 ### Dashboard log lines show plain text and their real level

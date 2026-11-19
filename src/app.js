@@ -1381,6 +1381,8 @@ function normalizeLogEntry(entry) {
     message: entry.message || '',
     source,
     _seq: state.logSeq++,
+    // The line's <p> while it is in the log body, so eviction can remove it.
+    _el: null,
   };
 }
 
@@ -1497,6 +1499,11 @@ function renderLogOutput() {
   if (!output) return;
   const stickToBottom =
     output.scrollHeight - output.scrollTop - output.clientHeight < 60;
+  // replaceChildren below detaches every line, so drop the references that
+  // would otherwise keep the filtered-out ones alive.
+  for (const lines of Object.values(state.logBuffers)) {
+    for (const entry of lines) entry._el = null;
+  }
   const visible = visibleLogEntries();
   const total = totalBufferedLogCount();
   const frag = document.createDocumentFragment();
@@ -1507,7 +1514,8 @@ function renderLogOutput() {
     frag.appendChild(empty);
   } else {
     for (const entry of visible) {
-      frag.appendChild(buildLogLineElement(entry));
+      entry._el = buildLogLineElement(entry);
+      frag.appendChild(entry._el);
     }
   }
   output.replaceChildren(frag);
@@ -1569,14 +1577,15 @@ function appendLog(entry) {
     renderLogSourceChips();
   }
   const buf = state.logBuffers[src];
-  // If the ring buffer drops a line that currently matches both filters,
-  // keep the match count in sync with the buffers (DOM eviction of that
-  // single node is left for the next full re-render — same as pre-filter).
+  // A line the ring buffer drops leaves the DOM with it. Without this the
+  // log body grows for as long as the app runs, because a full re-render
+  // happens only when a filter changes. A dropped line that matched both
+  // filters also comes off the match count.
   let droppedVisible = false;
   if (buf.length >= state.MAX_LOG_LINES) {
-    const dropped = buf[0];
+    const dropped = buf.shift();
     if (entryIsVisible(dropped)) droppedVisible = true;
-    buf.shift();
+    if (dropped._el) dropped._el.remove();
   }
   buf.push(normalized);
 
@@ -1600,7 +1609,8 @@ function appendLog(entry) {
     output.scrollHeight - output.scrollTop - output.clientHeight < 60;
   // New lines always arrive last, so append preserves arrival order among
   // currently visible lines.
-  output.appendChild(buildLogLineElement(normalized));
+  normalized._el = buildLogLineElement(normalized);
+  output.appendChild(normalized._el);
   // +1 for the new line; -1 if we also dropped a previously-visible line.
   const nextVisible = state.logVisibleCount + 1 - (droppedVisible ? 1 : 0);
   updateLogMatchCount(nextVisible, total);
