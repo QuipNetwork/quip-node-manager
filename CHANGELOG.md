@@ -128,10 +128,10 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## v0.4.1-rc3
+## v0.4.1
 
-This release candidate replaces `v0.4.1-rc2`, which was tagged but never
-published. It contains the same two fixes.
+This stable release contains the changes from `v0.4.1-rc1` and
+`v0.4.1-rc3`. `v0.4.1-rc2` was tagged but never published.
 
 ### The log pane no longer grows without a limit
 
@@ -141,7 +141,7 @@ the app ran. One operator measured about 1 GB of memory an hour.
 
 - The manager now removes a line from the window when the line leaves the
   500-line history.
-- Memory use of the app and its window stays level while the node runs.
+- The window holds at most 500 lines for each source.
 
 ### The install script stops on Linux arm64
 
@@ -152,10 +152,6 @@ start with `Exec format error`.
 - The script now selects the Linux download from the machine architecture.
 - On a Linux architecture with no build, the script stops before it
   downloads anything and reports that the architecture is not supported yet.
-
----
-
-## v0.4.1-rc1
 
 ### Dashboard log lines show plain text and their real level
 
