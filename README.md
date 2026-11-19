@@ -26,6 +26,10 @@ Download the `.dmg`, open it, and drag the app to `/Applications`.
 
 ### Linux
 
+Each release carries builds for x86_64 and arm64. The commands below use the
+x86_64 file names. On an arm64 machine, use the files with `arm64` in place
+of `x86_64`.
+
 The recommended format is **AppImage** (works on any distro):
 
 ```sh

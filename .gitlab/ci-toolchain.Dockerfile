@@ -3,31 +3,34 @@
 # CI toolchain image: ubuntu:22.04 plus everything `bun run tauri build` needs
 # on Linux — the GTK/WebKit system libraries, a pinned Rust toolchain, and bun.
 #
-# `build-linux-x86_64` in `.gitlab-ci.yml` pulls this image from this project's
-# own registry. Before it existed that job ran on a stock ubuntu:22.04 and
+# The Linux build jobs in `.gitlab-ci.yml` pull this image from this project's
+# own registry. Before it existed the x86_64 job ran on a stock ubuntu:22.04 and
 # re-paid the whole setup on every run: an apt-get of ~120 packages, a rustup
 # install, and a bun install. `GIT_CLEAN_FLAGS` already preserves
 # src-tauri/target and .cargo-cache, so the compile was warm while the setup
 # was not — three concurrent pipelines spent over 40 minutes each in apt
 # without reaching a single crate.
 #
-# The `build-toolchain-image` job builds and pushes this with kaniko. It runs
-# automatically when this file changes and is manual otherwise. Unlike the
+# The `build-toolchain-image` jobs build and push this with kaniko. They run
+# automatically when this file changes and are manual otherwise. Unlike the
 # validator's toolchain image, which lives on Docker Hub and must be pushed
 # from a workstation because CI holds no Docker Hub credentials, every job
 # here is already authenticated to $CI_REGISTRY through the job token.
 #
-# After that job publishes, bump the pinned digest in TOOLCHAIN_IMAGE in
-# `.gitlab-ci.yml` — CI resolves the digest, not the tag, so a re-push alone
-# changes nothing. The job prints the digest it pushed.
+# After a job publishes, bump its pinned digest in `.gitlab-ci.yml` — CI
+# resolves the digest, not the tag, so a re-push alone changes nothing. Each
+# job prints the digest it pushed and the variable that holds it.
 #
 # `make builder-image` builds and pushes the same image from a workstation.
 # That path is a fallback for when the runners are unavailable, and it needs a
 # `docker login registry.gitlab.com` first.
 #
-# Single-arch on purpose. `build-linux-x86_64` carries `tags: [linux, x86_64]`
-# and no arm64 Linux runner takes Tauri work, so the multi-arch manifest the
-# validator's toolchain image needs would only buy emulated build time.
+# One Dockerfile, two images. `build-toolchain-image` builds it on an amd64
+# runner and `build-toolchain-image-arm64` builds it on an arm64 runner. Each
+# image is single-arch and has its own pinned digest (`TOOLCHAIN_IMAGE` and
+# `TOOLCHAIN_IMAGE_ARM64`), because a Tauri bundle must be built on the
+# architecture it targets. The rustup and bun installers below select the
+# architecture of the machine they run on.
 
 # Ubuntu 22.04, not the Debian bookworm base the validator's toolchain uses.
 # The AppImage and .deb inherit their glibc floor from whatever builds them,

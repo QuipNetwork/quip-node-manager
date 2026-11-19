@@ -26,13 +26,6 @@ case "$ARCH" in
   *)             error "Unsupported architecture: $ARCH" ;;
 esac
 
-# The release carries a Linux build for x86_64 only. Stop here on any other
-# architecture: the x86_64 AppImage would download, pass its checksum, install,
-# and then fail at launch with "Exec format error".
-if [ "$PLATFORM" = "linux" ] && [ "$ARCH" != "x86_64" ]; then
-  error "Linux $ARCH is not supported yet. Releases carry a Linux build for x86_64 only."
-fi
-
 # ── Fetch latest release tag ────────────────────────────────────────────────
 info "Fetching latest release..."
 TAG=$(curl -fsSL "$API" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -48,6 +41,7 @@ case "$PLATFORM" in
     URL="${BASE}/${ARTIFACT}?job=build-macos-universal"
     ;;
   linux)
+    # A release carries one Linux build for each architecture accepted above.
     ARTIFACT="quip-node-manager-linux-${ARCH}.AppImage"
     URL="${BASE}/${ARTIFACT}?job=build-linux-${ARCH}"
     ;;
