@@ -1,5 +1,11 @@
 # GitLab CI/CD for Quip Node Manager
 # Tauri v2 desktop app builds for macOS (universal), Linux, Windows
+#
+# Runner tags: a job whose image or tools exist for amd64 only must say so.
+# The arm64 Docker runners accept untagged jobs, so an untagged job can land
+# on one and fail with "exec format error". Use `tags: [docker, amd64]` for a
+# job that needs an amd64 container image. Leave a job untagged only when its
+# image is published for arm64 as well.
 
 include:
   - project: quip.network/ci-templates
@@ -267,7 +273,7 @@ powershell-lint:
   image: mcr.microsoft.com/powershell:7.5-debian-12
   # The image is published for amd64 only. Without tags, an arm64 runner that
   # accepts untagged jobs takes this one and fails with "exec format error".
-  tags: [linux, x86_64]
+  tags: [docker, amd64]
   variables:
     GIT_SUBMODULE_STRATEGY: none
   before_script:
@@ -790,6 +796,9 @@ sign-artifacts:
 release-binaries:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
+  # The image is published for amd64 only, so keep this job off the arm64
+  # Docker runners. They accept untagged jobs.
+  tags: [docker, amd64]
   needs:
     - job: dependency-gate
       optional: true
