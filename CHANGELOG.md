@@ -128,7 +128,10 @@ against `SHA256SUMS` as shown above.
 
 ---
 
-## v0.4.1-rc2
+## v0.4.1-rc3
+
+This release candidate replaces `v0.4.1-rc2`, which was tagged but never
+published. It contains the same two fixes.
 
 ### The log pane no longer grows without a limit
 
