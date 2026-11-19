@@ -22,24 +22,25 @@ stages:
 # Pull vendor/nodes.quip.network (docker-compose.yml + Caddyfile bundled
 # as Tauri resources) before any job runs. Default is `none`, which would
 # leave the submodule dir empty and fail the Tauri resource-path check.
-# Toolchain image for build-linux-x86_64, built from
-# .gitlab/ci-toolchain.Dockerfile by the `build-toolchain-image` job below and
-# published to this project's own registry. Unlike the validator's toolchain
+# Toolchain images for the Linux build jobs, built from
+# .gitlab/ci-toolchain.Dockerfile by the `build-toolchain-image` jobs below and
+# published to this project's own registry. Each architecture has its own image. Unlike the validator's toolchain
 # image — which lives on Docker Hub and must be pushed by hand, because no
 # Docker Hub credentials exist in CI — every job here is already authenticated
 # to $CI_REGISTRY through the job token, so CI builds and pushes it itself.
 #
-# TOOLCHAIN_IMAGE is pinned by digest, not by tag: a tag can be re-pushed to
+# TOOLCHAIN_IMAGE and TOOLCHAIN_IMAGE_ARM64 are pinned by digest, not by tag: a tag can be re-pushed to
 # point at different content, which would change what every Linux build runs
 # with no diff in this repo. Changing the Dockerfile is therefore two steps —
-# let `build-toolchain-image` publish, then bump the digest here. The job
-# prints the digest it pushed.
+# let the `build-toolchain-image` jobs publish, then bump the digests here.
+# Each job prints the digest it pushed.
 #
 # The macOS and Windows jobs run on shell runners, which ignore `image:`
 # entirely, so they keep installing their own toolchains in before_script.
 variables:
   GIT_SUBMODULE_STRATEGY: recursive
   TOOLCHAIN_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain@sha256:5188558d319c6300a7aba885b2db430e3b6d0b7ebdfddbd7a1d940d1feefc15b
+  TOOLCHAIN_IMAGE_ARM64: $CI_REGISTRY_IMAGE/ci-toolchain@sha256:fedc245e086c9dc419835b448dae0d7389167ab359bde66353c5e43e36b63322
   TOOLCHAIN_CACHE_IMAGE: $CI_REGISTRY_IMAGE/ci-toolchain-buildcache
   # Keep the Rust build directory and the Cargo home across jobs.
   #
@@ -552,28 +553,23 @@ build-macos-universal:
       - dist/quip-node-manager-macos-universal.dmg
 
 # ---------------------------------------------------------------------------
-# Linux x86_64 (AppImage + deb)
+# Linux x86_64 and arm64 (AppImage + deb + rpm)
 # ---------------------------------------------------------------------------
 
-build-linux-x86_64:
+# One build, two architectures. Tauri builds a bundle for the architecture of
+# the machine it runs on, so each job below runs on a runner of its own
+# architecture, in the toolchain image built for that architecture. LINUX_ARCH
+# names the release files.
+.linux_build:
   extends: .tauri_build
-  resource_group: linux-build
-  # The toolchain image carries the GTK/WebKit system libraries, Rust, and bun
-  # (see .gitlab/ci-toolchain.Dockerfile). They used to be installed per job on
-  # a stock ubuntu:22.04, which re-paid an apt-get of ~120 packages plus two
-  # installer downloads on every run — 40 minutes of it under contention, none
-  # of which GIT_CLEAN_FLAGS could preserve, since only the project directory
-  # survives a job and none of that setup lands there.
-  image: $TOOLCHAIN_IMAGE
-  tags: [linux, x86_64]
   before_script:
     - bun install
   script:
     - rm -rf src-tauri/target/release/bundle
     - bun run tauri build
     - mkdir -p dist
-    - cp src-tauri/target/release/bundle/appimage/*.AppImage dist/quip-node-manager-linux-x86_64.AppImage
-    - cp src-tauri/target/release/bundle/deb/*.deb dist/quip-node-manager-linux-x86_64.deb
+    - cp src-tauri/target/release/bundle/appimage/*.AppImage "dist/quip-node-manager-linux-${LINUX_ARCH}.AppImage"
+    - cp src-tauri/target/release/bundle/deb/*.deb "dist/quip-node-manager-linux-${LINUX_ARCH}.deb"
     # `targets: all` builds this. A missing file means the bundler changed, and
     # failing here — in the build stage — costs nothing, while discovering it
     # after the sign stage would waste a real SSL.com signature.
@@ -583,10 +579,45 @@ build-linux-x86_64:
         echo "no RPM in src-tauri/target/release/bundle/rpm; check bundle.targets in tauri.conf.json" >&2
         exit 1
       fi
-      cp "$rpm" dist/quip-node-manager-linux-x86_64.rpm
+      cp "$rpm" "dist/quip-node-manager-linux-${LINUX_ARCH}.rpm"
+    # A bundle for the wrong architecture would pass every later step and fail
+    # only on a user's machine, so compare the binary with the job's own claim.
+    - |
+      case "$LINUX_ARCH" in
+        x86_64) want="x86-64" ;;
+        arm64)  want="aarch64" ;;
+      esac
+      file src-tauri/target/release/quip-node-manager | tee /tmp/file-report
+      grep -q "$want" /tmp/file-report || { echo "the binary is not $LINUX_ARCH" >&2; exit 1; }
+  artifacts:
+    paths:
+      - dist/quip-node-manager-linux-${LINUX_ARCH}.AppImage
+      - dist/quip-node-manager-linux-${LINUX_ARCH}.deb
+      - dist/quip-node-manager-linux-${LINUX_ARCH}.rpm
+
+build-linux-x86_64:
+  extends: .linux_build
+  resource_group: linux-build
+  # The toolchain image carries the GTK/WebKit system libraries, Rust, and bun
+  # (see .gitlab/ci-toolchain.Dockerfile). They used to be installed per job on
+  # a stock ubuntu:22.04, which re-paid an apt-get of ~120 packages plus two
+  # installer downloads on every run — 40 minutes of it under contention, none
+  # of which GIT_CLEAN_FLAGS could preserve, since only the project directory
+  # survives a job and none of that setup lands there.
+  image: $TOOLCHAIN_IMAGE
+  tags: [linux, x86_64]
+  variables:
+    LINUX_ARCH: x86_64
+  script:
+    - !reference [.linux_build, script]
+    # Written by this job only. Two jobs writing the same path would collide
+    # when sign-artifacts downloads both sets of artifacts.
     - |
       cat > dist/README-linux.txt << 'HEREDOC'
       Quip Node Manager — Linux
+
+      The file names below are for x86_64. On an arm64 machine, use the
+      files with arm64 in place of x86_64.
 
       AppImage (any distro):
         chmod +x quip-node-manager-linux-x86_64.AppImage
@@ -612,6 +643,15 @@ build-linux-x86_64:
       - dist/quip-node-manager-linux-x86_64.deb
       - dist/quip-node-manager-linux-x86_64.rpm
       - dist/README-linux.txt
+
+build-linux-arm64:
+  extends: .linux_build
+  resource_group: linux-arm64-build
+  image: $TOOLCHAIN_IMAGE_ARM64
+  # The arm64 Docker runners carry `docker` and `arm64`, and no `linux` tag.
+  tags: [docker, arm64]
+  variables:
+    LINUX_ARCH: arm64
 
 # ---------------------------------------------------------------------------
 # Windows x86_64
@@ -755,6 +795,7 @@ sign-artifacts:
       optional: true
     - build-macos-universal
     - build-linux-x86_64
+    - build-linux-arm64
     - sign-windows-x86_64
   variables:
     GIT_SUBMODULE_STRATEGY: none
@@ -785,7 +826,8 @@ sign-artifacts:
       rpmsign --define "__gpg $(command -v gpg)" \
               --define "_gpg_name $KEY_ID" \
               --define "_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback --passphrase-file $RELEASE_GPG_PASSPHRASE" \
-              --addsign dist/quip-node-manager-linux-x86_64.rpm
+              --addsign dist/quip-node-manager-linux-x86_64.rpm \
+                        dist/quip-node-manager-linux-arm64.rpm
     # Import the public half so --checksig can judge the signature, not just the
     # digests.
     - |
@@ -795,12 +837,14 @@ sign-artifacts:
     # so the exit status proves nothing. The word "signatures" in that line is
     # what separates a signed package from an unsigned one.
     - |
-      report=$(rpm --checksig dist/quip-node-manager-linux-x86_64.rpm)
-      echo "$report"
-      case "$report" in
-        *"digests signatures OK"*) ;;
-        *) echo "the RPM is not signed by $KEY_ID" >&2; exit 1 ;;
-      esac
+      for rpm in dist/quip-node-manager-linux-x86_64.rpm dist/quip-node-manager-linux-arm64.rpm; do
+        report=$(rpm --checksig "$rpm")
+        echo "$report"
+        case "$report" in
+          *"digests signatures OK"*) ;;
+          *) echo "$rpm is not signed by $KEY_ID" >&2; exit 1 ;;
+        esac
+      done
     # Checksums cover every file a user can download, the RPM included, and are
     # computed from the dist directory so the file names match what they fetch.
     - cd dist && sha256sum quip-node-manager-* > SHA256SUMS && cd ..
@@ -816,6 +860,7 @@ sign-artifacts:
     expire_in: 30 days
     paths:
       - dist/quip-node-manager-linux-x86_64.rpm
+      - dist/quip-node-manager-linux-arm64.rpm
       - dist/SHA256SUMS
       - dist/SHA256SUMS.asc
 
@@ -830,6 +875,7 @@ release-binaries:
       optional: true
     - build-macos-universal
     - build-linux-x86_64
+    - build-linux-arm64
     - sign-windows-x86_64
     - sign-artifacts
   rules:
@@ -855,7 +901,10 @@ release-binaries:
         --assets-link='{"name":"macOS Universal DMG","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-macos-universal.dmg?job=build-macos-universal","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.AppImage?job=build-linux-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.deb?job=build-linux-x86_64","link_type":"package"}' \
+        --assets-link='{"name":"Linux arm64 AppImage","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-arm64.AppImage?job=build-linux-arm64","link_type":"package"}' \
+        --assets-link='{"name":"Linux arm64 deb","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-arm64.deb?job=build-linux-arm64","link_type":"package"}' \
         --assets-link='{"name":"Windows x86_64 exe","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-windows-x86_64.exe?job=sign-windows-x86_64","link_type":"package"}' \
         --assets-link='{"name":"Linux x86_64 rpm (signed)","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-x86_64.rpm?job=sign-artifacts","link_type":"package"}' \
+        --assets-link='{"name":"Linux arm64 rpm (signed)","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/quip-node-manager-linux-arm64.rpm?job=sign-artifacts","link_type":"package"}' \
         --assets-link='{"name":"SHA256SUMS","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS?job=sign-artifacts","link_type":"other"}' \
         --assets-link='{"name":"SHA256SUMS.asc","url":"'"${CI_PROJECT_URL}"'/-/jobs/artifacts/'"${CI_COMMIT_TAG}"'/raw/dist/SHA256SUMS.asc?job=sign-artifacts","link_type":"other"}'

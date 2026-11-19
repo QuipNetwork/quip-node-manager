@@ -29,6 +29,10 @@ Download the `.dmg`, open it, and drag the app to `/Applications`.
 
 ### Linux
 
+Each release carries builds for x86_64 and arm64. The commands below use the
+x86_64 file names. On an arm64 machine, use the files with `arm64` in place
+of `x86_64`.
+
 The recommended format is **AppImage** (works on any distro):
 
 ```sh
@@ -125,6 +129,21 @@ The `.deb` and the AppImage carry no embedded signature. Check those two
 against `SHA256SUMS` as shown above.
 
 </details>
+
+---
+
+## v0.4.2
+
+### Linux arm64 has its own build
+
+Each release now carries an AppImage, a `.deb`, and a signed `.rpm` for Linux
+arm64, next to the x86_64 files. The arm64 files have `arm64` in their names.
+
+- `scripts/install.sh` installs the arm64 AppImage on a Linux arm64 machine.
+  In v0.4.1 the script stopped there and reported that the architecture was
+  not supported.
+- `SHA256SUMS` covers the arm64 files, and the arm64 `.rpm` carries the same
+  release signature as the x86_64 `.rpm`.
 
 ---
 
